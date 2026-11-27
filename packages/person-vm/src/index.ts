@@ -3,6 +3,7 @@ export type {
   PersonVmWebRoster,
   PersonVmWebEndpointReceipt,
   PersonVmWebStartup,
+  NativeWebSetupFailure,
   PersonVmWebRosterPort,
 } from './web-endpoints.ts';
 export type {
@@ -10,6 +11,7 @@ export type {
   PersonVmGuestCommand,
   PersonVmJobExit,
   PersonVmManagedJob,
+  PersonVmNativeWebGuestAddress,
   PersonVmStartingScope,
   PersonVmBootstrapScope,
   PersonVmGuestBootstrapPort,
@@ -23,6 +25,12 @@ export {
 export * from './admission-boundary.ts';
 export { PersonVmAdmissionHost } from './admission-host.ts';
 export { PersonVmService, sameVmBinding } from './person-vm.ts';
+export { PersonVmDiskPool, type PersonVmDiskPoolOptions } from './disk-pool.ts';
+export { MacosPersonVmDiskPool } from './disk-pool-macos.ts';
+export type {
+  PlatformVmDeletionRequest,
+  PlatformVmDeletionResult,
+} from './platform-deletion.ts';
 export {
   PostgresPersonVmStore,
   type PersonVmStore,
@@ -35,6 +43,7 @@ export {
   MicrosandboxPersonVm,
   type PersonVmNativePort,
 } from './microsandbox.ts';
+export { isMicrosandboxGuestIpv4 } from './microsandbox-bootstrap.ts';
 export {
   ApfsPersonVmDisk,
   FilePersonVmKeyStore,

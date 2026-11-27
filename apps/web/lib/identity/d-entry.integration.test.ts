@@ -31,6 +31,7 @@ import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src
 import {
   createChatSession,
   getSessionExecutionGeneration,
+  ensureDefaultEmployee,
   sendChatMessage,
   updateChatSession,
   linkFileToSession,
@@ -54,7 +55,12 @@ import { POST } from '../../app/api/v1/d-entry/admission/route';
 import { POST as createNativeRoot } from '../../app/api/v1/d-entry/native-root/route';
 import { PATCH } from '../../app/api/v1/sessions/[id]/route';
 import { POST as createBusinessThread } from '../../app/api/v1/sessions/route';
-import { findDEntryEmployee } from '../d-entry/entry-threads';
+import {
+  findDEntryCreationWorkspace,
+  findDEntryEmployee,
+  isDEntryPersonReleased,
+} from '../d-entry/entry-threads';
+import { POST as createEmployee } from '../../app/api/v1/employee-instances/route';
 import {
   POST as uploadAttachment,
   PUT as attachWorkspaceFile,
@@ -68,13 +74,24 @@ import { resolveDEntryIdentity } from '../d-entry/identity';
 import {
   dEntryReleasePolicyKey,
   readDEntryReleasePolicy,
+  readPersonVmDiskPreparationTarget,
   getDEntryReleasePolicy,
   updateDEntryReleasePolicy,
   requireCurrentPlatformAdmin,
   getDEntryNativeRootPin,
   getDEntryHistoryRootPin,
+  getDEntryPageNativeRoot,
+  registerDEntryPageNativeRoot,
   ensureDEntryNativeRoot,
   requireDEntryNativeIdentity,
+  readDEntryEmployeeDirectory,
+  preparePersonNativeWebRoster,
+  readPersonNativeWebRoster,
+  hasExistingDEntryEmployeeOrVm,
+  createEmployeeInstance,
+  getEmployeeDetails,
+  getOrganizationAiSharedDetails,
+  listOrganizationPersonAiInstances,
   createDEntryAuthorityFeed,
   watchDEntryNativeAuthority,
   watchDEntryHistoryAuthority,
@@ -162,6 +179,16 @@ suite(
     beforeEach(() => {
       cookie.token = '';
     });
+    async function expectFirstEmployeeLimit(response: Response) {
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: {
+          code: 'CONFLICT',
+          message: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+          retryable: false,
+        },
+      });
+    }
     afterAll(async () => {
       cookie.token = '';
       vi.restoreAllMocks();
@@ -285,14 +312,7 @@ suite(
       const policy = await updateDEntryReleasePolicy(f.context, {
         revision: 'not-a-published-revision',
         defaultGeneration: '3.x',
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0',
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       });
       const identity = await requireDEntryNativeIdentity(f.context, selection);
       return { ...f, thread, selection, identity, policy };
@@ -301,7 +321,7 @@ suite(
       () => fixture.db`delete from allrice_settings where scope_type='system'
       and scope_id is null and key=${dEntryReleasePolicyKey}`;
     function creation(
-      f: Awaited<ReturnType<typeof enabledFour>>,
+      f: Pick<Fixture, 'org' | 'user'>,
       nativeSessionId = 'dsh-host-created-root',
     ) {
       return {
@@ -497,6 +517,157 @@ suite(
         expect(legacy!.n).toBe(0);
         expect(runs!.n).toBe(0);
         expect(create).toHaveBeenCalledTimes(1);
+      } finally {
+        await clearPublished();
+      }
+    });
+
+    it('registers native page create and fork replies exactly once under the current person VM lease', async () => {
+      const f = await enabledFour();
+      const created = creation(f, 'native-page-created');
+      const binding = created.host.binding;
+      const identity = { ...f.identity, threadId: null };
+      const signal = new AbortController().signal;
+      try {
+        await fixture.db`insert into person_virtual_machines
+          (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+          values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+            ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'synthetic-registration' })})`;
+
+        const first = await registerDEntryPageNativeRoot(
+          f.context,
+          identity,
+          created,
+          signal,
+        );
+        expect(first.identity.threadId).toEqual(expect.any(String));
+        expect(first.identity.threadId).not.toBe(f.thread.id);
+        expect(first).toMatchObject({
+          rootNativeSessionId: created.nativeSessionId,
+          vmId: binding.vmId,
+        });
+        expect(
+          await registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            created,
+            signal,
+          ),
+        ).toEqual(first);
+        expect(
+          await getDEntryPageNativeRoot(
+            f.context,
+            identity,
+            binding.vmId,
+            created.nativeSessionId,
+          ),
+        ).toEqual(first);
+
+        const forked = {
+          ...created,
+          nativeSessionId: 'native-page-forked',
+          forkSource: { nativeSessionId: created.nativeSessionId, root: first },
+        };
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            {
+              ...forked,
+              forkSource: {
+                ...forked.forkSource,
+                root: { ...first, rootOriginDigest: 'replaced-source' },
+              },
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        const fork = await registerDEntryPageNativeRoot(
+          f.context,
+          first.identity,
+          forked,
+          signal,
+        );
+        expect(fork.identity.threadId).not.toBe(first.identity.threadId);
+        expect(fork).toMatchObject({
+          rootNativeSessionId: forked.nativeSessionId,
+          forkedFromNativeSessionId: created.nativeSessionId,
+        });
+        expect(
+          await registerDEntryPageNativeRoot(
+            f.context,
+            first.identity,
+            forked,
+            signal,
+          ),
+        ).toEqual(fork);
+        await fixture.db`update allrice_chat_sessions set archived_at=now() where id=${first.identity.threadId}`;
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            { ...forked, nativeSessionId: 'native-rejected-archived-source' },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(
+          await getDEntryNativeRootPin(f.context, {
+            ...f.selection,
+            threadId: fork.identity.threadId,
+          }),
+        ).toEqual(fork);
+
+        const other = await setup();
+        await fixture.db`insert into allrice_memberships (organization_id, workspace_id, user_id, role)
+          values (${f.org}, ${f.workspace}, ${other.user}, 'member')`;
+        const stranger = await authenticateSession(other.login.token, {
+          organizationId: f.org,
+          workspaceId: f.workspace,
+        });
+        if (!stranger) throw Error('Synthetic member login unavailable');
+        await expect(
+          registerDEntryPageNativeRoot(
+            stranger,
+            identity,
+            {
+              ...created,
+              nativeSessionId: 'native-rejected-actor',
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        await fixture.db`update person_virtual_machines set lease_epoch=lease_epoch + 1 where vm_id=${binding.vmId}`;
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            {
+              ...created,
+              nativeSessionId: 'native-rejected-old-epoch',
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        const threads =
+          await fixture.db`select id, d_entry_native_root->>'nativeSessionId' as native_session_id
+          from allrice_chat_sessions where organization_id=${f.org} and workspace_id=${f.workspace}
+            and execution_generation='4.0'`;
+        expect(threads).toHaveLength(3);
+        expect(threads).toEqual(
+          expect.arrayContaining([
+            { id: f.thread.id, native_session_id: null },
+            {
+              id: first.identity.threadId,
+              native_session_id: created.nativeSessionId,
+            },
+            {
+              id: fork.identity.threadId,
+              native_session_id: forked.nativeSessionId,
+            },
+          ]),
+        );
       } finally {
         await clearPublished();
       }
@@ -808,7 +979,7 @@ suite(
     });
 
     for (const otherOnly of [true, false])
-      it(`rechecks the current person/employee rollout after create, ignoring only unrelated policy changes (otherOnly=${otherOnly})`, async () => {
+      it(`rechecks the current person's rollout after create, ignoring only unrelated policy changes (otherOnly=${otherOnly})`, async () => {
         const f = await enabledFour(),
           other = otherOnly ? await setup() : null,
           fact = creation(f),
@@ -820,17 +991,9 @@ suite(
             selections: other
               ? [
                   ...f.policy.selections,
-                  {
-                    organizationId: other.org,
-                    personId: other.user,
-                    employeeInstanceId: other.assignment,
-                    generation: '4.0',
-                  },
+                  { organizationId: other.org, personId: other.user },
                 ]
-              : f.policy.selections.map((entry) => ({
-                  ...entry,
-                  generation: '3.x',
-                })),
+              : [],
           });
           expect(policy.revision).not.toBe(f.policy.revision);
           return fact;
@@ -1191,9 +1354,10 @@ suite(
         expect(
           (await createNativeRoot(rootRequest(f, f.selection))).status,
         ).toBe(503);
-        expect((await readDEntryReleasePolicy()).selections).toContainEqual(
-          expect.objectContaining({ personId: f.user, generation: '4.0' }),
-        );
+        expect((await readDEntryReleasePolicy()).selections).toContainEqual({
+          organizationId: f.org,
+          personId: f.user,
+        });
         for (const [path, body] of [
           ['native-owner', server.body],
           ['native-root', server.body],
@@ -1363,6 +1527,51 @@ suite(
         await Promise.allSettled([revoke, publish]);
       }
     });
+    it('orders the first person rollout publication after an in-flight default policy reader', async () => {
+      const f = await setup();
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      const held = deferred<number>();
+      const release = deferred<void>();
+      let publish: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
+      const read = fixture.db.begin(async (tx) => {
+        const policy = await readDEntryReleasePolicy(tx, true);
+        const [backend] = await tx`select pg_backend_pid() pid`;
+        held.resolve(backend!.pid);
+        await release.promise;
+        return policy;
+      });
+      try {
+        const blocker = await held.promise;
+        publish = updateDEntryReleasePolicy(f.context, {
+          revision: 'caller-revision',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: f.org, personId: f.user }],
+        });
+        void publish.catch(() => {});
+        await expect
+          .poll(async () => {
+            const [wait] =
+              await fixture.db`select exists(select 1 from pg_stat_activity a
+                where ${blocker}::integer=any(pg_blocking_pids(a.pid))
+                  and a.wait_event='advisory') blocked`;
+            return wait!.blocked;
+          })
+          .toBe(true);
+        expect((await readDEntryReleasePolicy()).revision).toBe('unpublished');
+        release.resolve();
+        expect((await read).revision).toBe('unpublished');
+        const published = await publish;
+        expect(published.selections).toEqual([
+          { organizationId: f.org, personId: f.user },
+        ]);
+        expect(await readDEntryReleasePolicy()).toEqual(published);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([read, publish]);
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
     it('maps the real login cookie to current person/employee/root without starting a VM', async () => {
       const f = await setup();
       const req = request(f);
@@ -1392,14 +1601,7 @@ suite(
       const policy = {
         revision: 'caller-revision-is-not-authority',
         defaultGeneration: '3.x' as const,
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0' as const,
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       };
       expect(await readDEntryReleasePolicy()).toEqual({
         revision: 'unpublished',
@@ -1494,14 +1696,7 @@ suite(
       const policy = {
         revision: 'synthetic-approved-policy',
         defaultGeneration: '3.x' as const,
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0' as const,
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       };
       for (const selection of [existing, newThread])
         expect(
@@ -1784,6 +1979,421 @@ suite(
         await fixture.db`select snapshot,snapshot_version from allrice_native_once_controls where automation_id=${taskId}`;
       expect(controlAfter).toEqual(controlBefore);
     });
+    it('discovers an active assignment after materializing its first employee instance', async () => {
+      const f = await setup(),
+        user = randomUUID(),
+        assignmentId = randomUUID();
+      await fixture.db`insert into allrice_users(id,email,display_name,password_hash)
+        values(${user},${user + '@example.test'},'Assigned employee owner','synthetic')`;
+      await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+        values(${f.org},${f.workspace},${user},'member')`;
+      await fixture.db`insert into allrice_employee_assignments
+        (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
+        select ${assignmentId},organization_id,workspace_id,employee_id,employee_version_id,${user},false,true,${f.user}
+        from allrice_employee_assignments where id=${f.assignment}`;
+      const { token } = await createSession(user);
+      const context = await authenticateSession(token, {
+        organizationId: f.org,
+        workspaceId: f.workspace,
+      });
+      if (!context) throw Error('Synthetic assignment login unavailable');
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      try {
+        await updateDEntryReleasePolicy(f.context, {
+          revision: 'initial',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: f.org, personId: user }],
+        });
+        expect(await findDEntryEmployee(context)).toBeNull();
+        expect(await hasExistingDEntryEmployeeOrVm(context)).toBe(true);
+        cookie.token = token;
+        const requestId = randomUUID();
+        await expectFirstEmployeeLimit(
+          await createEmployee(
+            new Request('https://allrice.test/api/v1/employee-instances', {
+              method: 'POST',
+              headers: {
+                origin: 'https://allrice.test',
+                'x-allrice-organization-id': f.org,
+                'x-allrice-workspace-id': f.workspace,
+              },
+              body: JSON.stringify({
+                assignmentId,
+                workspaceId: f.workspace,
+                requestId,
+                profile: { name: '额外员工' },
+              }),
+            }),
+          ),
+        );
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${user}`,
+        ).toEqual([]);
+        expect(
+          (await preparePersonNativeWebRoster(context)).entries,
+        ).toMatchObject([
+          { workspaceId: f.workspace, employeeInstanceId: assignmentId },
+        ]);
+        expect(await findDEntryEmployee(context)).toEqual({
+          workspaceId: f.workspace,
+          employeeInstanceId: assignmentId,
+        });
+      } finally {
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
+
+    it('creates from an empty personal roster and opens a 4.0 thread without changing existing writers', async () => {
+      const f = await setup();
+      const ownerId = randomUUID();
+      const signal = new AbortController().signal;
+      await fixture.db`insert into allrice_users(id,email,display_name,password_hash)
+        values(${ownerId},${ownerId + '@example.test'},'New employee owner','synthetic')`;
+      await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+        values(${f.org},${f.workspace},${ownerId},'member')`;
+      const login = await createSession(ownerId);
+      const owner = await authenticateSession(login.token, {
+        organizationId: f.org,
+        workspaceId: f.workspace,
+      });
+      if (!owner) throw Error('Synthetic owner session unavailable');
+      const input = {
+        workspaceId: f.workspace,
+        requestId: randomUUID(),
+        expectedOwnerId: ownerId,
+        profile: {
+          name: '🚀私人助理',
+          description: 'PRIVATE_FIRST_EMPLOYEE_DESCRIPTION',
+        },
+      };
+      const headers = {
+        origin: 'https://allrice.test',
+        'x-allrice-organization-id': f.org,
+        'x-allrice-workspace-id': f.workspace,
+      };
+      const create = (body: unknown = input) =>
+        createEmployee(
+          new Request('https://allrice.test/api/v1/employee-instances', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+          }),
+        );
+      await clearPublished();
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      cookie.token = login.token;
+      try {
+        expect(await isDEntryPersonReleased(owner)).toBe(false);
+        expect((await create()).status).toBe(403);
+        const initial = {
+          revision: 'initial',
+          defaultGeneration: '3.x' as const,
+          selections: [
+            {
+              organizationId: f.org.toUpperCase(),
+              personId: ownerId.toUpperCase(),
+            },
+          ],
+        };
+        await updateDEntryReleasePolicy(f.context, {
+          ...initial,
+          selections: [
+            ...initial.selections,
+            { organizationId: f.org, personId: f.user },
+          ],
+        });
+        cookie.token = f.login.token;
+        expect((await create()).status).toBe(403);
+        expect(
+          await fixture.db`select id from allrice_employee_instances where creation_request_id=${input.requestId}`,
+        ).toEqual([]);
+        cookie.token = login.token;
+        await updateDEntryReleasePolicy(f.context, initial);
+        expect(await findDEntryCreationWorkspace(owner)).toBe(f.workspace);
+        expect(await findDEntryEmployee(owner)).toBeNull();
+        expect(await ensureDefaultEmployee(owner)).toBeNull();
+        expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
+        expect(
+          await readPersonVmDiskPreparationTarget(ownerId, signal),
+        ).toBeNull();
+
+        const vmId = randomUUID();
+        await fixture.db`insert into person_virtual_machines
+          (person_id,vm_id,organization_id,phase,disk_tier)
+          values(${ownerId},${vmId},${f.org},'starting','warm')`;
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
+        await expectFirstEmployeeLimit(await create());
+        await fixture.db`update person_virtual_machines
+          set phase='deleted' where vm_id=${vmId}`;
+        await expectFirstEmployeeLimit(await create());
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
+        ).toEqual([]);
+        await fixture.db`update person_virtual_machines
+          set disk_retained=false where vm_id=${vmId}`;
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
+
+        const other = await setup();
+        const legacy = await createBusinessThread(
+          new Request('https://allrice.test/api/v1/sessions', {
+            method: 'POST',
+            headers: { 'x-allrice-organization-id': other.org },
+            body: JSON.stringify({
+              workspaceId: other.workspace,
+              employeeInstanceId: other.assignment,
+            }),
+          }),
+        );
+        expect(legacy.status).toBe(201);
+        const { session: legacyThread } = await legacy.json();
+        expect(
+          await getSessionExecutionGeneration(
+            other.context,
+            other.workspace,
+            legacyThread.id,
+          ),
+        ).toBe('3.x');
+        await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+          values(${other.org},${other.workspace},${ownerId},'member')`;
+        const otherTenant = await authenticateSession(login.token, {
+          organizationId: other.org,
+          workspaceId: other.workspace,
+        });
+        if (!otherTenant) throw Error('Synthetic second tenant unavailable');
+        expect(await isDEntryPersonReleased(otherTenant)).toBe(false);
+        await expect(
+          createEmployeeInstance(otherTenant, {
+            ...input,
+            workspaceId: other.workspace,
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        cookie.token = login.token;
+        expect(
+          (await create({ ...input, workspaceId: other.workspace })).status,
+        ).toBe(403);
+        expect(await isDEntryPersonReleased(f.context)).toBe(false);
+        cookie.token = f.login.token;
+        expect(
+          (
+            await create({
+              workspaceId: f.workspace,
+              assignmentId: f.assignment,
+              requestId: randomUUID(),
+              profile: { name: '既有 3.x 创建流程' },
+            })
+          ).status,
+        ).toBe(201);
+        cookie.token = login.token;
+        await fixture.db`update allrice_memberships set role='viewer' where user_id=${ownerId}`;
+        expect((await create()).status).toBe(403);
+        await fixture.db`update allrice_memberships set role='member' where user_id=${ownerId}`;
+
+        const attempts = [input, { ...input, requestId: randomUUID() }];
+        const concurrent = await Promise.all(attempts.map(create));
+        expect(concurrent.map(({ status }) => status).sort()).toEqual([
+          201, 409,
+        ]);
+        await expectFirstEmployeeLimit(
+          concurrent.find((result) => result.status === 409)!,
+        );
+        const winner =
+          attempts[concurrent.findIndex((result) => result.status === 201)]!;
+        const responses = await Promise.all([create(winner), create(winner)]);
+        expect(responses.map(({ status }) => status)).toEqual([201, 201]);
+        const [{ instance }, replay] = await Promise.all(
+          responses.map((response) => response.json()),
+        );
+        expect(replay.instance).toEqual(instance);
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
+        await expectFirstEmployeeLimit(
+          await create({ ...input, requestId: randomUUID() }),
+        );
+        await expectFirstEmployeeLimit(
+          await create({
+            workspaceId: f.workspace,
+            assignmentId: instance.assignmentId,
+            requestId: randomUUID(),
+            profile: input.profile,
+          }),
+        );
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
+        ).toEqual([{ id: instance.id }]);
+        await fixture.db`delete from person_virtual_machines where vm_id=${vmId}`;
+        expect(
+          await readPersonVmDiskPreparationTarget(ownerId, signal),
+        ).toMatchObject({
+          personId: ownerId,
+          organizationId: f.org,
+          workspaceId: f.workspace,
+          employeeInstanceId: instance.id,
+          employeeVersionId: instance.source.employeeVersionId,
+          platformRevisionId: null,
+        });
+        expect(instance).toMatchObject({
+          kind: 'custom',
+          workspaceId: f.workspace,
+          ownerId,
+          profile: input.profile,
+          source: { kind: 'tenant_version' },
+        });
+        expect(instance.profile.appearance).toMatchObject({
+          avatarValue: '🚀',
+        });
+        const details = await getEmployeeDetails(owner, instance.id);
+        expect(details.profile).toMatchObject(input.profile);
+        const directoryView = await listOrganizationPersonAiInstances(
+          f.context,
+          f.org,
+          ownerId,
+        );
+        const sharedDetails = await getOrganizationAiSharedDetails(
+          f.context,
+          f.org,
+          ownerId,
+          instance.id,
+        );
+        expect(directoryView.instances).toContainEqual(
+          expect.objectContaining({
+            id: instance.id,
+            sourceName: '自定义员工',
+          }),
+        );
+        expect(sharedDetails.details.profile.name).toBe('自定义员工');
+        expect(JSON.stringify({ directoryView, sharedDetails })).not.toContain(
+          input.profile.name,
+        );
+        expect(JSON.stringify({ directoryView, sharedDetails })).not.toContain(
+          input.profile.description,
+        );
+        const selection = {
+          workspaceId: f.workspace,
+          employeeInstanceId: instance.id,
+        };
+        expect(await findDEntryEmployee(owner)).toEqual(selection);
+        expect(
+          await requireDEntryNativeIdentity(owner, selection),
+        ).toMatchObject({
+          personId: ownerId,
+          employeeInstanceId: instance.id,
+          threadId: null,
+        });
+        const roster = await preparePersonNativeWebRoster(owner);
+        expect(roster.entries).toEqual([
+          {
+            ...selection,
+            employeeRevision: 1,
+            employeeVersionId: instance.source.employeeVersionId,
+          },
+        ]);
+        expect(await readPersonNativeWebRoster(owner)).toEqual(roster);
+        expect(
+          (
+            await createBusinessThread(
+              new Request('https://allrice.test/api/v1/sessions', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(selection),
+              }),
+            )
+          ).status,
+        ).toBe(403);
+        const thread = await createBusinessThread(
+          new Request('https://allrice.test/api/v1/sessions?entry=4.0', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ selection }),
+          }),
+        );
+        expect(thread.status).toBe(200);
+        const native = await thread.json();
+        expect(
+          await getSessionExecutionGeneration(
+            owner,
+            f.workspace,
+            native.threadId,
+          ),
+        ).toBe('4.0');
+        // A business thread is durable before its native root exists. The
+        // document directory opens only after the trusted host pins that root.
+        await expect(
+          readDEntryEmployeeDirectory(owner, native, signal),
+        ).rejects.toMatchObject({ code: 'not_found' });
+        const identity = await requireDEntryNativeIdentity(owner, native);
+        const receipt = creation({ org: f.org, user: ownerId });
+        const createRoot = vi.fn(async () => receipt);
+        const pin = await ensureDEntryNativeRoot(owner, native, identity, {
+          operationId: randomUUID(),
+          host: receipt.host,
+          signal,
+          create: createRoot,
+        });
+        expect(createRoot).toHaveBeenCalledOnce();
+        expect(pin.rootNativeSessionId).toBe(receipt.nativeSessionId);
+        const directory = await readDEntryEmployeeDirectory(
+          owner,
+          native,
+          signal,
+        );
+        expect(directory.employees.map(({ instanceId }) => instanceId)).toEqual(
+          [instance.id],
+        );
+        expect(directory.sessions.map(({ id }) => id)).toEqual([
+          native.threadId,
+        ]);
+        expect(
+          await getSessionExecutionGeneration(
+            f.context,
+            f.workspace,
+            f.session,
+          ),
+        ).toBe('3.x');
+        const [row] =
+          await fixture.db`select count(*)::int n from allrice_audit_events
+          where actor_id=${ownerId} and action='employee.instance.create'`;
+        expect(row?.n).toBe(1);
+        await updateDEntryReleasePolicy(f.context, {
+          ...initial,
+          selections: [],
+        });
+        await expect(
+          requireDEntryNativeIdentity(owner, native),
+        ).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        expect((await create()).status).toBe(403);
+        expect(
+          await getSessionExecutionGeneration(
+            owner,
+            f.workspace,
+            native.threadId,
+          ),
+        ).toBe('4.0');
+        const legacyInput = {
+          workspaceId: input.workspaceId,
+          profile: input.profile,
+          requestId: randomUUID(),
+        };
+        await expect(
+          createEmployeeInstance(owner, {
+            ...legacyInput,
+            assignmentId: instance.assignmentId,
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await expect(
+          createEmployeeInstance(owner, {
+            ...legacyInput,
+            assignmentId: f.assignment,
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+      } finally {
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
+
     it('pins old and new threads permanently and never creates a 3.x native origin for 4.0', async () => {
       const f = await setup(),
         thread = await four(f);
@@ -1830,14 +2440,7 @@ suite(
       await updateDEntryReleasePolicy(f.context, {
         revision: 'initial',
         defaultGeneration: '3.x',
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0',
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       });
       try {
         expect(

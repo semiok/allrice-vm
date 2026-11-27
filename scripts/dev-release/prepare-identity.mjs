@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-import { lstat, mkdir, writeFile, rename } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { mkdir, open, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { stagePersonVmConfiguration } from './stage-person-vm-config.mjs';
 import { resolveServiceBuildSource } from './prepare-identity-root.mjs';
+import { stageDshProfileAssets } from './stage-dsh-profile-assets.mjs';
 import { prepareServiceBuildManifest } from '../../packages/database/dist/service-build-identity.js';
 import {
   measureDshNativeArtifact,
@@ -28,22 +31,73 @@ if (configArgs.length)
     root,
     configArgs[0].slice('--person-vm-config='.length),
   );
-const hostConfiguration = await lstat(
-  join(root, '.local/person-vm-host.json'),
+const hostConfigurationPath = '.local/person-vm-host.json';
+const hostConfiguration = await open(
+  join(root, hostConfigurationPath),
+  constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
 ).catch((error) => {
   if (error?.code !== 'ENOENT') throw error;
   return undefined;
 });
+let hostConfigurationChecksum;
 if (hostConfiguration) {
-  if (!hostConfiguration.isFile()) throw Error('DEV_BUILD_IDENTITY_INVALID');
+  let config;
+  try {
+    const stat = await hostConfiguration.stat();
+    if (
+      !stat.isFile() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o777) !== 0o600 ||
+      stat.size > 64 * 1024 ** 2
+    )
+      throw Error('Invalid private configuration');
+    const bytes = await hostConfiguration.readFile();
+    if (bytes.length !== stat.size)
+      throw Error('Invalid private configuration');
+    config = JSON.parse(bytes.toString('utf8'));
+    hostConfigurationChecksum =
+      'sha256:' + createHash('sha256').update(bytes).digest('hex');
+  } catch {
+    throw Error('DEV_BUILD_PRIVATE_CONFIG_INVALID');
+  } finally {
+    await hostConfiguration.close();
+  }
+  const { employeeProfileRuntime } =
+    await import('../person-vm-image/verify.mjs');
+  const configuredTerminal = config?.web?.terminalEnabled;
+  if (
+    configuredTerminal !== undefined &&
+    typeof configuredTerminal !== 'boolean'
+  )
+    throw Error('DEV_BUILD_PRIVATE_CONFIG_INVALID');
+  const terminalEnabled = configuredTerminal ?? true;
+  const runtime = employeeProfileRuntime(config?.native);
   const { prepareEmployeeWebServiceArtifact } =
     await import('../../packages/dsh-web-composition/build-web-entry.mjs');
+  const linuxCapture = runtime
+    ? (
+        await import('../person-vm-image/employee-profile.mjs')
+      ).createEmployeeLinuxCapture(config.native, {
+        ...runtime,
+        terminalEnabled,
+      })
+    : undefined;
   await prepareEmployeeWebServiceArtifact(
     join(root, 'apps/worker/dist/d-entry-web'),
     sourceSha,
+    linuxCapture,
+    terminalEnabled,
   );
+  await stageDshProfileAssets(root, sourceSha);
 }
 const manifest = await prepareServiceBuildManifest(source);
+// The build inventory reopens the staged file. Its bytes must be the ones
+// that selected and supplied the profile capture, including absence.
+const sealedHostConfiguration = manifest.files.find(
+  ({ path, scope }) => path === hostConfigurationPath && scope === 'worker',
+);
+if (sealedHostConfiguration?.checksum !== hostConfigurationChecksum)
+  throw Error('DEV_BUILD_PRIVATE_CONFIG_CHANGED');
 const nativeArtifact = await measureDshNativeArtifact(root, undefined, {
   schemaVersion: 2,
 });

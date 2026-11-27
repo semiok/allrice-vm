@@ -100,6 +100,14 @@ it(
     );
     const ids = native.entries.map(({ id }) => id);
     const sealedIds = expected.entries.map(({ id }) => id);
+    const pickerIds = (entries: string[]) =>
+      entries.filter((id) =>
+        id.startsWith('@deepseek-ai/dsh-client-ui-directory-picker-'),
+      );
+    expect(pickerIds(ids)).toEqual([
+      '@deepseek-ai/dsh-client-ui-directory-picker-browse',
+    ]);
+    expect(pickerIds(sealedIds)).toEqual(pickerIds(ids));
     expect({
       missing: sealedIds.filter((id) => !ids.includes(id)),
       extra: ids.filter((id) => !sealedIds.includes(id)),

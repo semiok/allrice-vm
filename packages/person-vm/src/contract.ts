@@ -1,5 +1,6 @@
 import {
   readPlatformPersonVmConfiguration,
+  type DEntryIdentity,
   type RequestContext,
 } from '@allrice/contracts';
 import type {
@@ -66,6 +67,37 @@ export interface PersonVmAuthority {
     personId: string;
     organizationId: string;
   }>;
+}
+
+/** Host-derived storage target only. A rollout revision is not a user session
+ * or permission to start a VM. */
+export type PersonVmDiskPreparationTarget = Readonly<
+  Pick<
+    DEntryIdentity,
+    | 'personId'
+    | 'organizationId'
+    | 'workspaceId'
+    | 'employeeInstanceId'
+    | 'employeeRevision'
+    | 'employeeVersionId'
+  > & { platformRevisionId: string | null; policyRevision: string }
+>;
+
+export interface PersonVmDiskPreparationPort {
+  /** The provider owns the existing person lease and joins all disk I/O and
+   * cleanup before settling. Recheck current scope inside the lease before
+   * side effects and completion, and capacity before allocating bytes. This
+   * operation prepares only an offline disk and sealed public cache. Reject
+   * with PersonVmError('CLEANUP_INCOMPLETE') if cleanup remains unconfirmed,
+   * including when cancellation initiated that cleanup. */
+  prepare(
+    target: PersonVmDiskPreparationTarget,
+    guard: Readonly<{
+      signal: AbortSignal;
+      assertCurrent(): Promise<void>;
+      assertCapacity(): Promise<void>;
+    }>,
+  ): Promise<'prepared' | 'already-prepared' | 'deferred'>;
 }
 
 export type PersonVmActivity = Readonly<{
@@ -157,13 +189,26 @@ export class PersonVmError extends Error {
   }
 }
 
+export type PersonVmPrewarmTarget = Readonly<{
+  vmId: string | null;
+  instanceId: string | null;
+  leaseEpoch: number;
+  restoreRetained?: true;
+  /** Exact fully purged predecessor, only for a fresh VM chosen under lease. */
+  replacesVmId?: string;
+}>;
+
+export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
+  assertAuthority(signal: AbortSignal): Promise<void>;
+};
+
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
 export interface PersonVmPort {
   create(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input' },
+    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

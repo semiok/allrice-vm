@@ -163,8 +163,6 @@ suite(
           {
             organizationId: f.context.organizationId,
             personId: f.context.actor.id,
-            employeeInstanceId: f.instance.id,
-            generation: '4.0',
           },
         ],
       });

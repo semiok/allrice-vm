@@ -187,6 +187,7 @@ interface EmployeeProfileFormProps {
   initialValue: EmployeeProfileFormValues;
   busy?: boolean;
   disabled?: boolean;
+  namePlaceholder?: string;
   error?: string;
   reset?: {
     profile: EmployeeDetailsProfile;
@@ -228,6 +229,7 @@ export function EmployeeProfileForm({
   initialValue,
   busy = false,
   disabled = false,
+  namePlaceholder,
   error,
   reset,
   onSubmit,
@@ -343,7 +345,8 @@ export function EmployeeProfileForm({
                   autoComplete="off"
                   placeholder={
                     mode === 'create'
-                      ? '例如： 文案专家、财务专员、商务分析师'
+                      ? (namePlaceholder ??
+                        '例如： 文案专家、财务专员、商务分析师')
                       : undefined
                   }
                   onChange={(event) => update('name', event.target.value)}

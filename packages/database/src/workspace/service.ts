@@ -1,4 +1,6 @@
 import { notifyNativeRosterInsert } from '../employees/native-roster-notification.ts';
+import { hasDEntryPersonRelease } from '@allrice/contracts';
+import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import {
   BrandMediaInvocationSchema,
   type BrandMediaInvocation,
@@ -333,9 +335,15 @@ export async function ensureDefaultEmployee(
       await transaction`select id from allrice_platform_employee_tenant_assignments
       where organization_id=${context.organizationId} and workspace_id=${workspaceId}
       union all select id from allrice_organizations where id=${context.organizationId} and managed_employee_roster limit 1`;
-    if (managed) {
-      // A withdrawn deployment is a durable decision. Reads must never recreate
-      // Rice or revive an old personal assignment. An empty roster is valid.
+    if (
+      managed ||
+      hasDEntryPersonRelease(await readDEntryReleasePolicy(transaction, true), {
+        organizationId: context.organizationId,
+        personId: userId,
+      })
+    ) {
+      // Managed and person-released workspaces may deliberately be empty.
+      // Reading them must not recreate a default employee or revive an assignment.
       const [current] = await transaction<AssignmentRow[]>`
         select a.id assignment_id,a.employee_id,a.employee_version_id,a.user_id,a.organization_id,a.workspace_id,a.is_default,
           v.version,v.name,v.model,v.system_prompt,v.capabilities,v.published_at,v.config_checksum
@@ -518,11 +526,14 @@ export async function createChatSession(
   options: {
     sessionId?: string;
     freezeAccountCapabilities?: true;
+    requireLegacyBrowserWriter?: true;
     /** Host-selected birth owner. Never copied from browser JSON. */
     executionGeneration?: ExecutionGeneration;
   } = {},
 ) {
   const parsed = CreateChatSessionInputSchema.parse(input);
+  if (options.requireLegacyBrowserWriter)
+    await assertLegacyBrowserWriter(context);
   if (parsed.employeeInstanceId) {
     const { getEmployeeInstance } =
       await import('../employees/employee-instances.ts');
@@ -551,6 +562,19 @@ export async function createChatSession(
     options,
   );
 }
+async function assertLegacyBrowserWriter(
+  context: ResourcePrincipal,
+  tx?: TransactionSql,
+) {
+  if (
+    hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, !!tx), {
+      organizationId: context.organizationId,
+      personId: requireUser(context),
+    })
+  )
+    throw new DataAccessError('authorization_denied');
+}
+
 /** Explicit-assignment core for server-authorized platform work. Membership,
  * current published version and private owner checks remain mandatory. */
 export async function createAssignedChatSession(
@@ -559,6 +583,7 @@ export async function createAssignedChatSession(
   options: {
     sessionId?: string;
     freezeAccountCapabilities?: true;
+    requireLegacyBrowserWriter?: true;
     executionGeneration?: ExecutionGeneration;
   } = {},
   transaction?: TransactionSql,
@@ -605,6 +630,8 @@ export async function createAssignedChatSession(
     parsed.employeeInstanceId,
     transaction,
   );
+  if (options.requireLegacyBrowserWriter)
+    await assertLegacyBrowserWriter(context, transaction);
   let assignment: EmployeeAssignment | null = null;
   if (parsed.employeeAssignmentId) {
     const assignments = await sql<AssignmentRow[]>`

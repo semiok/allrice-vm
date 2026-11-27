@@ -10,13 +10,20 @@ import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
+import { nativeSessionRoot } from '@allrice/d-entry-principal/policy';
 import {
   createDEntryPrincipalControl,
   type PrincipalInvocationObservation,
 } from '../d-entry/principal-control.js';
-import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
+import type {
+  DEntryPrincipalIssue,
+  DEntryScopeIssue,
+} from '@allrice/d-entry-principal/types';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
-import { DEntryNativeTurnEndSchema } from '@allrice/database';
+import {
+  DEntryNativeTurnEndSchema,
+  getDEntryPageNativeRoot,
+} from '@allrice/database';
 import type {
   ModelCatalog,
   SessionFollowFrame,
@@ -29,6 +36,7 @@ import {
   type PersonVmBinding,
   type PersonVmBootstrapScope,
   type PersonVmPort,
+  type NativeWebSetupFailure,
 } from '@allrice/person-vm';
 import type {
   ImageAttachmentRef,
@@ -37,7 +45,9 @@ import type {
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
+  NativePromptOccurrenceSchema,
   observeNativePrompt,
   type NativePromptObservation,
 } from './prompt-observation.js';
@@ -60,6 +70,17 @@ type EditorEvidence<T> = (
 export type NativeModelAttemptKind =
   'assistant' | 'compaction' | 'session-title';
 
+const nativePrompts = z
+  .array(NativePromptOccurrenceSchema)
+  .max(64)
+  .refine(
+    (prompts) =>
+      new Set(
+        prompts.map(({ sessionId, messageId }) =>
+          JSON.stringify([sessionId, messageId]),
+        ),
+      ).size === prompts.length,
+  );
 const nativeRootWake = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('clear') }).strict(),
   z.object({ kind: z.literal('unproven') }).strict(),
@@ -67,11 +88,7 @@ const nativeRootWake = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('delegated'),
       turn: z.number().int().positive(),
-      promptIds: z
-        .array(z.string().min(1).max(256))
-        .min(1)
-        .max(64)
-        .refine((ids) => new Set(ids).size === ids.length),
+      prompts: nativePrompts,
     })
     .strict(),
 ]);
@@ -134,6 +151,11 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
+  startupPending?(): boolean;
+  recordStartupFailure?(
+    failure: NativeWebSetupFailure,
+    signal: AbortSignal,
+  ): Promise<void>;
   beforePrompt?(
     input: {
       binding: PersonVmBinding;
@@ -142,25 +164,95 @@ export async function openNativeWebOwner(input: {
       issue: DEntryPrincipalIssue;
     } & (
       | {
-          endpoint: 'session/prompt';
+          endpoint: 'session/prompt' | 'subagents/prompt';
           requestId: string;
           mode: 'queue' | 'steer';
+          child?: { sessionId: string; parentSessionId: string };
           observe(signal: AbortSignal): NativePromptObservation;
         }
-      | { endpoint: 'session/updateQueue' }
+      | {
+          endpoint: 'session/updateQueue';
+          child?: { sessionId: string; parentSessionId: string };
+          itemId: string;
+          action: 'edit' | 'remove' | 'steer';
+        }
     ),
     signal: AbortSignal,
   ): Promise<PrincipalInvocationObservation | undefined>;
 }) {
+  let step = 'validate-setup';
+  let transportStatus: number | undefined;
+  let controlHandshakeStatus: number | undefined;
+  let startupFailureAudit: Promise<void> | undefined;
+  let startupComplete = false;
+  function stage(next: string) {
+    step = next;
+    transportStatus = undefined;
+  }
+  function recordingStartup() {
+    return !startupComplete || input.startupPending?.() === true;
+  }
+  function recordFailure(reason: unknown, failedStep = step) {
+    if (!recordingStartup() || startupFailureAudit) return;
+    startupFailureAudit = Promise.resolve();
+    const diagnostic: NativeWebSetupFailure = {
+      step: failedStep,
+      ...nativeSetupError(
+        reason,
+        (failedStep === step ? transportStatus : undefined) ??
+          (failedStep === 'control-first-frame'
+            ? controlHandshakeStatus
+            : undefined),
+      ),
+      target: nativeSetupTarget(input.launch.auth.origin),
+    };
+    try {
+      console.warn('[MET-273] native Web startup failed', {
+        requestId: UuidSchema.safeParse(input.context.requestId).data,
+        vmId: UuidSchema.safeParse(input.scope.binding.vmId).data,
+        leaseEpoch: input.scope.binding.leaseEpoch,
+        ...diagnostic,
+      });
+    } catch {
+      // Logging cannot change the failure or its cleanup.
+    }
+    if (input.recordStartupFailure) {
+      // A stalled diagnostic writer must not delay the cause or cleanup.
+      const budget = new AbortController();
+      let timer: ReturnType<typeof setTimeout>;
+      const deadline = new Promise<void>((done) => {
+        timer = setTimeout(() => {
+          budget.abort();
+          done();
+        }, 250);
+      });
+      const audit = Promise.resolve().then(() =>
+        input.recordStartupFailure!(diagnostic, budget.signal),
+      );
+      startupFailureAudit = Promise.race([
+        audit.catch(() => {}),
+        deadline,
+      ]).finally(() => clearTimeout(timer));
+    }
+  }
   if (
     !input.scope.readNativeWebAuth ||
     !Number.isSafeInteger(input.cleanupTimeoutMs) ||
     input.cleanupTimeoutMs <= 0
-  )
-    throw new PersonVmError('PROVIDER_FAILED');
+  ) {
+    const error = new PersonVmError('PROVIDER_FAILED');
+    recordFailure(error);
+    await startupFailureAudit;
+    throw error;
+  }
   const binding = Object.freeze({ ...input.scope.binding });
-  if (!sameVmBinding(input.launch.binding, binding))
-    throw new PersonVmError('LEASE_LOST');
+  if (!sameVmBinding(input.launch.binding, binding)) {
+    const error = new PersonVmError('LEASE_LOST');
+    recordFailure(error);
+    await startupFailureAudit;
+    throw error;
+  }
+  stage('startup-authority');
   const stale = new AbortController(),
     carrier = new AbortController(),
     waitAbort = new AbortController();
@@ -202,10 +294,20 @@ export async function openNativeWebOwner(input: {
     while (operations.size) await Promise.allSettled([...operations]);
   }
   let disconnected: Promise<void> | undefined;
-  const lost = () => {
+  const lost = (reason: unknown = new PersonVmError('PROVIDER_FAILED')) => {
     if (disconnected) return;
+    recordFailure(reason);
+    const abortCarrier = () => {
+      carrier.abort(new PersonVmError('PROVIDER_FAILED'));
+      waitAbort.abort();
+    };
+    const audit = startupFailureAudit;
     // Publish before abort callbacks can reenter. Local drain is not remote ACK.
     disconnected = Promise.resolve().then(async () => {
+      if (audit) {
+        await audit;
+        abortCarrier();
+      }
       await Promise.allSettled([starting, nativeWait]);
       const results = await Promise.allSettled([
         principals.drainLocal(),
@@ -222,14 +324,29 @@ export async function openNativeWebOwner(input: {
     ready = false;
     principals.fence(new PersonVmError('PROVIDER_FAILED'));
     stale.abort(new PersonVmError('PROVIDER_FAILED'));
-    carrier.abort(new PersonVmError('PROVIDER_FAILED'));
-    waitAbort.abort();
+    if (!audit) abortCarrier();
     void disconnected.catch(() => {});
   };
   const transport = nativeWebTransport(
     input.launch.auth.origin,
     carrier.signal,
     lost,
+    (error, status, failed, source) => {
+      if (!recordingStartup()) return;
+      if (startupFailureAudit) return failed ? startupFailureAudit : undefined;
+      if (source === 'websocket') {
+        if (!failed) {
+          controlHandshakeStatus = status;
+          return;
+        }
+        if (step !== 'control-first-frame') stage('control-websocket');
+      }
+      transportStatus = status;
+      if (failed) {
+        recordFailure(error);
+        return startupFailureAudit;
+      }
+    },
   );
   function joinHost() {
     if (hostClosing) return hostClosing;
@@ -263,6 +380,7 @@ export async function openNativeWebOwner(input: {
     if (closing) return closing;
     // Publish before fence/abort: nested close must join this exact attempt.
     closing = Promise.resolve().then(async () => {
+      if (startupFailureAudit) await startupFailureAudit;
       const [scopes] = await Promise.allSettled([principals.close()]);
       // Even an unknown remote scope must get a real local drain. Only this
       // shared owner's close owns job cancellation; page scopes never do.
@@ -291,12 +409,21 @@ export async function openNativeWebOwner(input: {
     return closing;
   }
   const aborted = () => {
+    recordFailure(
+      input.scope.signal.aborted
+        ? input.scope.signal.reason
+        : input.lifetime.reason,
+    );
     void close().catch(() => {});
   };
   input.lifetime.addEventListener('abort', aborted, { once: true });
   input.scope.signal.addEventListener('abort', aborted, { once: true });
   if (input.lifetime.aborted || input.scope.signal.aborted) aborted();
-  const startupTimer = setTimeout(lost, input.launch.auth.timeoutMs);
+  const startupTimer = setTimeout(
+    () =>
+      lost(new DOMException('Native Web startup timed out', 'TimeoutError')),
+    input.launch.auth.timeoutMs,
+  );
   function readCurrentSessions(
     requestSignal: AbortSignal,
     assertCurrent: (signal: AbortSignal) => Promise<void>,
@@ -324,6 +451,40 @@ export async function openNativeWebOwner(input: {
         return result;
       }),
     );
+  }
+  async function readChildPromptTarget(
+    context: RequestContext,
+    sessionId: string,
+    active: AbortSignal,
+    expectedParent?: string,
+  ) {
+    const result = await readCurrentSessions(active, (current) =>
+      input.vm.assertCurrentBinding(context, binding, current),
+    );
+    if (!result.ok) throw result.error;
+    const rows = result.value.items;
+    const entries = new Map(
+      rows.map((entry) => [String(entry.sessionId), entry]),
+    );
+    const target = entries.get(sessionId);
+    const rootEntry = nativeSessionRoot(entries, sessionId);
+    const parent =
+      target?.parentSessionId && entries.get(target.parentSessionId);
+    if (
+      entries.size !== rows.length ||
+      target?.origin !== 'subagent' ||
+      !rootEntry ||
+      !parent?.agentAvailable ||
+      (expectedParent !== undefined && expectedParent !== parent.sessionId)
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    return {
+      rootSessionId: rootEntry.sessionId,
+      child: {
+        sessionId: target.sessionId,
+        parentSessionId: parent.sessionId,
+      },
+    };
   }
   function readGraph(current: AbortSignal) {
     return transport.readIndex(current).then((html): unknown => {
@@ -395,11 +556,29 @@ export async function openNativeWebOwner(input: {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
+  // The same exported object is used by startup proof and admitted page reads.
+  // It is replaced with the actual native owner at every new VM epoch.
+  const profileVerificationOwner = {};
   function verifyEditor<T>(
     caller: AbortSignal,
     guard: (signal: AbortSignal) => Promise<void>,
     verify: EditorEvidence<T>,
+    duringStartup = false,
   ) {
+    function editorRead<R>(name: string, read: () => Promise<R>) {
+      if (!duringStartup) return read();
+      stage(name);
+      return read().then(
+        (value) => {
+          stage('editor-proof');
+          return value;
+        },
+        (error: unknown) => {
+          recordFailure(error, name);
+          throw error;
+        },
+      );
+    }
     const current = AbortSignal.any([
       caller,
       AbortSignal.timeout(input.launch.auth.timeoutMs),
@@ -408,22 +587,34 @@ export async function openNativeWebOwner(input: {
       verify(
         {
           revoked: active,
-          readImmutableGraph: (signal) => readCurrent(signal, guard, readGraph),
+          verificationOwner: profileVerificationOwner,
+          readImmutableGraph: (signal) =>
+            editorRead('editor-index', () =>
+              readCurrent(signal, guard, readGraph),
+            ),
           readImmutableBundle: (reference, bytes, signal) =>
-            readCurrent(signal, guard, (reading) =>
-              readBundle(reference, bytes, reading),
+            editorRead('editor-bundle', () =>
+              readCurrent(signal, guard, (reading) =>
+                readBundle(reference, bytes, reading),
+              ),
             ),
         },
         () =>
-          readCurrent(active, guard, async (signal) => {
-            const method = TYPERT_REMOTE.methods['session/modelCatalog'];
-            const args = method.input({ strict: true }).create().parse({});
-            const result = await readSessionReply('modelCatalog', args, signal);
-            return {
-              ok: true as const,
-              value: method.result.create().parse(replyValue(result)),
-            };
-          }),
+          editorRead('editor-model-catalog', () =>
+            readCurrent(active, guard, async (signal) => {
+              const method = TYPERT_REMOTE.methods['session/modelCatalog'];
+              const args = method.input({ strict: true }).create().parse({});
+              const result = await readSessionReply(
+                'modelCatalog',
+                args,
+                signal,
+              );
+              return {
+                ok: true as const,
+                value: method.result.create().parse(replyValue(result)),
+              };
+            }),
+          ),
         active,
         installedModelAdapter,
       ),
@@ -432,6 +623,7 @@ export async function openNativeWebOwner(input: {
   try {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    stage('launch');
     starting = setup(async () => {
       const opened = await input.scope.launch(input.launch.command);
       job = opened;
@@ -444,25 +636,32 @@ export async function openNativeWebOwner(input: {
     nativeWait = Promise.resolve().then(() => started.wait(waitAbort.signal));
     void nativeWait.then(
       () => {
-        if (!waitAbort.signal.aborted) lost();
+        if (!waitAbort.signal.aborted) lost('NATIVE_JOB_EXITED');
       },
-      () => {
-        if (!waitAbort.signal.aborted) lost();
+      (error: unknown) => {
+        if (!waitAbort.signal.aborted) lost(error);
       },
     );
+    stage('auth-artifact');
     // Loss of this exact CLI job aborts the attached artifact read. Keep it
     // tracked in setup so close still waits for the native reader to join.
     const auth = await setup(() =>
       input.scope.readNativeWebAuth!(input.launch.auth, signal),
     );
+    stage('auth-authority');
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    stage('auth-adapter-proof');
     if (auth.modelAdapterId !== input.launch.auth.modelAdapterId)
       throw new PersonVmError('RUNTIME_NOT_READY');
     installedModelAdapter = auth.modelAdapterId;
+    stage('authenticate');
     await setup(() => transport.authenticate(auth.authenticatedUrl));
+    stage('authenticate-index');
     await setup(() => transport.authenticateIndex(auth.authenticatedUrl));
+    stage('install-registry');
     await setup(() => root.plugin(TypertRegistry));
+    stage('install-connection');
     signal.throwIfAborted();
     installConnection(root, {
       interactions: 'none',
@@ -472,18 +671,26 @@ export async function openNativeWebOwner(input: {
         streamBaseUrl: input.launch.auth.origin,
       },
     });
+    stage('install-gateway');
     await setup(() => root.plugin(GatewayClient));
+    stage('mount-session');
     await setup(() => root.remote.$mount(TYPERT_REMOTE));
+    stage('mount-principal');
     await setup(() => root.remote.$mount(PRINCIPAL_REMOTE));
+    stage('session-list');
     const list = await own(root.remote.session.list({}, signal));
     if (!list.ok) throw new PersonVmError('PROVIDER_FAILED');
+    stage('control-first-frame');
     const stream = root.remote.session.control(signal);
     const iterator = stream[Symbol.asyncIterator]();
     const first = await own(iterator.next());
     if (first.done || first.value.type !== 'baseline')
       throw new PersonVmError('PROVIDER_FAILED');
+    stage('final-authority');
     await setup(() => input.scope.assertCurrent());
     signal.throwIfAborted();
+    stage('awaiting-group-ready');
+    startupComplete = true;
     ready = true;
     own(
       (async () => {
@@ -503,21 +710,34 @@ export async function openNativeWebOwner(input: {
       binding,
       revoked: signal,
       modelAdapterId: installedModelAdapter,
+      profileVerificationOwner,
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
-      verifyStartingEditor<T>(
+      async verifyStartingEditor<T>(
         startingScope: PersonVmBootstrapScope,
         caller: AbortSignal,
         verify: EditorEvidence<T>,
       ) {
         if (startingScope !== input.scope)
-          return Promise.reject(new PersonVmError('LEASE_LOST'));
-        return verifyEditor(
-          AbortSignal.any([caller, startingScope.signal]),
-          () => startingScope.assertCurrent(),
-          verify,
-        );
+          throw new PersonVmError('LEASE_LOST');
+        startupComplete = false;
+        stage('editor-proof');
+        try {
+          return await verifyEditor(
+            AbortSignal.any([caller, startingScope.signal]),
+            () => startingScope.assertCurrent(),
+            verify,
+            true,
+          );
+        } catch (error) {
+          recordFailure(error);
+          await startupFailureAudit;
+          throw error;
+        } finally {
+          stage('awaiting-group-ready');
+          startupComplete = true;
+        }
       },
       verifyRunningEditor<T>(
         context: RequestContext,
@@ -567,7 +787,7 @@ export async function openNativeWebOwner(input: {
         );
       },
       acquirePrincipal(
-        issue: DEntryPrincipalIssue,
+        issue: DEntryScopeIssue,
         requestSignal: AbortSignal,
         context?: RequestContext,
       ) {
@@ -578,37 +798,115 @@ export async function openNativeWebOwner(input: {
           AbortSignal.any([requestSignal, signal]),
           async (call, active) => {
             if (
-              !input.beforePrompt ||
-              (call.endpoint !== 'session/prompt' &&
-                call.endpoint !== 'session/updateQueue')
+              call.endpoint !== 'session/prompt' &&
+              call.endpoint !== 'subagents/prompt' &&
+              call.endpoint !== 'session/updateQueue'
             )
               return;
-            if (
-              !context ||
-              !installedModelAdapter ||
-              call.args.request.sessionId !== issue.root.nativeSessionId
-            )
+            if (!input.beforePrompt) {
+              if (issue.access === 'page')
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              return;
+            }
+            if (!context || !installedModelAdapter)
               throw new PersonVmError('AUTHORIZATION_DENIED');
+            const readPagePin = (sessionId: string) =>
+              getDEntryPageNativeRoot(
+                context,
+                issue.identity,
+                binding.vmId,
+                sessionId,
+              );
+            let authorized: DEntryPrincipalIssue;
+            let child:
+              { sessionId: string; parentSessionId: string } | undefined;
+            let pin: Awaited<ReturnType<typeof readPagePin>>;
+            let rootSessionId: string;
+            if (call.endpoint === 'subagents/prompt') {
+              if (issue.access !== 'page')
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              const { childSessionId, parentSessionId } = call.args.request;
+              ({ rootSessionId, child } = await readChildPromptTarget(
+                context,
+                childSessionId,
+                active,
+                parentSessionId,
+              ));
+            } else {
+              rootSessionId = call.args.request.sessionId;
+              if (
+                issue.access === 'page' &&
+                call.endpoint === 'session/updateQueue'
+              ) {
+                pin = await readPagePin(rootSessionId);
+                if (!pin)
+                  ({ rootSessionId, child } = await readChildPromptTarget(
+                    context,
+                    rootSessionId,
+                    active,
+                  ));
+              }
+            }
+            if (issue.access === 'page') {
+              pin ??= await readPagePin(rootSessionId);
+              if (
+                !pin ||
+                pin.vmId !== binding.vmId ||
+                pin.rootNativeSessionId !== rootSessionId
+              )
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              authorized = {
+                scopeId: issue.scopeId,
+                identity: pin.identity,
+                access: 'execute',
+                root: {
+                  nativeSessionId: pin.rootNativeSessionId,
+                  rootBindingRef: pin.rootBindingRef,
+                  rootOriginDigest: pin.rootOriginDigest,
+                  ...(pin.forkedFromNativeSessionId && {
+                    forkedFromNativeSessionId: pin.forkedFromNativeSessionId,
+                  }),
+                },
+              };
+            } else {
+              if (rootSessionId !== issue.root.nativeSessionId)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              authorized = issue;
+            }
+            await input.vm.assertCurrentBinding(context, binding, active);
+            active.throwIfAborted();
             const adapterId = installedModelAdapter;
-            const write = { binding, adapterId, context, issue };
+            const write = { binding, adapterId, context, issue: authorized };
             if (call.endpoint === 'session/updateQueue')
               return input.beforePrompt(
-                { ...write, endpoint: call.endpoint },
+                {
+                  ...write,
+                  endpoint: call.endpoint,
+                  child,
+                  itemId: call.args.request.itemId,
+                  action: call.args.request.action.kind,
+                },
                 active,
               );
             const requestId = call.args.request.requestId;
-            return input.beforePrompt(
+            let observed: NativePromptObservation | undefined;
+            const admission = await input.beforePrompt(
               {
                 ...write,
                 endpoint: call.endpoint,
                 requestId,
-                mode: call.args.request.mode,
+                mode:
+                  call.endpoint === 'subagents/prompt'
+                    ? call.args.request.delivery
+                    : call.args.request.mode,
+                child,
                 observe(current) {
-                  const observed = observeNativePrompt(
+                  observed = observeNativePrompt(
                     transport,
                     {
                       adapterId,
-                      sessionId: issue.root.nativeSessionId,
+                      sessionId: child?.sessionId ?? rootSessionId,
+                      ...(child && { parentSessionId: child.parentSessionId }),
                       scopeId: issue.scopeId,
                       requestId,
                     },
@@ -621,6 +919,14 @@ export async function openNativeWebOwner(input: {
               },
               active,
             );
+            if (!child || !admission) return admission;
+            return {
+              ...admission,
+              assertInserted(messageId, signal) {
+                if (!observed) throw new PersonVmError('PROVIDER_FAILED');
+                return observed.assertInserted(messageId, signal);
+              },
+            };
           },
         );
       },
@@ -719,6 +1025,16 @@ export async function openNativeWebOwner(input: {
             if (!proof) throw new PersonVmError('PROVIDER_FAILED');
             const wake = nativeRootWake.safeParse(JSON.parse(proof));
             if (!wake.success) throw new PersonVmError('PROVIDER_FAILED');
+            if (
+              wake.data.kind === 'delegated' &&
+              (!wake.data.prompts.length ||
+                wake.data.prompts.some(
+                  (prompt) =>
+                    (prompt.sessionId === sessionId) ===
+                    !!prompt.parentSessionId,
+                ))
+            )
+              throw new PersonVmError('PROVIDER_FAILED');
             return wake.data;
           },
         );
@@ -765,10 +1081,11 @@ export async function openNativeWebOwner(input: {
                   ...attempt,
                   recipient: undefined,
                   promptIds: [] as string[],
+                  prompts: [],
                   sourceTurn: null,
                   rootSessionId: null,
                   delegated: false,
-                  delegatedPromptIds: [] as string[],
+                  inheritedPromptIndexes: [] as number[],
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -788,13 +1105,17 @@ export async function openNativeWebOwner(input: {
                 id?: unknown;
                 recipient?: unknown;
                 sourceTurn?: unknown;
-                promptIds?: unknown;
+                prompts?: unknown;
                 rootSessionId?: unknown;
                 delegated?: unknown;
-                delegatedPromptIds?: unknown;
+                inheritedPromptIndexes?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
-              const { promptIds, delegatedPromptIds } = value ?? {};
+              const prompts = nativePrompts.safeParse(value?.prompts);
+              const inherited = z
+                .array(z.number().int().nonnegative())
+                .max(64)
+                .safeParse(value?.inheritedPromptIndexes);
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
@@ -809,19 +1130,30 @@ export async function openNativeWebOwner(input: {
                   value.rootSessionId !== address.sessionId) ||
                 typeof value.delegated !== 'boolean' ||
                 (address.kind === 'subagent' && !value.delegated) ||
-                !Array.isArray(promptIds) ||
-                promptIds.length === 0 ||
-                promptIds.length > 64 ||
-                promptIds.some(
-                  (id) => typeof id !== 'string' || !id || id.length > 256,
-                ) ||
-                new Set(promptIds).size !== promptIds.length ||
-                !Array.isArray(delegatedPromptIds) ||
-                delegatedPromptIds.length > promptIds.length ||
-                delegatedPromptIds.some((id) => !promptIds.includes(id)) ||
-                new Set(delegatedPromptIds).size !==
-                  delegatedPromptIds.length ||
-                (value.delegated && delegatedPromptIds.length === 0)
+                !prompts.success ||
+                !prompts.data.length ||
+                !inherited.success ||
+                (value.delegated &&
+                  address.kind === 'session' &&
+                  !inherited.data.length)
+              )
+                throw new PersonVmError('PROVIDER_FAILED');
+              const references = new Set(inherited.data);
+              if (
+                references.size !== inherited.data.length ||
+                inherited.data.some((index) => index >= prompts.data.length) ||
+                prompts.data.some((prompt, index) => {
+                  if (references.has(index))
+                    return (
+                      (prompt.sessionId === value.rootSessionId) ===
+                      !!prompt.parentSessionId
+                    );
+                  return address.kind === 'session'
+                    ? prompt.sessionId !== address.sessionId ||
+                        prompt.parentSessionId !== undefined
+                    : prompt.sessionId !== address.childSessionId ||
+                        prompt.parentSessionId !== address.parentSessionId;
+                })
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {
@@ -831,8 +1163,9 @@ export async function openNativeWebOwner(input: {
                 sourceTurn: value.sourceTurn as number,
                 rootSessionId: value.rootSessionId,
                 delegated: value.delegated,
-                delegatedPromptIds: delegatedPromptIds as string[],
-                promptIds: promptIds as string[],
+                inheritedPromptIndexes: inherited.data,
+                promptIds: prompts.data.map(({ requestId }) => requestId),
+                prompts: prompts.data,
               };
             } finally {
               // Dispose this logical read on its original carrier. The
@@ -908,6 +1241,7 @@ export async function openNativeWebOwner(input: {
           turn: number | null;
           delegated?: boolean;
           parentSessionId?: string | null;
+          forkedFromNativeSessionId?: string;
         },
         assertCurrent: (active: AbortSignal) => Promise<void>,
         caller: AbortSignal,
@@ -1032,7 +1366,8 @@ export async function openNativeWebOwner(input: {
         }
       },
     });
-  } catch {
+  } catch (error) {
+    recordFailure(error);
     try {
       await close();
     } finally {

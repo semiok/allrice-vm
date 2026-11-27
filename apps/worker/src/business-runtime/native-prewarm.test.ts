@@ -648,6 +648,24 @@ it('uninstallation closes admission immediately and joins actual work without ab
   expect(f.stop).not.toHaveBeenCalled();
 });
 
+function prewarmStatus(
+  server: Awaited<ReturnType<typeof nativeEntryServer>>,
+  operationId: string,
+  token = 'original_session_opaque_token',
+) {
+  const query = new URLSearchParams({
+    ...server.body.selection,
+    organizationId: server.body.organizationId,
+    operationId,
+  });
+  return fetch(
+    `${server.origin}/internal/d-entry/native-prewarm/status?${query}`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+    },
+  );
+}
+
 it('the real Worker listener requires current release eligibility and the installed prewarm port, without resolving catalog/data', async () => {
   const f = fixture();
   const server = await nativeEntryServer(f.base, {
@@ -662,6 +680,7 @@ it('the real Worker listener requires current release eligibility and the instal
   const installed = installDEntryNativePrewarm({
     prewarmCurrent: f.prewarmCurrent,
     lifetime: f.lifetime.signal,
+    readCoordination: f.readCoordination,
   });
   cleanups.push(installed.close);
   f.base.deps.identity.mockRejectedValueOnce(
@@ -675,10 +694,12 @@ it('the real Worker listener requires current release eligibility and the instal
   ])
     expect((await server.request('native-prewarm', invalid)).status).toBe(400);
   const response = await server.request('native-prewarm', body);
-  expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({
-    identity: f.base.identity,
-    trigger: 'page',
+  expect(response.status).toBe(202);
+  const { ticket } = await response.json();
+  await vi.waitFor(async () => {
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'ready' });
   });
   expect(f.base.deps.owners.resolve).not.toHaveBeenCalled();
   expect(f.base.data.acquireRoot).not.toHaveBeenCalled();
@@ -688,100 +709,592 @@ it('the real Worker listener requires current release eligibility and the instal
   expect(f.start).toHaveBeenCalledTimes(1);
 });
 
-it('rejects the prewarm reply if the model route retires during final HTTP qualification', async () => {
+it('checks the accepted revision inside the lifecycle lease before creating a disk', async () => {
+  const f = fixture(true);
+  const { context, identity } = f.base;
+  const active = signal();
+  const plan = await f.assembly.port.prepare!(context, identity, active);
+  const lease = f.h.store.withLease.bind(f.h.store);
+  vi.spyOn(f.h.store, 'withLease').mockImplementationOnce((...args) => {
+    f.readCoordination.mockResolvedValue({
+      authorityRevision: 'new-grant',
+      vm: null,
+    });
+    return lease(...args);
+  });
+  await expect(
+    f.assembly.port.prewarm(context, identity, 'page', active, active, plan),
+  ).rejects.toMatchObject({ code: 'authorization_denied' });
+  expect(f.h.log).toEqual([]);
+  expect(await f.h.store.read(identity.personId)).toBeNull();
+});
+
+it('returns Worker 200 on a verified hot path and refuses proof revoked during reply qualification', async () => {
   const f = fixture();
   const route = new AbortController();
   const entered = deferred<void>();
   const release = deferred<void>();
+  const prewarm = vi.fn(async () => route.signal);
+  const check = vi.fn(async () => true);
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementation(async () => ({
+    ...(await watch()),
+    assertTicketThread: async () => {},
+  }));
   const server = await nativeEntryServer(f.base, {
     ...f.base.deps,
-    prewarm: { prewarm: async () => route.signal },
+    prewarm: {
+      isCurrent: check,
+      prepare: async () => ({
+        key: 'hot-exact',
+        target: f.base.binding,
+        running: true,
+      }),
+      prewarm,
+    },
   });
   cleanups.push(server.close);
-  f.base.deps.identity
-    .mockResolvedValueOnce(f.base.identity)
-    .mockImplementationOnce(async () => {
-      entered.resolve();
-      await release.promise;
-      return f.base.identity;
-    });
-  const request = server.request('native-prewarm', {
-    ...f.base.body,
+  const body = { ...f.base.body, trigger: 'page' };
+  const hot = await server.request('native-prewarm', body);
+  expect(hot.status).toBe(200);
+  expect(await hot.json()).toEqual({
+    identity: f.base.identity,
     trigger: 'page',
   });
+  await vi.waitFor(() => expect(f.base.authorityClose).toHaveBeenCalledOnce());
+  check.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return true;
+  });
+  const request = server.request('native-prewarm', body);
   await entered.promise;
   route.abort();
   release.resolve();
-  expect((await request).status).toBe(503);
+  expect((await request).status).toBe(202);
+  expect(prewarm).toHaveBeenCalledTimes(2);
 });
 
-it('browser disconnect through real HTTP does not cancel shared physical startup or close its authority watcher early', async () => {
-  const f = fixture(),
-    started = deferred<void>(),
-    finish = deferred<void>(),
-    disconnected = deferred<void>(),
-    caller = new AbortController(),
-    original = f.runPrewarm;
+it('returns ready for an exact verified running editor without opening a prewarm job', async () => {
+  const f = fixture(true);
+  const { context, body, data } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  const binding = await f.h.service.resolve(context, signal());
+  const verified = new AbortController();
+  const confirmVerifiedEditor = vi.fn(async () => ({
+    binding,
+    proof: verified.signal,
+  }));
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    confirmVerifiedEditor,
+    assertEditorReady: async () => signal(),
+  });
+  cleanups.push(async () => uninstall());
+  const prewarmCurrent = vi.fn(f.prewarmCurrent);
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(confirmVerifiedEditor).toHaveBeenCalledOnce();
+  expect(prewarmCurrent).not.toHaveBeenCalled();
+  expect(f.start).toHaveBeenCalledOnce();
+
+  verified.abort();
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(prewarmCurrent).toHaveBeenCalledOnce();
+  expect(f.start).toHaveBeenCalledOnce();
+});
+
+it('uses both the selected editor proof and physical Host readiness on the real hot HTTP path', async () => {
+  const f = fixture(true);
+  const { context, body, data } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  const route = new AbortController();
+  const proof = vi.fn(async () => route.signal);
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    assertEditorReady: proof,
+  });
+  cleanups.push(async () => uninstall());
   const installed = installDEntryNativePrewarm({
     prewarmCurrent: f.prewarmCurrent,
     lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
   });
   cleanups.push(installed.close);
-  let physical: AbortSignal | undefined,
-    completion: Promise<unknown> | undefined;
-  const delegate = dEntryNativePrewarmPort.prewarm;
-  vi.spyOn(dEntryNativePrewarmPort, 'prewarm').mockImplementation((...args) => {
-    args[3].addEventListener('abort', () => disconnected.resolve(), {
-      once: true,
-    });
-    const task = delegate(...args);
-    completion = task.catch((error: unknown) => error);
-    return task;
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+  const ping = vi.spyOn(f.h.native, 'ping');
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(ping).toHaveBeenCalledTimes(1);
+  // The selected owner still proves its editor, but an incomplete Host roster
+  // is reported by the existing VM-wide readiness port.
+  f.h.setReadiness({ authenticated: true, editorReady: false, canSend: false });
+  const rejected = await server.request('native-prewarm', {
+    ...body,
+    trigger: 'page',
   });
-  const watch = vi.fn<typeof Database.watchDEntryNativeAuthority>(
-    async (...args) => {
-      const subscription = await f.base.deps.watch();
-      return {
-        ...subscription,
-        revoked: AbortSignal.any([subscription.revoked, args[3]]),
-      };
+  expect(rejected.status).toBe(202);
+  const { ticket } = await rejected.json();
+  const status = await prewarmStatus(server, ticket.operationId);
+  expect(await status.json()).toEqual({
+    state: 'failed',
+    code: 'START_UNAVAILABLE',
+  });
+  expect(ping).toHaveBeenCalledTimes(2);
+  expect(proof).toHaveBeenCalledTimes(2);
+  expect(f.start).toHaveBeenCalledTimes(1);
+  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it.each([false, true])(
+  'expires the old ticket and prewarms after deletion (purge=%s)',
+  async (purge) => {
+    const f = fixture(true);
+    const { context, identity, body } = f.base;
+    const installed = installDEntryNativePrewarm({
+      prewarmCurrent: f.prewarmCurrent,
+      lifetime: f.lifetime.signal,
+      readCoordination: f.readCoordination,
+    });
+    cleanups.push(installed.close);
+    const server = await nativeEntryServer(f.base);
+    cleanups.push(server.close);
+    const post = () =>
+      server.request('native-prewarm', { ...body, trigger: 'page' });
+    const first = await post();
+    expect(first.status).toBe(202);
+    const { ticket: old } = await first.json();
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, old.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+    const binding = await f.h.service.resolve(context, signal());
+    f.h.states.set(binding.vmId, 'stopped');
+    f.h.authorizeDiskDelete(purge);
+    await f.h.service.delete(context, { deleteDisk: purge }, signal());
+    const before = f.h.log.slice();
+    const expired = await prewarmStatus(server, old.operationId);
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toEqual({ state: 'expired' });
+    expect(f.h.log).toEqual(before);
+    expect(await f.h.store.read(identity.personId)).toMatchObject({
+      phase: 'deleted',
+      diskRetained: !purge,
+    });
+    const restored = await post();
+    expect(restored.status).toBe(202);
+    const { ticket } = await restored.json();
+    expect(ticket.operationId).not.toBe(old.operationId);
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+    expect(await f.h.service.resolve(context, signal())).toMatchObject({
+      vmId: purge ? expect.not.stringContaining(binding.vmId) : binding.vmId,
+      leaseEpoch: binding.leaseEpoch + 1,
+    });
+    expect(f.h.log.filter((event) => event === 'disk:create')).toHaveLength(
+      purge ? 2 : 1,
+    );
+    expect(f.start).toHaveBeenCalledTimes(2);
+    expect((await prewarmStatus(server, old.operationId)).status).toBe(410);
+  },
+);
+
+it('returns a ticket for a running VM with slow editor proof and keeps just one owned job', async () => {
+  const f = fixture(),
+    proof = deferred<AbortSignal>();
+  const prewarm = vi.fn(() => proof.promise);
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async () => true,
+      prepare: async () => ({
+        key: 'same-boot',
+        target: f.base.binding,
+        running: true,
+      }),
+      prewarm,
     },
-  );
+  });
+  cleanups.push(server.close);
+  try {
+    const body = { ...f.base.body, trigger: 'page' };
+    const replies = await Promise.all([
+      server.request('native-prewarm', body),
+      server.request('native-prewarm', body),
+    ]);
+    expect(replies.map((reply) => reply.status)).toEqual([202, 202]);
+    const [{ ticket }, duplicate] = await Promise.all(
+      replies.map((reply) => reply.json()),
+    );
+    expect(duplicate.ticket).toEqual(ticket);
+    expect(prewarm).toHaveBeenCalledOnce();
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'starting' });
+    proof.resolve(signal());
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+  } finally {
+    proof.resolve(signal());
+  }
+});
+
+it('keeps the ticket when the last hot readiness recheck is slow and joins that read on shutdown', async () => {
+  const f = fixture(),
+    finish = deferred<void>();
+  let checking: AbortSignal | undefined;
+  const prewarm = vi.fn(async () => signal());
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async (_context, _identity, _plan, active, mode) => {
+        if (mode === 'ready' && !checking) {
+          checking = active;
+          await finish.promise;
+        }
+        return true;
+      },
+      prepare: async () => ({
+        key: 'same-boot',
+        target: f.base.binding,
+        running: true,
+      }),
+      prewarm,
+    },
+  });
+  let closing: Promise<void> | undefined;
+  try {
+    const reply = await server.request('native-prewarm', {
+      ...f.base.body,
+      trigger: 'page',
+    });
+    expect(reply.status).toBe(202);
+    const { ticket } = await reply.json();
+    expect(checking?.aborted).toBe(true);
+    expect(prewarm).toHaveBeenCalledOnce();
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'ready' });
+    let joined = false;
+    closing = server.close().then(() => {
+      joined = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(joined).toBe(false);
+  } finally {
+    finish.resolve();
+    await (closing ?? server.close());
+  }
+});
+
+it('serves short polls over a cold startup longer than 125 seconds and deduplicates POSTs', async () => {
+  const f = fixture(true),
+    started = deferred<void>(),
+    finish = deferred<void>();
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent: f.prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  let physical: AbortSignal | undefined;
   f.vm.mockImplementationOnce(async (...args) => {
     physical = args[2];
     started.resolve();
     await finish.promise;
-    expect(args[2].aborted).toBe(false);
-    return original(...args);
+    return f.runPrewarm(...args);
   });
-  const server = await nativeEntryServer(f.base, { ...f.base.deps, watch });
+  const server = await nativeEntryServer(f.base);
   cleanups.push(server.close);
-  const request = fetch(`${server.origin}/internal/d-entry/native-prewarm`, {
-    method: 'POST',
-    headers: {
-      authorization: 'Bearer original_session_opaque_token',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ ...f.base.body, trigger: 'page' }),
-    signal: caller.signal,
-  }).catch((error: unknown) => error);
-  await started.promise;
+  const body = { ...f.base.body, trigger: 'page' };
+  const now = Date.now();
+  const time = vi.spyOn(Date, 'now').mockReturnValue(now);
   try {
-    caller.abort();
-    expect(await request).toBeInstanceOf(Error);
-    await disconnected.promise;
-    expect(watch.mock.calls[0]![3].aborted).toBe(false);
+    const replies = await Promise.all([
+      server.request('native-prewarm', body),
+      server.request('native-prewarm', { ...body, trigger: 'input' }),
+    ]);
+    expect(replies.map(({ status }) => status)).toEqual([202, 202]);
+    const results = await Promise.all(replies.map((reply) => reply.json()));
+    const { ticket } = results[0]!;
+    expect(results[1]!.ticket).toEqual(ticket);
+    await started.promise;
+    expect(f.vm).toHaveBeenCalledTimes(1);
+    // An accepted response has ended. Advancing time models a long cold start
+    // while exercising real, independent short HTTP requests.
+    time.mockReturnValue(now + 126_000);
+    const status = await prewarmStatus(server, ticket.operationId);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({ state: 'starting' });
     expect(physical?.aborted).toBe(false);
-    expect(f.base.authorityClose).not.toHaveBeenCalled();
+    // Only the duplicate watcher has closed so far.
+    expect(f.base.authorityClose).toHaveBeenCalledTimes(1);
+    f.readCoordination.mockImplementationOnce(async () => ({
+      authorityRevision: 'new-release-same-business-identity',
+      vm: await f.h.store.read(f.base.identity.personId),
+    }));
+    const stale = await prewarmStatus(server, ticket.operationId);
+    expect(stale.status).toBe(410);
+    expect(await stale.json()).toEqual({ state: 'expired' });
+    finish.resolve();
+    await vi.waitFor(async () => {
+      const ready = await prewarmStatus(server, ticket.operationId);
+      expect(await ready.json()).toEqual({ state: 'ready' });
+    });
+    expect(f.base.authorityClose).toHaveBeenCalledTimes(2);
+    expect(f.start).toHaveBeenCalledTimes(1);
+    f.readCoordination.mockImplementationOnce(async () => ({
+      authorityRevision: 'release-1',
+      vm: {
+        ...(await f.h.store.read(f.base.identity.personId))!,
+        leaseOwner: randomUUID(),
+      },
+    }));
+    const busy = await prewarmStatus(server, ticket.operationId);
+    expect(await busy.json()).toEqual({ state: 'expired' });
+    expect(busy.status).toBe(410);
+    time.mockReturnValue(now + 601_000);
+    const expired = await prewarmStatus(server, ticket.operationId);
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toEqual({ state: 'expired' });
   } finally {
     finish.resolve();
+    time.mockRestore();
   }
-  expect(completion).toBeDefined();
-  expect(await completion).toBeInstanceOf(Error);
-  await server.close();
-  expect(f.base.authorityClose).toHaveBeenCalledTimes(1);
-  expect(f.start).toHaveBeenCalledTimes(1);
-  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it.each([
+  [new DataAccessError('authorization_denied'), 'AUTHORITY_REVOKED'],
+  [Error('authority observer disconnected'), 'START_UNAVAILABLE'],
+])(
+  'owns cancellation and cleanup after admission (%s), and rejects another login and a restarted Worker',
+  async (failure, code) => {
+    const f = fixture(),
+      started = deferred<void>(),
+      finish = deferred<void>();
+    let owned: AbortSignal | undefined;
+    const changedLogin = { ...f.base.context, sessionId: randomUUID() };
+    const authenticate: typeof Database.authenticateSession = async (token) =>
+      token === 'other_valid_login_token' ? changedLogin : f.base.context;
+    const prewarm = vi.fn(
+      async (_context, _identity, _trigger, active: AbortSignal) => {
+        owned = active;
+        started.resolve();
+        await finish.promise;
+        active.throwIfAborted();
+      },
+    );
+    const deps = {
+      ...f.base.deps,
+      authenticate,
+      prewarm: {
+        isCurrent: async () => true,
+        prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
+        prewarm,
+      },
+    };
+    const server = await nativeEntryServer(f.base, deps);
+    cleanups.push(server.close);
+    const restarted = await nativeEntryServer(f.base, deps);
+    cleanups.push(restarted.close);
+    const reply = await server.request('native-prewarm', {
+      ...f.base.body,
+      trigger: 'page',
+    });
+    expect(reply.status).toBe(202);
+    const { ticket } = await reply.json();
+    await started.promise;
+    try {
+      expect(
+        (
+          await prewarmStatus(
+            server,
+            ticket.operationId,
+            'other_valid_login_token',
+          )
+        ).status,
+      ).toBe(404);
+      const gone = await prewarmStatus(restarted, ticket.operationId);
+      expect(gone.status).toBe(410);
+      expect(await gone.json()).toEqual({ state: 'expired' });
+      expect(prewarm).toHaveBeenCalledTimes(1);
+      f.base.identityRevoked.abort(failure);
+      expect(owned?.aborted).toBe(true);
+      expect(f.base.authorityClose).not.toHaveBeenCalled();
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'starting' });
+    } finally {
+      finish.resolve();
+    }
+    await vi.waitFor(async () => {
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({
+        state: 'failed',
+        code,
+      });
+    });
+    expect(f.base.authorityClose).toHaveBeenCalledOnce();
+  },
+);
+
+it('keeps the thread observer alive after readiness and expires the original ticket when the observer revokes it', async () => {
+  const f = fixture();
+  const observe = vi.fn(async (signal: AbortSignal) => {
+    signal.throwIfAborted();
+    f.base.identityRevoked.signal.throwIfAborted();
+  });
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementationOnce(async () => ({
+    ...(await watch()),
+    assertTicketThread: observe,
+  }));
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async () => true,
+      prepare: async () => ({ key: 'exact-thread', target: f.base.binding }),
+      prewarm: async () => signal(),
+    },
+  });
+  cleanups.push(server.close);
+  const reply = await server.request('native-prewarm', {
+    ...f.base.body,
+    trigger: 'page',
+  });
+  expect(reply.status).toBe(202);
+  const { ticket } = await reply.json();
+  await vi.waitFor(async () =>
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'ready' }),
+  );
+  expect(f.base.authorityClose).not.toHaveBeenCalled();
+  expect(observe.mock.calls.length).toBeGreaterThan(1);
+  f.base.identityRevoked.abort(new DataAccessError('authorization_denied'));
+  const status = await prewarmStatus(server, ticket.operationId);
+  expect(status.status).toBe(410);
+  expect(await status.json()).toEqual({ state: 'expired' });
+  expect(f.base.authorityClose).toHaveBeenCalledOnce();
+});
+
+it('reports a startup failure when the observer closes during an authenticated poll', async () => {
+  const f = fixture(),
+    finish = deferred<void>(),
+    closeHeld = deferred<void>(),
+    checked = deferred<void>(),
+    resume = deferred<void>();
+  f.base.authorityClose.mockImplementationOnce(() => closeHeld.promise);
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementationOnce(async () => ({
+    ...(await watch()),
+    async assertTicketThread() {
+      if (f.base.authorityClose.mock.calls.length)
+        throw new DataAccessError('authorization_denied');
+    },
+  }));
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      async isCurrent(_context, _identity, _plan, _signal, mode) {
+        if (mode === 'operation') {
+          checked.resolve();
+          await resume.promise;
+        }
+        return true;
+      },
+      prepare: async () => ({ key: 'exact-thread', target: f.base.binding }),
+      async prewarm() {
+        await finish.promise;
+        throw new Error('private native failure');
+      },
+    },
+  });
+  cleanups.push(server.close);
+  try {
+    const reply = await server.request('native-prewarm', {
+      ...f.base.body,
+      trigger: 'page',
+    });
+    expect(reply.status).toBe(202);
+    const { ticket } = await reply.json();
+    const status = prewarmStatus(server, ticket.operationId);
+    await checked.promise;
+    finish.resolve();
+    await vi.waitFor(() =>
+      expect(f.base.authorityClose).toHaveBeenCalledOnce(),
+    );
+    resume.resolve();
+    const response = await status;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ state: 'starting' });
+    closeHeld.resolve();
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'failed', code: 'START_UNAVAILABLE' }),
+    );
+  } finally {
+    finish.resolve();
+    closeHeld.resolve();
+    resume.resolve();
+  }
+});
+
+it('reports immediate startup failure without exposing native errors', async () => {
+  const f = fixture();
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async () => true,
+      prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
+      prewarm: async () => {
+        throw Error('private provider internals');
+      },
+    },
+  });
+  cleanups.push(server.close);
+  const reply = await server.request('native-prewarm', {
+    ...f.base.body,
+    trigger: 'page',
+  });
+  expect(reply.status).toBe(202);
+  const { ticket } = await reply.json();
+  await vi.waitFor(async () => {
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({
+      state: 'failed',
+      code: 'START_UNAVAILABLE',
+    });
+  });
 });
 
 it('genuine current-authority revocation still reaches physical prewarm without treating browser cancellation as authority', async () => {

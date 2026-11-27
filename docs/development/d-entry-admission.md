@@ -38,9 +38,9 @@
 
 ## 发布配置与产品代际归属
 
-`DEntryRolloutPolicySchema`保留显式revision、defaultGeneration、selections；每条selection为完整organizationId/personId/employeeInstanceId/generation，重复tuple拒绝。共享来源是现有 `allrice_settings` 的 system/null/`d_entry_rollout_policy`，沿 `native_question_mode` 平台管理方式。无新表/字段/env/管理UI。缺行返回 `{revision:"unpublished",defaultGeneration:"3.x",selections:[]}`；发布服务只接受默认3.x，只有精确本人/员工条目可开启4.0。当前没有实际名单被写入任何环境。
+`DEntryRolloutPolicySchema`保留显式revision、defaultGeneration、selections；每条 selection 是唯一的 organizationId 和 personId，覆盖该人在此企业里当前与之后创建且有权使用的员工。共享来源是现有 `allrice_settings` 的 system/null/`d_entry_rollout_policy`，沿 `native_question_mode` 平台管理方式。无新表/字段/env/管理UI。缺行返回 `{revision:"unpublished",defaultGeneration:"3.x",selections:[]}`；发布服务只接受默认3.x，名单中的人开通 4.0，缺行或空名单时保持 3.x。
 
-`GET/PUT /api/v1/admin/d-entry-release-policy` 只走现有 platform-admin cookie/同源写门卫，PUT body 为该 policy schema；revision由服务端生成，客户端revision不能授予权限。`@allrice/database#getDEntryReleasePolicy/updateDEntryReleasePolicy` 使用身份owner的 `requireCurrentPlatformAdmin`，最终写事务持当前session/user SHARE锁，与撤权/停用排序；写入既有 audit_events。配置非法或DB不可用不启用4.0。`readDEntryReleasePolicy` 是宿主内部只读口，调用方先核真实登录/员工；不向guest暴露全名单。
+`GET/PUT /api/v1/admin/d-entry-release-policy` 只走现有 platform-admin cookie/同源写门卫，PUT body 为该 policy schema；revision由服务端生成，客户端revision不能授予权限。`@allrice/database#getDEntryReleasePolicy/updateDEntryReleasePolicy` 使用身份owner的 `requireCurrentPlatformAdmin`，最终写事务持当前 session/user SHARE 锁，与撤权和停用排序，并写入现有 audit_events。发布和需要锁定现权的读取持相同设置键上的事务锁，首次发布时也保持写入顺序。配置非法或DB不可用不启用4.0。`readDEntryReleasePolicy` 是宿主内部只读口，调用方先核真实登录/员工；不向guest暴露全名单。
 
 `allrice_chat_sessions.execution_generation`由0249迁移加入；已有线程/3.x创建是3.x，4.0创建由可信宿主调用`createChatSession(...,{executionGeneration:'4.0'})`同事务写入。该options不是浏览器body。DB trigger禁止更新pin；固定ID幂等重试必须匹配代际。4.0创建不伪造3.x native_root_origin。后续VM/native root绑定由各owner公开口完成。
 

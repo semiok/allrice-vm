@@ -98,7 +98,9 @@ export function parseNativeWebAuth(
         : { modelAdapterId: request.modelAdapterId }),
     });
   } catch {
-    throw new PersonVmError('PROVIDER_FAILED');
+    throw new PersonVmError('PROVIDER_FAILED', {
+      cause: 'AUTH_ARTIFACT_INVALID',
+    });
   } // Never retain secret input in errors.
 }
 

@@ -13,6 +13,7 @@ import type { PersonDisk, PersonVmDiskPort } from './encrypted-disk.ts';
 import type { PersonVmNativePort } from './microsandbox.ts';
 import { PersonVmService } from './person-vm.ts';
 import type { PersonVmStore, VmAudit, VmRecord } from './store.ts';
+import type { DiskPoolOwner } from './disk-pool-platform.ts';
 
 export function context(
   organizationId: string = randomUUID(),
@@ -30,29 +31,75 @@ export function context(
 }
 export class MemoryStore implements PersonVmStore {
   rows = new Map<string, VmRecord>();
-  audits: (VmAudit & { vmId: string })[] = [];
-  private busy = new Set<string>();
+  audits: (VmAudit & DiskPoolOwner)[] = [];
+  onOfflineWait?: () => void;
+  private busy = new Map<
+    string,
+    { preparation?: string; settled: Promise<void> }
+  >();
   async read(id: string) {
     const row = this.rows.get(id);
     return row ? structuredClone(row) : null;
   }
   async withLease<T>(
     personId: string,
-    _options: Parameters<PersonVmStore['withLease']>[1],
+    options: Parameters<PersonVmStore['withLease']>[1],
     work: Parameters<PersonVmStore['withLease']>[2],
   ): Promise<T> {
+    const lane = options.offlinePreparation;
+    lane?.signal.throwIfAborted();
+    const prior = this.busy.get(personId);
+    let joinedOfflinePreparation = false;
+    if (lane?.mode === 'join' && prior?.preparation === lane.organizationId) {
+      joinedOfflinePreparation = true;
+      let abort!: () => void;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        abort = () => reject(lane.signal.reason);
+      });
+      lane.signal.addEventListener('abort', abort, { once: true });
+      try {
+        this.onOfflineWait?.();
+        await Promise.race([prior.settled, cancelled]);
+      } finally {
+        lane.signal.removeEventListener('abort', abort);
+      }
+      lane.signal.throwIfAborted();
+    }
     if (this.busy.has(personId) || this.rows.get(personId)?.leaseOwner)
       throw new PersonVmError('LEASE_CONFLICT');
-    this.busy.add(personId);
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    this.busy.set(personId, {
+      settled,
+      preparation: lane?.mode === 'prepare' ? lane.organizationId : undefined,
+    });
     const row = await this.read(personId);
     const owner = randomUUID();
     if (this.rows.has(personId)) this.rows.get(personId)!.leaseOwner = owner;
     try {
       return (await work({
         row,
+        joinedOfflinePreparation,
         signal: new AbortController().signal,
         assertAdmissionOpen: async () => {},
         guard: async () => {},
+        hasCompletedDiskDeletion: async ({ personId, organizationId, vmId }) =>
+          this.audits.some(
+            (event) =>
+              event.personId === personId &&
+              event.organizationId === organizationId &&
+              event.vmId === vmId &&
+              event.action === 'delete-disk' &&
+              event.result === 'succeeded',
+          ),
+        hasRetainedDiskRows: async (vmIds) =>
+          vmIds.every((id) =>
+            [...this.rows.values()].some(
+              (row) => row.vmId === id && row.diskRetained,
+            ),
+          ),
         save: async (value) => {
           this.rows.set(personId, {
             ...structuredClone(value),
@@ -60,13 +107,19 @@ export class MemoryStore implements PersonVmStore {
           });
         },
         audit: async (value, event) => {
-          this.audits.push({ ...event, vmId: value.vmId });
+          this.audits.push({
+            ...event,
+            vmId: value.vmId,
+            personId: value.personId,
+            organizationId: value.organizationId,
+          });
         },
       })) as T;
     } finally {
       this.busy.delete(personId);
       const saved = this.rows.get(personId);
       if (saved) saved.leaseOwner = null;
+      settle();
     }
   }
   async recover<T>(): Promise<T> {
@@ -95,6 +148,9 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
     },
   };
   const disk: PersonVmDiskPort = {
+    listFormalDiskIds: async () => [...new Set([...disks, ...partialDisks])],
+    confirmAbsence: async (vmId) =>
+      !disks.has(vmId) && !partialDisks.has(vmId) && !mounts.has(vmId),
     inspect: async (id) =>
       partialDisks.has(id)
         ? { state: 'unknown' }

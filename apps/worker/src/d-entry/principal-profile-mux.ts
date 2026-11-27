@@ -12,10 +12,18 @@ import {
   RemoteError,
   isRemoteJsonValue,
 } from '@deepseek-ai/dsh-typert-protocol';
-import { DEntryPageMuxQuerySchema } from '@allrice/contracts';
+import {
+  DEntryPageMuxQuerySchema,
+  DEntryPageRpcRequestSchema,
+  DEntryPageUnarySchema,
+} from '@allrice/contracts';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import {
+  D_ENTRY_PAGE_UPLINK_BYTES,
+  type DEntryPageInput,
+} from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
-import { authorizeDEntryNativeInvocation } from './native-invocation.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -256,7 +264,14 @@ async function runStreams(
   signal: AbortSignal,
 ) {
   const send = sendTo(peer);
-  const streams = new Map<string, { cancel(): void; work: Promise<void> }>();
+  const streams = new Map<
+    string,
+    {
+      cancel(): void;
+      sendInput(input: DEntryPageInput): void;
+      work: Promise<void>;
+    }
+  >();
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
   const active = AbortSignal.any([signal, stop.signal]);
@@ -264,88 +279,120 @@ async function runStreams(
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = Promise.resolve()
-      .then(async () => {
-        let call;
-        let check = () => page.assertCurrent(child);
-        if (frame.endpoint === '$events') {
-          emptyPayload.parse(frame.payload);
-          call = {
-            kind: 'events' as const,
-            scopeId,
-            payload: REMOTE_EVENT_STREAM_PAYLOAD,
-          };
-        } else if (frame.endpoint === 'remoteAccess/follow') {
-          const { args } = emptyPayload.parse(frame.payload);
-          call = { scopeId, endpoint: 'remoteAccess/follow' as const, args };
-        } else if (frame.endpoint === 'session/follow') {
-          const authorize = () =>
-            authorizeDEntryNativeInvocation(
-              page.authorize,
-              frame.endpoint,
-              frame.payload,
-              'mux',
-              child,
-            );
-          const initial = await authorize();
-          check = async () => {
-            await page.assertCurrent(child);
-            const next = await authorize();
-            if (
-              next.resource.bindingRef !== initial.resource.bindingRef ||
-              next.resource.parentNativeSessionId !==
-                initial.resource.parentNativeSessionId
-            )
-              throw denied();
-          };
-          // The literal branch and existing strict native invocation codec
-          // establish this input's method/args pair before any guest dispatch.
-          call = {
-            scopeId,
-            endpoint: 'session/follow' as const,
-            args: initial.payload.args,
-          } as Parameters<DEntryPageHandle['scope']['stream']>[0];
-        } else {
-          throw denied();
-        }
-        await check();
-        for await (const item of page.scope.stream(call, child)) {
+    let settled = false;
+    let buffered = 0;
+    let input = Promise.resolve();
+    let inputError = Promise.resolve();
+
+    function failInput(error: unknown) {
+      if (settled || child.aborted) return;
+      settled = true;
+      controller.abort();
+      inputError = page.assertCurrent(active).then(async () => {
+        active.throwIfAborted();
+        await send({
+          type: 'error',
+          streamId: id,
+          error: pageRemoteFailure(error),
+        });
+      });
+      void inputError.catch((error: unknown) => stop.abort(error));
+    }
+    const source = (async () => {
+      await page.assertCurrent(child);
+      child.throwIfAborted();
+      if (frame.endpoint === '$events') {
+        emptyPayload.parse(frame.payload);
+        return page.scope.stream(
+          { kind: 'events', scopeId, payload: REMOTE_EVENT_STREAM_PAYLOAD },
+          child,
+        );
+      }
+      const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
+      const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
+        frame.payload,
+      );
+      if (!isRemoteJsonValue(args)) throw denied();
+      return page.scope.streamPage(
+        {
+          kind: 'page',
+          scopeId,
+          endpoint,
+          args: args as Record<string, JsonValue>,
+        },
+        child,
+      );
+    })();
+    const work = source
+      .then(async (stream) => {
+        for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
-          if (frame.endpoint === 'remoteAccess/follow') {
-            const { value } = item;
-            const grants =
-              value.type === 'baseline' && 'owner' in value && !value.owner
-                ? value.grants
-                : value.type === 'upsert' && 'grant' in value
-                  ? [value.grant]
-                  : undefined;
-            if (!grants && value.type !== 'remove') throw denied();
-            const sessionIds = grants?.map(({ resource }) => {
-              if (resource.kind !== 'session') throw denied();
-              return String(resource.id);
-            });
-            // A remove must still reach the client after the child has left
-            // the catalogue. Only frames granting access require child proof.
-            await page.assertCurrent(child, sessionIds);
-          } else await check();
+          await page.assertCurrent(child);
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
+        await page.assertCurrent(child);
         child.throwIfAborted();
+        settled = true;
         await send({ type: 'end', streamId: id });
       })
       .catch(async (error) => {
-        if (!child.aborted) {
+        if (child.aborted) return;
+        if (settled) throw error;
+        try {
+          await page.assertCurrent(child);
+          child.throwIfAborted();
+          settled = true;
           await send({
             type: 'error',
             streamId: id,
             error: pageRemoteFailure(error),
           });
+        } catch (failure) {
+          if (!child.aborted) throw failure;
         }
       })
-      .finally(() => streams.delete(id));
-    streams.set(id, { cancel: () => controller.abort(), work });
+      .finally(async () => {
+        settled = true;
+        controller.abort();
+        await Promise.allSettled([input, inputError]);
+        streams.delete(id);
+      });
+    streams.set(id, {
+      work,
+      cancel: () => controller.abort(),
+      sendInput(command) {
+        if (settled || child.aborted) return;
+        const bytes = Buffer.byteLength(JSON.stringify(command));
+        if (buffered + bytes > D_ENTRY_PAGE_UPLINK_BYTES) {
+          failInput(
+            new RemoteError('gateway/uplink-overflow', 'Native input is full', {
+              endpoint: frame.endpoint,
+            }),
+          );
+          return;
+        }
+        buffered += bytes;
+        input = input
+          .then(async () => {
+            if (settled || child.aborted) return;
+            const stream = await source.catch(() => undefined);
+            if (!stream || settled || child.aborted) return;
+            if (!('send' in stream)) {
+              if (command.type === 'input') throw denied();
+              controller.abort();
+              return;
+            }
+            await page.assertCurrent(child);
+            if (!settled && !child.aborted) stream.send(command);
+          })
+          .catch(failInput)
+          .finally(() => {
+            buffered -= bytes;
+          });
+      },
+    });
     void work.catch((error) => stop.abort(error));
   }
   try {
@@ -358,9 +405,21 @@ async function runStreams(
       if (binary) throw denied();
       const frame = parseRemoteStreamClientMessage(String(message));
       const prior = streams.get(frame.streamId);
-      if (frame.type === 'open' && !prior) open(frame);
-      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
-      else throw denied();
+      if (frame.type === 'open') {
+        if (prior) throw denied();
+        open(frame);
+      } else if (frame.type === 'cancel') {
+        prior?.cancel();
+      } else if (frame.type === 'end') {
+        prior?.sendInput({ type: 'input-end' });
+      } else {
+        if (frame.value !== undefined && !isRemoteJsonValue(frame.value))
+          throw denied();
+        prior?.sendInput({
+          type: 'input',
+          value: frame.value as JsonValue | undefined,
+        });
+      }
     }
   } finally {
     stop.abort();

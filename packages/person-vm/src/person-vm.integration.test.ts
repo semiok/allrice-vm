@@ -11,6 +11,7 @@ import { context, harness, running, signal } from './test-support.ts';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import type { CommandRunner } from './process.ts';
 import { PersonVmService } from './person-vm.ts';
+import { PersonVmDiskPool } from './disk-pool.ts';
 import type { PersonVmStartingScope } from './guest-bootstrap.ts';
 
 // Actual adapter and filesystem renames, with a synthetic hdiutil protocol.
@@ -64,6 +65,7 @@ suite(
     const workerClosures: Promise<void>[] = [];
     const workerNames: string[] = [];
     let workerQueries = 0;
+    let observeWorkerQuery: ((query: string) => void) | undefined;
     let admin: postgres.Sql, db: postgres.Sql, store: PostgresPersonVmStore;
     function openWorker() {
       let closed!: () => void;
@@ -78,8 +80,9 @@ suite(
         max: 1,
         onnotice: () => {},
         onclose: () => closed(),
-        debug: () => {
+        debug: (_connection, query) => {
           workerQueries += 1;
+          observeWorkerQuery?.(query);
         },
         connection: { search_path: schema, application_name: name },
       });
@@ -95,15 +98,17 @@ suite(
         // Fixture inspection/teardown must not borrow a lifecycle-owned client.
         connection: { search_path: schema },
       });
-      await db.unsafe(
-        await readFile(
-          new URL(
-            '../../database/migrations/0247_person_virtual_machines.sql',
-            import.meta.url,
+      for (const migration of [
+        '0002_identity.sql',
+        '0247_person_virtual_machines.sql',
+      ]) {
+        await db.unsafe(
+          await readFile(
+            new URL(`../../database/migrations/${migration}`, import.meta.url),
+            'utf8',
           ),
-          'utf8',
-        ),
-      );
+        );
+      }
       store = new PostgresPersonVmStore(openWorker);
     });
     afterEach(async () => {
@@ -124,6 +129,191 @@ suite(
         await admin`select pg_terminate_backend(${rows[0]!.pid}) as killed`;
       expect(killed!.killed).toBe(true);
     }
+    it('bounds a blocked diagnostic insert on its own connection and leaves the VM lease usable', async () => {
+      const h = harness(store);
+      const rc = context();
+      await h.service.create(rc, signal());
+      await store.withLease(
+        rc.actor.id,
+        { now: () => new Date(), ttlMs: 5000 },
+        async (lease) => {
+          const leaseWorker = workerNames.at(-1);
+          await db.begin(async (tx) => {
+            await tx`lock table person_vm_audit in access exclusive mode`;
+            const cancel = new AbortController();
+            const writing = store.auditStartupFailure(
+              lease.row!,
+              {
+                requestId: rc.requestId,
+                action: 'start.native-web.authenticate',
+                result: 'failed',
+                errorCode: '{"httpStatus":401}',
+              },
+              cancel.signal,
+            );
+            const rejected = expect(writing).rejects.toBeDefined();
+            const diagnosticWorker = workerNames.at(-1);
+            const diagnosticClosed = workerClosures.at(-1);
+            try {
+              expect(diagnosticWorker).not.toBe(leaseWorker);
+              await expect
+                .poll(async () => {
+                  const [activity] =
+                    await admin`select wait_event_type from pg_stat_activity
+                where application_name=${diagnosticWorker!}`;
+                  return activity?.wait_event_type;
+                })
+                .toBe('Lock');
+              await lease.guard();
+              expect(lease.signal.aborted).toBe(false);
+            } finally {
+              cancel.abort();
+              await rejected;
+              await diagnosticClosed;
+            }
+          });
+          await lease.guard();
+        },
+      );
+      expect(
+        await db`select action from person_vm_audit where action like 'start.native-web.%'`,
+      ).toEqual([]);
+    });
+
+    it.each(['join', 'cancel'] as const)(
+      'a first workbench can %s the exact offline preparation across dedicated PG sessions',
+      async (scenario) => {
+        const h = harness(store);
+        const rc = context();
+        const old = await h.service.create(rc, signal());
+        const root = await realpath(
+          await mkdtemp(join(tmpdir(), 'ar-pool-wait-')),
+        );
+        const diskPool = new PersonVmDiskPool(
+          root,
+          store.diskPoolLocks(root),
+          () => {},
+        );
+        const foreground = new PersonVmService({ ...h.options, diskPool });
+        const offlineWorker = new PostgresPersonVmStore(openWorker);
+        let entered!: () => void, release!: () => void, observed!: () => void;
+        const markerReady = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const hold = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const gateSampled = new Promise<void>((resolve) => {
+          observed = resolve;
+        });
+        const preparation = offlineWorker.withLease(
+          rc.actor.id,
+          {
+            now: h.now,
+            ttlMs: 90000,
+            offlinePreparation: {
+              mode: 'prepare',
+              organizationId: rc.organizationId,
+              signal: signal(),
+            },
+          },
+          async (lease) => {
+            await lease.guard();
+            entered();
+            await hold;
+          },
+        );
+        const cancel = new AbortController();
+        let opening: ReturnType<PersonVmService['prewarm']> | undefined;
+        try {
+          const ownerReady = await Promise.race([
+            markerReady.then(() => 'marked'),
+            preparation.then(() => 'ended'),
+          ]);
+          expect(ownerReady).toBe('marked');
+          observeWorkerQuery = (query) => {
+            if (query.includes('pg_try_advisory_lock_shared')) observed();
+          };
+          opening = foreground.prewarm(rc, { trigger: 'page' }, cancel.signal);
+          // If the request returns early, report that original failure rather than waiting on an unobserved gate.
+          const early = await Promise.race([
+            gateSampled.then(() => 'gate'),
+            opening.then(() => 'opening'),
+          ]);
+          expect(early).toBe('gate');
+          expect((await store.read(rc.actor.id))?.leaseOwner).not.toBeNull();
+          if (scenario === 'cancel') {
+            cancel.abort('test caller closed');
+            await expect(opening).rejects.toBe('test caller closed');
+            expect((await store.read(rc.actor.id))?.leaseOwner).not.toBeNull();
+            expect(h.log).not.toContain('native:start');
+          }
+        } finally {
+          release();
+          try {
+            await preparation;
+            if (scenario === 'join') await opening;
+          } finally {
+            observeWorkerQuery = undefined;
+            await rm(root, { recursive: true, force: true });
+          }
+        }
+        if (scenario === 'join')
+          await expect(opening).resolves.toMatchObject({
+            vmId: old.vmId,
+            ready: true,
+          });
+        expect(await db`select vm_id from person_virtual_machines`).toEqual([
+          { vm_id: old.vmId },
+        ]);
+      },
+    );
+    it('preserves cold and legacy disk ownership across a missing PostgreSQL row', async () => {
+      const h = harness(store);
+      const { root, volume, disk } = await syntheticDisk();
+      try {
+        const legacy = new PersonVmService({ ...h.options, disk });
+        const guarded = new PersonVmService({
+          ...h.options,
+          disk,
+          diskPool: new PersonVmDiskPool(
+            volume,
+            store.diskPoolLocks(volume),
+            () => {},
+          ),
+        });
+        const olderUser = context();
+        const previous = await legacy.create(olderUser, signal());
+        const coldUser = context();
+        // The legacy disk is accounted for by its exact retained PG row.
+        const cold = await guarded.create(coldUser, signal());
+        await db`delete from person_virtual_machines where person_id=${coldUser.actor.id}`;
+        await expect(guarded.create(coldUser, signal())).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(await store.read(coldUser.actor.id)).toBeNull();
+        // The missing PG row has a host receipt, so unrelated users can
+        // still allocate while the known cold disk remains fenced to its owner.
+        const currentUser = context();
+        const current = await guarded.create(currentUser, signal());
+        await db`delete from person_virtual_machines where person_id=${olderUser.actor.id}`;
+        const denied = context();
+        await expect(guarded.create(denied, signal())).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(await store.read(denied.actor.id)).toBeNull();
+        await expect(
+          guarded.create(currentUser, signal()),
+        ).resolves.toMatchObject({
+          vmId: current.vmId,
+        });
+        expect(new Set(await disk.listFormalDiskIds(signal()))).toEqual(
+          new Set([previous.vmId, cold.vmId, current.vmId]),
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
     it('真实PG物理owner持有至confirmed-stop runtime退役实际join，再释放并允许新代重试', async () => {
       const h = harness(store),
         rc = context();

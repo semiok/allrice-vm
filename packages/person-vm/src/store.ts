@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type postgres from 'postgres';
 import {
   PersonVmError,
@@ -8,7 +9,15 @@ import {
   type PersonVmHoldKind,
 } from './contract.ts';
 import type { PersonDisk } from './encrypted-disk.ts';
+import type { DiskPoolLocks, DiskPoolOwner } from './disk-pool-platform.ts';
 import type { PersonVmStartingScope } from './guest-bootstrap.ts';
+import {
+  recordPlatformVmDeletion,
+  type PlatformVmDeletionAudit,
+  type PlatformVmDeletionAuthorization,
+  type PlatformVmDeletionRequest,
+  type PlatformVmErasingDisk,
+} from './platform-deletion.ts';
 
 export type VmHold = {
   id: string;
@@ -43,19 +52,48 @@ export type VmAudit = {
 };
 export interface VmLease {
   row: VmRecord | null;
+  joinedOfflinePreparation?: boolean;
   /** Loss cancels owned work; the holder still MUST join before releasing. */
   signal: AbortSignal;
   assertAdmissionOpen(generationChange?: boolean): Promise<void>;
-  save(row: VmRecord): Promise<void>;
-  guard(): Promise<void>;
+  save(
+    row: VmRecord,
+    deletionAudit?: PlatformVmDeletionAudit,
+    authorizeDeletion?: PlatformVmDeletionAuthorization,
+  ): Promise<void>;
+  guard(expected?: DiskPoolOwner): Promise<void>;
   assertPhysicalOwner?(): Promise<void>;
+  hasCompletedDiskDeletion?(owner: DiskPoolOwner): Promise<boolean>;
+  hasRetainedDiskRows?(vmIds: readonly string[]): Promise<boolean>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
+  auditPlatformDeletion?(
+    event: PlatformVmDeletionAudit,
+    authorize?: PlatformVmDeletionAuthorization,
+  ): Promise<void>;
+  readPlatformErasingDisk?(): Promise<PlatformVmErasingDisk | undefined>;
+  confirmRetainedDeletion?(): Promise<boolean>;
+  claimDeletionCleanup?(): Promise<void>;
 }
+type VmLeaseOptions = {
+  now: () => Date;
+  ttlMs: number;
+  deletionAction?: PlatformVmDeletionRequest['action'];
+  offlinePreparation?: Readonly<{
+    mode: 'prepare' | 'join';
+    organizationId: string;
+    signal: AbortSignal;
+  }>;
+};
 export interface PersonVmStore {
   read(personId: string): Promise<VmRecord | null>;
+  auditStartupFailure?(
+    row: VmRecord,
+    event: VmAudit,
+    signal: AbortSignal,
+  ): Promise<void>;
   withLease<T>(
     personId: string,
-    options: { now: () => Date; ttlMs: number },
+    options: VmLeaseOptions,
     work: (lease: VmLease) => Promise<T>,
   ): Promise<T>;
   recover<T>(
@@ -63,6 +101,30 @@ export interface PersonVmStore {
     options: { now: () => Date; ttlMs: number; signal: AbortSignal },
     work: (lease: VmLease) => Promise<T>,
   ): Promise<T>;
+}
+
+async function physicalLeaseHolder(
+  session: VmSqlSession,
+  physical: string,
+  marker: string,
+) {
+  const sql = session.client;
+  const [row] = await session.query(
+    () => sql`
+    with keys as (select hashtextextended(${physical},0) as physical_key,
+      hashtextextended(${marker},0) as marker_key),
+    held as materialized (
+      select pid, classid::bigint as hi, objid::bigint as lo from pg_locks
+      where locktype='advisory' and objsubid=1 and granted and mode='ExclusiveLock'
+        and database=(select oid from pg_database where datname=current_database())
+    )
+    select case when p.pid is null then 'none'
+      when a.pid is null then 'other' else 'preparation' end as holder
+    from keys
+    left join held p on p.hi=((physical_key >> 32) & 4294967295) and p.lo=(physical_key & 4294967295)
+    left join held a on a.pid=p.pid and a.hi=((marker_key >> 32) & 4294967295) and a.lo=(marker_key & 4294967295)`,
+  );
+  return row?.holder;
 }
 
 export type PersonVmLeaseOwner = Readonly<{
@@ -248,6 +310,15 @@ async function assertAdmissionOpen(
   }
 }
 
+function insertVmAudit(
+  sql: postgres.Sql | postgres.TransactionSql,
+  row: VmRecord,
+  event: VmAudit,
+) {
+  return sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
+    values(${row.vmId},${row.personId},${row.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${row.leaseEpoch})`;
+}
+
 export class PostgresPersonVmStore implements PersonVmStore {
   // ownerToken -> personId. A claim whose COMMIT acknowledgement was lost may
   // leave either token durable; neither can authorize physical work until its
@@ -262,6 +333,92 @@ export class PostgresPersonVmStore implements PersonVmStore {
    * Factories must not change database/schema between calls. No DSN is exposed. */
   assertAdmissionFactory(factory: PersonVmSqlFactory) {
     if (factory !== this.openSql) throw new PersonVmError('PROVIDER_FAILED');
+  }
+  async auditStartupFailure(
+    row: VmRecord,
+    event: VmAudit,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    // This insert must never sit ahead of teardown on the advisory-lock
+    // connection. The diagnostic owns and closes its own short-lived client.
+    const sql = this.openSql();
+    let ending: Promise<void> | undefined;
+    const end = () => (ending ??= sql.end({ timeout: 0 }));
+    const abort = () => {
+      void end().catch(() => {});
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    try {
+      await sql.begin(async (tx) => {
+        signal.throwIfAborted();
+        // A sent PostgreSQL statement can outlive local client shutdown.
+        // Give the server its own deadline before dispatching the insert.
+        await tx`set local statement_timeout = '200ms'`;
+        signal.throwIfAborted();
+        await insertVmAudit(tx, row, event);
+      });
+    } finally {
+      signal.removeEventListener('abort', abort);
+      await end();
+    }
+  }
+  diskPoolLocks(namespace: string): DiskPoolLocks {
+    return {
+      withLock: async (kind, signal, work) => {
+        signal.throwIfAborted();
+        const session = new VmSqlSession(this.openSql());
+        const sql = session.client;
+        const active = AbortSignal.any([signal, session.signal]);
+        const key = `person-vm:disk-pool:${kind}:${namespace}`;
+        let locked = false;
+        try {
+          do {
+            active.throwIfAborted();
+            const [row] = await session.query(
+              () =>
+                sql`select pg_try_advisory_lock(hashtextextended(${key},0)) as locked`,
+            );
+            locked = row?.locked === true;
+            if (!locked) {
+              if (kind === 'fill') return undefined;
+              await sleep(15, undefined, { signal: active });
+            }
+          } while (!locked);
+          active.throwIfAborted();
+          const result = await work({
+            signal: active,
+            ownerSignal: session.signal,
+            assertOwned: async () => {
+              await session.query(() => sql`select 1`);
+            },
+            async foregroundStarting() {
+              // A recent start is a scheduling hint only. Physical ownership
+              // and settlement never depend on this clock comparison.
+              const [row] = await session.query(
+                () => sql`
+                select exists (select 1 from person_virtual_machines
+                  where phase='starting' and lease_owner is not null
+                    and lease_expires_at > statement_timestamp()) as busy`,
+              );
+              return row?.busy === true;
+            },
+          });
+          active.throwIfAborted();
+          return result;
+        } finally {
+          try {
+            if (locked && !session.connectionFailure)
+              await session.query(
+                () =>
+                  sql`select pg_advisory_unlock(hashtextextended(${key},0))`,
+              );
+          } finally {
+            await session.end();
+          }
+        }
+      },
+    };
   }
   async read(personId: string) {
     const session = new VmSqlSession(this.openSql());
@@ -289,7 +446,10 @@ export class PostgresPersonVmStore implements PersonVmStore {
     mayClaim: () => boolean = () => true,
   ): Promise<T> {
     signal.throwIfAborted();
-    const exact = Object.freeze({ ...binding });
+    const exact = Object.freeze({
+      ...binding,
+      personId: binding.personId.toLowerCase(),
+    });
     const session = new VmSqlSession(this.openSql());
     const sql = session.client;
     const leaseOwner = randomUUID();
@@ -390,55 +550,256 @@ export class PostgresPersonVmStore implements PersonVmStore {
     }
   }
   async withLease<T>(
-    personId: string,
-    options: { now: () => Date; ttlMs: number },
+    requestedPersonId: string,
+    options: VmLeaseOptions,
     work: (lease: VmLease) => Promise<T>,
   ) {
+    const personId = requestedPersonId.toLowerCase();
+    const preparation = options.offlinePreparation;
+    preparation?.signal.throwIfAborted();
     const session = new VmSqlSession(this.openSql());
     const sql = session.client;
+    const physical = 'person-vm:' + personId;
+    const marker =
+      preparation &&
+      `person-vm:offline-preparation:${personId}:${preparation.organizationId}`;
+    const active =
+      preparation && AbortSignal.any([preparation.signal, session.signal]);
     const token = randomUUID();
     let locked = false;
+    let joinedOfflinePreparation = false;
+    const reviewOnly = options.deletionAction === 'review';
+    let ownsDurable = !options.deletionAction;
     let bodyError: unknown;
     let result!: T;
     const expires = () =>
       new Date(options.now().getTime() + options.ttlMs).toISOString();
-    try {
-      const [lock] = await session.query(
+    const tryPhysical = async () => {
+      const [row] = await session.query(
         () =>
-          sql`select pg_try_advisory_lock(hashtextextended(${'person-vm:' + personId},0)) as locked`,
+          sql`select pg_try_advisory_lock(hashtextextended(${physical},0)) as locked`,
       );
-      if (!lock?.locked) throw new PersonVmError('LEASE_CONFLICT');
-      locked = true;
+      return row?.locked === true;
+    };
+    try {
+      if (preparation?.mode === 'prepare') {
+        // Publish the exact lane before attempting the ordinary lease. The
+        // session holds it through actual settlement and closes it on every exit.
+        const [row] = await session.query(
+          () =>
+            sql`select pg_try_advisory_lock(hashtextextended(${marker!},0)) as marked`,
+        );
+        if (!row?.marked) throw new PersonVmError('LEASE_CONFLICT');
+      }
+      active?.throwIfAborted();
+      locked = await tryPhysical();
+      active?.throwIfAborted();
+      if (!locked && preparation?.mode === 'join') {
+        const holder = await physicalLeaseHolder(session, physical, marker!);
+        if (holder === 'preparation') {
+          // Only the identified offline lane can make us wait. Once its gate
+          // is shared, a new preparation cannot win it ahead of this attempt.
+          for (;;) {
+            active!.throwIfAborted();
+            const [row] = await session.query(
+              () =>
+                sql`select pg_try_advisory_lock_shared(hashtextextended(${marker!},0)) as joined`,
+            );
+            if (row?.joined) break;
+            try {
+              await sleep(25, undefined, { signal: active });
+            } catch (error) {
+              active!.throwIfAborted();
+              throw error;
+            }
+          }
+        }
+        active!.throwIfAborted();
+        // An empty observation means the original holder just released. Any
+        // unrelated operation encountered at reacquisition still fails fast.
+        if (holder === 'preparation' || holder === 'none') {
+          joinedOfflinePreparation = true;
+          locked = await tryPhysical();
+        }
+      }
+      active?.throwIfAborted();
+      if (!locked) throw new PersonVmError('LEASE_CONFLICT');
       const [stored] = await session.query(
         () =>
           sql`select * from person_virtual_machines where person_id=${personId}`,
       );
       const row = stored ? fromRow(stored) : null;
       // Expiry is NOT proof the previous owner/operation is fenced. Never steal on TTL alone.
-      if (row?.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
-      if (row)
-        await session.query(
-          () =>
-            sql`update person_virtual_machines set lease_owner=${token},lease_expires_at=${expires()} where person_id=${personId}`,
+      if (row?.leaseOwner) {
+        const oldOwner = row.leaseOwner;
+        if (
+          !options.deletionAction ||
+          this.settledOrphans.get(oldOwner) !== personId
+        )
+          throw new PersonVmError('LEASE_CONFLICT');
+        const [settled] = await session.query(
+          () => sql`update person_virtual_machines
+          set lease_owner=null,lease_expires_at=null
+          where person_id=${personId} and lease_owner=${oldOwner} returning vm_id`,
         );
-      const guard = async (requireAdmission = true) => {
-        const [current] = await session.query(
-          () => sql`update person_virtual_machines set lease_expires_at=${expires()}
-          where person_id=${personId} and lease_owner=${token} returning *`,
+        if (!settled) throw new PersonVmError('LEASE_LOST');
+        row.leaseOwner = null;
+        row.leaseExpiresAt = null;
+        this.settledOrphans.delete(oldOwner);
+      }
+      const readPlatformErasingDisk = async (): Promise<
+        PlatformVmErasingDisk | undefined
+      > => {
+        if (
+          !row ||
+          row.phase !== 'deleted' ||
+          !row.diskRetained ||
+          row.instanceId ||
+          row.nativeCreated ||
+          row.egressReceipt
+        )
+          return;
+        const [saved] = await session.query(
+          () => sql`select metadata
+          from allrice_audit_events where organization_id=${row.organizationId}
+            and resource_type='person_vm' and resource_id=${row.vmId}
+            and action='person_vm.platform.purge-disk.erasing'
+            and metadata @> ${sql.json({ personId: row.personId, leaseEpoch: row.leaseEpoch })}
+          order by occurred_at desc limit 1`,
+        );
+        const identity = saved?.metadata?.diskIdentitySha256;
+        const tier = saved?.metadata?.diskTier;
+        if (!saved) return;
+        if (
+          (identity !== null &&
+            (typeof identity !== 'string' ||
+              !/^[a-f0-9]{64}$/.test(identity))) ||
+          (tier !== 'warm' && tier !== 'cold')
+        )
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+        return { diskIdentitySha256: identity, diskTier: tier };
+      };
+      const pendingErasure = await readPlatformErasingDisk();
+      if (pendingErasure) {
+        ownsDurable = false;
+        if (!reviewOnly && options.deletionAction !== 'purge-disk')
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }
+      let erasing = Boolean(pendingErasure);
+      async function claim() {
+        if (!row || reviewOnly || erasing)
+          throw new PersonVmError('LEASE_LOST');
+        ownsDurable = true;
+        const [claimed] = await session.query(
+          () => sql`update person_virtual_machines
+          set lease_owner=${token},lease_expires_at=${expires()}
+          where person_id=${personId} and lease_owner is null and vm_id=${row.vmId}
+            and lease_epoch=${row.leaseEpoch} returning vm_id`,
+        );
+        if (!claimed) throw new PersonVmError('LEASE_CONFLICT');
+      }
+      if (row && ownsDurable) await claim();
+      const guard = async (
+        requireAdmission = true,
+        expected?: DiskPoolOwner,
+      ) => {
+        if (reviewOnly) throw new PersonVmError('LEASE_LOST');
+        const [current] = await session.query(() =>
+          !ownsDurable
+            ? sql`select * from person_virtual_machines
+              where person_id=${personId} and vm_id=${row!.vmId} and lease_epoch=${row!.leaseEpoch}
+                and lease_owner is null and phase='deleted' and disk_retained`
+            : sql`update person_virtual_machines set lease_expires_at=${expires()}
+              where person_id=${personId} and lease_owner=${token} returning *`,
         );
         if (!current) throw new PersonVmError('LEASE_LOST');
+        if (
+          expected &&
+          (current.person_id !== expected.personId ||
+            current.organization_id !== expected.organizationId ||
+            current.vm_id !== expected.vmId ||
+            current.disk_retained !== true)
+        )
+          throw new PersonVmError('LEASE_LOST');
         if (requireAdmission && current.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };
+      async function withCurrentOperator<T>(
+        authorize: PlatformVmDeletionAuthorization | undefined,
+        apply: () => Promise<T>,
+      ) {
+        await session.query(() => sql.unsafe('begin'));
+        try {
+          if (authorize) await session.query(() => authorize(sql));
+          const result = await apply();
+          await session.query(() => sql.unsafe('commit'));
+          return result;
+        } catch (error) {
+          if (!session.connectionFailure)
+            await session.query(() => sql.unsafe('rollback'));
+          throw error;
+        }
+      }
       const lease: VmLease = {
         row,
+        joinedOfflinePreparation,
         signal: session.signal,
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),
-        guard,
+        guard: (expected) => guard(true, expected),
         assertPhysicalOwner: () => guard(false),
-        save: async (record) => {
-          if (record.personId !== personId)
+        hasCompletedDiskDeletion: async (owner) => {
+          if (owner.personId !== personId)
+            throw new PersonVmError('LEASE_LOST');
+          const [record] = await session.query(
+            () => sql`
+            select exists (
+              select 1 from person_vm_audit where vm_id=${owner.vmId}
+                and person_id=${owner.personId} and organization_id=${owner.organizationId}
+                and action='delete-disk' and result='succeeded'
+              union all
+              select 1 from allrice_audit_events where resource_type='person_vm'
+                and action='person_vm.platform.purge-disk.succeeded'
+                and organization_id=${owner.organizationId} and resource_id=${owner.vmId}
+                and metadata @> ${sql.json({ personId: owner.personId })}
+            ) as deleted`,
+          );
+          return record?.deleted === true;
+        },
+        hasRetainedDiskRows: async (vmIds) => {
+          const [record] = await session.query(
+            () => sql`
+            select count(*)::int as retained from person_virtual_machines
+              where disk_retained and vm_id = any(${sql.array([...vmIds])}::uuid[])`,
+          );
+          return record?.retained === vmIds.length;
+        },
+        save: async (record, deletionAudit, authorizeDeletion) => {
+          if (reviewOnly || record.personId !== personId)
+            throw new PersonVmError('LEASE_LOST');
+          const erasureCheckpoint = deletionAudit?.result === 'erasing';
+          const retained =
+            deletionAudit?.action === 'retain-disk' &&
+            deletionAudit.result === 'succeeded';
+          if (
+            (erasureCheckpoint || deletionAudit?.action === 'retain-disk') &&
+            !authorizeDeletion
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          if (
+            (erasureCheckpoint || erasing) &&
+            (!row ||
+              record.vmId !== row.vmId ||
+              record.leaseEpoch !== row.leaseEpoch ||
+              record.phase !== 'deleted' ||
+              record.instanceId ||
+              record.nativeCreated ||
+              record.egressReceipt ||
+              deletionAudit?.action !== 'purge-disk' ||
+              (erasing
+                ? record.diskRetained || deletionAudit.result !== 'succeeded'
+                : !record.diskRetained))
+          )
             throw new PersonVmError('LEASE_LOST');
           const values = {
             person_id: record.personId,
@@ -462,23 +823,101 @@ export class PostgresPersonVmStore implements PersonVmStore {
             idle_since: record.idleSince,
             activity_observed_at: record.activityObservedAt,
           };
-          const rows = await session.query(
-            () => sql`insert into person_virtual_machines ${sql(values)}
+          const save = async () => {
+            if (erasing) {
+              const [erased] = await sql`update person_virtual_machines
+                set disk_retained=false,updated_at=now()
+                where person_id=${personId} and vm_id=${record.vmId} and lease_epoch=${record.leaseEpoch}
+                  and lease_owner is null and phase='deleted' and disk_retained and instance_id is null
+                returning vm_id`;
+              if (!erased) throw new PersonVmError('LEASE_LOST');
+              return;
+            }
+            if (!ownsDurable) {
+              if (!erasureCheckpoint) throw new PersonVmError('LEASE_LOST');
+              const [detached] = await sql`update person_virtual_machines
+                set instance_id=null, native_created=false, disk_tier=${record.diskTier}, gateway_ports='[]'::jsonb, updated_at=now()
+                where person_id=${personId} and vm_id=${record.vmId} and lease_epoch=${record.leaseEpoch}
+                  and lease_owner is null and phase='deleted' and disk_retained and egress_receipt is null
+                returning vm_id`;
+              if (!detached) throw new PersonVmError('LEASE_LOST');
+              return;
+            }
+            const rows =
+              await sql`insert into person_virtual_machines ${sql(values)}
             on conflict (person_id) do update set
               vm_id=excluded.vm_id,phase=excluded.phase,disk_tier=excluded.disk_tier,disk_retained=excluded.disk_retained,
               native_created=excluded.native_created,instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
               egress_receipt=excluded.egress_receipt,gateway_ports=excluded.gateway_ports,holds=excluded.holds,
               last_activity_at=excluded.last_activity_at,stopped_at=excluded.stopped_at,idle_since=excluded.idle_since,
               activity_observed_at=excluded.activity_observed_at,lease_expires_at=excluded.lease_expires_at,updated_at=now()
-            where person_virtual_machines.lease_owner=${token} returning vm_id`,
-          );
-          if (rows.length !== 1) throw new PersonVmError('LEASE_LOST');
+            where person_virtual_machines.lease_owner=${token} returning vm_id`;
+            if (rows.length !== 1) throw new PersonVmError('LEASE_LOST');
+          };
+          if (!deletionAudit) return session.query(save);
+          await withCurrentOperator(authorizeDeletion, async () => {
+            await session.query(save);
+            await session.query(() =>
+              recordPlatformVmDeletion(sql, deletionAudit),
+            );
+            if ((erasureCheckpoint || retained) && ownsDurable) {
+              // The exact runtime and mount already joined. Publish the
+              // detached tombstone and release the physical owner together.
+              // An erasure still holds the advisory lock for scoped unlinks.
+              const [released] = await session.query(
+                () =>
+                  sql`update person_virtual_machines set lease_owner=null,lease_expires_at=null
+                  where person_id=${personId} and lease_owner=${token} returning vm_id`,
+              );
+              if (!released) throw new PersonVmError('LEASE_LOST');
+            }
+          });
+          if (erasureCheckpoint || retained) ownsDurable = false;
+          if (erasureCheckpoint) erasing = true;
         },
         audit: async (record, event) => {
-          await session.query(
-            () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
-            values(${record.vmId},${record.personId},${record.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${record.leaseEpoch})`,
+          await session.query(() => insertVmAudit(sql, record, event));
+        },
+        auditPlatformDeletion: async (event, authorize) => {
+          if (reviewOnly && event.result !== 'reviewed')
+            throw new PersonVmError('LEASE_LOST');
+          if (
+            (event.result === 'erasing' ||
+              (event.action === 'retain-disk' &&
+                event.result === 'succeeded')) &&
+            !authorize
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          const record = () =>
+            session.query(() => recordPlatformVmDeletion(sql, event));
+          if (authorize) await withCurrentOperator(authorize, record);
+          else await record();
+        },
+        readPlatformErasingDisk: async () => pendingErasure,
+        claimDeletionCleanup: claim,
+        async confirmRetainedDeletion() {
+          if (
+            !row ||
+            ownsDurable ||
+            row.phase !== 'deleted' ||
+            !row.diskRetained ||
+            row.egressReceipt ||
+            row.holds.length
+          )
+            return false;
+          const [clean] = await session.query(
+            () => sql`select exists(
+            select 1 from allrice_audit_events where resource_type='person_vm' and action='person_vm.platform.retain-disk.succeeded'
+              and organization_id=${row.organizationId} and resource_id=${row.vmId}
+              and metadata @> ${sql.json({ personId: row.personId, leaseEpoch: row.leaseEpoch, instanceId: row.instanceId })}
+            union all
+            select 1 from person_vm_audit where ${options.deletionAction === 'purge-disk'}
+              and person_id=${row.personId} and vm_id=${row.vmId}
+              and organization_id=${row.organizationId} and lease_epoch=${row.leaseEpoch}
+              and action='delete' and result='succeeded'
+          ) as ok`,
           );
+          return clean?.ok === true;
         },
       };
       result = await work(lease);
@@ -488,20 +927,21 @@ export class PostgresPersonVmStore implements PersonVmStore {
       try {
         // A broken session leaves a durable orphan for explicit fenced recovery.
         if (locked && !session.connectionFailure) {
+          if (ownsDurable)
+            await session.query(
+              () =>
+                sql`update person_virtual_machines set lease_owner=null,lease_expires_at=null where person_id=${personId} and lease_owner=${token}`,
+            );
           await session.query(
             () =>
-              sql`update person_virtual_machines set lease_owner=null,lease_expires_at=null where person_id=${personId} and lease_owner=${token}`,
-          );
-          await session.query(
-            () =>
-              sql`select pg_advisory_unlock(hashtextextended(${'person-vm:' + personId},0))`,
+              sql`select pg_advisory_unlock(hashtextextended(${physical},0))`,
           );
         }
       } catch (error) {
         bodyError ??= error;
       } finally {
         // work() and physical cleanup have settled before this local fence exists.
-        if (locked && session.connectionFailure)
+        if (locked && ownsDurable && session.connectionFailure)
           this.settledOrphans.set(token, personId);
         bodyError ??= session.connectionFailure;
         await session.end();
@@ -511,10 +951,11 @@ export class PostgresPersonVmStore implements PersonVmStore {
     return result;
   }
   async recover<T>(
-    personId: string,
+    requestedPersonId: string,
     options: { now: () => Date; ttlMs: number; signal: AbortSignal },
     work: (lease: VmLease) => Promise<T>,
   ) {
+    const personId = requestedPersonId.toLowerCase();
     options.signal.throwIfAborted();
     if (this.activeRecoveries.has(personId))
       throw new PersonVmError('LEASE_CONFLICT');
@@ -572,12 +1013,20 @@ export class PostgresPersonVmStore implements PersonVmStore {
       this.settledOrphans.delete(previousToken);
       row.leaseOwner = token;
       row.leaseExpiresAt = expires;
-      const guard = async () => {
+      const guard = async (expected?: DiskPoolOwner) => {
         const [found] = await session.query(
           () =>
             sql`update person_virtual_machines set lease_expires_at=${new Date(options.now().getTime() + options.ttlMs)} where person_id=${personId} and lease_owner=${token} returning *`,
         );
         if (!found) throw new PersonVmError('LEASE_LOST');
+        if (
+          expected &&
+          (found.person_id !== expected.personId ||
+            found.organization_id !== expected.organizationId ||
+            found.vm_id !== expected.vmId ||
+            found.disk_retained !== true)
+        )
+          throw new PersonVmError('LEASE_LOST');
         if (found.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };
@@ -601,10 +1050,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
           if (!found) throw new PersonVmError('LEASE_LOST');
         },
         audit: async (value, event) => {
-          await session.query(
-            () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
-            values(${value.vmId},${value.personId},${value.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${value.leaseEpoch})`,
-          );
+          await session.query(() => insertVmAudit(sql, value, event));
         },
       });
       const [cleared] = await session.query(

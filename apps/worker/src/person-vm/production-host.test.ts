@@ -1,9 +1,10 @@
 import type * as ProductionConfig from './production-config.js';
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
-import { rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
+import { join } from 'node:path';
 import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
@@ -21,6 +22,7 @@ import {
 } from '@allrice/person-vm';
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
+import type * as ReleasedProfile from '../d-entry/released-profile.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -38,6 +40,7 @@ const io = vi.hoisted(() => ({
   read: vi.fn(),
   database: vi.fn(),
   dedicated: vi.fn(),
+  diskPreprovision: vi.fn(),
   model:
     vi.fn<
       (
@@ -65,6 +68,13 @@ const io = vi.hoisted(() => ({
         gateway: ReturnType<typeof Egress.createEgressGateway>,
       ) => void
     >(),
+}));
+vi.mock('../d-entry/released-profile.js', async (original) => ({
+  ...(await original<typeof ReleasedProfile>()),
+  primeWorkerEmployeeWebRelease: async () => {},
+}));
+vi.mock('./production-disk-preprovision.js', () => ({
+  startProductionDiskPreprovision: io.diskPreprovision,
 }));
 vi.mock('./production-config.js', async (original) => ({
   ...(await original<typeof ProductionConfig>()),
@@ -332,6 +342,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   io.authority.mockReset();
   io.installation.mockReset();
+  io.diskPreprovision.mockReset();
   f = await productionInputsFixture();
   io.read.mockResolvedValue(f.loaded);
   io.database.mockReturnValue(trustedDatabase);
@@ -347,6 +358,7 @@ afterEach(async () => {
       .map((close) => close()),
   );
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await rm(f.root, { recursive: true, force: true });
   const errors = joined.flatMap((result) =>
     result.status === 'rejected' ? [result.reason] : [],
@@ -365,6 +377,132 @@ it('missing required production sources leaves ports uninstalled before any prov
   expect(io.database).not.toHaveBeenCalled();
   expect(io.gateway).not.toHaveBeenCalled();
   expectUninstalled();
+});
+
+function configureDiskPreprovision(enabled: boolean, sealedCache: boolean) {
+  const native = f.loaded.configuration.native;
+  if (sealedCache) {
+    const hash = '1'.repeat(64);
+    native.image = `docker.io/library/node@sha256:${hash}`;
+    native.publicImageCache = {
+      directory: `${f.root}/cache/${hash}`,
+      manifestSha256: hash,
+    };
+  }
+  f.loaded.configuration.disk.preprovision = enabled
+    ? {
+        enabled: true,
+        platform: 'macos',
+        minimumFreeBytes: 100,
+        reserveBytes: 20,
+      }
+    : { enabled: false };
+}
+
+it('does not install disk preparation from a seal with the switch off', async () => {
+  configureDiskPreprovision(false, true);
+  const host = await createProductionPersonVmHost({
+    lifetime: signal(),
+    sources: fixture().sources,
+  });
+  cleanup.push(() => host.close());
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+});
+
+it('creates and reopens the first private cold owner receipt through the default-off Host and system tmp path', async () => {
+  const configuration = f.loaded.configuration.disk;
+  configuration.root = join(f.root, 'volume', 'person-vms', 'disks');
+  await mkdir(configuration.keyRoot, { mode: 0o700 });
+  await expect(lstat(configuration.root)).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  const opened = await receiptFixture();
+  const owner = (await opened.memory.read(opened.entry.context.actor.id))!;
+  const physicalRoot = join(
+    await realpath(f.root),
+    'volume',
+    'person-vms',
+    'disks',
+  );
+  const ledger = join(physicalRoot, '.preprovision-ledger');
+  const record = join(ledger, `owner.${owner.vmId}.json`);
+  expect((await lstat(physicalRoot)).mode & 0o777).toBe(0o700);
+  expect((await lstat(ledger)).mode & 0o777).toBe(0o700);
+  expect((await lstat(record)).mode & 0o777).toBe(0o600);
+  expect(JSON.parse(await readFile(record, 'utf8'))).toEqual({
+    version: 1,
+    personId: owner.personId,
+    organizationId: owner.organizationId,
+    vmId: owner.vmId,
+  });
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+  opened.memory.rows.delete(owner.personId);
+  await expect(
+    opened.input().vm.create(opened.entry.context, signal()),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  expect(await opened.memory.read(owner.personId)).toBeNull();
+});
+
+it('rejects an enabled Host with no sealed public cache', async () => {
+  configureDiskPreprovision(true, false);
+  await expect(
+    createProductionPersonVmHost({
+      lifetime: signal(),
+      sources: fixture().sources,
+    }),
+  ).rejects.toMatchObject({ code: 'HOST_CONFIGURATION_UNAVAILABLE' });
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+});
+
+it('installs the actual service disk preparation and joins it before Host close settles', async () => {
+  configureDiskPreprovision(true, true);
+  const root = await realpath(f.root);
+  f.loaded.configuration.disk.root = join(root, 'missing', 'child');
+  f.loaded.configuration.disk.keyRoot = join(root, 'keys');
+  vi.stubEnv('DATABASE_URL', 'postgres://synthetic.invalid/test');
+  const draining = gate();
+  const schedulerClose = vi.fn(() => draining.promise);
+  io.diskPreprovision.mockReturnValue({ close: schedulerClose });
+  const originalPlatform = Object.getOwnPropertyDescriptor(
+    process,
+    'platform',
+  )!;
+  const host = await (async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    try {
+      return await createProductionPersonVmHost({
+        lifetime: signal(),
+        sources: fixture().sources,
+      });
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+    }
+  })();
+  cleanup.push(() => host.close());
+  try {
+    expect(io.diskPreprovision).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        port: { prepare: expect.any(Function) },
+        refill: expect.any(Function),
+        minimumFreeBytes: 100,
+        reserveBytes: 20,
+      }),
+    );
+    const installed = io.diskPreprovision.mock.calls[0]?.[0];
+    expect((await installed.availableBytes(signal())) > 0n).toBe(true);
+    let stopped = false;
+    const closing = host.close().then(() => {
+      stopped = true;
+    });
+    await turn();
+    expect(schedulerClose).toHaveBeenCalledOnce();
+    expect(stopped).toBe(false);
+    draining.release();
+    await closing;
+    expect(stopped).toBe(true);
+  } finally {
+    draining.release();
+  }
 });
 
 it('an already cancelled lifetime returns the original reason without constructing sources', async () => {

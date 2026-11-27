@@ -83,10 +83,10 @@ export async function updatePlatformModelSettings(
   });
 }
 
-export async function platformEmployeeModelPolicy(): Promise<
-  PlatformEmployeeDefinition['modelPolicy']
-> {
-  const { configuration } = await readPlatformModelSettings();
+export async function platformEmployeeModelPolicy(
+  sql?: ReturnType<typeof getDatabase> | TransactionSql,
+): Promise<PlatformEmployeeDefinition['modelPolicy']> {
+  const { configuration } = await readPlatformModelSettings(sql);
   return {
     provider: 'openai-codex',
     model: configuration.workModel,

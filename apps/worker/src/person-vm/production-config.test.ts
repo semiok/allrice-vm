@@ -106,9 +106,9 @@ function value() {
     },
     web: {
       cliPath: '/opt/allrice/dsh/synthetic/cli.mjs',
-      guestAddress: '127.0.0.1',
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
+      terminalEnabled: true,
     },
     lifecycle: {
       leaseTtlMs: 30000,
@@ -226,6 +226,61 @@ afterEach(async () => {
 });
 
 describe('private production Host configuration', () => {
+  it('keeps disk preprovision disabled when absent or explicitly off', async () => {
+    const read = () => readProductionHostConfiguration(signal());
+    expect((await read()).configuration.disk.preprovision).toBeUndefined();
+    const config = value();
+    await seal({
+      ...config,
+      disk: { ...config.disk, preprovision: { enabled: false } },
+    });
+    expect((await read()).configuration.disk.preprovision).toEqual({
+      enabled: false,
+    });
+  });
+
+  it('requires a positive floor and reserve before accepting an enabled disk configuration', async () => {
+    const config = value();
+    const enabled = {
+      enabled: true,
+      platform: 'macos',
+      minimumFreeBytes: 100,
+      reserveBytes: 20,
+    };
+    const withBudget = (preprovision: unknown) => ({
+      ...config,
+      native: {
+        ...config.native,
+        image: `docker.io/library/node@sha256:${hash}`,
+        publicImageCache: {
+          directory: join(root, 'public', hash),
+          manifestSha256: hash,
+        },
+      },
+      disk: { ...config.disk, preprovision },
+    });
+    await seal(withBudget(enabled));
+    expect(
+      (await readProductionHostConfiguration(signal())).configuration.disk
+        .preprovision,
+    ).toEqual(enabled);
+    for (const bad of [
+      { enabled: true },
+      { ...enabled, reserveBytes: 0 },
+      { ...enabled, platform: undefined },
+      { ...enabled, platform: 'linux' },
+    ]) {
+      await seal(withBudget(bad));
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    }
+    await seal({ ...config, disk: { ...config.disk, preprovision: enabled } });
+    await expect(
+      readProductionHostConfiguration(signal()),
+    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+  });
+
   it.each([
     '0.0.0.0',
     '::',
@@ -343,6 +398,17 @@ describe('private production Host configuration', () => {
       await fs.rm(f.root, { recursive: true, force: true });
     }
   });
+  it.each(['127.0.0.1', '172.16.0.6'])(
+    'rejects a sealed manually configured guest Web bind %s',
+    async (guestAddress) => {
+      const config = value();
+      await seal({ ...config, web: { ...config.web, guestAddress } });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
+
   it('reads only exact measured bytes after the original build verifier succeeds', async () => {
     const result = await readProductionHostConfiguration(signal());
     expect(result.configuration).toEqual(value());
@@ -358,6 +424,18 @@ describe('private production Host configuration', () => {
     expect(source.build).toHaveBeenCalledWith('worker');
     expect(result).not.toHaveProperty('verified');
     expect(result).not.toHaveProperty('ready');
+  });
+  it('enables the terminal by default and honors an explicit sealed opt-out', async () => {
+    const config = value();
+    await seal({
+      ...config,
+      web: { ...config.web, terminalEnabled: undefined },
+    });
+    const defaults = await readProductionHostConfiguration(signal());
+    expect(defaults.configuration.web.terminalEnabled).toBe(true);
+    await seal({ ...config, web: { ...config.web, terminalEnabled: false } });
+    const disabled = await readProductionHostConfiguration(signal());
+    expect(disabled.configuration.web.terminalEnabled).toBe(false);
   });
   it.each([
     { label: 'missing', patch: null },

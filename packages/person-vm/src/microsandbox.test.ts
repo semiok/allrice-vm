@@ -26,7 +26,7 @@ import {
   verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
-import { PERSON_VM_MEMORY_MIB } from './contract.ts';
+import { PersonVmError, PERSON_VM_MEMORY_MIB } from './contract.ts';
 import { runCommand } from './process.ts';
 import { context, currentReceipt, harness, signal } from './test-support.ts';
 import { PersonVmService } from './person-vm.ts';
@@ -229,6 +229,7 @@ save();
     rc,
     service,
     mount,
+    socketRoot: nativeOptions.socketRoot,
     calls: async () =>
       (await readFile(join(mount, 'host-home/calls.jsonl'), 'utf8'))
         .trim()
@@ -336,6 +337,24 @@ async function readonlyFixture(withSandbox = false) {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  it('releases only the exact owned mount alias and preserves recoverable native state', async () => {
+    const f = await bootstrapFixture();
+    await f.service.create(f.rc, signal());
+    await f.service.start(f.rc, signal());
+    const binding = await f.service.resolve(f.rc, signal());
+    await f.native.stop(binding, signal());
+    const alias = join(f.socketRoot, binding.vmId);
+    await expect(
+      f.native.releaseDiskHome(binding.vmId, f.mount + '-other', signal()),
+    ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+    expect(await readlink(alias)).toBe(join(f.mount, 'microsandbox'));
+    await f.native.releaseDiskHome(binding.vmId, f.mount, signal());
+    await f.native.releaseDiskHome(binding.vmId, f.mount, signal());
+    await expect(lstat(alias)).rejects.toMatchObject({ code: 'ENOENT' });
+    const restored = f.reloadNative();
+    await restored.prepare(binding, f.mount, signal());
+    expect(await restored.status(binding, signal())).toBe('stopped');
+  });
   it('reopens only an existing running VM configuration for a bounded detached read after restart', async () => {
     const f = await bootstrapFixture('ok', await readonlyFixture());
     await f.service.create(f.rc, signal());
@@ -1548,6 +1567,52 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toBe(false);
     },
   );
+  it('rechecks the admitted ticket after staging the host file and before the first guest copy', async () => {
+    const f = await bootstrapFixture();
+    const home = join(f.mount, 'host-home');
+    const readPlan = f.h.runtime.memoryGuestPlan;
+    let planning = false;
+    let staged = false;
+    f.h.runtime.memoryGuestPlan = async (...args) => {
+      planning = true;
+      return readPlan(...args);
+    };
+    await expect(
+      f.service.prewarm(
+        f.rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!planning) return;
+              const directory = (await readdir(home)).find((name) =>
+                name.startsWith('bootstrap-'),
+              );
+              if (
+                directory &&
+                (await readdir(join(home, directory))).includes('0')
+              ) {
+                staged = true;
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              }
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(staged).toBe(true);
+    const calls = await f.calls();
+    expect(calls.some(([verb]) => verb === 'cp')).toBe(false);
+    expect(calls.some(([verb]) => verb === 'stop')).toBe(true);
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      (await readdir(home)).some((name) => name.startsWith('bootstrap-')),
+    ).toBe(false);
+  });
   it('a partial native cp failure never sends the remaining files or initializes', async () => {
     const f = await bootstrapFixture('partial-copy');
     await expect(

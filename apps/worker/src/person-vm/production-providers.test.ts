@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ApfsPersonVmDisk, MicrosandboxPersonVm } from '@allrice/person-vm';
 import { productionInputsFixture } from './production-inputs.fixture.js';
+import type * as ProductionConfig from './production-config.js';
 const source = vi.hoisted(() => ({ read: vi.fn(), run: vi.fn() }));
-vi.mock('./production-config.js', () => ({
+vi.mock('./production-config.js', async (original) => ({
+  ...(await original<typeof ProductionConfig>()),
   readProductionHostConfiguration: source.read,
 }));
 vi.mock('../../../../packages/person-vm/src/process.ts', async (original) => ({
@@ -32,12 +34,40 @@ it('constructs actual providers without launching or creating a disk', async () 
   const value = await createProductionPersonVmProviders(signal());
   expect(value.native).toBeInstanceOf(MicrosandboxPersonVm);
   expect(value.disk).toBeInstanceOf(ApfsPersonVmDisk);
+  expect(value.diskPool).toBeUndefined();
   expect(value.platform).toBe(f.loaded.platform);
   expect(value.configuration).toBe(f.loaded.configuration);
   expect(source.run).not.toHaveBeenCalled();
   await expect(stat(f.loaded.configuration.disk.root)).rejects.toMatchObject({
     code: 'ENOENT',
   });
+});
+
+it('rejects the sealed macOS pool on a different host before constructing active providers', async () => {
+  const cfg = f.loaded.configuration;
+  const hash = '2'.repeat(64);
+  cfg.native.image = `docker.io/library/node@sha256:${hash}`;
+  cfg.native.publicImageCache = {
+    directory: join(f.root, hash),
+    manifestSha256: hash,
+  };
+  cfg.disk.preprovision = {
+    enabled: true,
+    platform: 'macos',
+    minimumFreeBytes: 80,
+    reserveBytes: 60,
+  };
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { value: 'linux' });
+  try {
+    await expect(createProductionPersonVmProviders(signal())).rejects.toThrow(
+      'PERSON_VM_HOST_CONFIGURATION_UNAVAILABLE',
+    );
+    expect(source.run).not.toHaveBeenCalled();
+    await expect(stat(cfg.disk.root)).rejects.toMatchObject({ code: 'ENOENT' });
+  } finally {
+    Object.defineProperty(process, 'platform', original);
+  }
 });
 
 it('the actual native configuration consumes the same loaded platform snapshot', async () => {

@@ -1,16 +1,18 @@
-import { useSyncExternalStore, type ComponentProps } from 'react';
+import { useState, useSyncExternalStore, type ComponentProps } from 'react';
 import { flushSync } from 'react-dom';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
+import type { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
 import { ChatSidebarFrame } from '../../../apps/web/app/chatflow/chat-sidebar-frame';
 import { EmployeeSidebarView } from '../../../apps/web/app/chatflow/employee-sidebar-view';
 import {
   SidebarSettingsButton,
   SidebarSettingsTrigger,
 } from '../../../apps/web/app/chatflow/sidebar-settings-trigger';
+import { dEntryFirstEmployeeLimitMessage } from '../../../apps/web/lib/d-entry/employee-creation';
 import '@allrice/ui/tokens.css';
 import '../../../apps/web/app/styles/sidebar-palette.css';
 
@@ -24,6 +26,10 @@ const subscribeCompact = (listener: () => void) => {
 
 type Tree = ComponentProps<typeof EmployeeSidebarView>;
 type Frame = ComponentProps<typeof ChatSidebarFrame>;
+type PersonalCreation = Omit<
+  Extract<ComponentProps<typeof EmployeeCreateDialog>, { personal: true }>,
+  'personal' | 'onClose'
+>;
 
 /** Business projection and operations supplied by the authenticated AllRice owner. */
 export interface EmployeeSidebarSnapshot {
@@ -39,7 +45,7 @@ export interface EmployeeSidebarSnapshot {
 export interface EmployeeSidebarPort {
   getSnapshot: () => EmployeeSidebarSnapshot | null;
   subscribe: (listener: () => void) => () => void;
-  createEmployee: () => void;
+  createEmployee: (() => void) | PersonalCreation;
   openArchive: () => void;
   /** MET-279 supplies the employee settings surface; never an admin route. */
   openEmployeeSettings: () => void;
@@ -69,7 +75,9 @@ export function EmployeeSidebar({
     compactSnapshot,
     () => false,
   );
+  const [showCreationLimit, setShowCreationLimit] = useState(false);
   if (!snapshot) return null;
+  const creation = port.createEmployee;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
   };
@@ -81,7 +89,16 @@ export function EmployeeSidebar({
       overlay={compact && !collapsed}
       style={{ height: '100%' }}
       onCollapsedChange={() => ctx.layout.toggleSidebar()}
-      onCreateEmployee={port.createEmployee}
+      onCreateEmployee={
+        // Personal creation is offered here only after selecting an employee
+        // and mounting its VM. The first employee dialog lives at bare entry.
+        typeof creation === 'function'
+          ? creation
+          : () => {
+              if (collapsed) ctx.layout.toggleSidebar();
+              setShowCreationLimit(true);
+            }
+      }
       onOpenArchive={port.openArchive}
       onOpenAutomations={() => {
         ctx.layout.selectPanel(
@@ -93,6 +110,11 @@ export function EmployeeSidebar({
       employeeTree={
         <>
           {snapshot.error && <p role="alert">{snapshot.error}</p>}
+          {!collapsed &&
+            typeof creation !== 'function' &&
+            showCreationLimit && (
+              <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
+            )}
           <EmployeeSidebarView
             {...snapshot.tree}
             archive={snapshot.archive}

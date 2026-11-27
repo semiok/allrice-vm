@@ -1,9 +1,11 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
+  type DEntryNativePrewarmTicket,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import {
@@ -24,15 +26,22 @@ import {
   employeeEntryQuery,
   prepareEmployeeEntry,
   prewarmEmployeeEntry,
+  type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
 import styles from './employee-native-page.module.css';
 
 type Status =
   | 'warming'
+  | 'accepted'
+  | 'starting'
   | 'opening'
   | 'ready'
   | 'cancelled'
   | 'failed'
+  | 'asset-timeout'
+  | 'selection-unavailable'
+  | 'sign-in'
+  | 'forbidden'
   | 'denied'
   | 'closing'
   | 'unknown';
@@ -40,11 +49,16 @@ type Status =
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
 const closingNoticeMs = 10_000;
+const closingConfirmationMs = 60_000;
 
 type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
-  expiresAt: number;
+  progress: {
+    current?: EmployeePrewarmProgress;
+    ticket?: DEntryNativePrewarmTicket;
+    show?(state: EmployeePrewarmProgress): void;
+  };
 };
 
 async function waitForVisibleEntry(signal: AbortSignal) {
@@ -73,6 +87,7 @@ export function EmployeeNativePage({
   initialUnavailable?: boolean;
 }) {
   const frame = useRef<HTMLIFrameElement>(null);
+  const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
@@ -83,6 +98,8 @@ export function EmployeeNativePage({
     query: string;
     confirmedQuery?: string;
     warmup?: EntryWarmup;
+    retainFrame?: boolean;
+    ticket?: DEntryNativePrewarmTicket;
   }>({ query });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
@@ -115,17 +132,27 @@ export function EmployeeNativePage({
     let retired = false;
     let mounted = false;
     let documentStarted = false;
+    let discardingPendingDocument = false;
     let remoteRevoked = false;
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
+    let ticket = activation.ticket;
+    let resumable = false;
     let superseded = false;
     let timer: number | undefined;
     let closingNotice: number | undefined;
+    let closingConfirmation: number | undefined;
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
-    setSource(undefined);
+    const retainedDocument = activation.retainFrame
+      ? frame.current?.contentDocument
+      : undefined;
+    if (!activation.retainFrame) {
+      frameSelection.current = undefined;
+      setSource(undefined);
+    }
     setFailed(false);
     setStatus('warming');
     setSettled(false);
@@ -148,8 +175,32 @@ export function EmployeeNativePage({
         },
       );
     }
+    function matchesDocument(url: string) {
+      const address = new URL(url);
+      const path = '/chatflow/4.0/document';
+      return (
+        address.origin === location.origin &&
+        ((address.pathname === path &&
+          address.searchParams.getAll('scopeId').length === 1 &&
+          address.searchParams.get('scopeId') === scopeId) ||
+          address.pathname.startsWith(path + '/' + scopeId + '/'))
+      );
+    }
     function retire() {
-      return (replacing ??= (async () => {
+      if (replacing) return replacing;
+      if (prepare) {
+        closingNotice = window.setTimeout(
+          () => setStatus('closing'),
+          closingNoticeMs,
+        );
+        // Loss of either completion signal must not leave a perpetual spinner
+        // or enable a new page without the old page's actual close proof.
+        closingConfirmation = window.setTimeout(
+          () => setStatus('unknown'),
+          closingConfirmationMs,
+        );
+      }
+      replacing = (async () => {
         // A render change keeps the old iframe and its authenticated sender
         // attached until both halves have settled.
         if (!mounted || !frame.current) {
@@ -162,28 +213,62 @@ export function EmployeeNativePage({
           return remote !== 'unknown';
         }
         send(pageRevoked);
+        // Before the inline lifecycle runs there is no child to acknowledge
+        // revoke. Observe a blank navigation before accepting local closure.
+        if (!documentStarted) {
+          try {
+            const win = frame.current.contentWindow;
+            const previous = frame.current.contentDocument;
+            if (
+              win &&
+              previous &&
+              (previous.URL === 'about:blank' ||
+                previous === retainedDocument ||
+                (matchesDocument(previous.URL) &&
+                  !Reflect.get(win, '__ALLRICE_EMPLOYEE_DOCUMENT__')))
+            ) {
+              discardingPendingDocument = true;
+              win.stop();
+              win.location.replace('about:blank');
+            }
+          } catch {
+            // An uninspectable child must supply its own completion.
+          }
+        }
         const [remote, entry] = await Promise.all([close(), local.promise]);
         return remote === 'closed' && entry === 'closed';
-      })());
+      })()
+        .catch(() => false)
+        .finally(() => {
+          window.clearTimeout(closingNotice);
+          window.clearTimeout(closingConfirmation);
+        });
+      return replacing;
     }
-    function finish(status: 'cancelled' | 'failed' | 'denied') {
+    function finish(
+      status:
+        | 'cancelled'
+        | 'failed'
+        | 'asset-timeout'
+        | 'forbidden'
+        | 'selection-unavailable'
+        | 'sign-in',
+      retainTicket = status === 'cancelled',
+    ) {
       if (navigating || replace.current !== applyQuery) return;
       navigating = true;
+      resumable = retainTicket;
       window.clearTimeout(timer);
       setStatus(status);
-      closingNotice = window.setTimeout(
-        () => setStatus('closing'),
-        closingNoticeMs,
-      );
       void retire().then((closed) => {
-        window.clearTimeout(closingNotice);
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
           if (nextQuery.current !== activeQuery) {
-            setActivation({ query: nextQuery.current });
+            activateSelection(nextQuery.current);
             return;
           }
+          frameSelection.current = undefined;
           setSource(undefined);
           setStatus(status);
           setSettled(true);
@@ -202,16 +287,13 @@ export function EmployeeNativePage({
       if (!scopeId || node !== frame.current || !mounted) return;
       try {
         const doc = node.contentDocument;
-        if (doc?.URL === 'about:blank') return;
+        if (doc?.URL === 'about:blank') {
+          if (discardingPendingDocument && !documentStarted)
+            local.resolve('closed');
+          return;
+        }
         if (!doc) return failedDocument('unknown');
-        const address = new URL(doc.URL);
-        const path = '/chatflow/4.0/document';
-        const exact =
-          address.origin === location.origin &&
-          ((address.pathname === path &&
-            address.searchParams.getAll('scopeId').length === 1 &&
-            address.searchParams.get('scopeId') === scopeId) ||
-            address.pathname.startsWith(path + '/' + scopeId + '/'));
+        const exact = matchesDocument(doc.URL);
         const child = node.contentWindow as
           | (Window & { __ALLRICE_EMPLOYEE_DOCUMENT__?: { scopeId: string } })
           | null;
@@ -222,6 +304,7 @@ export function EmployeeNativePage({
           documentStarted = true;
           return;
         }
+        if (discardingPendingDocument && exact && !documentStarted) return;
         // The two authenticated document handlers return a JSON problem
         // before any owned document exists. An uninspectable or changed
         // document has no equivalent local completion proof.
@@ -235,6 +318,20 @@ export function EmployeeNativePage({
       }
     };
     loaded.current = documentLoaded;
+    function activateSelection(query: string, warmup?: EntryWarmup) {
+      const params = new URLSearchParams(query);
+      const same = (key: 'workspaceId' | 'employeeInstanceId') =>
+        params.getAll(key).length === 1 &&
+        params.get(key) === frameSelection.current?.[key];
+      setActivation({
+        query,
+        warmup,
+        // The previous thread already joined. A fresh authorized document
+        // can use the same frame without creating an outer navigation.
+        retainFrame:
+          !!frame.current && same('workspaceId') && same('employeeInstanceId'),
+      });
+    }
     const applyQuery = () => {
       if (navigating) {
         if (nextWarmup && nextQuery.current !== activeQuery) {
@@ -243,14 +340,14 @@ export function EmployeeNativePage({
           superseded = true;
         }
         if (retired && nextQuery.current !== activeQuery)
-          setActivation({ query: nextQuery.current });
+          activateSelection(nextQuery.current);
         return;
       }
       navigating = true;
       window.clearTimeout(timer);
       void retire().then((closed) => {
         if (replace.current !== applyQuery) return;
-        if (closed) setActivation({ query: nextQuery.current });
+        if (closed) activateSelection(nextQuery.current);
         else if (prepare) setStatus('unknown');
         else setFailed(true);
       });
@@ -262,6 +359,10 @@ export function EmployeeNativePage({
       setActivation({
         query,
         confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+        ticket:
+          resumable && query === activeQuery
+            ? (ticket ?? activation.warmup?.progress.ticket)
+            : undefined,
       });
     };
     const receive = (event: MessageEvent) => {
@@ -272,9 +373,15 @@ export function EmployeeNativePage({
         event.data?.scopeId !== scopeId
       )
         return;
-      if (event.data.type === pageClosing) void close();
+      if (event.data.type === pageClosing) {
+        if (prepare && !navigating && !detached) finish('failed');
+        else void close();
+      }
       if (event.data.type === pageStartupFailed) {
-        if (prepare) finish('failed');
+        if (prepare)
+          finish(
+            event.data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed',
+          );
         else {
           setFailed(true);
           void close();
@@ -320,27 +427,28 @@ export function EmployeeNativePage({
         );
         if (prepare && !next.data.threadId)
           params.set('new', crypto.randomUUID());
-        if (
+        const sameEmployee =
           prepare &&
-          !document.hidden &&
           location.pathname === '/chatflow/4.0' &&
           selectedEmployee?.workspaceId === next.data.workspaceId &&
-          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
-        ) {
+          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId;
+        if (sameEmployee && !document.hidden) {
           // A navigation from this verified employee can start qualification
           // for the selected thread while the old page joins its transport.
           // This request has no page-carrier or thread-creation side effect.
           const lifetime = new AbortController();
-          const expiresAt = performance.now() + entryWaitMs;
-          const result = prewarmEmployeeEntry(
-            next.data,
-            AbortSignal.any([
-              lifetime.signal,
-              AbortSignal.timeout(entryWaitMs),
-            ]),
-          );
+          const progress: EntryWarmup['progress'] = {};
+          const result = prewarmEmployeeEntry(next.data, lifetime.signal, {
+            accepted: (ticket) => {
+              progress.ticket = ticket;
+            },
+            progress(state) {
+              progress.current = state;
+              progress.show?.(state);
+            },
+          });
           void result.catch(() => {}); // the next activation reports the result
-          nextWarmup = { lifetime, result, expiresAt };
+          nextWarmup = { lifetime, result, progress };
         }
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
@@ -352,12 +460,12 @@ export function EmployeeNativePage({
           if (closed) {
             if (superseded || nextQuery.current !== activeQuery) {
               warmup?.lifetime.abort();
-              setActivation({ query: nextQuery.current });
-            } else if (warmup) {
+              activateSelection(nextQuery.current);
+            } else if (sameEmployee) {
               const query = params.toString();
               nextQuery.current = query;
               history.pushState(null, '', '/chatflow/4.0?' + query);
-              setActivation({ query, warmup });
+              activateSelection(query, warmup);
             } else location.assign('/chatflow/4.0?' + params);
           } else {
             warmup?.lifetime.abort();
@@ -388,20 +496,28 @@ export function EmployeeNativePage({
     const parsedEntry = Promise.resolve().then(() =>
       employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
     );
-    // The rendered shell owns this one request. The existing POST qualifies
-    // the exact selection before starting a VM; no background request lends
-    // its result to another activation, cookie session, or page carrier.
+    // The shell owns only its wait; the Worker owns an accepted cold start.
+    const showPrewarm = (state: EmployeePrewarmProgress) => {
+      if (!lifetime.signal.aborted && !navigating)
+        setStatus(activation.retainFrame ? 'warming' : state);
+    };
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
-          const remaining = activation.warmup
-            ? activation.warmup.expiresAt - performance.now()
-            : entryWaitMs;
-          if (remaining <= 0) throw new EmployeeEntryError(503);
-          timer = window.setTimeout(() => finish('failed'), remaining);
-          await (activation.warmup?.result ??
-            prewarmEmployeeEntry(selection, lifetime.signal));
+          if (activation.warmup) {
+            const { progress, result } = activation.warmup;
+            progress.show = showPrewarm;
+            if (progress.current) showPrewarm(progress.current);
+            await result;
+          } else
+            await prewarmEmployeeEntry(selection, lifetime.signal, {
+              ticket,
+              accepted: (accepted) => {
+                ticket = accepted;
+              },
+              progress: showPrewarm,
+            });
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -411,7 +527,13 @@ export function EmployeeNativePage({
         ? await prepareEmployeeEntry(
             entry,
             lifetime.signal,
-            () => setStatus('opening'),
+            () => {
+              ticket = undefined;
+              if (activation.warmup)
+                activation.warmup.progress.ticket = undefined;
+              setStatus('opening');
+              timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+            },
             prewarming,
           )
         : entry.selection;
@@ -435,7 +557,7 @@ export function EmployeeNativePage({
         identity.employeeInstanceId !== selection.employeeInstanceId ||
         identity.threadId !== (selection.threadId ?? null)
       )
-        throw Error('Employee selection changed');
+        throw new EmployeeEntryError(403, 'response-mismatch');
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         send(pageRevoked);
@@ -448,24 +570,32 @@ export function EmployeeNativePage({
       lifetime.signal.throwIfAborted();
       if (navigating) return;
       selectedEmployee = selection;
+      frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
       mounted = true;
-      setSource('/chatflow/4.0/document?' + params);
+      const documentUrl = '/chatflow/4.0/document?' + params;
+      const retainedWindow = activation.retainFrame
+        ? frame.current?.contentWindow
+        : undefined;
+      if (retainedWindow) retainedWindow.location.replace(documentUrl);
+      else setSource(documentUrl);
     };
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;
-      if (!prepare) setFailed(true);
-      else
-        finish(
-          error instanceof EmployeeEntryError &&
-            [400, 401, 403, 404].includes(error.status)
-            ? 'denied'
-            : 'failed',
-        );
+      if (!prepare) return setFailed(true);
+      if (!(error instanceof EmployeeEntryError)) return finish('failed');
+      const responseMismatch = error.reason === 'response-mismatch';
+      if (error.status === 401) finish('sign-in');
+      else if (error.status === 403 && !responseMismatch) finish('forbidden');
+      else if (responseMismatch || [400, 404].includes(error.status))
+        finish('selection-unavailable');
+      else finish('failed', error.status === 408);
     });
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
+      window.clearTimeout(closingConfirmation);
+      if (activation.warmup) activation.warmup.progress.show = undefined;
       leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
@@ -518,13 +648,19 @@ export function EmployeeNativePage({
 }
 
 const messages = {
-  warming: [
-    '正在启动工作台',
-    '首次启动可能需要一些时间，就绪后将自动打开对话。',
+  warming: ['正在打开对话', '马上就好。'],
+  accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
+  starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  opening: ['工作台已就绪', '正在打开对话。'],
+  failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
+  'asset-timeout': [
+    '工作台资源下载超时',
+    '自动重试后仍未下载完成，可以点重试。',
   ],
-  opening: ['正在打开对话', '工作台已启动，正在连接对话。'],
-  failed: ['暂时无法打开工作台', '请重试。已创建的对话会继续打开。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
+  'selection-unavailable': ['暂时打不开这条对话', '可以返回员工页重选。'],
+  'sign-in': ['请重新登录', '登录后再打开工作台。'],
+  forbidden: ['当前请求未获授权', '请确认登录账号和工作区权限。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
   unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
@@ -542,20 +678,31 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = status === 'warming' || status === 'opening';
-  const resumable = status === 'cancelled' || status === 'failed';
+  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
+    status,
+  );
+  const failedOpening = status === 'failed' || status === 'asset-timeout';
+  const resumable = status === 'cancelled' || failedOpening;
+  const canReturn = status === 'failed' || status === 'selection-unavailable';
+  const attention =
+    failedOpening ||
+    [
+      'selection-unavailable',
+      'sign-in',
+      'forbidden',
+      'denied',
+      'unknown',
+    ].includes(status);
   return (
     <div className={styles.status}>
       <section>
-        <div
-          role={
-            status === 'failed' || status === 'denied' || status === 'unknown'
-              ? 'alert'
-              : 'status'
-          }
-        >
+        <div role={attention ? 'alert' : 'status'} aria-atomic="true">
+          {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
           <p>{description}</p>
+          {failedOpening && (
+            <p>如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试</p>
+          )}
         </div>
         {starting && (
           <button type="button" onClick={stop}>
@@ -566,6 +713,10 @@ function EntryStatus({
           <button type="button" disabled={!settled} onClick={retry}>
             {status === 'cancelled' ? '继续' : '重试'}
           </button>
+        )}
+        {canReturn && settled && <a href="/chatflow/4.0">返回员工页</a>}
+        {status === 'sign-in' && settled && (
+          <a href="/login?next=%2Fchatflow%2F4.0">重新登录</a>
         )}
       </section>
     </div>

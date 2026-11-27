@@ -19,6 +19,272 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  it('rejects a changed prewarm epoch under the lease before any disk or native side effect', async () => {
+    const store = new MemoryStore(),
+      h = harness(store),
+      rc = context();
+    await h.service.create(rc, signal());
+    const previous = store.rows.get(rc.actor.id)!;
+    const target = {
+      vmId: previous.vmId,
+      instanceId: null,
+      leaseEpoch: previous.leaseEpoch + 1,
+      assertAuthority: async () => {},
+    };
+    const withLease = store.withLease.bind(store);
+    vi.spyOn(store, 'withLease').mockImplementationOnce((...args) => {
+      store.rows.set(rc.actor.id, {
+        ...previous,
+        leaseEpoch: target.leaseEpoch,
+      });
+      return withLease(...args);
+    });
+    h.log.length = 0;
+    await expect(
+      h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(h.log).toEqual([]);
+    expect(store.rows.get(rc.actor.id)?.leaseEpoch).toBe(target.leaseEpoch);
+    expect(store.rows.get(rc.actor.id)?.leaseOwner).toBeNull();
+  });
+  it.each(['create', 'start'])(
+    'checks the accepted authority while owning the %s lease',
+    async (phase) => {
+      const store = new MemoryStore(),
+        h = harness(store),
+        rc = context();
+      if (phase === 'start') await h.service.create(rc, signal());
+      h.log.length = 0;
+      let acquisitions = 0;
+      const withLease = store.withLease.bind(store);
+      vi.spyOn(store, 'withLease').mockImplementation((...args) => {
+        acquisitions++;
+        return withLease(...args);
+      });
+      const denied = new PersonVmError('AUTHORIZATION_DENIED');
+      const target = {
+        vmId: store.rows.get(rc.actor.id)?.vmId ?? null,
+        instanceId: null,
+        leaseEpoch: 1,
+        async assertAuthority() {
+          if (acquisitions === (phase === 'create' ? 1 : 2)) throw denied;
+        },
+      };
+      await expect(
+        h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+      ).rejects.toBe(denied);
+      expect(h.log).toEqual([]);
+      expect(store.rows.get(rc.actor.id)?.phase ?? 'missing').toBe(
+        phase === 'start' ? 'stopped' : 'missing',
+      );
+      await expect(
+        store.withLease(
+          rc.actor.id,
+          { now: () => new Date(), ttlMs: 1000 },
+          async () => 'released',
+        ),
+      ).resolves.toBe('released');
+    },
+  );
+  it('rechecks admitted authority after inspecting a cold disk without a pool', async () => {
+    const h = harness();
+    const rc = context();
+    let current = true;
+    const inspect = h.disk.inspect.bind(h.disk);
+    vi.spyOn(h.disk, 'inspect').mockImplementationOnce(async (...args) => {
+      const inspection = await inspect(...args);
+      current = false;
+      return inspection;
+    });
+    const revoked = Object.assign(Error('ticket grant changed'), {
+      code: 'authorization_denied',
+    });
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!current) throw revoked;
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED', cause: revoked });
+    expect(h.log).toEqual([]);
+    expect(h.disks.size).toBe(0);
+  });
+  it.each(['native create', 'readiness'] as const)(
+    'rechecks the admitted revision after %s before proceeding and joins startup cleanup',
+    async (boundary) => {
+      const h = harness(),
+        rc = context();
+      let valid = true;
+      const create = h.native.create.bind(h.native);
+      const readiness = h.runtime.readiness.bind(h.runtime);
+      if (boundary === 'native create')
+        vi.spyOn(h.native, 'create').mockImplementationOnce(async (...args) => {
+          await create(...args);
+          valid = false;
+        });
+      else
+        vi.spyOn(h.runtime, 'readiness').mockImplementationOnce(
+          async (...args) => {
+            const result = await readiness(...args);
+            valid = false;
+            return result;
+          },
+        );
+
+      const target = {
+        vmId: null,
+        instanceId: null,
+        leaseEpoch: 1,
+        async assertAuthority() {
+          if (!valid) throw new PersonVmError('AUTHORIZATION_DENIED');
+        },
+      };
+      await expect(
+        h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const saved = (await h.store.read(rc.actor.id))!;
+      expect(saved).toMatchObject({
+        phase: 'stopped',
+        diskRetained: true,
+        egressReceipt: null,
+        leaseOwner: null,
+      });
+      expect(h.log.includes('native:bootstrap')).toBe(boundary === 'readiness');
+      expect(h.log.includes('runtime:start')).toBe(boundary === 'readiness');
+      expect(h.states.get(saved.vmId)).toBe('stopped');
+      expect(h.mounts.size).toBe(0);
+      expect(h.active.size).toBe(0);
+    },
+  );
+  it('cleans up a running row if the admitted grant changes while saving it under the lease', async () => {
+    const store = new MemoryStore(),
+      h = harness(store),
+      rc = context();
+    let valid = true,
+      sawOwnedPublication = false;
+    const withLease = store.withLease.bind(store);
+    vi.spyOn(store, 'withLease').mockImplementation((id, options, work) =>
+      withLease(id, options, (lease) =>
+        work({
+          ...lease,
+          async save(row) {
+            await lease.save(row);
+            if (row.phase === 'running') {
+              sawOwnedPublication = !!(await store.read(id))?.leaseOwner;
+              valid = false;
+            }
+          },
+        }),
+      ),
+    );
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!valid) throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(sawOwnedPublication).toBe(true);
+    const saved = (await store.read(rc.actor.id))!;
+    expect(saved).toMatchObject({
+      phase: 'stopped',
+      leaseOwner: null,
+      egressReceipt: null,
+    });
+    expect(h.states.get(saved.vmId)).toBe('stopped');
+    expect(h.mounts.size).toBe(0);
+    expect(h.active.size).toBe(0);
+  });
+  it('checks the admitted authority before taking responsibility for an interrupted generation', async () => {
+    const store = new MemoryStore(),
+      h = harness(store);
+    const { rc, binding } = await running(h);
+    const previous = store.rows.get(rc.actor.id)!;
+    store.rows.set(rc.actor.id, { ...previous, phase: 'failed' });
+    h.states.set(binding.vmId, 'stopped');
+    const before = h.log.slice();
+    let checks = 0;
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: binding.vmId,
+            instanceId: null,
+            leaseEpoch: binding.leaseEpoch + 1,
+            async assertAuthority() {
+              // Create and initial start checks finish before the revision changes.
+              if (++checks > 2) throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(h.log).toEqual(before);
+    expect(await store.read(rc.actor.id)).toMatchObject({
+      phase: 'failed',
+      leaseOwner: null,
+      egressReceipt: previous.egressReceipt,
+    });
+    expect(h.active.size).toBe(1);
+  });
+  it('never restores a retained disk when a prewarm planned before deletion reaches the lease', async () => {
+    const h = harness(),
+      rc = context();
+    const created = await h.service.create(rc, signal());
+    const lease = h.store.withLease.bind(h.store);
+    const original = (await h.store.read(rc.actor.id))!;
+    vi.spyOn(h.store, 'withLease').mockImplementationOnce(async (...args) => {
+      await lease(rc.actor.id, args[1], async (deleteLease) => {
+        await deleteLease.save({ ...original, phase: 'deleted' });
+      });
+      return lease(...args);
+    });
+    const before = h.log.slice();
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: created.vmId,
+            instanceId: null,
+            leaseEpoch: 1,
+            assertAuthority: async () => {},
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(h.log).toEqual(before);
+    expect(await h.store.read(rc.actor.id)).toMatchObject({
+      phase: 'deleted',
+      diskRetained: true,
+      leaseOwner: null,
+    });
+  });
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');

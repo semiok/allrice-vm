@@ -4,6 +4,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type postgres from 'postgres';
 import {
   CreateEmployeeInstanceInputSchema,
+  CreatePersonalEmployeeInstanceInputSchema,
+  hasDEntryPersonRelease,
   UpdateEmployeeInstanceInputSchema,
   EmployeeInstanceSchema,
   EmployeeInstanceSnapshotSchema,
@@ -33,7 +35,12 @@ import { getDatabase } from '../core/client.ts';
 import { DataAccessError } from '../data.ts';
 import { readContentPrincipal } from '../content-maintenance.ts';
 import { isBaseRiceInstance } from './employee-instance-policy.ts';
-import { employeeManifestChecksum } from './employee-config.ts';
+import {
+  employeeManifest,
+  employeeManifestChecksum,
+} from './employee-config.ts';
+import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
+import { platformEmployeeModelPolicy } from '../providers/platform-model-settings.ts';
 import { runtimePolicyDigest } from '../runtime-policy-digest.ts';
 import { frozenPackageSkills } from '../skill-bundles.ts';
 import {
@@ -669,7 +676,10 @@ function parseEmployeePersonaVersion(
 export class EmployeeInstanceError extends Error {
   constructor(
     public readonly code:
-      'instance_conflict' | 'instance_archived' | 'default_protected',
+      | 'instance_conflict'
+      | 'instance_archived'
+      | 'default_protected'
+      | 'd_entry_first_employee_limit',
   ) {
     super(code);
   }
@@ -696,11 +706,12 @@ async function auditInstance(
   context: Identity & Pick<RequestContext, 'requestId'>,
   id: string,
   operation: 'create' | 'update' | 'archive' | 'restore',
+  reason = 'owner_with_current_assignment',
 ) {
   await tx`insert into allrice_audit_events
     (organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id)
     values(${context.organizationId},${context.workspaceId},${actorId(context)},${`employee.instance.${operation}`},
-      'employee_instance',${id},'allowed','owner_with_current_assignment',${context.requestId})`;
+      'employee_instance',${id},'allowed',${reason},${context.requestId})`;
 }
 
 /** The assignment row serializes publication/revocation. We deliberately do
@@ -922,21 +933,69 @@ export async function listHistoricalEmployeeInstances(
   );
 }
 
+/** The caller must establish current workspace write authority first. The
+ * limit belongs to the person, and retained employees and disks still count. */
+export async function hasExistingDEntryEmployeeOrVm(
+  context: RequestContext,
+  sql: Sql = getDatabase(),
+) {
+  const personId = actorId(context);
+  const [row] = await sql<{ blocked: boolean }[]>`select
+    exists(select 1 from allrice_employee_instances where owner_id=${personId})
+    or exists(select 1 from allrice_employee_assignments where user_id=${personId} and active)
+    or exists(select 1 from person_virtual_machines
+      where person_id=${personId} and (phase<>'deleted' or disk_retained))
+    as blocked`;
+  return row?.blocked !== false;
+}
+
 export async function createEmployeeInstance(
   context: RequestContext,
   input: unknown,
 ) {
-  const value = CreateEmployeeInstanceInputSchema.parse(input),
-    scope = { ...context, workspaceId: value.workspaceId };
+  const value = CreateEmployeeInstanceInputSchema.or(
+    CreatePersonalEmployeeInstanceInputSchema,
+  ).parse(input);
+  const scope = { ...context, workspaceId: value.workspaceId };
+  const assigned = 'assignmentId' in value;
+  if (
+    !assigned &&
+    context.workspaceId &&
+    context.workspaceId !== scope.workspaceId
+  )
+    throw new DataAccessError('authorization_denied');
+
   return getDatabase().begin(async (tx) => {
-    await authority(scope, tx, true);
-    const current = await assignment(scope, value.assignmentId, tx, true);
-    await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-instance-create:${scope.organizationId}:${scope.workspaceId}:${actorId(scope)}:${value.requestId}`},0))`;
+    // A personal instance starts from the authenticated member, without a
+    // pre-existing assignment. Keep the legacy path's assignment lock.
+    await authority(scope, tx, assigned ? true : 'update_user');
+    const ownerId = actorId(scope);
+    if (!assigned && value.expectedOwnerId !== ownerId)
+      throw new DataAccessError('authorization_denied');
+    const released = hasDEntryPersonRelease(
+      await readDEntryReleasePolicy(tx, true),
+      { organizationId: scope.organizationId, personId: ownerId },
+    );
+    if (!assigned && !released)
+      throw new DataAccessError('authorization_denied');
+    const existingAssignment = assigned
+      ? await assignment(scope, value.assignmentId, tx, true)
+      : undefined;
+    if (existingAssignment && !released) {
+      // The private ownership row of a self-created employee is not a
+      // dispatched template for the legacy creation endpoint.
+      const [personal] = await tx`select 1 from allrice_employee_instances
+        where id=${existingAssignment.id} and assignment_id=id
+          and kind='custom' and organization_id=${scope.organizationId}
+          and workspace_id=${scope.workspaceId} and owner_id=${ownerId}`;
+      if (personal) throw new DataAccessError('authorization_denied');
+    }
+    await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-instance-create:${scope.organizationId}:${scope.workspaceId}:${ownerId}:${value.requestId}`},0))`;
     const [prior] = await tx<
       { id: string; matches: boolean }[]
     >`select id,creation_input=${tx.json(value)}::jsonb matches
       from allrice_employee_instances where organization_id=${scope.organizationId} and workspace_id=${scope.workspaceId}
-        and owner_id=${actorId(scope)} and creation_request_id=${value.requestId}`;
+        and owner_id=${ownerId} and creation_request_id=${value.requestId}`;
     if (prior) {
       if (!prior.matches) throw new EmployeeInstanceError('instance_conflict');
       await getEmployeeInstance(scope, prior.id, tx);
@@ -944,21 +1003,88 @@ export async function createEmployeeInstance(
         await tx`select response from allrice_employee_instance_revisions where instance_id=${prior.id} and revision=1`;
       return EmployeeInstanceSchema.parse(saved?.response);
     }
+    // A verified assignment already counts as an existing employee. Only the
+    // unassigned path can admit a new 4.0 employee, under its person row lock.
+    if (
+      released &&
+      (existingAssignment || (await hasExistingDEntryEmployeeOrVm(scope, tx)))
+    )
+      throw new EmployeeInstanceError('d_entry_first_employee_limit');
     const id = randomUUID();
+    const current = assigned
+      ? existingAssignment!
+      : await createPersonalEmployeeSource(tx, scope, ownerId, id);
+    const profile = assigned
+      ? value.profile
+      : {
+          ...value.profile,
+          appearance: {
+            avatarType: 'initials',
+            avatarValue: Array.from(value.profile.name)[0]!.toLocaleUpperCase(),
+            ...value.profile.appearance,
+          },
+        };
     await tx`insert into allrice_employee_instances
       (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id,profile,creation_request_id,creation_input)
-      values(${id},${scope.organizationId},${scope.workspaceId},${actorId(scope)},${current.id},'custom',${current.employee_version_id},${tx.json(value.profile)},${value.requestId},${tx.json(value)})`;
-    await tx`insert into allrice_employee_instance_revisions(instance_id,revision,profile,operation) values(${id},1,${tx.json(value.profile)},'create')`;
+      values(${id},${scope.organizationId},${scope.workspaceId},${ownerId},${current.id},'custom',${current.employee_version_id},${tx.json(profile)},${value.requestId},${tx.json(value)})`;
+    await tx`insert into allrice_employee_instance_revisions(instance_id,revision,profile,operation) values(${id},1,${tx.json(profile)},'create')`;
     const result = await getEmployeeInstance(scope, id, tx);
     await tx`update allrice_employee_instance_revisions set response=${tx.json(result)} where instance_id=${id} and revision=1`;
-    await auditInstance(tx, scope, id, 'create');
+    await auditInstance(
+      tx,
+      scope,
+      id,
+      'create',
+      assigned ? undefined : 'd_entry_personal_employee_create',
+    );
     await notifyNativeRosterInsert(tx, 'allrice_employee_instances', {
       organizationId: scope.organizationId,
       workspaceId: scope.workspaceId,
-      personId: actorId(scope),
+      personId: ownerId,
     });
+    if (!assigned && !(await readContentPrincipal(scope, tx))?.writable)
+      throw new DataAccessError('authorization_denied');
     return result;
   });
+}
+
+/** Persist the ownership and version expected by existing readers. Using the
+ * instance id as its private assignment id keeps general materialization
+ * idempotent: this single custom instance is the assignment's root instance. */
+async function createPersonalEmployeeSource(
+  tx: Tx,
+  scope: RequestContext & { workspaceId: string },
+  ownerId: string,
+  id: string,
+) {
+  const employeeId = randomUUID();
+  const versionId = randomUUID();
+  const key = `personal-${employeeId}`;
+  const manifest = employeeManifest({
+    key,
+    // Company administration can read the source version. The owner's
+    // personal profile is written only to their instance and its revisions.
+    name: '自定义员工',
+    description: '个人自定义员工',
+    applicableScenarios: [],
+    behaviorRules: [],
+    toolNames: [],
+    runtimePolicy: {
+      harness: 'dsh',
+      ...(await platformEmployeeModelPolicy(tx)),
+    },
+  });
+  await tx`insert into allrice_employees (id,organization_id,workspace_id,employee_key,name)
+    values(${employeeId},${scope.organizationId},${scope.workspaceId},${key},${manifest.name})`;
+  await tx`insert into allrice_employee_versions
+    (id,organization_id,workspace_id,employee_id,version,name,description,model,system_prompt,capabilities,manifest,provider_snapshot,skill_version_ids,config_checksum)
+    values(${versionId},${scope.organizationId},${scope.workspaceId},${employeeId},1,${manifest.name},${manifest.description},
+      ${manifest.provider.model},${manifest.systemPrompt},${tx.json(manifest.capabilities)},${tx.json(manifest)},
+      ${tx.json(manifest.provider)},${tx.json(manifest.skillVersionIds)},${employeeManifestChecksum(manifest)})`;
+  await tx`insert into allrice_employee_assignments
+    (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
+    values(${id},${scope.organizationId},${scope.workspaceId},${employeeId},${versionId},${ownerId},false,true,${ownerId})`;
+  return { id, employee_version_id: versionId };
 }
 
 export async function updateEmployeeInstance(

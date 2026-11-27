@@ -23,6 +23,10 @@ export type PersonVmGuestCommand = Readonly<{
   workdir?: string;
 }>;
 export type PersonVmJobExit = Readonly<{ exitCode: number; timedOut: boolean }>;
+declare const nativeWebGuestAddress: unique symbol;
+export type PersonVmNativeWebGuestAddress = string & {
+  readonly [nativeWebGuestAddress]: true;
+};
 export interface PersonVmManagedJob {
   readonly binding: PersonVmBinding;
   readonly jobId: string;
@@ -40,6 +44,10 @@ export interface PersonVmBootstrapScope extends PersonVmStartingScope {
   /** Only after person memory init; always prepends the installed native launcher.
    * The runtime owner retains the returned job, not this expiring startup scope. */
   launch(command: PersonVmGuestCommand): Promise<PersonVmManagedJob>;
+  /** Fixed native probe of the current sandbox's assigned Web interface. */
+  readNativeWebGuestAddress?(
+    signal?: AbortSignal,
+  ): Promise<PersonVmNativeWebGuestAddress>;
   /** Fixed nonce artifact only, captured privately. The reader joins on cancellation. */
   readNativeWebAuth?(
     request: PersonVmNativeWebAuthRequest,
@@ -50,7 +58,12 @@ export interface PersonVmGuestBootstrapPort {
   bootstrap(
     scope: PersonVmStartingScope,
     plan: PersonVmMemoryGuestPlan,
-  ): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>>;
+  ): Promise<
+    Pick<
+      PersonVmBootstrapScope,
+      'launch' | 'readNativeWebGuestAddress' | 'readNativeWebAuth'
+    >
+  >;
 }
 
 /** Internal service kernel: the actual lease stays owned through callback and
@@ -112,6 +125,12 @@ export async function bootstrapPersonVm(input: {
       ...scope,
       launch: (command: PersonVmGuestCommand) =>
         track(() => launcher.launch(command)),
+      ...(launcher.readNativeWebGuestAddress
+        ? {
+            readNativeWebGuestAddress: (signal?: AbortSignal) =>
+              track(() => launcher.readNativeWebGuestAddress!(signal)),
+          }
+        : {}),
       ...(launcher.readNativeWebAuth
         ? {
             readNativeWebAuth: (

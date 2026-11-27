@@ -81,6 +81,7 @@ files:
     - packages/browser-control/src/local-preview.integration.test.ts
   browser:
     - apps/worker/src/d-entry/principal-page-carrier.browser.test.ts
+    - scripts/acceptance/public-greenfield/greenfield.browser.test.mjs
     - packages/dsh-web-composition/tests/installed-profile.browser.test.ts
     - packages/dsh-web-composition/tests/employee-sidebar.browser.test.ts
     - packages/dsh-web-composition/tests/settings-integration.browser.test.ts
@@ -109,6 +110,7 @@ files:
     - apps/worker/src/native-schedule-once.test.ts
   db:
     - apps/web/lib/d-entry/history-authority.integration.test.ts
+    - apps/worker/src/person-vm/production-delete.integration.test.ts
     - packages/egress-gateway/src/admission.integration.test.ts
     - packages/egress-gateway/src/managed-model.integration.test.ts
     - packages/model-gateway/src/postgres-store.integration.test.ts

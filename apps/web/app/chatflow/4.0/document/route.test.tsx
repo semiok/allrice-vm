@@ -24,6 +24,7 @@ const authenticated = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
 const directory = vi.hoisted(() => vi.fn());
+const releasedAssets = vi.hoisted(() => vi.fn());
 const cookie = vi.hoisted(() => ({ value: '' }));
 vi.mock('@allrice/database', async (load) => ({
   ...(await load<typeof Database>()),
@@ -41,6 +42,9 @@ vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
 vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
   ...(await importOriginal<typeof SessionIdentity>()),
   requireRequestContext: authenticated,
+}));
+vi.mock('../../../../lib/d-entry/released-profile-assets', () => ({
+  readReleasedProfileAssets: releasedAssets,
 }));
 vi.mock('../../../../lib/d-entry/identity', () => ({
   resolveDEntryIdentity: historyIdentity,
@@ -65,6 +69,7 @@ beforeEach(() => {
   historyIdentity.mockReset();
   profileRequest.mockReset();
   directory.mockReset();
+  releasedAssets.mockReset();
   cookie.value = 'unit-test-original-session-cookie';
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
@@ -205,11 +210,36 @@ it('requires the issued scope in the document address and leaves the two exact n
       { params: Promise.resolve({ publicationPath }) },
     );
   };
+  const assetRoot = '/_next/static/dsh-profile/' + claims.manifestSha256 + '/';
+  releasedAssets.mockResolvedValue({
+    root: assetRoot,
+    paths: new Set([
+      'native/assets/index-BxpfOGf3.css',
+      'managed/employee-web-entry.js',
+    ]),
+    bundles: [
+      {
+        reference: 'plugins/??bundle/client.js&rev=r1',
+        revision: 'r1',
+        sha256: '2'.repeat(64),
+      },
+    ],
+  });
   const doc = await call('index.html');
   expect(doc.status).toBe(200);
   const html = await doc.text();
   expect(html).toContain('data-native-session-id="real-native-root"');
-  expect(html).toContain('/managed/employee-web-entry.js');
+  expect(doc.headers.get('cache-control')).toBe('private, no-store');
+  expect(releasedAssets).toHaveBeenCalledExactlyOnceWith(claims.manifestSha256);
+  expect(html).toContain(
+    'src="' + assetRoot + 'managed/employee-web-entry.js"',
+  );
+  expect(html).toContain(
+    'href="' + assetRoot + 'native/assets/index-BxpfOGf3.css"',
+  );
+  expect(html).toContain('href="assets/vendor-DV2921Zo.css"');
+  expect(html).toContain('data-public-asset-root="' + assetRoot + '"');
+  expect(html).toContain('&amp;rev=r1');
   const lifecycle = html.indexOf('__ALLRICE_EMPLOYEE_DOCUMENT__');
   const stylesheetTags = [
     ...html.matchAll(/data-allrice-document-asset="style"/g),

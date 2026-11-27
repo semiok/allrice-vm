@@ -383,8 +383,6 @@ suite(
         selections: people.map((p) => ({
           organizationId: p.context.organizationId,
           personId: p.context.actor.id,
-          employeeInstanceId: p.selection.employeeInstanceId,
-          generation: '4.0',
         })),
       };
       await f.db`insert into allrice_settings(scope_type,key,value) values('system','d_entry_rollout_policy',${f.db.json(policy)})
@@ -1233,8 +1231,6 @@ suite(
                 {
                   organizationId: p.context.organizationId,
                   personId: p.context.actor.id,
-                  employeeInstanceId: p.selection.employeeInstanceId,
-                  generation: '4.0',
                 },
               ],
             });

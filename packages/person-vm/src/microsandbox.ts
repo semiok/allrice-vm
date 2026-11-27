@@ -1,5 +1,12 @@
 import { constants } from 'node:fs';
-import { lstat, open, readlink, symlink, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  open,
+  readlink,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
@@ -11,6 +18,7 @@ import { privateDirectory } from './encrypted-disk.ts';
 import {
   checkedPublicImageCache,
   seedPublicImageCache,
+  verifySeededPublicImageCache,
   type PublicImageCache,
 } from './image-cache.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
@@ -120,6 +128,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     signal: AbortSignal,
   ): Promise<void>;
   stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  releaseDiskHome?(
+    vmId: string,
+    mount: string,
+    signal: AbortSignal,
+  ): Promise<void>;
   ping(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
 }
 
@@ -139,6 +152,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       readonlyDshRuntimeDisk?: ReadonlyDshRuntimeDisk;
       readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
       publicImageCache?: PublicImageCache;
+      seededPublicCache?(vmId: string, signal: AbortSignal): Promise<boolean>;
+      refreshBoundPublicCache?(
+        binding: PersonVmBinding,
+        mount: string,
+        signal: AbortSignal,
+        resumeOnly?: boolean,
+      ): Promise<boolean>;
       rootDiskGiB: number;
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
@@ -462,6 +482,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     await privateDirectory(this.options.socketRoot);
     const target = join(mount, 'microsandbox');
     await privateDirectory(target);
+    // Rejoin an elected cache cutover before the CLI can open its cache path.
+    await this.options.refreshBoundPublicCache?.(binding, mount, signal, true);
     const userHome = join(mount, 'host-home');
     await privateDirectory(userHome);
     try {
@@ -603,14 +625,30 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if ((await this.status(binding, signal)) !== 'absent')
       throw new PersonVmError('PROVIDER_FAILED');
     const artifact = await this.artifact(binding, signal, true);
-    if (this.options.publicImageCache)
-      await seedPublicImageCache(
-        this.options.publicImageCache,
-        this.options.image,
-        join(dirname(paths.config), 'microsandbox'),
+    if (this.options.publicImageCache) {
+      const hasSeed = await this.options.seededPublicCache?.(
+        binding.vmId,
         signal,
       );
-    else
+      const mount = dirname(paths.config);
+      const nativeRoot = join(mount, 'microsandbox');
+      if (hasSeed)
+        await verifySeededPublicImageCache(
+          this.options.publicImageCache,
+          this.options.image,
+          nativeRoot,
+          signal,
+        );
+      else if (
+        !(await this.options.refreshBoundPublicCache?.(binding, mount, signal))
+      )
+        await seedPublicImageCache(
+          this.options.publicImageCache,
+          this.options.image,
+          nativeRoot,
+          signal,
+        );
+    } else
       await this.command(
         binding,
         ['pull', this.options.image, '--materialize', 'flat', '--quiet'],
@@ -806,6 +844,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (after !== 'stopped' && after !== 'absent')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
+  async releaseDiskHome(vmId: string, mount: string, signal: AbortSignal) {
+    const home = join(this.options.socketRoot, vmId);
+    assertSocketHome(home);
+    signal.throwIfAborted();
+    try {
+      if ((await readlink(home)) !== join(mount, 'microsandbox'))
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      signal.throwIfAborted();
+      await unlink(home);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    signal.throwIfAborted();
+    this.homes.delete(vmId);
+  }
   async ping(binding: PersonVmBinding, signal: AbortSignal) {
     await this.command(binding, ['ping', this.name(binding)], signal);
     await this.assertArtifact(binding, signal);
@@ -848,8 +901,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
           },
         }),
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,
-      command: (args, signal, readNonzeroExit) =>
-        this.command(scope.binding, args, signal, readNonzeroExit),
+      command: async (args, signal, readNonzeroExit) => {
+        // Local file staging happens before this dispatch boundary.
+        if (args[0] === 'cp') await scope.assertCurrent();
+        return this.command(scope.binding, args, signal, readNonzeroExit);
+      },
     });
   }
   /** Trusted diagnostics only. CLI abort is not proof of guest cancellation. */

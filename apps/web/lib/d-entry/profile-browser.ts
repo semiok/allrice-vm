@@ -2,6 +2,8 @@ import {
   DEntryPageBorrowSchema,
   DEntryPageUnarySchema,
   DEntryProfileBootstrapSchema,
+  DEntryProfileChunkFilenameSchema,
+  type DEntryProfileGraphSchema,
   UuidSchema,
 } from '@allrice/contracts';
 import { z } from 'zod';
@@ -19,6 +21,121 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
+const publicBundlesSchema = z.array(
+  z.strictObject({
+    reference: z.string(),
+    revision: z.string(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+);
+export function releasedBundleResolver(data: DOMStringMap) {
+  const root = data.publicAssetRoot;
+  if (!root || !publicRoot.test(root)) return () => undefined;
+  try {
+    const bundles = publicBundlesSchema.parse(
+      JSON.parse(data.publicBundles ?? '[]'),
+    );
+    return ({ url, rev }: { url: string; rev: string }) => {
+      const entry = bundles.find(
+        ({ reference, revision }) => url === reference && rev === revision,
+      );
+      return entry ? root + 'bundles/' + entry.sha256 + '.js' : undefined;
+    };
+  } catch {
+    return () => undefined;
+  }
+}
+
+const profileBundleTimeoutMs = 30_000;
+
+export function profileBundleReference(
+  graph: z.infer<typeof DEntryProfileGraphSchema>,
+  reference: string,
+) {
+  const bundle = [...graph.entries, ...graph.batches].find(
+    ({ url }) => url === reference,
+  );
+  if (bundle) return bundle;
+  // Native require.async requests a sibling of its current graph entry.
+  const [path, query, trailing] = reference.split('?');
+  if (!path || trailing !== undefined) return;
+  const slash = path.lastIndexOf('/');
+  if (
+    !DEntryProfileChunkFilenameSchema.safeParse(path.slice(slash + 1)).success
+  )
+    return;
+  const owner = graph.entries.find(
+    ({ id, rev }) =>
+      path.slice(0, slash) === `plugins/${id}` && query === `rev=${rev}`,
+  );
+  if (owner) return { url: reference, rev: owner.rev };
+}
+
+export class EmployeeProfileBundleTimeout extends Error {
+  constructor() {
+    super('Employee profile bundle download timed out');
+  }
+}
+
+async function fetchProfileBundle(
+  url: URL | string,
+  parent: AbortSignal,
+  options: Pick<RequestInit, 'credentials' | 'cache'>,
+) {
+  parent.throwIfAborted();
+  const timeout = new AbortController();
+  const until = AbortSignal.any([parent, timeout.signal]);
+  const timer = setTimeout(
+    () => timeout.abort(new EmployeeProfileBundleTimeout()),
+    profileBundleTimeoutMs,
+  );
+  try {
+    const response = await fetch(url, { ...options, signal: until });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw Error('Employee profile bundle unavailable');
+    }
+    // A 200 with a stalled body is subject to the same deadline as headers.
+    const bytes = await response.arrayBuffer();
+    until.throwIfAborted();
+    return bytes;
+  } catch (error) {
+    until.throwIfAborted();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function readProfileBundle(
+  target: URL,
+  signal: AbortSignal,
+  publicUrl?: string,
+) {
+  const read = () =>
+    fetchProfileBundle(target, signal, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  try {
+    return await (publicUrl
+      ? fetchProfileBundle(publicUrl, signal, { credentials: 'omit' })
+      : read());
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!publicUrl && !(error instanceof EmployeeProfileBundleTimeout))
+      throw error;
+    try {
+      return await read();
+    } catch (retryError) {
+      signal.throwIfAborted();
+      if (error instanceof EmployeeProfileBundleTimeout) throw error;
+      throw retryError;
+    }
+  }
+}
+
 export function readEmployeeDocument(data: DOMStringMap) {
   const { scopeId, ...selection } = DEntryPageBorrowSchema.parse({
     scopeId: data.scopeId,
@@ -40,12 +157,14 @@ export function readEmployeeDocument(data: DOMStringMap) {
 export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
+  onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
   );
   const bindingRef = container.dataset.bindingRef!;
   const graphRev = container.dataset.graphRev!;
+  const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
   const pending = new Set<Promise<unknown>>();
   const channels = new Map<WebSocket, Promise<void>>();
@@ -204,26 +323,28 @@ export function nativeProfileDocument(
             const signal = lifetime.signal;
             signal.throwIfAborted();
             const graph = published?.graph;
-            const resource =
-              graph &&
-              [...graph.entries, ...graph.batches].find(
-                ({ url }) => url === reference,
-              );
+            const resource = graph && profileBundleReference(graph, reference);
             if (!resource) throw Error('Native bundle was not published');
             const target = profileUrl('assets');
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);
-            const response = await fetch(target, {
+            const bytes = await readProfileBundle(
+              target,
               signal,
-              credentials: 'same-origin',
-              cache: 'no-store',
+              releasedBundle(resource),
+            ).catch((error: unknown) => {
+              if (
+                error instanceof EmployeeProfileBundleTimeout &&
+                !signal.aborted
+              ) {
+                // The rc.2 loader also retries bundles, then falls back to
+                // per-module URLs. Fence those reads after our terminal retry.
+                lifetime.abort(error);
+                onBundleTimeout(error);
+              }
+              throw error;
             });
-            if (!response.ok) {
-              await response.body?.cancel();
-              throw Error('Employee profile bundle unavailable');
-            }
-            const bytes = await response.arrayBuffer();
             signal.throwIfAborted();
             // rc.2 payloads are classic registration scripts. Download belongs
             // to the abortable request; only the received, certified bytes can

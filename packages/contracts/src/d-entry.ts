@@ -54,6 +54,7 @@ export type DEntryAdmission = z.infer<typeof DEntryAdmissionSchema>;
 
 // No env/default/list is created here. The approved release source must supply
 // every field. Matching one person's employee never grants another's access.
+const RolloutUuidSchema = UuidSchema.transform((id) => id.toLowerCase());
 export const DEntryRolloutPolicySchema = z
   .object({
     revision: z.string().min(1),
@@ -61,33 +62,43 @@ export const DEntryRolloutPolicySchema = z
     selections: z.array(
       z
         .object({
-          organizationId: UuidSchema,
-          personId: UuidSchema,
-          employeeInstanceId: UuidSchema,
-          generation: ExecutionGenerationSchema,
+          organizationId: RolloutUuidSchema,
+          personId: RolloutUuidSchema,
         })
         .strict(),
     ),
   })
   .strict()
   .superRefine((policy, ctx) => {
-    const keys = new Set<string>();
+    const people = new Set<string>();
     for (const [index, selection] of policy.selections.entries()) {
       const key = JSON.stringify([
         selection.organizationId,
         selection.personId,
-        selection.employeeInstanceId,
       ]);
-      if (keys.has(key))
+      if (people.has(key))
         ctx.addIssue({
           code: 'custom',
-          message: 'Duplicate employee selection',
+          message: 'Duplicate person selection',
           path: ['selections', index],
         });
-      keys.add(key);
+      people.add(key);
     }
   });
 export type DEntryRolloutPolicy = z.infer<typeof DEntryRolloutPolicySchema>;
+
+export function hasDEntryPersonRelease(
+  policy: DEntryRolloutPolicy,
+  identity: Pick<DEntryIdentity, 'organizationId' | 'personId'>,
+) {
+  const organizationId = identity.organizationId.toLowerCase();
+  const personId = identity.personId.toLowerCase();
+  return policy.selections.some(
+    (selection) =>
+      selection.organizationId === organizationId &&
+      selection.personId === personId,
+  );
+}
 
 /** Selects a NEW thread's writer only; never changes a persisted thread pin. */
 export function selectDEntryGeneration(
@@ -96,14 +107,7 @@ export function selectDEntryGeneration(
 ): ExecutionGeneration {
   const policy = DEntryRolloutPolicySchema.parse(policyInput);
   const identity = DEntryIdentitySchema.parse(identityInput);
-  return (
-    policy.selections.find(
-      (selection) =>
-        selection.organizationId === identity.organizationId &&
-        selection.personId === identity.personId &&
-        selection.employeeInstanceId === identity.employeeInstanceId,
-    )?.generation ?? policy.defaultGeneration
-  );
+  return hasDEntryPersonRelease(policy, identity) ? '4.0' : '3.x';
 }
 
 // Browser-safe mount references only; no guest URL, cookie, token or disk path.
@@ -147,17 +151,11 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
 });
-export const DEntryPageUnarySchema = z.enum([
-  'session/attachment',
-  'session/page',
-  'session/projections',
-  'skills/list',
-  'session/prompt',
-  'session/updateQueue',
-  'session/cancel',
-  'session/rename',
-  'session/selectModel',
-]);
+// Connection's canonical namespace/method syntax. A caller can name a method
+// here, but only the admitted guest can resolve and authorize its descriptor.
+export const DEntryPageUnarySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/u);
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {
     selection: DEntrySelectionInputSchema,
@@ -178,6 +176,12 @@ export const DEntryProfileAssetSchema = DEntryProfileBindingSchema.extend({
   reference: z.string().min(1).max(16384),
   revision: profileToken,
 });
+export const DEntryProfileChunkFilenameSchema = z
+  .string()
+  .regex(/^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$/u)
+  .refine(
+    (file) => file !== 'client.node.js' && !file.startsWith('client.node.'),
+  );
 export const DEntryProfileAddressSchema = z.strictObject({
   bindingRef: profileToken,
   graphRev: profileToken,
@@ -262,6 +266,36 @@ export const DEntryNativePrewarmResultSchema = z
     trigger: DEntryNativePrewarmTriggerSchema,
   })
   .strict();
+export const DEntryNativePrewarmTicketSchema = z
+  .object({
+    operationId: UuidSchema,
+    expiresAt: z.iso.datetime(),
+    pollAfterMs: z.number().int().min(1000).max(3000),
+  })
+  .strict();
+export const DEntryNativePrewarmAcceptedSchema =
+  DEntryNativePrewarmResultSchema.extend({
+    ticket: DEntryNativePrewarmTicketSchema,
+  });
+export const DEntryNativePrewarmStatusQuerySchema =
+  DEntrySelectionInputSchema.extend({ operationId: UuidSchema });
+export const DEntryNativePrewarmStatusSchema = z.discriminatedUnion('state', [
+  z
+    .object({ state: z.enum(['accepted', 'starting', 'ready', 'expired']) })
+    .strict(),
+  z
+    .object({
+      state: z.literal('failed'),
+      code: z.enum(['START_UNAVAILABLE', 'AUTHORITY_REVOKED']),
+    })
+    .strict(),
+]);
+export type DEntryNativePrewarmTicket = z.infer<
+  typeof DEntryNativePrewarmTicketSchema
+>;
+export type DEntryNativePrewarmStatus = z.infer<
+  typeof DEntryNativePrewarmStatusSchema
+>;
 export const DEntryNativeResourceRequestSchema = z
   .object({
     organizationId: UuidSchema,

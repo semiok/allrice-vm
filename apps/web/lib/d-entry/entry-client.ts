@@ -1,11 +1,17 @@
 import {
+  DEntryNativePrewarmStatusSchema,
+  DEntryNativePrewarmTicketSchema,
+  type DEntryNativePrewarmTicket,
   DEntrySelectionInputSchema,
   UuidSchema,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 
 export class EmployeeEntryError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly reason?: 'response-mismatch',
+  ) {
     super('Employee entry is unavailable');
   }
 }
@@ -42,17 +48,118 @@ function postEmployeeEntry(path: string, data: object, signal: AbortSignal) {
   });
 }
 
+export type EmployeePrewarmProgress = 'accepted' | 'starting';
+const prewarmRequestMs = 20_000;
+const prewarmWaitMs = 5 * 60_000;
+
+function waitForPrewarmPoll(delay: number, signal: AbortSignal) {
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const cancel = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', cancel);
+      resolve();
+    }, delay);
+    signal.addEventListener('abort', cancel, { once: true });
+  });
+}
+
 export async function prewarmEmployeeEntry(
   selection: DEntrySelectionInput,
   signal: AbortSignal,
+  options: {
+    ticket?: DEntryNativePrewarmTicket;
+    accepted?(ticket: DEntryNativePrewarmTicket): void;
+    progress?(state: EmployeePrewarmProgress): void;
+  } = {},
 ) {
-  const warm = await postEmployeeEntry(
-    '/api/v1/d-entry/native-prewarm',
-    { selection, trigger: 'page' },
-    signal,
-  );
+  let ticket = options.ticket;
+  if (!ticket) {
+    const warm = await postEmployeeEntry(
+      '/api/v1/d-entry/native-prewarm',
+      { selection, trigger: 'page' },
+      AbortSignal.any([signal, AbortSignal.timeout(prewarmRequestMs)]),
+    );
+    signal.throwIfAborted();
+    if (warm.status === 204) return;
+    if (warm.status !== 202) throw new EmployeeEntryError(warm.status);
+    ticket = DEntryNativePrewarmTicketSchema.parse(await warm.json());
+  }
   signal.throwIfAborted();
-  if (warm.status !== 204) throw new EmployeeEntryError(warm.status);
+  options.accepted?.(ticket);
+  options.progress?.('accepted');
+  const { operationId, pollAfterMs, expiresAt } = ticket;
+  const query = new URLSearchParams({ ...selection, operationId });
+  const pause = new AbortController();
+  // Give even a cached ticket near its deadline one short poll so the Worker,
+  // rather than the browser clock, can report that it has expired.
+  const budget = Math.min(
+    prewarmWaitMs,
+    Math.max(prewarmRequestMs, Date.parse(expiresAt) - Date.now()),
+  );
+  const timer = setTimeout(
+    () => pause.abort(new EmployeeEntryError(408)),
+    budget,
+  );
+  const wait = AbortSignal.any([signal, pause.signal]);
+  try {
+    for (let delay = pollAfterMs; ; delay = Math.min(3000, delay + 1000)) {
+      await waitForPrewarmPoll(delay, wait);
+      const request = AbortSignal.any([
+        wait,
+        AbortSignal.timeout(prewarmRequestMs),
+      ]);
+      const response = await fetch(
+        '/api/v1/d-entry/native-prewarm/status?' + query,
+        {
+          method: 'GET',
+          signal: request,
+          cache: 'no-store',
+          credentials: 'same-origin',
+          redirect: 'error',
+        },
+      ).catch((error: unknown) => {
+        request.throwIfAborted();
+        if (error instanceof TypeError) throw new EmployeeEntryError(408);
+        throw error;
+      });
+      request.throwIfAborted();
+      // A gateway outage says nothing about an already admitted operation.
+      // Let an explicit retry resume the same ticket when polling is available.
+      if (response.status === 429 || response.status >= 500)
+        throw new EmployeeEntryError(408);
+      if (response.status !== 200 && response.status !== 410)
+        throw new EmployeeEntryError(response.status);
+      const body = await response.json().catch((error: unknown) => {
+        request.throwIfAborted();
+        if (error instanceof TypeError || error instanceof SyntaxError)
+          throw new EmployeeEntryError(408);
+        throw error;
+      });
+      request.throwIfAborted();
+      const parsed = DEntryNativePrewarmStatusSchema.safeParse(body);
+      if (!parsed.success) throw new EmployeeEntryError(408);
+      const status = parsed.data;
+      if (response.status === 410 || status.state === 'expired')
+        throw new EmployeeEntryError(410);
+      if (status.state === 'failed')
+        throw new EmployeeEntryError(
+          status.code === 'AUTHORITY_REVOKED' ? 403 : 503,
+        );
+      if (status.state === 'ready') return;
+      options.progress?.(status.state);
+    }
+  } catch (error) {
+    wait.throwIfAborted();
+    if (error instanceof DOMException && error.name === 'TimeoutError')
+      throw new EmployeeEntryError(408);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function prepareEmployeeEntry(
@@ -83,6 +190,6 @@ export async function prepareEmployeeEntry(
     !next.threadId ||
     (operationId && operationId !== next.threadId)
   )
-    throw new EmployeeEntryError(403);
+    throw new EmployeeEntryError(403, 'response-mismatch');
   return next;
 }

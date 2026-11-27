@@ -9,7 +9,7 @@ import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
 import { createDEntryPrincipalChildren } from '../d-entry/principal-activity.js';
 import type {
   DEntryPrincipalActivity,
-  DEntryPrincipalIssue,
+  DEntryScopeIssue,
 } from '@allrice/d-entry-principal/types';
 import {
   DEntryNativeUnavailable,
@@ -41,9 +41,10 @@ export type PublishedNativeCatalog = Readonly<{
   revoked: AbortSignal;
   owner: Readonly<{
     revoked: AbortSignal;
+    profileVerificationOwner?: object;
     controlReady(): boolean;
     acquirePrincipal(
-      issue: DEntryPrincipalIssue,
+      issue: DEntryScopeIssue,
       signal: AbortSignal,
       context?: RequestContext,
     ): DEntryPrincipalActivity;
@@ -187,6 +188,7 @@ export function createDEntryNativeCatalogPort(input: {
             readBundle && {
               fixedProfile: {
                 revoked,
+                verificationOwner: owner.owner.profileVerificationOwner,
                 readImmutableGraph(reading: AbortSignal) {
                   return own(async () => {
                     const who = context;

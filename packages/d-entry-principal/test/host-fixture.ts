@@ -9,24 +9,24 @@ import {
 } from '@deepseek-ai/dsh-credentials';
 import * as HostConnection from '@deepseek-ai/dsh-client-connection';
 import {
-  serverResponseSchema,
-  RpcId,
-} from '@deepseek-ai/dsh-client-connection';
-import {
   installConnection,
-  type ClientConnectionRpc,
+  type ConnectionHandle,
 } from '@deepseek-ai/dsh-client-connection/client';
 import TypertRegistry, {
   type TypertContribution,
 } from '@deepseek-ai/dsh-typert-registry';
-import RemoteAccess from '@deepseek-ai/dsh-api-remote-access';
+import RemoteAccess, {
+  type RemoteAccessService,
+} from '@deepseek-ai/dsh-api-remote-access';
 import { TYPERT as AccessMetadata } from '@deepseek-ai/dsh-api-remote-access/typert';
 import Gateway, {
   type TypertRemoteEventDispatch,
 } from '@deepseek-ai/dsh-api-gateway';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
+import * as NativeRemoteEvents from '@deepseek-ai/dsh-api-remotes';
 import {
   Remote,
+  RemoteError,
   TypertRemoteService,
   type PeerScope,
 } from '@deepseek-ai/dsh-typert-protocol';
@@ -34,8 +34,13 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type {
   SessionFollowFrame,
   SessionFollowRequest,
+  SessionControlFrame,
   SessionPage,
   SessionPageRequest,
+  SessionCreateRequest,
+  SessionForkRequest,
+  SessionSearchRequest,
+  SessionSelectModelRequest,
   SessionSummary,
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT as NativeMetadata } from '@deepseek-ai/dsh-api-session-controller/typert';
@@ -144,22 +149,99 @@ class Credentials extends CredentialProvider {
 /** Native catalog content is an explicit fixture. Peers, invocation scopes,
  * RemoteAccess snapshots/follow, event ready, codecs and carriers are real rc.2. */
 class Catalog extends TypertRemoteService {
+  static inject = ['remoteAccess'];
   items = [summary('root'), summary('child', 'root'), summary('other')];
-  beforeList?: (signal: AbortSignal) => Promise<void>;
+  beforeList?: (signal: AbortSignal, scoped: boolean) => Promise<void>;
   beforeFollow?: () => Promise<void>;
+  beforeCreate?: () => Promise<void>;
   afterFollowSnapshot?: () => Promise<void>;
   afterFollow?: () => Promise<void>;
   pageRecords: SessionPage['records'] = [];
   readonly pages: PeerScope[] = [];
   readonly follows: PeerScope[] = [];
+  readonly creationRequests: SessionCreateRequest[] = [];
   constructor(ctx: Context) {
     super(ctx, 'sessionController', { namespace: 'session' });
   }
+  private allows({ sessionId }: SessionSummary) {
+    // This fixture runs the Host service even when typechecked in the Web
+    // workspace, whose Cordis augmentation names the Client service instead.
+    const access = this.ctx.remoteAccess as unknown as RemoteAccessService;
+    return access.allows({ kind: 'session', id: sessionId });
+  }
   @Remote('list')
   async list(_request: object, signal: AbortSignal) {
-    await this.beforeList?.(signal);
+    await this.beforeList?.(
+      signal,
+      this.ctx.invocation?.peer.principal.kind === 'allrice-d-entry',
+    );
     signal.throwIfAborted();
-    return { items: this.items };
+    return { items: this.items.filter((row) => this.allows(row)) };
+  }
+  @Remote('fixtureBytes')
+  fixtureBytes() {
+    return { result: [new Uint8Array([0, 128, 255])] };
+  }
+  @Remote('search')
+  search(request: SessionSearchRequest) {
+    return {
+      items: this.items
+        .filter((item) => item.sessionId.includes(request.query))
+        .map((item) => ({
+          sessionId: item.sessionId,
+          snippet: 'matching session',
+        })),
+      hasMore: false,
+    };
+  }
+  @Remote('create')
+  async create(request: SessionCreateRequest) {
+    this.creationRequests.push(request);
+    await this.beforeCreate?.();
+    const sessionId = request.sessionId ?? SessionId('native-created');
+    this.items.push(summary(sessionId));
+    return { sessionId };
+  }
+  @Remote('fork')
+  fork(request: SessionForkRequest) {
+    const sessionId = SessionId('native-forked');
+    this.items.push({
+      ...summary(sessionId),
+      parentSessionId: request.sessionId,
+    });
+    return { sessionId };
+  }
+  @Remote('selectModel')
+  selectModel({ sessionId, ...selected }: SessionSelectModelRequest) {
+    if (
+      !this.items.some((row) => row.sessionId === sessionId) ||
+      selected.provider !== 'openai-codex' ||
+      selected.model !== 'fixture-codex'
+    )
+      throw new RemoteError(
+        'session/model-unavailable',
+        'Unknown fixture model',
+        selected,
+      );
+    return { selected };
+  }
+  @Remote({ mode: 'stream' })
+  async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
+    signal.throwIfAborted();
+    const projections = Object.fromEntries(
+      this.items
+        .filter((row) => this.allows(row))
+        .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
+    );
+    yield { type: 'baseline', value: { projections } };
+    await new Promise<void>((resolve) => {
+      const stop = () => {
+        signal.removeEventListener('abort', stop);
+        resolve();
+      };
+      signal.addEventListener('abort', stop, { once: true });
+      if (signal.aborted) stop();
+    });
   }
   @Remote({
     name: 'page',
@@ -209,6 +291,7 @@ class Catalog extends TypertRemoteService {
         records: [],
         hasMore: false,
         projections: { asOfSeq: 0, values: {} },
+        ...(request.assistantStream && { assistantStream: { revision: 0 } }),
       };
       await this.afterFollowSnapshot?.();
       await new Promise<void>((resolve) => {
@@ -246,7 +329,8 @@ export async function hostFixture(
   host.typert.resources.register('session', { field: 'sessionId' });
   await host.plugin(RemoteAccess);
   await host.plugin(Gateway);
-  const catalog = new Catalog(host);
+  await host.plugin(Catalog);
+  const catalog = host.get('sessionController') as unknown as Catalog;
   const dispatched: TypertRemoteEventDispatch[] = [];
   let wake = () => {};
   const source = (
@@ -269,7 +353,7 @@ export async function hostFixture(
       }
     },
   });
-  host.effect(() =>
+  const fixtureEvents = host.effect(() =>
     host.typertGateway.registerRemoteEvents(source, {
       home: '/home/native-fixture',
     }),
@@ -307,40 +391,31 @@ export async function hostFixture(
   const node = new Context();
   await node.plugin(TypertRegistry);
   const fetch = host.connection.createSharedFetchHandler('/api');
-  const wire: ClientConnectionRpc = {
-    async call(channel, endpoint, payload, signal) {
-      const response = await fetch.fetch(
-        new Request(`http://127.0.0.1${channel}/${endpoint}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            type: 'client-request',
-            rpcId: RpcId(randomUUID()),
-            method: endpoint,
-            payload,
-          }),
-          signal,
-        }),
-        parent,
-      );
-      return serverResponseSchema.parse(await response.json()).result;
+  installConnection(node, {
+    interactions: 'none',
+    transport: {
+      fetch(input, init) {
+        return fetch.fetch(
+          new Request(new URL(input, 'http://127.0.0.1'), init),
+          parent,
+        );
+      },
+      openStream(endpoint, payload, signal, uplink) {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield* await host.typertGateway.wireStream.open(
+              endpoint,
+              payload,
+              uplink ?? { async *[Symbol.asyncIterator]() {} },
+              parent,
+              signal,
+            );
+          },
+        };
+      },
     },
-    open(channel, endpoint, payload, signal, uplink) {
-      if (channel !== '/api') throw Error('fixture channel');
-      return {
-        async *[Symbol.asyncIterator]() {
-          yield* await host.typertGateway.wireStream.open(
-            endpoint,
-            payload,
-            uplink ?? { async *[Symbol.asyncIterator]() {} },
-            parent,
-            signal,
-          );
-        },
-      };
-    },
-  };
-  installConnection(node, { interactions: 'none', transport: { rpc: wire } });
+  });
+  const wire = (node.connection as unknown as ConnectionHandle).rpc;
   await node.plugin(GatewayClient);
   await node.remote.$mount(TYPERT_REMOTE);
   return {
@@ -351,6 +426,10 @@ export async function hostFixture(
     selected,
     config,
     wire,
+    async useNativeEvents() {
+      await fixtureEvents();
+      await host.plugin(NativeRemoteEvents);
+    },
     emit(row: TypertRemoteEventDispatch) {
       dispatched.push(row);
       wake();

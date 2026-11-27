@@ -1,13 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   DEntryNativeOwnerRequestSchema,
+  DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmRequestSchema,
   DEntryNativePrewarmResultSchema,
+  DEntryNativePrewarmStatusQuerySchema,
   DEntryNativeResourceRequestSchema,
   sameDEntryIdentity,
 } from '@allrice/contracts';
@@ -40,6 +43,7 @@ import {
   ownDEntryCatalog,
 } from './native-data.js';
 import {
+  createPrewarmOperations,
   dEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
 } from './native-prewarm.js';
@@ -147,15 +151,30 @@ export function createDEntryHttpHandler(
   serviceSignal?: AbortSignal,
 ) {
   const lifetime = new AbortController();
-  const pending = new Set<Promise<boolean>>();
+  const workerLifetime = serviceSignal
+    ? AbortSignal.any([lifetime.signal, serviceSignal])
+    : lifetime.signal;
+  const pending = new Set<Promise<unknown>>();
+  function track<T>(work: Promise<T>) {
+    pending.add(work);
+    const settled = () => pending.delete(work);
+    void work.then(settled, settled);
+    return work;
+  }
   const cleanupErrors: unknown[] = [];
+  const prewarm = createPrewarmOperations(workerLifetime, (error) =>
+    cleanupErrors.push(error),
+  );
+  const statusPath = '/internal/d-entry/native-prewarm/status';
   let closing: Promise<void> | undefined;
   const handle = async (
     request: IncomingMessage,
     response: ServerResponse,
     stopping = false,
   ) => {
-    const path = request.url;
+    const statusRequest =
+      request.url === statusPath || request.url?.startsWith(statusPath + '?');
+    const path = statusRequest ? statusPath : request.url;
     if (
       ![
         '/internal/d-entry/native-owner',
@@ -163,15 +182,12 @@ export function createDEntryHttpHandler(
         '/internal/d-entry/native-rpc',
         '/internal/d-entry/native-root',
         '/internal/d-entry/native-prewarm',
+        statusPath,
       ].includes(path ?? '')
     )
       return false;
     const abort = new AbortController();
-    const signal = AbortSignal.any([
-      abort.signal,
-      lifetime.signal,
-      ...(serviceSignal ? [serviceSignal] : []),
-    ]);
+    const signal = AbortSignal.any([abort.signal, workerLifetime]);
     const disconnect = () => {
       if (!response.writableEnded) abort.abort();
     };
@@ -185,10 +201,15 @@ export function createDEntryHttpHandler(
     let parsedInput = false;
     let authority:
       Awaited<ReturnType<typeof watchDEntryNativeAuthority>> | undefined;
+    let transferred = false;
+    let finishPrewarmReply: (() => void) | undefined;
     const revoke = () => abort.abort(authority?.revoked.reason);
     try {
       signal.throwIfAborted();
-      if (request.method !== 'POST' || request.headers.origin)
+      if (
+        request.method !== (statusRequest ? 'GET' : 'POST') ||
+        request.headers.origin
+      )
         throw new DataAccessError('not_found');
       if (stopping) throw new DEntryNativeUnavailable();
       const token = dEntryBearer(request);
@@ -198,6 +219,49 @@ export function createDEntryHttpHandler(
       if (!(await deps.authenticate(token)))
         throw new DataAccessError('authentication_required');
       signal.throwIfAborted();
+      if (statusRequest) {
+        const query = new URL(request.url!, 'http://worker.invalid')
+          .searchParams;
+        if ([...query.keys()].some((key) => query.getAll(key).length !== 1))
+          throw new SyntaxError('Invalid entry status request');
+        const { organizationId, ...selectors } = Object.fromEntries(query);
+        const { operationId, ...selection } =
+          DEntryNativePrewarmStatusQuerySchema.parse(selectors);
+        const input = DEntryNativeOwnerRequestSchema.parse({
+          organizationId,
+          selection,
+        });
+        const { context, identity } = await currentDEntryRequest(
+          deps,
+          token,
+          input,
+          signal,
+        );
+        const result = await prewarm.read(
+          operationId,
+          context,
+          identity,
+          signal,
+          (plan, ready) => {
+            if (!deps.prewarm.isCurrent) throw new DEntryNativeUnavailable();
+            return deps.prewarm.isCurrent(
+              context,
+              identity,
+              plan,
+              signal,
+              ready ? 'ready' : 'operation',
+            );
+          },
+        );
+        signal.throwIfAborted();
+        response
+          .writeHead(result.state === 'expired' ? 410 : 200, {
+            'content-type': 'application/json',
+            'cache-control': 'no-store',
+          })
+          .end(JSON.stringify(result));
+        return true;
+      }
       let size = 0;
       const chunks: Buffer[] = [];
       for await (const chunk of request) {
@@ -236,47 +300,148 @@ export function createDEntryHttpHandler(
         : undefined;
       parsedInput = true;
       const auth = await currentDEntryRequest(deps, token, input, signal);
-      authority = await deps.watch(
-        auth.context,
-        input.selection,
-        auth.identity,
-        // Keep genuine authority loss separate from browser disconnection.
-        // The watcher remains owned until actual prewarm settlement below.
-        prewarmRequest
-          ? AbortSignal.any([
-              lifetime.signal,
-              ...(serviceSignal ? [serviceSignal] : []),
-            ])
-          : signal,
-      );
+      const plan =
+        prewarmRequest &&
+        (await deps.prewarm.prepare?.(auth.context, auth.identity, signal));
+      const check = deps.prewarm.isCurrent?.bind(deps.prewarm);
+      if (prewarmRequest && (!plan || !check))
+        throw new DEntryNativeUnavailable();
+      // The job takes ownership of its subscription on acceptance. LISTEN
+      // rechecks the captured revision even after a revoke/regrant.
+      authority =
+        plan && check
+          ? await deps.watch(
+              auth.context,
+              input.selection,
+              auth.identity,
+              workerLifetime,
+              undefined,
+              async (current) => {
+                if (
+                  !(await check(
+                    auth.context,
+                    auth.identity,
+                    plan,
+                    current,
+                    'authority',
+                  ))
+                )
+                  throw new DataAccessError('authorization_denied');
+              },
+            )
+          : await deps.watch(
+              auth.context,
+              input.selection,
+              auth.identity,
+              signal,
+            );
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
-      if (prewarmRequest) {
-        const proof = await deps.prewarm.prewarm(
-          auth.context,
-          auth.identity,
-          prewarmRequest.trigger,
-          signal,
-          authority.revoked,
-        );
+      if (prewarmRequest && plan && check) {
         const next = await currentDEntryRequest(deps, token, input, signal);
-        if (!sameDEntryIdentity(auth.identity, next.identity))
+        if (
+          auth.context.sessionId !== next.context.sessionId ||
+          !sameDEntryIdentity(auth.identity, next.identity)
+        )
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
-        if (proof?.aborted) throw new DEntryNativeUnavailable();
-        response.writeHead(200, {
-          'content-type': 'application/json',
-          'cache-control': 'no-store',
-        });
-        response.end(
-          JSON.stringify(
-            DEntryNativePrewarmResultSchema.parse({
-              identity: next.identity,
-              trigger: prewarmRequest.trigger,
-            }),
-          ),
+        const { context, identity } = next;
+        plan.assertTicketThread = authority.assertTicketThread;
+        await plan.assertTicketThread?.(signal);
+        const { trigger } = prewarmRequest;
+        const receipt = { identity, trigger };
+        function sendReady() {
+          response
+            .writeHead(200, {
+              'content-type': 'application/json',
+              'cache-control': 'no-store',
+            })
+            .end(
+              JSON.stringify(DEntryNativePrewarmResultSchema.parse(receipt)),
+            );
+          return true;
+        }
+        if (plan.running && deps.prewarm.confirmRunning) {
+          const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
+          try {
+            const verify = track(
+              deps.prewarm.confirmRunning(context, identity, plan, probe),
+            );
+            const verified = await Promise.race([
+              verify,
+              delay(2000, undefined, { signal: probe, ref: false }),
+            ]);
+            signal.throwIfAborted();
+            if (verified && !verified.aborted) return sendReady();
+          } finally {
+            budget.abort();
+          }
+        }
+        const accepted = prewarm.accept(
+          context,
+          identity,
+          plan,
+          authority,
+          (active) =>
+            deps.prewarm.prewarm(
+              context,
+              identity,
+              trigger,
+              active,
+              active,
+              plan,
+            ),
         );
-        return true;
+        transferred = accepted.owned;
+        finishPrewarmReply = accepted.finishReply;
+        let hot = false;
+        // An already running VM only gets a short window for immediate proof.
+        // If proof is slow, keep that same Worker-owned task and return its ID.
+        if (plan.running) {
+          const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
+          try {
+            const verify = track(
+              (async () => {
+                await accepted.settled;
+                probe.throwIfAborted();
+                if (
+                  !accepted.ready() ||
+                  !(await check(context, identity, plan, probe, 'ready'))
+                )
+                  return false;
+                await accepted.assertTicketThread?.(probe);
+                return accepted.ready();
+              })().catch(() => false),
+            );
+            hot = await Promise.race([
+              verify,
+              delay(1000, false, { signal: probe, ref: false }),
+            ]);
+          } finally {
+            budget.abort();
+          }
+          signal.throwIfAborted();
+        }
+        if (!hot) {
+          accepted.publish();
+          response
+            .writeHead(202, {
+              'content-type': 'application/json',
+              'cache-control': 'no-store',
+            })
+            .end(
+              JSON.stringify(
+                DEntryNativePrewarmAcceptedSchema.parse({
+                  ...receipt,
+                  ticket: accepted.ticket,
+                }),
+              ),
+            );
+          return true;
+        }
+        return sendReady();
       }
       const current = await currentDEntryNativeOwner(
         deps.owners,
@@ -659,9 +824,10 @@ export function createDEntryHttpHandler(
           : error,
       );
     } finally {
+      finishPrewarmReply?.();
       authority?.revoked.removeEventListener('abort', revoke);
       try {
-        await authority?.close();
+        if (!transferred) await authority?.close();
       } catch (error) {
         cleanupErrors.push(error);
         sendDEntryHttpProblem(response, error);
@@ -674,20 +840,15 @@ export function createDEntryHttpHandler(
   };
   return Object.assign(
     (request: IncomingMessage, response: ServerResponse, stopping = false) => {
-      const operation = handle(request, response, stopping);
-      pending.add(operation);
-      void operation.then(
-        () => pending.delete(operation),
-        () => pending.delete(operation),
-      );
-      return operation;
+      return track(handle(request, response, stopping));
     },
     {
       close() {
         if (closing) return closing;
         lifetime.abort();
         closing = (async () => {
-          await Promise.allSettled([...pending]);
+          while (pending.size) await Promise.allSettled([...pending]);
+          await prewarm.close();
           if (cleanupErrors.length)
             throw new AggregateError(
               cleanupErrors,

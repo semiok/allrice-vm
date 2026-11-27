@@ -5,6 +5,15 @@ import {
 } from '@allrice/contracts';
 import { DEntryDependencyUnavailable } from './release-policy';
 
+const prewarmHttpTimeoutMs = 15_000;
+
+type WorkerRequest = {
+  token: string;
+  context: RequestContext;
+  selection: DEntrySelectionInput;
+  signal: AbortSignal;
+};
+
 export class DEntryWorkerProblem extends Error {
   constructor(
     readonly status: number,
@@ -17,12 +26,7 @@ export class DEntryWorkerProblem extends Error {
 /** Original login Bearer only to the fixed existing Worker deployment address.
  * Never forwards a browser URL, Cookie, supplied identity or redirect. */
 export async function requestDEntryWorker(
-  input: {
-    token: string;
-    context: RequestContext;
-    selection: DEntrySelectionInput;
-    signal: AbortSignal;
-  },
+  input: WorkerRequest,
   path:
     | 'native-owner'
     | 'native-resource'
@@ -48,8 +52,30 @@ export async function requestDEntryWorker(
         selection: input.selection,
       }),
     },
+    { short: path === 'native-prewarm' },
   );
   return response;
+}
+
+export function requestDEntryPrewarmStatus(
+  input: WorkerRequest,
+  operationId: string,
+) {
+  const target = new URL(
+    '/internal/d-entry/native-prewarm/status',
+    workerBase(),
+  );
+  target.search = new URLSearchParams({
+    ...input.selection,
+    organizationId: input.context.organizationId,
+    operationId,
+  }).toString();
+  return requestWorker(
+    input.signal,
+    target,
+    { method: 'GET', headers: { authorization: `Bearer ${input.token}` } },
+    { short: true, allowExpired: true },
+  );
 }
 
 function workerBase() {
@@ -100,17 +126,24 @@ export function requestDEntryProfile(
   });
 }
 
-async function requestWorker(signal: AbortSignal, url: URL, init: RequestInit) {
+async function requestWorker(
+  signal: AbortSignal,
+  url: URL,
+  init: RequestInit,
+  options: { short?: boolean; allowExpired?: boolean } = {},
+) {
   const response = await fetch(url, {
     ...init,
     redirect: 'error',
     cache: 'no-store',
-    signal,
+    signal: options.short
+      ? AbortSignal.any([signal, AbortSignal.timeout(prewarmHttpTimeoutMs)])
+      : signal,
   }).catch((error) => {
     signal.throwIfAborted();
     throw new DEntryDependencyUnavailable('native-route', { cause: error });
   });
-  if (!response.ok) {
+  if (!response.ok && !(options.allowExpired && response.status === 410)) {
     let problem: unknown;
     try {
       problem = await response.json();

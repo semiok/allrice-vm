@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { Buffer } from 'node:buffer';
 import { execFile } from 'node:child_process';
 import {
   mkdir,
@@ -20,6 +19,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { promisify } from 'node:util';
 import { build } from 'esbuild';
+import { collectProfileArtifacts } from './collect-profile-artifacts.mjs';
 
 const execute = promisify(execFile);
 const packageRoot = fileURLToPath(new URL('./', import.meta.url));
@@ -70,162 +70,6 @@ export const employeeWebKernelOptions = {
   },
 };
 
-/** Run only inside the isolated build child, using the released launcher's
- * real application-readiness lifecycle. Never a SaaS Host or identity source. */
-async function collectProfileArtifacts(outputDirectory, dshHome) {
-  const { loadProfileDirectory, loadLayeredEnv } =
-    await import('@deepseek-ai/dsh-app-boot');
-  const { runProfile } = await import('@deepseek-ai/dsh/profile-boot');
-  const { bootInjections } = await import('@deepseek-ai/dsh-client-modules');
-  const profileDir = join(dshHome, 'profiles/allrice-web');
-  await mkdir(join(profileDir, 'node_modules/@allrice'), { recursive: true });
-  await symlink(
-    packageRoot,
-    join(profileDir, 'node_modules/@allrice/dsh-web-composition'),
-    'dir',
-  );
-  await writeFile(
-    join(profileDir, 'package.json'),
-    await readFile(join(packageRoot, 'profiles/allrice-web/package.json')),
-  );
-  const overlay = join(profileDir, 'build-only.patch.yml');
-  await writeFile(
-    overlay,
-    '- id: web-runtime\n  config:\n    openBrowser: false\n    printUrl: false\n    surfaceContext: true\n',
-  );
-  const installAnchor = require.resolve('@deepseek-ai/dsh/package.json');
-  const profile = loadProfileDirectory(
-    'allrice-artifact',
-    profileDir,
-    installAnchor,
-  );
-  if (profile.skippedBundles.length)
-    throw new Error('Profile bundle unavailable');
-  // Installation-first may find an older workspace package's patch. Accept it
-  // only when its complete patch bytes and dsh metadata equal this source.
-  const ownMetadata = JSON.parse(
-    await readFile(join(packageRoot, 'package.json'), 'utf8'),
-  );
-  const allriceLayer = profile.layers.find(
-    (layer) => layer.packageName === ownMetadata.name,
-  );
-  if (
-    !allriceLayer ||
-    allriceLayer.patchPaths.length !== 1 ||
-    !Buffer.from(await readFile(allriceLayer.patchPaths[0])).equals(
-      await readFile(join(packageRoot, 'cordis.patch.yml')),
-    ) ||
-    JSON.stringify(
-      JSON.parse(
-        await readFile(join(allriceLayer.packageDir, 'package.json'), 'utf8'),
-      ).dsh,
-    ) !== JSON.stringify(ownMetadata.dsh)
-  )
-    throw new Error('Profile bundle differs from the current AllRice source');
-  let root;
-  try {
-    ({ ctx: root } = await runProfile({
-      profile: 'allrice-web',
-      resolvedProfile: { profile, installAnchor },
-      environment: loadLayeredEnv('allrice-artifact'),
-      patchFiles: [overlay],
-      args: ['--host', '127.0.0.1', '--port', '0', '--no-open'],
-    }));
-    const modules = root.get('clientModules');
-    const web = root.get('webServer');
-    if (!modules || !web)
-      throw new Error('Public artifact services unavailable');
-    if (
-      (await realpath(modules.clientPath(ownMetadata.name))) !==
-      (await realpath(join(packageRoot, 'dist/client.js')))
-    )
-      throw new Error('Profile did not select the source-built AllRice client');
-    const graph = modules.graph();
-    const rows = web.collectIndexInjections();
-    const moduleRows = new Set(
-      bootInjections(graph).map((row) => JSON.stringify(row)),
-    );
-    const files = [];
-    const references = [
-      ...new Set([...graph.entries, ...graph.batches].map((row) => row.url)),
-    ];
-    for (const reference of references) {
-      const url = new URL(reference, 'http://127.0.0.1/');
-      const response = await modules.fetchBundle(new globalThis.Request(url));
-      if (!response.ok)
-        throw new Error('Advertised profile bundle unavailable');
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      const path = 'plugins/' + sha256(Buffer.from(reference)) + '.js';
-      await writeFile(join(outputDirectory, path), bytes);
-      files.push({
-        reference,
-        path,
-        bytes: bytes.length,
-        sha256: sha256(bytes),
-      });
-      const mapReference = Buffer.from(bytes)
-        .toString('utf8')
-        .match(/\/\/# sourceMappingURL=([^\r\n]+)\s*$/)?.[1];
-      if (mapReference) {
-        const mapUrl = new URL(mapReference.trim(), url);
-        if (
-          mapUrl.origin !== url.origin ||
-          !mapUrl.pathname.startsWith('/plugins/')
-        )
-          throw new Error('Profile advertised an external source-map resource');
-        const map = await modules.fetchBundle(new globalThis.Request(mapUrl));
-        if (!map.ok)
-          throw new Error('Advertised profile source map unavailable');
-        const mapBytes = new Uint8Array(await map.arrayBuffer());
-        const mapName = mapUrl.pathname.slice(1) + mapUrl.search;
-        const mapPath = 'plugins/' + sha256(Buffer.from(mapName)) + '.map';
-        await writeFile(join(outputDirectory, mapPath), mapBytes);
-        files.push({
-          reference: mapName,
-          path: mapPath,
-          bytes: mapBytes.length,
-          sha256: sha256(mapBytes),
-        });
-      }
-    }
-    const result = {
-      graph,
-      bootInjections: bootInjections(graph),
-      files,
-      // No collected values are emitted: owner:true and current configuration
-      // must never become a release's replayable runtime identity/preferences.
-      injectionInputs: rows.map((row) => ({
-        kind: row.kind,
-        name: row.kind === 'global' ? row.name : null,
-        classification:
-          row.kind === 'global' && row.name === '__DSH_REMOTE_ACCESS__'
-            ? 'runtime-authority-unbound'
-            : moduleRows.has(JSON.stringify(row))
-              ? row.kind === 'script'
-                ? 'release-code'
-                : 'release-authority-unbound'
-              : 'runtime-config-unbound',
-        source: moduleRows.has(JSON.stringify(row))
-          ? '@deepseek-ai/dsh-client-modules#bootInjections'
-          : 'collectIndexInjections: current Host runtime input, not static release data',
-      })),
-      buildOwnerObserved: rows.some(
-        (row) =>
-          row.kind === 'global' &&
-          row.name === '__DSH_REMOTE_ACCESS__' &&
-          row.value?.owner === true,
-      ),
-      sourceBuiltClient: true,
-    };
-    await writeFile(
-      join(outputDirectory, 'profile-code.json'),
-      JSON.stringify(result, null, 2) + '\n',
-    );
-  } finally {
-    await root?.fiber.dispose();
-  }
-}
-
 /** Enumerate only the release's publicly exported dist tree. This inventories
  * all lazy chunks/fonts/CSS, rather than equating graph scripts with closure. */
 async function publicNativeFiles() {
@@ -262,7 +106,11 @@ async function publicNativeFiles() {
 
 /** Build code artifacts only. A code inventory never supplies production
  * principal, access baseline, graph events or authority to execute a document. */
-export async function buildEmployeeWebArtifact(outputDirectory) {
+export async function buildEmployeeWebArtifact(
+  outputDirectory,
+  linuxCapture,
+  terminalEnabled = true,
+) {
   outputDirectory = resolve(outputDirectory);
   await mkdir(dirname(outputDirectory), { recursive: true });
   // A failed build must not leave an old success beside replaced new bytes.
@@ -341,43 +189,48 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     JSON.stringify(kernel.metafile, null, 2) + '\n',
   );
   await mkdir(join(outputDirectory, 'plugins'), { recursive: true });
-  const state = await mkdtemp(join(outputDirectory, '.build-state-'));
-  const dshHome = join(state, 'dsh');
-  try {
-    for (const name of ['home', 'dsh', 'agents', 'tmp', 'work'])
-      await mkdir(join(state, name));
-    const child = await execute(
-      process.execPath,
-      [
-        '--max-old-space-size=512',
-        fileURLToPath(import.meta.url),
-        '--profile-artifacts',
-        outputDirectory,
-        dshHome,
-      ],
-      {
-        cwd: join(state, 'work'),
-        timeout: 60000,
-        maxBuffer: 4 * 1024 * 1024,
-        env: {
-          PATH: dirname(process.execPath) + ':/usr/bin:/bin',
-          HOME: join(state, 'home'),
-          DSH_HOME: dshHome,
-          DSH_AGENTS_HOME: join(state, 'agents'),
-          XDG_CONFIG_HOME: join(state, 'home/.config'),
-          XDG_DATA_HOME: join(state, 'home/.local/share'),
-          TMPDIR: join(state, 'tmp'),
-          DSH_TELEMETRY_DISABLED: '1',
-          DO_NOT_TRACK: '1',
+  if (linuxCapture) {
+    await linuxCapture.collect(outputDirectory, guestInputs);
+  } else {
+    const state = await mkdtemp(join(outputDirectory, '.build-state-'));
+    const dshHome = join(state, 'dsh');
+    try {
+      for (const name of ['home', 'dsh', 'agents', 'tmp', 'work'])
+        await mkdir(join(state, name));
+      const child = await execute(
+        process.execPath,
+        [
+          '--max-old-space-size=512',
+          fileURLToPath(import.meta.url),
+          '--profile-artifacts',
+          outputDirectory,
+          dshHome,
+          String(terminalEnabled),
+        ],
+        {
+          cwd: join(state, 'work'),
+          timeout: 60000,
+          maxBuffer: 4 * 1024 * 1024,
+          env: {
+            PATH: dirname(process.execPath) + ':/usr/bin:/bin',
+            HOME: join(state, 'home'),
+            DSH_HOME: dshHome,
+            DSH_AGENTS_HOME: join(state, 'agents'),
+            XDG_CONFIG_HOME: join(state, 'home/.config'),
+            XDG_DATA_HOME: join(state, 'home/.local/share'),
+            TMPDIR: join(state, 'tmp'),
+            DSH_TELEMETRY_DISABLED: '1',
+            DO_NOT_TRACK: '1',
+          },
         },
-      },
-    );
-    await writeFile(
-      join(outputDirectory, 'profile-startup.log'),
-      child.stdout + child.stderr,
-    );
-  } finally {
-    await rm(state, { recursive: true, force: true });
+      );
+      await writeFile(
+        join(outputDirectory, 'profile-startup.log'),
+        child.stdout + child.stderr,
+      );
+    } finally {
+      await rm(state, { recursive: true, force: true });
+    }
   }
   const profile = JSON.parse(
     await readFile(join(outputDirectory, 'profile-code.json'), 'utf8'),
@@ -407,6 +260,8 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     ),
     // Full-profile bundle graph and the managed entry are separate proof items.
     profile,
+    terminalEnabled,
+    ...(linuxCapture ? { profileRuntime: linuxCapture.identity } : {}),
     managedEntry: 'managed/employee-web-entry.js',
     closure: {
       publicNativeDist: true,
@@ -431,7 +286,12 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
 
 /** The Worker release seal inventories real files under dist. A sealed
  * release directory must never be overwritten after it is available. */
-export async function prepareEmployeeWebServiceArtifact(directory, head) {
+export async function prepareEmployeeWebServiceArtifact(
+  directory,
+  head,
+  linuxCapture,
+  terminalEnabled = true,
+) {
   let current;
   try {
     current = await readFile(join(directory, 'artifact.json'), 'utf8');
@@ -442,15 +302,25 @@ export async function prepareEmployeeWebServiceArtifact(directory, head) {
     const existing = JSON.parse(current);
     if (existing.source?.head !== head || existing.source.dirty !== false)
       throw Error('Employee Web artifact belongs to another source');
+    if (
+      existing.terminalEnabled !== terminalEnabled ||
+      !isDeepStrictEqual(existing.profileRuntime, linuxCapture?.identity)
+    )
+      throw Error('Employee Web artifact belongs to another runtime');
     await verifyEmployeeWebArtifact(directory, existing);
     return existing;
   }
   const stage = await mkdtemp(join(dirname(directory), '.employee-web-'));
   try {
     const built = join(stage, 'contents');
-    const manifest = await buildEmployeeWebArtifact(built);
+    const manifest = await buildEmployeeWebArtifact(
+      built,
+      linuxCapture,
+      terminalEnabled,
+    );
     if (manifest.source.head !== head || manifest.source.dirty)
       throw Error('Employee Web artifact requires the fixed service source');
+    await verifyEmployeeWebArtifact(built, manifest);
     await rename(built, directory);
     return manifest;
   } finally {
@@ -602,7 +472,15 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   if (process.argv[2] === '--profile-artifacts') {
-    await collectProfileArtifacts(process.argv[3], process.argv[4]);
+    await collectProfileArtifacts({
+      outputDirectory: process.argv[3],
+      dshHome: process.argv[4],
+      packageRoot,
+      installAnchor: require.resolve('@deepseek-ai/dsh/package.json'),
+      resolutionAnchor: import.meta.url,
+      host: '127.0.0.1',
+      terminalEnabled: process.argv[5] !== 'false',
+    });
   } else {
     const directory = process.argv[2] ?? join(packageRoot, 'dist/web-entry');
     const manifest = await (process.argv[2]

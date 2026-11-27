@@ -29,7 +29,81 @@ async function directory() {
 const hash = (value: Buffer) =>
   createHash('sha256').update(value).digest('hex');
 
+async function aliasedDisk(alias: 'configured' | 'reported') {
+  const lexical = await mkdtemp('/tmp/ar-apfs-alias-');
+  temporary.push(lexical);
+  const physical = await realpath(lexical);
+  if (process.platform === 'darwin') expect(physical).not.toBe(lexical);
+  const configured = join(alias === 'configured' ? lexical : physical, 'disks');
+  const observed = join(alias === 'reported' ? lexical : physical, 'disks');
+  const ref = { vmId: randomUUID(), tier: 'warm' as const };
+  const mount = join(configured, 'mounts', ref.vmId);
+  const observedImage = join(observed, 'warm', ref.vmId + '.sparseimage');
+  const observedMount = join(observed, 'mounts', ref.vmId);
+  const keys = new FilePersonVmKeyStore(join(lexical, 'keys'));
+  let attachments: unknown[] = [];
+  const report = (mounted: boolean) => {
+    attachments = [
+      {
+        'image-path': observedImage,
+        'system-entities': [mounted ? { 'mount-point': observedMount } : {}],
+      },
+    ];
+  };
+  const detachments: string[] = [];
+  const disk = new ApfsPersonVmDisk({
+    root: configured,
+    keys,
+    capacityGiB: 8,
+    runner: async ({ executable, args, input }) => {
+      if (executable.endsWith('/plutil')) return Buffer.from(input!).toString();
+      if (args[0] === 'info') return JSON.stringify({ images: attachments });
+      if (args[0] === 'create') await writeFile(args.at(-1)!, 'test image');
+      if (args[0] === 'attach') report(true);
+      if (args[0] === 'detach') {
+        detachments.push(args[1]!);
+        attachments = [];
+      }
+      return '';
+    },
+  });
+  return { disk, keys, ref, mount, report, detachments };
+}
+
 describe('APFS adapter protocol and private filesystem (not actual encryption acceptance)', () => {
+  it.each(['configured', 'reported'] as const)(
+    'confirms absence after a complete detach and deletion with a %s system alias',
+    async (alias) => {
+      const { disk, keys, ref, mount, detachments } = await aliasedDisk(alias);
+      await disk.create(ref, signal());
+      expect(await disk.listFormalDiskIds(signal())).toEqual([ref.vmId]);
+      expect(await keys.listDiskIds(signal())).toEqual([ref.vmId]);
+      await expect(disk.attach(ref, signal())).resolves.toBe(mount);
+      await expect(disk.verifyAttachedMount(ref, signal())).resolves.toBe(
+        mount,
+      );
+      await disk.detach(ref, signal());
+      expect(detachments).toEqual([mount]);
+      await disk.delete(ref, signal());
+      await expect(disk.confirmAbsence(ref.vmId, signal())).resolves.toBe(true);
+      expect(await disk.listFormalDiskIds(signal())).toEqual([]);
+    },
+  );
+  it.each(['configured', 'reported'] as const)(
+    'refuses absence when files are gone but a device still reports a %s system alias',
+    async (alias) => {
+      const { disk, ref, report } = await aliasedDisk(alias);
+      await disk.create(ref, signal());
+      await disk.delete(ref, signal());
+      expect(await disk.listFormalDiskIds(signal())).toEqual([]);
+      report(false);
+      await expect(
+        disk.confirmAbsence(ref.vmId, signal()),
+      ).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+    },
+  );
   it('key仅stdin、AES-256参数、停止后挂卸/冷盘移动/重开保留同字节', async () => {
     const root = await directory(),
       volume = join(root, 'volume'),
