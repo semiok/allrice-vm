@@ -1715,6 +1715,43 @@ suite(
       await h.peer.participant('entry').thaw(lease, signal());
     });
 
+    it('keeps public egress visible to a peer until its transfer joins and refuses new traffic during freeze', async () => {
+      const h = await setup(),
+        entered = latch(),
+        release = latch();
+      const transfer = own(
+        h.host.withPublicEgress(h.binding, signal(), async () => {
+          entered.resolve();
+          await release.promise;
+        }),
+      );
+      await entered.promise;
+      const lease = await frozen(h);
+      expect(
+        await h.peer.participant('gateway').observe(h.binding, signal()),
+      ).toMatchObject({ active: 1, queued: 0, deferred: 0 });
+      const forbidden = vi.fn(async () => {});
+      await expect(
+        h.peer.withPublicEgress(h.binding, signal(), forbidden),
+      ).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+      expect(forbidden).not.toHaveBeenCalled();
+      expect(await counts(h.rc.actor.id)).toEqual([
+        { disposition: 'active', count: 1 },
+      ]);
+      h.states.set(h.binding.vmId, 'stopped');
+      await expect(
+        h.host.stopFrozen(h.rc, lease, signal()),
+      ).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
+      expect(h.log).not.toContain('native:stop');
+      release.resolve();
+      await transfer;
+      expect(await counts(h.rc.actor.id)).toEqual([]);
+      await h.host.participant('gateway').thaw(lease, signal());
+      await h.peer.participant('entry').thaw(lease, signal());
+    });
+
     it('two independent clients linearize ordinary admission against freeze, never lose a queue to deferred', async () => {
       const h = await setup(),
         lease = await h.host.issue(h.rc, h.binding, signal());

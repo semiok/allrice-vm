@@ -79,7 +79,9 @@ async function installedFile() {
 function gateway(owner = installation, publicProxy = false) {
   const value = createEgressGateway({
     provisioner: owner.provisioner,
-    publicProxy,
+    publicProxy: publicProxy
+      ? (_binding, active, transfer) => transfer(active)
+      : undefined,
     admission: admissionFixture(),
     vm: { assertAdmissionBinding: async () => {} },
     authority: { context: async () => rc, allow: async () => {} },

@@ -130,7 +130,11 @@ export function createEgressGateway(
     provisioner: EgressProvisioner;
     services?: readonly ManagedHostService[];
     lifetime?: AbortSignal;
-    publicProxy?: boolean;
+    publicProxy?: (
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      transfer: (signal: AbortSignal) => Promise<void>,
+    ) => Promise<void>;
     prepareRollbackSignal?: () => AbortSignal;
   },
 ) {
@@ -474,14 +478,20 @@ export function createEgressGateway(
           server: createServer(),
           origin: endpoint.guestOrigin,
         };
-        if (options.publicProxy) {
+        const admitPublicProxy = options.publicProxy;
+        if (admitPublicProxy) {
           const active = options.lifetime
             ? AbortSignal.any([state.controller.signal, options.lifetime])
             : state.controller.signal;
-          state.publicProxy = createVmPublicProxy(active, () => {
-            stateFor(state.receipt);
-            active.throwIfAborted();
-          });
+          state.publicProxy = createVmPublicProxy(
+            active,
+            () => {
+              stateFor(state.receipt);
+              active.throwIfAborted();
+            },
+            (signal, transfer) =>
+              admitPublicProxy(state.receipt.binding, signal, transfer),
+          );
         }
         function ownRequest(work: () => Promise<void>) {
           const operation = runHostRequest(work);

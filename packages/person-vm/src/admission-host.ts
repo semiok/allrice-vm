@@ -47,7 +47,7 @@ import {
 import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
-  context: RequestContext;
+  authorize(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   operationId: string;
   owner: string;
   source: string;
@@ -586,9 +586,42 @@ export class PersonVmAdmissionHost
     input: { participant: PersonVmAdmissionParticipant; operationId: string },
     signal: AbortSignal,
   ) {
-    await this.authorize(context, binding, signal);
+    const authorize = (bound: PersonVmBinding, active: AbortSignal) =>
+      this.authorize(context, bound, active);
+    await authorize(binding, signal);
     if (!['gateway', 'entry'].includes(input.participant) || !input.operationId)
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    return this.admitBound(binding, input, signal, authorize);
+  }
+
+  /** Host-only lifetime for traffic already authenticated to the exact VM
+   * proxy. It can never wake a VM or authorize an actor or managed route. */
+  async withPublicEgress(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    transfer: (signal: AbortSignal) => Promise<void>,
+  ) {
+    const permit = await this.admitBound(
+      binding,
+      { participant: 'gateway', operationId: randomUUID() },
+      signal,
+      async (_bound, active) => active.throwIfAborted(),
+    );
+    try {
+      if (permit.disposition === 'deferred')
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      await this.activate(permit, transfer, signal);
+    } finally {
+      await this.finish(permit);
+    }
+  }
+
+  private async admitBound(
+    binding: PersonVmBinding,
+    input: { participant: PersonVmAdmissionParticipant; operationId: string },
+    signal: AbortSignal,
+    authorize: OwnedPermit['authorize'],
+  ) {
     const owner = randomUUID(),
       permitId = randomUUID();
     let issued: {
@@ -646,7 +679,7 @@ export class PersonVmAdmissionHost
       signal: controller.signal,
     });
     this.permits.set(permit, {
-      context,
+      authorize,
       operationId: input.operationId,
       owner,
       source,
@@ -717,7 +750,7 @@ export class PersonVmAdmissionHost
       };
       let entered = false;
       try {
-        await this.authorize(owned.context, permit.binding, operationSignal);
+        await owned.authorize(permit.binding, operationSignal);
         await this.options.shared.transaction(
           permit.binding.personId,
           operationSignal,

@@ -90,10 +90,16 @@ async function listen(server: Net.Server) {
   );
   return address.port;
 }
-const setup = async (rejectHint?: ServerResponse['writeEarlyHints']) => {
+const setup = async (
+  rejectHint?: ServerResponse['writeEarlyHints'],
+  admit: Parameters<typeof createVmPublicProxy>[2] = (signal, transfer) =>
+    transfer(signal),
+) => {
   const stop = new AbortController();
-  const proxy = createVmPublicProxy(stop.signal, () =>
-    stop.signal.throwIfAborted(),
+  const proxy = createVmPublicProxy(
+    stop.signal,
+    () => stop.signal.throwIfAborted(),
+    admit,
   );
   const requests = new Set<Promise<void>>();
   const track = (work: Promise<void>) => {
@@ -306,6 +312,48 @@ function openTunnel(
   req.end();
   return result;
 }
+
+it('admits only authenticated public HTTP and CONNECT and does not dial when admission refuses', async () => {
+  const admit = vi.fn(async () => {
+    throw Error('test gateway frozen');
+  });
+  const vm = await setup(undefined, admit);
+  expect((await get(vm.port, 'http://public.example/')).status).toBe(407);
+  const [challenge, unauthenticated] = await openTunnel(vm, 443);
+  unauthenticated.destroy();
+  expect(challenge.statusCode).toBe(407);
+  expect(admit).not.toHaveBeenCalled();
+
+  const [refused, tunnel] = await openTunnel(vm, 443, vm.authorization);
+  tunnel.destroy();
+  expect(refused.statusCode).toBe(502);
+  expect(
+    (await get(vm.port, 'http://public.example/', vm.authorization)).status,
+  ).toBe(502);
+  expect(admit).toHaveBeenCalledTimes(2);
+  expect(network.dns).not.toHaveBeenCalled();
+  expect(network.attempted).not.toHaveBeenCalled();
+});
+
+it('joins an established CONNECT that is cancelled by its gateway permit before dialing', async () => {
+  const permit = new AbortController();
+  const joined = deferred<void>();
+  const vm = await setup(undefined, async (signal, transfer) => {
+    await transfer(AbortSignal.any([signal, permit.signal]));
+    joined.resolve();
+  });
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [handshake, tunnel] = await openTunnel(vm, 443, vm.authorization);
+  try {
+    expect(handshake.statusCode).toBe(200);
+    const closed = once(tunnel, 'close');
+    permit.abort();
+    await Promise.all([joined.promise, closed]);
+    expect(network.attempted).not.toHaveBeenCalled();
+  } finally {
+    tunnel.destroy();
+  }
+});
 
 it('uses validated fallback addresses and accepts only parsed HTTP inside a plaintext CONNECT', async () => {
   const upstream = createServer((req, res) => {

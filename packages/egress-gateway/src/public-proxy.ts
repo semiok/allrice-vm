@@ -203,6 +203,7 @@ async function relayHttp(
   const transfer = req.headers['transfer-encoding'];
   if (transfer && transfer.toLowerCase() !== 'chunked') throw denied();
   const upstream = await open(addresses, target.port, signal);
+  let streams: readonly Promise<unknown>[] = [];
   try {
     signal.throwIfAborted();
     const headers = forwarded(req.headers);
@@ -241,9 +242,11 @@ async function relayHttp(
       });
       return pipeline(reply, res, { signal });
     });
-    await Promise.all([pipeline(req, out, { signal }), response]);
+    streams = [pipeline(req, out, { signal }), response];
+    await Promise.all(streams);
   } finally {
     await upstream.release();
+    await Promise.allSettled(streams);
   }
 }
 
@@ -505,6 +508,10 @@ async function httpInsideTunnel(
 export function createVmPublicProxy(
   owner: AbortSignal,
   assertActive: () => void,
+  admit: (
+    signal: AbortSignal,
+    transfer: (signal: AbortSignal) => Promise<void>,
+  ) => Promise<void>,
 ) {
   const capability = randomBytes(32).toString('base64url');
   const expected = Buffer.from(
@@ -540,20 +547,36 @@ export function createVmPublicProxy(
       const cancel = () => disconnected.abort();
       res.once('close', cancel);
       const signal = AbortSignal.any([owner, disconnected.signal]);
-      try {
-        assertActive();
-        const target = publicProxyTarget(req.url ?? '', false);
-        const addresses = await resolveTarget(target.hostname, setup(signal));
-        assertActive();
-        await relayHttp(req, res, target, addresses, signal);
-        counts.http++;
-      } catch (error) {
+      const joinResponse = () =>
+        finished(res, { cleanup: true }).catch(() => {});
+      async function fail(error: unknown, active: AbortSignal) {
         const status = responseCode(error);
         counts[status === 403 ? 'denied' : 'unavailable']++;
         if (!res.destroyed) {
-          if (res.headersSent || signal.aborted) res.destroy();
+          if (res.headersSent || active.aborted) res.destroy();
           else res.writeHead(status, { connection: 'close' }).end();
         }
+        await joinResponse();
+      }
+      try {
+        assertActive();
+        await admit(signal, async (active) => {
+          try {
+            assertActive();
+            const target = publicProxyTarget(req.url ?? '', false);
+            const addresses = await resolveTarget(
+              target.hostname,
+              setup(active),
+            );
+            assertActive();
+            await relayHttp(req, res, target, addresses, active);
+            counts.http++;
+          } catch (error) {
+            await fail(error, active);
+          }
+        });
+      } catch (error) {
+        await fail(error, signal);
       } finally {
         res.off('close', cancel);
       }
@@ -578,6 +601,15 @@ export function createVmPublicProxy(
       const cancel = addAbortListener(owner, () => client.destroy());
       let upstream: Awaited<ReturnType<typeof open>> | undefined;
       let established = false;
+      let joining: Promise<unknown> | undefined;
+      function join(active: AbortSignal) {
+        if (joining) return joining;
+        if (established || active.aborted) client.destroy();
+        // After an HTTP error, flush the status before closing the paused client.
+        client.once('finish', () => client.destroy());
+        if (client.writableFinished) client.destroy();
+        return (joining = Promise.all([clientClosed, upstream?.release()]));
+      }
       function fail(status: keyof typeof statuses) {
         if (client.destroyed) return;
         const auth =
@@ -588,6 +620,11 @@ export function createVmPublicProxy(
           `HTTP/1.1 ${status} ${statuses[status]}\r\n${auth}Connection: close\r\nContent-Length: 0\r\n\r\n`,
         );
       }
+      function rejectTransfer(error: unknown, active: AbortSignal) {
+        const status = responseCode(error);
+        counts[status === 403 ? 'denied' : 'unavailable']++;
+        if (!established && !active.aborted) fail(status);
+      }
       try {
         if (!authenticated(req)) {
           counts.denied++;
@@ -595,50 +632,68 @@ export function createVmPublicProxy(
           return;
         }
         assertActive();
-        const target = publicProxyTarget(req.url ?? '', true);
-        const budget = setup(signal);
-        const addresses = await resolveTarget(target.hostname, budget);
-        assertActive();
-        budget.throwIfAborted();
-        established = true;
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        const initial = await firstBytes(client, head, target.hostname, budget);
-        assertActive();
-        counts.connect++;
-        if (!initial.hello) {
-          await httpInsideTunnel(
-            client,
-            initial.bytes,
-            target,
-            addresses,
-            signal,
+        await admit(signal, async (active) => {
+          const cancelTransfer = addAbortListener(active, () =>
+            client.destroy(),
           );
-          return;
-        }
-        tls = true;
-        upstream = await open(addresses, target.port, signal, true);
-        assertActive();
-        signal.throwIfAborted();
-        const { end, earlyData } = initial.hello;
-        upstream.socket.write(initial.bytes.subarray(0, end));
-        await relayTls(
-          client,
-          upstream.socket,
-          initial.bytes.subarray(end),
-          earlyData,
-          signal,
-        );
+          try {
+            assertActive();
+            const target = publicProxyTarget(req.url ?? '', true);
+            const budget = setup(active);
+            const addresses = await resolveTarget(target.hostname, budget);
+            assertActive();
+            budget.throwIfAborted();
+            established = true;
+            client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            const initial = await firstBytes(
+              client,
+              head,
+              target.hostname,
+              budget,
+            );
+            assertActive();
+            counts.connect++;
+            if (!initial.hello) {
+              await httpInsideTunnel(
+                client,
+                initial.bytes,
+                target,
+                addresses,
+                active,
+              );
+              return;
+            }
+            tls = true;
+            upstream = await open(addresses, target.port, active, true);
+            assertActive();
+            active.throwIfAborted();
+            const { end, earlyData } = initial.hello;
+            upstream.socket.write(initial.bytes.subarray(0, end));
+            await relayTls(
+              client,
+              upstream.socket,
+              initial.bytes.subarray(end),
+              earlyData,
+              active,
+            );
+          } catch (error) {
+            rejectTransfer(error, active);
+          } finally {
+            try {
+              await join(active);
+            } finally {
+              cancelTransfer[Symbol.dispose]();
+            }
+          }
+        });
       } catch (error) {
-        const status = responseCode(error);
-        counts[status === 403 ? 'denied' : 'unavailable']++;
-        if (!established && !signal.aborted) fail(status);
+        rejectTransfer(error, signal);
       } finally {
-        if (established || signal.aborted) client.destroy();
-        // After an HTTP error, flush the status before closing the paused client.
-        client.once('finish', () => client.destroy());
-        if (client.writableFinished) client.destroy();
-        await Promise.all([clientClosed, upstream?.release()]);
-        cancel[Symbol.dispose]();
+        try {
+          await join(signal);
+        } finally {
+          cancel[Symbol.dispose]();
+        }
       }
     },
   };

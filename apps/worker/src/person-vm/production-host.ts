@@ -1122,7 +1122,9 @@ export function createProductionPersonVmHost(input: {
         transport: createPublicHttpsTransport(),
         publicProxy: ['127.0.0.1', '::1'].includes(
           providers.configuration.egress?.listenAddress ?? '',
-        ),
+        )
+          ? admission.withPublicEgress.bind(admission)
+          : undefined,
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
