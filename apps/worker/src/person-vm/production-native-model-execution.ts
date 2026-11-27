@@ -50,6 +50,7 @@ import {
   nativeAdoptedTextProofVersion,
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
+  recordNativeMemoryToolCall,
   recoverNativeMemoryRun,
   bindNativeMemoryExecutionRef,
   type NativeExecutionBuild,
@@ -487,12 +488,20 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         // The DB reopens the same immutable B in its caller transaction. It
         // also rechecks its pinned sources before disclosing the original index.
         const { vmId, instanceId, leaseEpoch } = receipt.origin.vm;
+        const firstIssue = receipt.firstIssue && phase === 'seal';
+        if (
+          firstIssue &&
+          receipt.request.executionId !== receipt.origin.originalExecutionId
+        )
+          return reject();
         await scope.assertObserved(active);
         active.throwIfAborted();
         const issued = await memory.publication.root(
           scope.context,
           {
-            mode: receipt.firstIssue && phase === 'seal' ? 'issue' : 'restore',
+            ...(firstIssue
+              ? { mode: 'issue', nativeRequestRef: receipt.request.executionId }
+              : { mode: 'restore' }),
             runId: receipt.run.runId,
             workspaceId: scope.identity.workspaceId,
             employeeInstanceId: call.employeeInstanceId,
@@ -557,10 +566,20 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             const { occurrence, kind, digest } = fact.human;
             await prompt.assertObserved(active);
             active.throwIfAborted();
+            const nativeRequestRef = await recordNativeMemoryToolCall(
+              receipt,
+              receipt.memoryExecutionRef,
+              fact,
+              active,
+            );
+            if (!nativeRequestRef) return null;
+            await prompt.assertObserved(active);
+            active.throwIfAborted();
             const result = await memory.publication.call(
               prompt.context,
               {
                 executionRef: receipt.memoryExecutionRef,
+                nativeRequestRef,
                 nativeSessionRef: fact.executionSessionRef,
                 parentSessionRef: fact.executionParentRef,
                 callRef: fact.callId,
@@ -580,7 +599,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             );
             await prompt.assertObserved(active);
             active.throwIfAborted();
-            return result.nativeRequestRef || null;
+            return result.nativeRequestRef === nativeRequestRef
+              ? nativeRequestRef
+              : null;
           },
         );
       }

@@ -2,6 +2,7 @@ import type { ApplicationBuiltinModulesProjection } from '@allrice/contracts';
 import { getDatabase } from '@allrice/database';
 import type { ModelCallBinding } from '@allrice/model-gateway';
 import type {
+  NativeMemoryToolObservation,
   NativeRequestObservation,
   NativeToolObservation,
 } from '../native-web/prompt-observation.js';
@@ -72,6 +73,15 @@ export type NativeExecutionEvidence =
   | NativeExecutionOriginEvidence
   | NativeExecutionRequestEvidence
   | NativeExecutionToolEvidence
+  | Readonly<{
+      source: typeof nativeExecutionEvidenceSource;
+      kind: 'memory-tool';
+      b: string;
+      executionId: string;
+      executionRef: string;
+      proofVersion: typeof nativeAdoptedTextProofVersion;
+      tool: NativeMemoryToolObservation;
+    }>
   | Readonly<{
       source: typeof nativeExecutionEvidenceSource;
       kind: 'memory-root';
@@ -156,10 +166,22 @@ async function append(
   run: Run,
   fact: NativeExecutionEvidence,
 ) {
-  await tx`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
+  const [row] = await tx<
+    { id: string }[]
+  >`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
     select ${run.organizationId},${run.workspaceId},${run.runId},coalesce(max(sequence)+1,0),
       'harness.native',${tx.json(fact)}
-    from allrice_run_events where run_id=${run.runId}`;
+    from allrice_run_events where run_id=${run.runId} returning id`;
+  return row!.id;
+}
+
+async function lockNativeMemoryRun(tx: TransactionSql, run: Run) {
+  const [locked] = await tx`
+    select id from allrice_runs where id=${run.runId}
+      and organization_id=${run.organizationId} and workspace_id=${run.workspaceId}
+      and owner_id=${run.ownerId} and visibility='private' and state='running'
+      and execution_spec->>'generation'='4.0' for update`;
+  return !!locked;
 }
 
 /** Persist the DB's stable reference for B, without retaining the index text.
@@ -171,11 +193,7 @@ export async function bindNativeMemoryExecutionRef(
 ) {
   signal.throwIfAborted();
   const accepted = await getDatabase().begin(async (tx) => {
-    const [locked] = await tx`
-      select id from allrice_runs where id=${run.runId}
-        and organization_id=${run.organizationId} and workspace_id=${run.workspaceId}
-        and owner_id=${run.ownerId} and visibility='private' and state='running'
-        and execution_spec->>'generation'='4.0' for update`;
+    const locked = await lockNativeMemoryRun(tx, run);
     signal.throwIfAborted();
     if (!locked) return false;
     const [bound] =
@@ -351,6 +369,87 @@ export function matchNativeToolObservation(
     actual.turn === expected.turn &&
     actual.turn === request.turn
   );
+}
+
+/** A sealed tool body waits on this commit before the memory callback can
+ * authorize the invocation. The row ID identifies the actual occurrence. */
+export async function recordNativeMemoryToolCall(
+  { run, request, origin }: Receipt,
+  executionRef: string,
+  tool: NativeMemoryToolObservation,
+  signal: AbortSignal,
+) {
+  if (
+    !origin.moduleConfigRevisionRef ||
+    !matchNativeToolObservation(request, tool) ||
+    tool.dispatch.kind !== 'sealed-handler' ||
+    !['mcp__allrice__memory_read', 'mcp__allrice__memory_remember'].includes(
+      tool.name,
+    )
+  )
+    return null;
+  const fact = {
+    source: nativeExecutionEvidenceSource,
+    kind: 'memory-tool',
+    b: run.runId,
+    executionId: request.executionId,
+    executionRef,
+    proofVersion: nativeAdoptedTextProofVersion,
+    tool,
+  } as const;
+  signal.throwIfAborted();
+  const id = await getDatabase().begin(async (tx) => {
+    if (!(await lockNativeMemoryRun(tx, run))) return null;
+    signal.throwIfAborted();
+    const exact = await tx<{ id: string }[]>`
+      select step.id from allrice_run_events step
+      where step.id=${request.executionId} and step.run_id=${run.runId}
+        and step.organization_id=${run.organizationId} and step.workspace_id=${run.workspaceId}
+        and step.event_type='step.started' and step.payload @> ${tx.json({
+          source: 'dsh-native-attempt',
+          kind: 'assistant',
+          sessionId: tool.executionSessionRef,
+          parentSessionId: tool.executionParentRef,
+          nativeInstanceId: origin.nativeOwnerRef,
+          profile: origin.nativeProfileRef,
+          vmInstanceId: origin.vm.instanceId,
+          leaseEpoch: origin.vm.leaseEpoch,
+          attemptId: request.nativeAttemptId,
+          cursor: request.nativeCursor,
+          turn: request.turn,
+        })}
+        and (select count(*) from allrice_run_events e where e.run_id=step.run_id
+          and e.organization_id=step.organization_id and e.workspace_id=step.workspace_id
+          and e.event_type='harness.native' and e.payload=${tx.json(request)})=1
+        and (select count(*) from allrice_run_events e where e.run_id=step.run_id
+          and e.organization_id=step.organization_id and e.workspace_id=step.workspace_id
+          and e.event_type='harness.native' and e.payload=${tx.json(origin)})=1`;
+    if (exact.length !== 1) return null;
+    const roots = await tx<{ ref: string }[]>`
+      select payload->>'executionRef' as ref from allrice_run_events
+      where run_id=${run.runId} and organization_id=${run.organizationId}
+        and workspace_id=${run.workspaceId} and event_type='harness.native'
+        and payload @> ${tx.json({ source: nativeExecutionEvidenceSource, kind: 'memory-root', b: run.runId })}
+      limit 2`;
+    if (roots.length !== 1 || roots[0]!.ref !== executionRef) return null;
+    const existing = await tx<{ id: string; exact: boolean }[]>`
+      select id, payload=${tx.json(fact)} as exact from allrice_run_events
+      where run_id=${run.runId} and organization_id=${run.organizationId}
+        and workspace_id=${run.workspaceId} and event_type='harness.native'
+        and payload @> ${tx.json({ source: nativeExecutionEvidenceSource, kind: 'memory-tool', b: run.runId, executionId: request.executionId })}
+        and (payload#>>'{tool,callId}'=${tool.callId} or payload#>>'{tool,sequence}'=${String(tool.sequence)})
+      limit 2`;
+    signal.throwIfAborted();
+    if (existing.length)
+      return existing.length === 1 && existing[0]!.exact
+        ? existing[0]!.id
+        : null;
+    const id = await append(tx, run, fact);
+    signal.throwIfAborted();
+    return id;
+  });
+  signal.throwIfAborted();
+  return id;
 }
 
 export async function recordNativeExecutionTool(

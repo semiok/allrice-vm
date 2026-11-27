@@ -108,16 +108,27 @@ async function readPin(
   sql: Sql | TransactionSql,
   identity: DEntryIdentity,
   history = false,
+  lock = false,
 ) {
   const [row] = await sql`select d_entry_native_root from allrice_chat_sessions
     where id=${identity.threadId} and organization_id=${identity.organizationId}
       and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
       and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
-      and execution_generation='4.0' and (${history} or archived_at is null)`;
+      and execution_generation='4.0' and (${history} or archived_at is null)
+    ${lock ? sql`for share` : sql``}`;
   if (!row) return deny();
   return row.d_entry_native_root == null
     ? null
     : projectPin(row.d_entry_native_root, identity);
+}
+
+/** Private evidence reader. The caller supplies its already locked identity. */
+export function readLockedDEntryNativeRootPin(
+  tx: Sql | TransactionSql,
+  identity: DEntryIdentity,
+) {
+  if (!identity.threadId) return deny();
+  return readPin(tx, identity, false, true);
 }
 
 /** Cold, owner-only persistent read. Missing/claim-only never creates or wakes. */
