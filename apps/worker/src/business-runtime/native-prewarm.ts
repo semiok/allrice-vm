@@ -557,7 +557,7 @@ export function createDEntryNativePrewarmPort(input: {
       }
       return plan;
     },
-    prewarm(context, identity, trigger, caller, revoked, plan) {
+    prewarm(context, identity, trigger, caller, revoked, plan, reportCapacity) {
       if (admission.aborted) return Promise.reject(admission.reason);
       const data = currentDEntryNativeDataPort();
       const prove = data?.assertEditorReady?.bind(data);
@@ -599,7 +599,13 @@ export function createDEntryNativePrewarmPort(input: {
         )
           throw new DEntryNativeUnavailable();
         const runningProof = runningBinding
-          ? await prove?.(context, identity, active, runningBinding)
+          ? await prove?.(
+              context,
+              identity,
+              active,
+              runningBinding,
+              ...(reportCapacity ? [reportCapacity] : []),
+            )
           : undefined;
         runningProof?.throwIfAborted();
         if (
@@ -790,7 +796,13 @@ export function createDEntryNativePrewarmPort(input: {
             proof =
               runningProof ??
               (expected
-                ? await prove?.(context, identity, active, expected)
+                ? await prove?.(
+                    context,
+                    identity,
+                    active,
+                    expected,
+                    ...(reportCapacity ? [reportCapacity] : []),
+                  )
                 : await prove?.(context, identity, active));
           } catch (error) {
             active.throwIfAborted();

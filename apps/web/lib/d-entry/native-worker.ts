@@ -61,6 +61,7 @@ export async function requestDEntryWorker(
 export function requestDEntryPrewarmStatus(
   input: WorkerRequest,
   operationId: string,
+  method: 'GET' | 'DELETE' = 'GET',
 ) {
   const target = new URL(
     '/internal/d-entry/native-prewarm/status',
@@ -74,7 +75,7 @@ export function requestDEntryPrewarmStatus(
   return requestWorker(
     input.signal,
     target,
-    { method: 'GET', headers: { authorization: `Bearer ${input.token}` } },
+    { method, headers: { authorization: `Bearer ${input.token}` } },
     { short: true, allowExpired: true },
   );
 }

@@ -52,6 +52,43 @@ export type EmployeePrewarmProgress = 'accepted' | 'starting';
 const prewarmRequestMs = 20_000;
 const prewarmWaitMs = 5 * 60_000;
 
+function prewarmStatusPath(
+  selection: DEntrySelectionInput,
+  operationId: string,
+) {
+  return (
+    '/api/v1/d-entry/native-prewarm/status?' +
+    new URLSearchParams({ ...selection, operationId })
+  );
+}
+
+/** A cancellation applies only while this exact ticket is waiting for capacity. */
+export async function cancelEmployeeCapacityWait(
+  selection: DEntrySelectionInput,
+  ticket: DEntryNativePrewarmTicket,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const response = await fetch(
+    prewarmStatusPath(selection, ticket.operationId),
+    {
+      method: 'DELETE',
+      signal: AbortSignal.any([signal, AbortSignal.timeout(prewarmRequestMs)]),
+      cache: 'no-store',
+      credentials: 'same-origin',
+      redirect: 'error',
+    },
+  );
+  signal.throwIfAborted();
+  if (response.status !== 200 && response.status !== 410)
+    throw new EmployeeEntryError(response.status);
+  const status = DEntryNativePrewarmStatusSchema.parse(await response.json());
+  signal.throwIfAborted();
+  if ((status.state === 'expired') !== (response.status === 410))
+    throw new EmployeeEntryError(502, 'response-mismatch');
+  return status.state === 'expired';
+}
+
 function waitForPrewarmPoll(delay: number, signal: AbortSignal) {
   signal.throwIfAborted();
   return new Promise<void>((resolve, reject) => {
@@ -73,7 +110,7 @@ export async function prewarmEmployeeEntry(
   options: {
     ticket?: DEntryNativePrewarmTicket;
     accepted?(ticket: DEntryNativePrewarmTicket): void;
-    progress?(state: EmployeePrewarmProgress): void;
+    progress?(state: EmployeePrewarmProgress, activeLimit?: number): void;
   } = {},
 ) {
   let ticket = options.ticket;
@@ -92,7 +129,7 @@ export async function prewarmEmployeeEntry(
   options.accepted?.(ticket);
   options.progress?.('accepted');
   const { operationId, pollAfterMs, expiresAt } = ticket;
-  const query = new URLSearchParams({ ...selection, operationId });
+  const statusPath = prewarmStatusPath(selection, operationId);
   const pause = new AbortController();
   // Give even a cached ticket near its deadline one short poll so the Worker,
   // rather than the browser clock, can report that it has expired.
@@ -112,16 +149,13 @@ export async function prewarmEmployeeEntry(
         wait,
         AbortSignal.timeout(prewarmRequestMs),
       ]);
-      const response = await fetch(
-        '/api/v1/d-entry/native-prewarm/status?' + query,
-        {
-          method: 'GET',
-          signal: request,
-          cache: 'no-store',
-          credentials: 'same-origin',
-          redirect: 'error',
-        },
-      ).catch((error: unknown) => {
+      const response = await fetch(statusPath, {
+        method: 'GET',
+        signal: request,
+        cache: 'no-store',
+        credentials: 'same-origin',
+        redirect: 'error',
+      }).catch((error: unknown) => {
         request.throwIfAborted();
         if (error instanceof TypeError) throw new EmployeeEntryError(408);
         throw error;
@@ -150,7 +184,9 @@ export async function prewarmEmployeeEntry(
           status.code === 'AUTHORITY_REVOKED' ? 403 : 503,
         );
       if (status.state === 'ready') return;
-      options.progress?.(status.state);
+      if (status.state === 'waiting_for_capacity')
+        options.progress?.('starting', status.activeLimit);
+      else options.progress?.(status.state);
     }
   } catch (error) {
     wait.throwIfAborted();

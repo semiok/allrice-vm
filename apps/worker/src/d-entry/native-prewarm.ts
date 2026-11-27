@@ -28,6 +28,7 @@ type PrewarmReadMode = Exclude<
 >;
 type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
+export type ReportPrewarmCapacity = (activeLimit: number | undefined) => void;
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
@@ -128,6 +129,7 @@ export interface DEntryNativePrewarmPort {
     signal: AbortSignal,
     revoked: AbortSignal,
     plan?: PrewarmPlan,
+    reportCapacity?: ReportPrewarmCapacity,
   ): Promise<AbortSignal | void>;
 }
 
@@ -152,10 +154,18 @@ export const dEntryNativePrewarmPort: DEntryNativePrewarmPort = {
     if (!installed?.isCurrent) throw new DEntryNativeUnavailable();
     return installed.isCurrent(context, identity, plan, signal, mode, purpose);
   },
-  prewarm(context, identity, trigger, signal, revoked, plan) {
+  prewarm(context, identity, trigger, signal, revoked, plan, reportCapacity) {
     signal.throwIfAborted();
     if (!installed) throw new DEntryNativeUnavailable();
-    return installed.prewarm(context, identity, trigger, signal, revoked, plan);
+    return installed.prewarm(
+      context,
+      identity,
+      trigger,
+      signal,
+      revoked,
+      plan,
+      reportCapacity,
+    );
   },
 };
 
@@ -171,6 +181,7 @@ export function createPrewarmOperations(
     ticket: DEntryNativePrewarmTicket;
     expires: number;
     deadline: AbortSignal;
+    cancellation: AbortController;
     replies: number;
     published: boolean;
     state: DEntryNativePrewarmStatus;
@@ -185,9 +196,13 @@ export function createPrewarmOperations(
   const pending = new Set<Promise<void>>();
   const lifetimeReleases = new Set<Promise<boolean>>();
   const active = (entry: Operation) =>
-    entry.state.state === 'accepted' || entry.state.state === 'starting';
+    entry.state.state === 'accepted' ||
+    entry.state.state === 'starting' ||
+    entry.state.state === 'waiting_for_capacity';
   const expired = (entry: Operation, now = Date.now()) =>
-    entry.deadline.aborted || entry.expires <= now;
+    entry.cancellation.signal.aborted ||
+    entry.deadline.aborted ||
+    entry.expires <= now;
   const belongs = (
     entry: Operation,
     context: RequestContext,
@@ -395,7 +410,10 @@ export function createPrewarmOperations(
       identity: DEntryIdentity,
       plan: PrewarmPlan,
       authority: { revoked: AbortSignal; close(): Promise<void> },
-      start: (signal: AbortSignal) => Promise<AbortSignal | void>,
+      start: (
+        signal: AbortSignal,
+        reportCapacity: ReportPrewarmCapacity,
+      ) => Promise<AbortSignal | void>,
     ) {
       lifetime.throwIfAborted();
       authority.revoked.throwIfAborted();
@@ -425,7 +443,13 @@ export function createPrewarmOperations(
         pollAfterMs: 1000,
       };
       const deadline = AbortSignal.timeout(lifetimeMs);
-      const signal = AbortSignal.any([lifetime, authority.revoked, deadline]);
+      const cancellation = new AbortController();
+      const signal = AbortSignal.any([
+        lifetime,
+        authority.revoked,
+        deadline,
+        cancellation.signal,
+      ]);
       const operation: Operation = {
         identity,
         sessionId: context.sessionId,
@@ -434,6 +458,7 @@ export function createPrewarmOperations(
         ticket,
         expires,
         deadline,
+        cancellation,
         replies: 0,
         published: false,
         state: { state: 'accepted' },
@@ -472,7 +497,14 @@ export function createPrewarmOperations(
         try {
           signal.throwIfAborted();
           operation.state = { state: 'starting' };
-          operation.proof = (await start(signal)) || undefined;
+          operation.proof =
+            (await start(signal, (activeLimit) => {
+              if (!signal.aborted && active(operation))
+                operation.state =
+                  activeLimit === undefined
+                    ? { state: 'starting' }
+                    : { state: 'waiting_for_capacity', activeLimit };
+            })) || undefined;
           operation.proof?.throwIfAborted();
           signal.throwIfAborted();
         } catch {
@@ -514,15 +546,15 @@ export function createPrewarmOperations(
       verify: (plan: PrewarmPlan, mode: PrewarmReadMode) => Promise<boolean>,
     ): Promise<DEntryNativePrewarmStatus> {
       const entry = tickets.get(operationId);
-      if (!entry || expired(entry)) return { state: 'expired' };
-      if (!belongs(entry, context, identity))
-        throw new DataAccessError('not_found');
+      if (!entry || !belongs(entry, context, identity) || expired(entry))
+        return { state: 'expired' };
       const state = entry.state;
       const ready = state.state === 'ready';
       const orphan = entry.plan.orphanedInstanceId !== undefined;
       if (
         !(await verify(entry.plan, readMode(state))) ||
-        (orphan && entry.revoked.aborted) ||
+        ((orphan || state.state === 'waiting_for_capacity') &&
+          entry.revoked.aborted) ||
         (ready && entry.proof?.aborted) ||
         expired(entry)
       )
@@ -542,7 +574,7 @@ export function createPrewarmOperations(
             !orphan &&
             !entry.revoked.aborted &&
             entry.closeJoin &&
-            (closing.state === 'starting' || closing.state === 'failed') &&
+            (active(entry) || closing.state === 'failed') &&
             !expired(entry)
           ) {
             if (
@@ -563,11 +595,47 @@ export function createPrewarmOperations(
       if (
         (recheck && !(await verify(entry.plan, readMode(latest)))) ||
         expired(entry) ||
-        (orphan && entry.revoked.aborted) ||
-        (ready && entry.proof?.aborted)
+        ((orphan || latest.state === 'waiting_for_capacity') &&
+          entry.revoked.aborted) ||
+        ((ready || latest.state === 'ready') && entry.proof?.aborted)
       )
         return { state: 'expired' };
-      return latest.state === 'failed' ? latest : state;
+      if (latest.state === 'failed') return latest;
+      if (
+        state.state === 'waiting_for_capacity' ||
+        latest.state === 'waiting_for_capacity'
+      )
+        return entry.state === latest ? latest : { state: 'starting' };
+      return state;
+    },
+    async cancel(
+      operationId: string,
+      context: RequestContext,
+      identity: DEntryIdentity,
+      signal: AbortSignal,
+      verify: (plan: PrewarmPlan, mode: PrewarmReadMode) => Promise<boolean>,
+    ): Promise<DEntryNativePrewarmStatus> {
+      const status = await this.read(
+        operationId,
+        context,
+        identity,
+        signal,
+        verify,
+      );
+      signal.throwIfAborted();
+      const entry = tickets.get(operationId);
+      if (!entry || !belongs(entry, context, identity)) return status;
+      if (!entry.cancellation.signal.aborted) {
+        if (status.state !== 'waiting_for_capacity') return status;
+        if (expired(entry) || entry.revoked.aborted)
+          return { state: 'expired' };
+        if (entry.state.state !== 'waiting_for_capacity')
+          return { state: 'starting' };
+        entry.cancellation.abort();
+      }
+      await entry.settled;
+      if (!(await entry.release())) throw new DEntryNativeUnavailable();
+      return { state: 'expired' };
     },
     async close() {
       await Promise.allSettled(pending);

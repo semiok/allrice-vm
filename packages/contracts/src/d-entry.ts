@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { UuidSchema } from './common.ts';
+import { MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS } from './platform-person-vm-configuration.ts';
 
 // Product writer ownership, independent of the installed DSH distribution.
 export const ExecutionGenerationSchema = z.enum(['3.x', '4.0']);
@@ -282,6 +283,16 @@ export const DEntryNativePrewarmStatusQuerySchema =
 export const DEntryNativePrewarmStatusSchema = z.discriminatedUnion('state', [
   z
     .object({ state: z.enum(['accepted', 'starting', 'ready', 'expired']) })
+    .strict(),
+  z
+    .object({
+      state: z.literal('waiting_for_capacity'),
+      activeLimit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS),
+    })
     .strict(),
   z
     .object({

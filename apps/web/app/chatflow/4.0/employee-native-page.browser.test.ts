@@ -50,7 +50,7 @@ suite('4.0 browser cold entry', () => {
           import { EmployeeFirstStart } from './app/chatflow/4.0/employee-first-start';
           createRoot(document.getElementById('root')).render(location.search
             ? <EmployeeNativePage prepare query={location.search.slice(1)} />
-            : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} creationBlocked={location.pathname === '/creation-limited'} />);`,
+            : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
           },
@@ -750,32 +750,6 @@ suite('4.0 browser cold entry', () => {
         expect(payload).toHaveProperty('expectedOwnerId', f.identity.personId);
       } finally {
         await firstStart.close();
-      }
-
-      const limited = await context.newPage();
-      try {
-        const createRequests: string[] = [];
-        await limited.route('**/api/v1/employee-instances', async (route) => {
-          createRequests.push(route.request().method());
-          await route.abort();
-        });
-        await limited.goto(f.origin + '/creation-limited');
-        const notice = limited.getByRole('status').filter({
-          hasText: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
-        });
-        await notice.waitFor();
-        expect(await notice.textContent()).toBe(
-          '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
-        );
-        expect(
-          await limited
-            .getByRole('button', { name: '创建员工', exact: true })
-            .count(),
-        ).toBe(0);
-        expect(await limited.getByRole('dialog').count()).toBe(0);
-        expect(createRequests).toEqual([]);
-      } finally {
-        await limited.close();
       }
     },
   );

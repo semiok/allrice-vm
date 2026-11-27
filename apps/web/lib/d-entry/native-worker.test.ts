@@ -8,7 +8,10 @@ import { POST as resource } from '../../app/api/v1/d-entry/native-resource/route
 import { POST as rpc } from '../../app/api/v1/d-entry/native-rpc/route';
 import { POST as root } from '../../app/api/v1/d-entry/native-root/route';
 import { POST as prewarm } from '../../app/api/v1/d-entry/native-prewarm/route';
-import { GET as prewarmStatus } from '../../app/api/v1/d-entry/native-prewarm/status/route';
+import {
+  DELETE as cancelPrewarmStatus,
+  GET as prewarmStatus,
+} from '../../app/api/v1/d-entry/native-prewarm/status/route';
 
 const ports = vi.hoisted(() => ({
   context: vi.fn(),
@@ -77,6 +80,56 @@ afterEach(() => {
 });
 
 describe('Web original-cookie to fixed Worker adapters', () => {
+  it('validates same-origin and current authority when cancelling a capacity wait', async () => {
+    const operationId = randomUUID();
+    const query = new URLSearchParams({ ...selection, operationId });
+    const url =
+      'https://allrice.test/api/v1/d-entry/native-prewarm/status?' + query;
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ state: 'waiting_for_capacity', activeLimit: 3 }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ state: 'expired' }, { status: 410 }),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const cancel = (origin: string) =>
+      cancelPrewarmStatus(
+        new Request(url, {
+          method: 'DELETE',
+          headers: { origin },
+        }),
+      );
+    expect((await cancel('https://other.test')).status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+    const waiting = await prewarmStatus(new Request(url));
+    expect(waiting.headers.get('cache-control')).toBe('private, no-store');
+    expect(await waiting.json()).toEqual({
+      state: 'waiting_for_capacity',
+      activeLimit: 3,
+    });
+    const cancelled = await cancel('https://allrice.test');
+    expect(cancelled.status).toBe(410);
+    expect(await cancelled.json()).toEqual({ state: 'expired' });
+    expect(ports.identity).toHaveBeenCalledTimes(2);
+    const [worker, options] = fetch.mock.calls[1]!;
+    expect(worker).toEqual(
+      new URL(
+        'http://worker.internal:3101/internal/d-entry/native-prewarm/status?' +
+          new URLSearchParams({
+            ...selection,
+            organizationId: identity.organizationId,
+            operationId,
+          }),
+      ),
+    );
+    expect(options).toMatchObject({
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${ports.token}` },
+    });
+  });
+
   it('returns only the cold ticket and reauthenticates each status GET, including an expired ticket', async () => {
     const ticket = {
       operationId: randomUUID(),

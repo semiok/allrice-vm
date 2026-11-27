@@ -244,7 +244,9 @@ export function createDEntryHttpHandler(
     try {
       signal.throwIfAborted();
       if (
-        request.method !== (statusRequest ? 'GET' : 'POST') ||
+        (statusRequest
+          ? request.method !== 'GET' && request.method !== 'DELETE'
+          : request.method !== 'POST') ||
         request.headers.origin
       )
         throw new DataAccessError('not_found');
@@ -274,7 +276,8 @@ export function createDEntryHttpHandler(
           input,
           signal,
         );
-        const result = await prewarm.read(
+        const method = request.method === 'DELETE' ? 'cancel' : 'read';
+        const result = await prewarm[method](
           operationId,
           context,
           identity,
@@ -549,7 +552,7 @@ export function createDEntryHttpHandler(
           identity,
           plan,
           authority,
-          (active) =>
+          (active, reportCapacity) =>
             deps.prewarm.prewarm(
               context,
               identity,
@@ -557,6 +560,7 @@ export function createDEntryHttpHandler(
               active,
               active,
               plan,
+              reportCapacity,
             ),
         );
         transferred = true;
