@@ -9,6 +9,7 @@ import {
   DataAccessError,
   EmployeeInstanceError,
   resolveDEntryIdentity,
+  readApplicationBuiltinModules,
 } from '@allrice/database';
 
 function denyArchivedEmployee(error: unknown): never {
@@ -18,6 +19,16 @@ function denyArchivedEmployee(error: unknown): never {
   )
     throw new DataAccessError('authorization_denied');
   throw error;
+}
+
+/** Mutation owners already check current identity, assignment and instance
+ * inside the writer transaction, including the legacy general-instance alias. */
+export async function requireEmployeeMemoryModule(signal: AbortSignal) {
+  signal.throwIfAborted();
+  const { builtinModules } = await readApplicationBuiltinModules('web');
+  signal.throwIfAborted();
+  if (builtinModules['employee-memory'] !== true)
+    throw new DataAccessError('authorization_denied');
 }
 
 const builtinAuthority = createApplicationBuiltinModuleAuthority('web');

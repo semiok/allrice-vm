@@ -942,6 +942,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
             ...exact(active, instance),
             summary: '不应写入的更正',
             details: '不应写入的正文',
+            reason: '归档时拒绝编辑',
           },
           'PATCH',
         ),
@@ -962,7 +963,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
       from allrice_memories where instance_id=${instance} order by id`;
     const before = await snapshot();
     await f.db`update allrice_employee_instances set archived_at=clock_timestamp() where id=${instance}`;
-    for (const [path, init] of requests) {
+    for (const [path, init, previousReadStatus] of requests) {
       const denied = await api(
         path,
         init,
@@ -970,7 +971,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
         identity.workspace,
         instance,
       );
-      expect(denied.status).toBe(403);
+      expect(denied.status, path).toBe(previousReadStatus === null ? 409 : 403);
       expect(denied.headers.get('cache-control')).toBe('private, no-store');
       expect(await denied.text()).not.toContain('本人正文');
     }
