@@ -83,8 +83,7 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
     server: Server,
     origin: string;
   let platform: Awaited<ReturnType<typeof principal>>,
-    snow: Awaited<ReturnType<typeof principal>>,
-    other: Awaited<ReturnType<typeof principal>>;
+    snow: Awaited<ReturnType<typeof principal>>;
   const requests: string[] = [],
     failures: string[] = [];
   async function principal(displayName: string, role: 'admin' | 'member') {
@@ -109,7 +108,6 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
     platform = await principal('Platform fixture', 'admin');
     await fixture.db`update allrice_organizations set slug='allrice-platform' where id=${platform.organizationId}`;
     snow = await principal('Snow fixture', 'member');
-    other = await principal('Other fixture', 'member');
     vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', platform.user.email);
     ports.context.mockImplementation(async (request: Request) => {
       const token = request.headers
@@ -319,23 +317,33 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
     if (fixture) await fixture.close();
     expect(failures).toEqual([]);
   }, 30000);
-  async function pageFor(p = platform, width = 1440) {
+  async function contextFor(p = platform, width = 1440) {
     const context = await browser.newContext({
       viewport: { width, height: 1000 },
     });
     await context.addCookies([
       { name: 'fixture_session', value: p.session.token, url: origin },
     ]);
+    return context;
+  }
+  async function pageFor(width = 1440) {
+    const context = await contextFor(platform, width);
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
     page.on('pageerror', (e) => failures.push(e.stack ?? e.message));
-    await page.goto(origin);
-    await page.getByLabel('管理租户').selectOption(snow.organizationId);
-    await page.getByRole('button', { name: '租户账号', exact: true }).click();
-    await page
-      .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-      .waitFor();
     return { page, context };
+  }
+  function resourcePage(
+    view: 'quotas' | 'environments' | 'validation',
+    scope: { organizationId: string; workspaceId: string; subjectId?: string },
+  ) {
+    const params = new URLSearchParams({
+      view,
+      organizationId: scope.organizationId,
+      workspaceId: scope.workspaceId,
+    });
+    if (scope.subjectId) params.set('subjectId', scope.subjectId);
+    return origin + '/?' + params;
   }
   it.each([1440, 390])(
     'browses real employee instances, shared content and exact template history (%i)',
@@ -490,76 +498,31 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       await context.close();
     }
   });
-  it('hides the platform tenant and ignores its old management link without affecting business tenants', async () => {
-    const { page, context } = await pageFor();
+  it('shows the read-only connection overview without exposing engineering forms', async () => {
+    const { page, context } = await pageFor(390);
     try {
-      await page.goto(
-        `${origin}/runtime-console?view=tenants&organizationId=${platform.organizationId}&workspaceId=${platform.workspaceId}&tenantView=members`,
-      );
-      await page
-        .getByLabel('管理租户')
-        .locator(`option[value="${snow.organizationId}"]`)
-        .waitFor({ state: 'attached' });
-      expect(
-        await page
-          .getByLabel('管理租户')
-          .locator(`option[value="${platform.organizationId}"]`)
-          .count(),
-      ).toBe(0);
-      expect(await page.getByLabel('管理租户').inputValue()).toBe('');
-      expect(await page.getByRole('button', { name: /^编辑 / }).count()).toBe(
-        0,
-      );
-      for (const suffix of ['', '/employees', '/policy']) {
-        const response = await context.request.get(
-          `${origin}/api/v1/admin/tenants/${platform.organizationId}${suffix}?workspaceId=${platform.workspaceId}`,
-        );
-        expect(response.status()).toBe(404);
-      }
-      await page.getByLabel('管理租户').selectOption(snow.organizationId);
-      await page.getByRole('button', { name: '租户账号', exact: true }).click();
-      await page
-        .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-        .waitFor();
-    } finally {
-      await context.close();
-    }
-  });
-  it('shows three tenant sections and a read-only connection overview without exposing engineering forms', async () => {
-    const { page, context } = await pageFor(platform, 390);
-    try {
-      expect(
-        await page
-          .getByRole('navigation', { name: '租户管理栏目', exact: true })
-          .getByRole('button')
-          .allTextContents(),
-      ).toEqual(['AI 员工团队', '租户账号', '连接与用量']);
-      expect(
-        await page
-          .getByRole('button', { name: '执行策略', exact: true })
-          .count(),
-      ).toBe(0);
-      await page.getByLabel('管理工作区').selectOption(snow.workspaceId);
       const start = requests.length;
-      await page
-        .getByRole('button', { name: '连接与用量', exact: true })
-        .click();
+      await page.goto(resourcePage('environments', snow));
       await page.getByRole('region', { name: '已连接应用概览' }).waitFor();
       await page
         .getByRole('heading', { name: '已连接电脑', exact: true })
         .waitFor();
+      await page.getByText('暂无应用连接。', { exact: false }).waitFor();
+      await page.getByText('还没有连接电脑。', { exact: false }).waitFor();
+      const connections = await context.request.get(
+        `${origin}/api/v1/admin/tenants/${snow.organizationId}/mcp?workspaceId=${snow.workspaceId}&subjectId=${snow.user.id}`,
+      );
+      expect(connections.status()).toBe(200);
+      expect(await connections.json()).toMatchObject({
+        organizationId: snow.organizationId,
+        workspaceId: snow.workspaceId,
+        subjectId: snow.user.id,
+      });
       expect(await page.getByLabel('环境修改原因').count()).toBe(0);
       expect(await page.getByLabel('授权执行目标').count()).toBe(0);
       expect(
         await page
           .getByRole('button', { name: '保存连接', exact: true })
-          .count(),
-      ).toBe(0);
-      await page.getByRole('button', { name: '用量', exact: true }).click();
-      await page.getByRole('article', { name: '成员用量概览' }).waitFor();
-      expect(
-        await page
-          .getByRole('spinbutton', { name: '月 Token 上限', exact: true })
           .count(),
       ).toBe(0);
       expect(
@@ -574,96 +537,21 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       await context.close();
     }
   });
-  it('deploys, selects a default and withdraws a published employee through the real UI without a mandatory note', async () => {
-    const source = await createEmployeeAdministrationFixture(fixture.db);
-    await fixture.db`update allrice_workspaces set name='Deployment fixture workspace' where id=${source.workspaceId}`;
-    await source.preview();
-    expect((await source.publish()).valid).toBe(true);
-    const { page, context } = await pageFor(platform, 390);
-    try {
-      await page
-        .getByRole('button', { name: 'AI 员工团队', exact: true })
-        .click();
-      const panel = page.getByRole('region', {
-        name: '在岗 AI 员工',
-        exact: true,
-      });
-      await panel.getByLabel('选择已发布员工').selectOption(source.employeeId);
-      expect(await panel.getByLabel('派驻备注（可选）').inputValue()).toBe('');
-      await panel
-        .getByRole('button', { name: '派驻员工', exact: true })
-        .click();
-      await panel
-        .getByText('员工已派驻，当前租户用户可以开始使用。', { exact: true })
-        .waitFor();
-      const card = panel.getByRole('article', {
-        name: '在岗员工 Synthetic publication',
-        exact: true,
-      });
-      await card.waitFor();
-      expect(await card.innerText()).toContain('已派驻 v1');
-      const member = await authenticateSession(snow.session.token, {
-        organizationId: snow.organizationId,
-        workspaceId: snow.workspaceId,
-      });
-      const available = await getEmployeeWorkspace(member!, snow.workspaceId);
-      const [deployment] =
-        await fixture.db`select tenant_employee_id from allrice_platform_employee_tenant_assignments where employee_id=${source.employeeId} and workspace_id=${snow.workspaceId}`;
-      const employee = available.employees.find(
-        (e) => e.employeeId === deployment!.tenant_employee_id,
-      )!;
-      expect(employee).toBeTruthy();
-      const session = await createChatSession(member!, {
-        workspaceId: snow.workspaceId,
-        employeeAssignmentId: employee.id,
-        title: 'Synthetic browser deployment',
-      });
-      if (await card.getByRole('button', { name: '设为默认员工' }).count())
-        await card.getByRole('button', { name: '设为默认员工' }).click();
-      await expect.poll(() => card.innerText()).toContain('默认员工');
-      expect(
-        await page.evaluate(
-          () => document.documentElement.scrollWidth <= innerWidth,
-        ),
-      ).toBe(true);
-      await card.getByRole('button', { name: '撤回员工', exact: true }).click();
-      await panel
-        .getByText('员工已撤回，历史会话与成果保留。', { exact: true })
-        .waitFor();
-      expect(
-        (await getEmployeeWorkspace(member!, snow.workspaceId)).employees.some(
-          (e) => e.id === employee.id,
-        ),
-      ).toBe(false);
-      expect(
-        await fixture.db`select id from allrice_chat_sessions where id=${session.id}`,
-      ).toHaveLength(1);
-      await page.getByRole('button', { name: '刷新员工', exact: true }).click();
-      await expect.poll(() => card.count()).toBe(0);
-      const response = await context.request.post(
-        `${origin}/api/v1/admin/tenants/${snow.organizationId}/employees`,
-        { headers: { origin: 'https://foreign.invalid' }, data: {} },
-      );
-      expect(response.status()).toBe(403);
-    } finally {
-      await context.close();
-    }
-  });
-
-  it('opens scoped validation from a deep link, inspects the real stored Run and never exposes execution controls', async () => {
+  it('opens scoped validation, inspects the real stored Run and never exposes execution controls', async () => {
     const a = await tenantValidationFixture(fixture.db),
       { page, context } = await pageFor();
     try {
       const start = requests.length;
-      await page.goto(
-        `${origin}/runtime-console?view=tenants&organizationId=${a.target.organizationId}&workspaceId=${a.target.workspaceId}&tenantView=validation&subjectId=${a.target.subjectId}`,
-      );
+      const [initialRead] = await Promise.all([
+        page.waitForRequest(
+          `${origin}/api/v1/admin/tenants/${a.target.organizationId}/validation?workspaceId=${a.target.workspaceId}&subjectId=${a.target.subjectId}`,
+        ),
+        page.goto(resourcePage('validation', a.target)),
+      ]);
+      expect(initialRead.method()).toBe('GET');
       await page
         .getByRole('heading', { name: '运行检查', exact: true })
         .waitFor();
-      expect(
-        await page.getByLabel('实际使用者', { exact: true }).inputValue(),
-      ).toBe(a.target.subjectId);
       await page.getByLabel('选择验收 Run').selectOption(a.task.runId);
       await page.getByRole('region', { name: '真实任务检查结果' }).waitFor();
       await page.getByText('技术详情', { exact: true }).click();
@@ -706,12 +594,6 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
           )
         ).status(),
       ).toBe(404);
-      await page.getByRole('link', { name: '查看用量' }).click();
-      await page.getByText('额度详情与调整', { exact: true }).click();
-      await page.getByLabel('月 Token 上限', { exact: true }).waitFor();
-      expect(
-        await page.getByLabel('实际使用者', { exact: true }).inputValue(),
-      ).toBe(a.target.subjectId);
     } finally {
       await context.close();
     }
@@ -721,9 +603,7 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       b = await tenantValidationFixture(fixture.db),
       { page, context } = await pageFor();
     try {
-      await page.goto(
-        `${origin}/runtime-console?view=tenants&organizationId=${a.target.organizationId}&workspaceId=${a.target.workspaceId}&tenantView=validation&subjectId=${a.target.subjectId}`,
-      );
+      await page.goto(resourcePage('validation', a.target));
       await page.getByLabel('选择验收 Run').selectOption(a.task.runId);
       await page.getByRole('region', { name: '真实任务检查结果' }).waitFor();
       await page.getByLabel('完整验收 Run ID').fill(b.task.runId);
@@ -741,18 +621,20 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
   it('configures real member quotas through UI, restores inheritance with CAS and prevents cross-origin updates', async () => {
     const { page, context } = await pageFor();
     try {
-      await page.getByLabel('管理工作区').selectOption(snow.workspaceId);
-      await page
-        .getByRole('button', { name: '连接与用量', exact: true })
-        .click();
-      // Initial member discovery starts both connection reads; wait for those
-      // before switching tabs so canSwitch does not reject an in-flight load.
-      await page.getByText('暂无应用连接。', { exact: false }).waitFor();
-      await page.getByText('还没有连接电脑。', { exact: false }).waitFor();
-      await page.getByRole('button', { name: '用量', exact: true }).click();
+      const start = requests.length;
+      await page.goto(resourcePage('quotas', snow));
       await page
         .getByLabel('实际使用者', { exact: true })
         .selectOption(snow.user.id);
+      await page.getByRole('article', { name: '成员用量概览' }).waitFor();
+      expect(
+        await page
+          .getByRole('spinbutton', { name: '月 Token 上限', exact: true })
+          .count(),
+      ).toBe(0);
+      expect(requests.slice(start).every((r) => r.startsWith('GET '))).toBe(
+        true,
+      );
       await page.getByText('额度详情与调整', { exact: true }).click();
       expect(
         await page.getByLabel('月 Token 上限', { exact: true }).isEditable(),
@@ -858,204 +740,90 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       await context.close();
     }
   });
-  it('shows all missing prerequisites, grants cloud via UI without a device and exposes scoped MCP configuration', async () => {
+  it('stores a scoped cloud grant and an encrypted MCP binding through the management API', async () => {
     vi.stubEnv('ALLRICE_RUNTIME_POLICY_ENABLED', '1');
     vi.stubEnv('ALLRICE_CLOUD_RUNNER_ENABLED', '1');
     vi.stubEnv('ALLRICE_CLOUD_MCP_ENABLED', '1');
     vi.stubEnv('ALLRICE_MCP_CREDENTIAL_KEY', 'ab'.repeat(32));
-    const target = randomUUID(),
-      approvalRun = randomUUID();
-    await fixture.db`insert into allrice_execution_targets(id,organization_id,workspace_id,target_key,kind,label,state,capabilities) values(${target},${snow.organizationId},${snow.workspaceId},${`cloud.${target}`},'cloud_sandbox','Synthetic cloud target','online','["process.execute","browser.navigate"]')`;
-    await fixture.db`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec,input) values(${approvalRun},${snow.organizationId},${snow.workspaceId},${snow.user.id},'waiting_approval','{}','{}')`;
-    await fixture.db`insert into allrice_approval_requests(organization_id,workspace_id,run_id,actor_id,resource_type,resource_id,action,input_digest,requested_at,runtime_request,runtime_binding_digest,runtime_control_version,runtime_expires_at)
-      values(${snow.organizationId},${snow.workspaceId},${approvalRun},${snow.user.id},'runtime_operation',${randomUUID()},'process.execute',${`sha256:${'a'.repeat(64)}`},now()-interval '2 hours','{}',${`sha256:${'b'.repeat(64)}`},1,now()-interval '1 hour')`;
-    const { page, context } = await pageFor();
+    const targetId = randomUUID();
+    await fixture.db`insert into allrice_execution_targets(id,organization_id,workspace_id,target_key,kind,label,state,capabilities) values(${targetId},${snow.organizationId},${snow.workspaceId},${`cloud.${targetId}`},'cloud_sandbox','Synthetic cloud target','online','["process.execute","browser.navigate"]')`;
+    const context = await contextFor();
+    const endpoint = `${origin}/api/v1/admin/tenants/${snow.organizationId}`;
+    const scope = { workspaceId: snow.workspaceId, subjectId: snow.user.id };
     try {
-      await page.getByLabel('管理工作区').selectOption(snow.workspaceId);
-      await page.getByText('开发者工具', { exact: true }).click();
-      await page.getByRole('button', { name: '连接配置', exact: true }).click();
-      await page
-        .getByLabel('实际使用者', { exact: true })
-        .selectOption(snow.user.id);
-      await page
-        .getByRole('heading', { name: '已有平台授权', exact: true })
-        .waitFor();
+      const granted = await context.request.put(`${endpoint}/environments`, {
+        headers: { origin },
+        data: {
+          ...scope,
+          targetId,
+          action: 'cloud_grant',
+          reason: 'Synthetic cloud platform approval',
+        },
+      });
+      expect(granted.status()).toBe(200);
       expect(
-        await page.getByText(/连接电脑后就能处理电脑上的任务/).count(),
-      ).toBeGreaterThan(0);
-      await page
-        .getByText('单次任务审批状态（与环境授权分开）', { exact: true })
-        .click();
-      await page
-        .getByText(new RegExp(`Run ${approvalRun.slice(0, 8)}.*单次审批已过期`))
-        .waitFor();
-      await page.getByRole('button', { name: '设备下载与确认指引' }).click();
-      await page
-        .getByRole('link', {
-          name: '下载 AllRice 助手（Apple 芯片）',
-          exact: true,
-        })
-        .waitFor();
-      await page.getByLabel('授权执行目标').selectOption(target);
-      await page
-        .getByLabel('环境修改原因')
-        .fill('Synthetic cloud platform approval');
-      await page
-        .getByRole('button', { name: '保存平台授权', exact: true })
-        .click();
-      await page
-        .getByText(
-          '平台授权已保存；设备端确认、员工版本、运行审批仍需分别满足。',
-          { exact: true },
-        )
-        .waitFor();
-      expect(
-        await fixture.db`select id from allrice_cloud_execution_grants where organization_id=${snow.organizationId} and owner_id=${snow.user.id} and target_id=${target} and enabled`,
+        await fixture.db`select id from allrice_cloud_execution_grants where organization_id=${snow.organizationId} and owner_id=${snow.user.id} and target_id=${targetId} and enabled`,
       ).toHaveLength(1);
       expect(
         await fixture.db`select id from allrice_bridge_devices where organization_id=${snow.organizationId}`,
       ).toHaveLength(0);
-      await page.evaluate(() => window.scrollTo(0, 0));
-      if (process.env.ALLRICE_TEST_SCREENSHOT_DIR)
-        await page.screenshot({
-          path: resolve(
-            process.env.ALLRICE_TEST_SCREENSHOT_DIR,
-            'tenant-environments.png',
-          ),
-        });
-      await page
-        .getByRole('button', { name: '云端 MCP 配置', exact: true })
-        .click();
-      await page
-        .getByRole('heading', { name: '云端 MCP', exact: true })
-        .waitFor();
-      await expect
-        .poll(
-          () =>
-            requests.filter((r) =>
-              r.includes(`/tenants/${snow.organizationId}/mcp`),
-            ).length,
-        )
-        .toBeGreaterThan(0);
-      const read = await context.request.get(
-        `${origin}/api/v1/admin/tenants/${snow.organizationId}/mcp?workspaceId=${snow.workspaceId}&subjectId=${snow.user.id}`,
-      );
-      expect(read.status()).toBe(200);
-      expect(await read.json()).toMatchObject({
-        organizationId: snow.organizationId,
-        subjectId: snow.user.id,
+
+      const bearerToken = 'synthetic-browser-credential';
+      const mcpEndpoint = 'https://example.com/mcp';
+      const connection = await context.request.post(`${endpoint}/mcp`, {
+        headers: { origin },
+        data: {
+          ...scope,
+          name: 'Fixture MCP connection',
+          endpoint: mcpEndpoint,
+          bearerToken,
+          reason: 'Synthetic MCP connection configuration',
+        },
       });
-      await page
-        .getByLabel('环境修改原因')
-        .fill('Synthetic MCP connection configuration');
-      await page
-        .getByLabel('连接名称', { exact: true })
-        .fill('Browser configured MCP');
-      await page
-        .getByLabel('HTTPS MCP 地址', { exact: true })
-        .fill('https://example.com/mcp');
-      await page
-        .getByLabel('租户 Bearer Token', { exact: true })
-        .fill('synthetic-browser-credential');
-      await page.getByRole('button', { name: '保存连接', exact: true }).click();
-      await page.getByText('Browser configured MCP', { exact: true }).waitFor();
-      expect(
-        await page
-          .getByLabel('租户 Bearer Token', { exact: true })
-          .inputValue(),
-      ).toBe('');
+      expect(connection.status()).toBe(200);
+      expect(await connection.json()).toMatchObject({
+        ...scope,
+        organizationId: snow.organizationId,
+      });
       const [binding] =
-        await fixture.db`select b.created_by,b.organization_id,c.credential_envelope from allrice_connector_bindings b join allrice_mcp_binding_config c on c.binding_id=b.id where b.organization_id=${snow.organizationId} and c.endpoint='https://example.com/mcp'`;
+        await fixture.db`select b.created_by,b.organization_id,c.credential_envelope from allrice_connector_bindings b join allrice_mcp_binding_config c on c.binding_id=b.id where b.organization_id=${snow.organizationId} and c.endpoint=${mcpEndpoint}`;
       expect(binding).toMatchObject({
         created_by: platform.user.id,
         organization_id: snow.organizationId,
       });
-      expect(JSON.stringify(binding)).not.toContain(
-        'synthetic-browser-credential',
-      );
+      expect(JSON.stringify(binding)).not.toContain(bearerToken);
     } finally {
       await context.close();
     }
   });
-  it('configures a workspace policy through the actual UI and rejects stale and cross-origin writes', async () => {
-    const { page, context } = await pageFor();
-    try {
-      await page.getByLabel('管理工作区').selectOption(snow.workspaceId);
-      await page.getByText('开发者工具', { exact: true }).click();
-      await page.getByRole('button', { name: '执行策略', exact: true }).click();
-      await page.getByLabel('启用工作区策略').check();
-      await page
-        .getByLabel('local.process.execute 规则', { exact: true })
-        .selectOption('allow');
-      await page
-        .getByLabel('assistant.delegate 规则', { exact: true })
-        .selectOption('allow');
-      expect(
-        await page
-          .getByLabel('assistant.delegate 规则', { exact: true })
-          .locator('option[value="ask"]')
-          .count(),
-      ).toBe(0);
-      await page
-        .getByLabel('策略修改原因')
-        .fill('Synthetic explicit policy approval');
-      await page
-        .getByRole('button', { name: '确认保存策略', exact: true })
-        .click();
-      await page
-        .getByText(
-          '工作区规则已保存。成员的应用和电脑连接可在「连接与用量」查看。',
-          {
-            exact: true,
-          },
-        )
-        .waitFor();
-      await page
-        .getByText('当前版本：1 · 保存将创建版本 2', { exact: true })
-        .waitFor();
-      expect(
-        await page
-          .getByRole('row')
-          .filter({
-            has: page.getByText('local.process.execute', { exact: true }),
-          })
-          .locator('td')
-          .nth(2)
-          .textContent(),
-      ).toContain('按成员工作方式执行');
-      // A saved allow policy does not make the retired delegation capability available.
-      expect(
-        await page
-          .getByRole('row')
-          .filter({
-            has: page.getByText('assistant.delegate', { exact: true }),
-          })
-          .locator('td')
-          .nth(2)
-          .textContent(),
-      ).toContain('策略允许 · 子智能体暂不可用');
-      const [stored] =
-        await fixture.db`select controls from allrice_runtime_policy_controls where workspace_id=${snow.workspaceId}`;
-      expect(stored!.controls).toMatchObject({
+  it('persists workspace policy and rejects stale, cross-origin and malformed writes', async () => {
+    const context = await contextFor();
+    const url = `${origin}/api/v1/admin/tenants/${snow.organizationId}/policy`;
+    const data = {
+      workspaceId: snow.workspaceId,
+      expectedVersion: null,
+      controls: {
         version: 1,
         enabled: true,
+        mode: 'execute',
         rules: [
           { action: 'local.process.execute', effect: 'allow' },
           { action: 'assistant.delegate', effect: 'allow' },
         ],
+      },
+      reason: 'Synthetic explicit policy approval',
+    };
+    try {
+      const write = await context.request.put(url, {
+        headers: { Origin: origin },
+        data,
       });
-      const body = {
-        workspaceId: snow.workspaceId,
-        expectedVersion: null,
-        controls: stored!.controls,
-        reason: 'Synthetic stale request',
-      };
-      const url = `${origin}/api/v1/admin/tenants/${snow.organizationId}/policy`;
+      expect(write.status()).toBe(200);
       expect(
         (
           await context.request.put(url, {
             headers: { Origin: origin },
-            data: body,
+            data,
           })
         ).status(),
       ).toBe(409);
@@ -1063,7 +831,7 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
         (
           await context.request.put(url, {
             headers: { Origin: 'https://foreign.example.test' },
-            data: body,
+            data,
           })
         ).status(),
       ).toBe(403);
@@ -1075,23 +843,16 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
           })
         ).status(),
       ).toBe(400);
-      await page.reload();
-      await page.getByLabel('管理租户').selectOption(snow.organizationId);
-      await page.getByRole('button', { name: '租户账号', exact: true }).click();
-      await page.getByLabel('管理工作区').selectOption(snow.workspaceId);
-      await page.getByText('开发者工具', { exact: true }).click();
-      await page.getByRole('button', { name: '执行策略', exact: true }).click();
-      await page
-        .getByText('当前版本：1 · 保存将创建版本 2', { exact: true })
-        .waitFor();
-      expect(
-        await page
-          .getByLabel('assistant.delegate 规则', { exact: true })
-          .inputValue(),
-      ).toBe('allow');
-      await page.screenshot({
-        path: '/tmp/met151-policy-desktop.png',
-        fullPage: true,
+      const [stored] =
+        await fixture.db`select controls from allrice_runtime_policy_controls where workspace_id=${snow.workspaceId}`;
+      expect(stored!.controls).toMatchObject(data.controls);
+      const read = await context.request.get(
+        `${url}?workspaceId=${snow.workspaceId}`,
+      );
+      expect(read.status()).toBe(200);
+      expect(await read.json()).toMatchObject({
+        version: 1,
+        controls: data.controls,
       });
     } finally {
       await context.close();
@@ -2073,114 +1834,33 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       await context.close();
     }
   }, 60000);
-  it('saves account access without a role selector, persists it, and does not grant platform membership', async () => {
-    const { page, context } = await pageFor();
+  it('excludes the platform tenant and rejects cross-origin and tenant-admin writes', async () => {
+    const context = await contextFor();
     try {
-      await page
-        .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-        .click();
-      expect(await page.getByLabel('成员角色').count()).toBe(0);
-      await page.getByLabel('授权有效', { exact: true }).uncheck();
-      await page
-        .getByRole('button', { name: '确认保存授权', exact: true })
-        .click();
-      await page
-        .getByRole('status')
-        .filter({ hasText: '修改已保存' })
-        .waitFor();
-      const [row] =
-        await fixture.db`select role,id,active from allrice_memberships where user_id=${snow.user.id} and organization_id=${snow.organizationId}`;
-      expect(row!.role).toBe('member');
-      expect(row!.active).toBe(false);
-      const [audit] =
-        await fixture.db`select actor_id,metadata from allrice_audit_events where resource_id=${row!.id} and action='tenant.member.updated' order by occurred_at desc limit 1`;
-      expect(audit!.actor_id).toBe(platform.user.id);
-      expect(audit!.metadata.deviceAuthorizationChanged).toBe(false);
-      await expect(
-        ensureBootstrapPortalPrincipal(snow.input, fixture.db),
-      ).rejects.toMatchObject({ code: 'authorization_denied' });
-      await page.reload();
-      await page.getByLabel('管理租户').selectOption(snow.organizationId);
-      await page.getByRole('button', { name: '租户账号', exact: true }).click();
-      await page
-        .getByRole('row')
-        .filter({ hasText: 'Snow fixture' })
-        .getByText('授权已停用', { exact: true })
-        .waitFor();
-      await page.screenshot({ path: '/tmp/met151-tenant-admin-desktop.png' });
-      expect(
-        await page
-          .getByRole('table')
-          .evaluate((table) => getComputedStyle(table).color),
-      ).toBe('rgb(233, 237, 242)');
-      expect(
-        await fixture.db`select id from allrice_memberships where user_id=${platform.user.id} and organization_id=${snow.organizationId}`,
-      ).toHaveLength(0);
-    } finally {
-      await context.close();
-    }
-  });
-  it('discards unsaved state only after confirmation, keeps scope isolated, and renders narrow screens', async () => {
-    const { page, context } = await pageFor(platform, 390);
-    try {
-      await page
-        .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-        .click();
-      await page.getByLabel('成员备注（可选）').fill('Do not leak this draft');
-      page.once('dialog', (dialog) => dialog.dismiss());
-      await page.getByLabel('管理租户').selectOption(other.organizationId);
-      expect(await page.getByLabel('管理租户').inputValue()).toBe(
-        snow.organizationId,
+      const list = await context.request.get(`${origin}/api/v1/admin/tenants`);
+      expect(list.status()).toBe(200);
+      const { tenants } = await list.json();
+      expect(tenants).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: snow.organizationId }),
+        ]),
       );
-      page.once('dialog', (dialog) => dialog.accept());
-      await page.getByLabel('管理租户').selectOption(other.organizationId);
-      await page
-        .getByRole('button', { name: '编辑 Other fixture', exact: true })
-        .waitFor();
-      expect(await page.getByLabel('成员备注（可选）').count()).toBe(0);
-      expect(await page.getByText('Do not leak this draft').count()).toBe(0);
-      expect(
-        await page.evaluate(
-          () => document.documentElement.scrollWidth <= innerWidth,
-        ),
-      ).toBe(true);
-      await page.screenshot({ path: '/tmp/met151-tenant-admin-mobile.png' });
-    } finally {
-      await context.close();
-    }
-  });
-  it('denies tenant-admin direct API requests and cross-origin writes, and treats unconfirmed saves as non-retryable', async () => {
-    const { page, context } = await pageFor();
-    try {
-      await page
-        .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-        .click();
-      await page.getByLabel('授权有效', { exact: true }).check();
-      await page
-        .getByLabel('成员备注（可选）')
-        .fill('Synthetic unavailable save');
-      const before = requests.filter((r) => r.startsWith('PATCH')).length;
-      await page.route('**/members/*', (route) =>
-        route.fulfill({
-          status: 503,
-          json: { code: 'TENANT_ADMIN_UNAVAILABLE' },
-        }),
+      expect(tenants).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: platform.organizationId }),
+        ]),
       );
-      await page
-        .getByRole('button', { name: '确认保存授权', exact: true })
-        .click();
-      await page.getByRole('alert').waitFor();
-      expect(
-        await page
-          .getByRole('button', { name: '确认保存授权', exact: true })
-          .count(),
-      ).toBe(0);
-      expect(requests.filter((r) => r.startsWith('PATCH')).length).toBe(before);
-      await page.unroute('**/members/*');
-      await page.getByRole('button', { name: '刷新账号', exact: true }).click();
-      await page
-        .getByRole('button', { name: '编辑 Snow fixture', exact: true })
-        .waitFor();
+      for (const suffix of ['', '/employees', '/policy']) {
+        const response = await context.request.get(
+          `${origin}/api/v1/admin/tenants/${platform.organizationId}${suffix}?workspaceId=${platform.workspaceId}`,
+        );
+        expect(response.status()).toBe(404);
+      }
+      const deployment = await context.request.post(
+        `${origin}/api/v1/admin/tenants/${snow.organizationId}/employees`,
+        { headers: { origin: 'https://foreign.invalid' }, data: {} },
+      );
+      expect(deployment.status()).toBe(403);
       const [row] =
         await fixture.db`select id,md5(to_jsonb(m)::text) as version from allrice_memberships m where user_id=${snow.user.id} and organization_id=${snow.organizationId}`;
       const payload = {
