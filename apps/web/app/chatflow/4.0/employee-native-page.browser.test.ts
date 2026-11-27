@@ -562,6 +562,15 @@ suite('4.0 browser cold entry', () => {
       } finally {
         await limited.close();
       }
+
+      await page.route('**/api/v1/auth/session', (route) =>
+        route.fulfill({ status: 401 }),
+      );
+      await page.route('**/login', (route) =>
+        route.fulfill({ body: 'synthetic login' }),
+      );
+      f.identityRevoked.abort();
+      await page.waitForURL(f.origin + '/login');
     },
   );
 });

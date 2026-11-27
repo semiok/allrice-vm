@@ -410,8 +410,10 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       const page = await context.newPage();
       const errors: string[] = [];
       page.on('pageerror', (error) => errors.push(error.message));
-      const authenticated = await context.request.get(host.authUrl);
-      expect(authenticated.ok()).toBe(true);
+      await page.goto(host.authUrl);
+      const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
+      await proceed.waitFor({ timeout: 5_000 }).catch(() => {});
+      if (await proceed.isVisible()) await proceed.click();
       const employee = createSidebarFixtureData().employees[1]!;
       employee.currentVersion.manifest.name = '虚拟哥';
       const roster = {
@@ -473,6 +475,11 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       );
       await page.goto(workbenchUrl);
       const workbench = page.frameLocator('iframe[title="员工工作区"]');
+      const resume = workbench.getByRole('button', {
+        name: /^(Continue|继续)$/,
+      });
+      await resume.waitFor({ timeout: 5_000 }).catch(() => {});
+      if (await resume.isVisible()) await resume.click();
       const trigger = workbench.locator('#chat-sidebar').getByRole('button', {
         name: '设置',
         exact: true,

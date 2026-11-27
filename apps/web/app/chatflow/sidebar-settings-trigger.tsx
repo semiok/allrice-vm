@@ -30,7 +30,7 @@ export function SidebarSettingsButton({
   dialog = true,
 }: {
   collapsed: boolean;
-  expanded: boolean;
+  expanded?: boolean;
   onOpen: () => void;
   dialog?: boolean;
 }) {

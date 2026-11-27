@@ -140,12 +140,7 @@ function SettingsPane({
 /** SettingsRoot supplies the live launcher; the native Dock owns the right tab. */
 export function applyEmployeeSettingsPane(ctx: Context) {
   ctx.inject(
-    [
-      'allriceEmployeeWorkbenchSettings',
-      'sidebarRightTabs',
-      'sidebarRight',
-      'layout',
-    ],
+    ['allriceEmployeeWorkbenchSettings', 'sidebarRightTabs', 'sidebarRight'],
     (scope) => {
       const port = scope.allriceEmployeeWorkbenchSettings;
       const lifetime = new AbortController();
@@ -161,21 +156,10 @@ export function applyEmployeeSettingsPane(ctx: Context) {
           signal.removeEventListener('abort', listener);
         };
       };
-      const subscribePresentation = (listener: () => void) => {
-        const disposeTabs = right.openTabs.subscribe(listener);
-        const disposeLayout = scope.layout.panelInfo.subscribe(listener);
-        return () => {
-          disposeTabs();
-          disposeLayout();
-        };
-      };
-      const expanded = () =>
-        right.isExpanded() && right.active()?.kind === settingsTab;
       let launcher: { open: () => void } | undefined;
       scope.effect(() => () => lifetime.abort());
       function Launcher({ wide, openSettings }: SettingsLauncherOwnerProps) {
         const live = useSyncExternalStore(subscribe, current);
-        const open = useSyncExternalStore(subscribePresentation, expanded);
         useLayoutEffect(() => {
           const binding = { open: openSettings };
           launcher = binding;
@@ -187,7 +171,6 @@ export function applyEmployeeSettingsPane(ctx: Context) {
         return (
           <SidebarSettingsButton
             collapsed={!wide}
-            expanded={open}
             dialog={false}
             onOpen={() => {
               if (!current()) return;
