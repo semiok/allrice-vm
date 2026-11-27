@@ -51,6 +51,8 @@ it
     const f = await fixture(release);
     const otherThread = randomUUID();
     const revokeOther = switching ? f.registerThread(otherThread) : undefined;
+    const cross =
+      scenario === 'switch' ? await f.registerOtherEmployee() : undefined;
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       ['root', 'root-' + otherThread].includes(String(row.sessionId))
         ? { ...row, blank: true, cwd: '/work' }
@@ -304,9 +306,12 @@ it
         documentLoads++;
         const selection = {
           ...f.selection,
+          employeeInstanceId:
+            url.searchParams.get('employeeInstanceId') ??
+            f.selection.employeeInstanceId,
           threadId: url.searchParams.get('threadId') ?? f.selection.threadId,
         };
-        const identity = { ...f.identity, threadId: selection.threadId };
+        const identity = f.selectionIdentity(selection);
         const nativeId =
           selection.threadId === otherThread ? 'root-' + otherThread : 'root';
         const version = {
@@ -317,20 +322,28 @@ it
           ...identity,
           viewerId: identity.personId,
           employees: [
-            {
-              id: identity.employeeInstanceId,
-              employeeId: identity.employeeInstanceId,
-              isDefault: true,
-              currentVersion: version,
-              versions: [version],
-            },
-          ],
+            f.selection.employeeInstanceId,
+            ...(cross ? [cross.identity.employeeInstanceId] : []),
+          ].map((id) => ({
+            id,
+            employeeId: id,
+            isDefault: id === f.selection.employeeInstanceId,
+            currentVersion: version,
+            versions: [version],
+          })),
           sessions: (switching
-            ? [f.selection.threadId, otherThread]
+            ? [
+                f.selection.threadId,
+                otherThread,
+                ...(cross ? [cross.identity.threadId!] : []),
+              ]
             : [selection.threadId]
           ).map((id) => ({
             id,
-            employeeInstanceId: identity.employeeInstanceId,
+            employeeInstanceId:
+              id === cross?.identity.threadId
+                ? cross.identity.employeeInstanceId
+                : f.selection.employeeInstanceId,
             ownerId: identity.personId,
             updatedAt: '2026-01-01T00:00:00.000Z',
             createdAt: '2026-01-01T00:00:00.000Z',
@@ -340,6 +353,7 @@ it
         if (!scopeId) return response.writeHead(404).end();
         const bootstrap = await f.publish('bootstrap', scopeId, {
           threadId: selection.threadId,
+          employeeInstanceId: selection.employeeInstanceId,
         });
         if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
         const published = DEntryProfileBootstrapSchema.parse(
@@ -359,7 +373,7 @@ it
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
-            data-native-session-id="${nativeId}" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"
+            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${graph.rev}"
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
@@ -554,6 +568,54 @@ it
             socketCount,
           }),
       );
+      if (cross) {
+        await page.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        await editor.waitFor();
+        const before = { documentLoads, socketCount };
+        const original = await workbench
+          .locator('#app')
+          .getAttribute('data-scope-id');
+        const next = {
+          workspaceId: cross.identity.workspaceId,
+          employeeInstanceId: cross.identity.employeeInstanceId,
+          threadId: cross.identity.threadId,
+        };
+        await workbench.locator('#app').evaluate((node, selection) => {
+          parent.postMessage(
+            {
+              type: 'allrice:d-entry:navigate',
+              scopeId: node.dataset.scopeId,
+              selection,
+            },
+            location.origin,
+          );
+        }, next);
+        await page.waitForURL(
+          (url) =>
+            url.searchParams.get('employeeInstanceId') ===
+            next.employeeInstanceId,
+        );
+        await editor.waitFor();
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-employee-instance-id'),
+        ).toBe(next.employeeInstanceId);
+        expect(
+          await workbench.locator('#app').getAttribute('data-scope-id'),
+        ).not.toBe(original);
+        expect(await editor.innerText()).not.toContain('未发送的原生草稿');
+        expect(documentLoads).toBe(before.documentLoads + 1);
+        expect(socketCount).toBe(before.socketCount + 1);
+        expect(
+          (await f.invokeThread(original!, f.selection.threadId)).status,
+        ).toBe(404);
+        console.info(
+          'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
+        );
+      }
       await cdp.detach();
       await context.close();
       return;

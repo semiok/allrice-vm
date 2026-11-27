@@ -88,6 +88,10 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const roots = new Map([
     [f.selection.threadId, selected.root.nativeSessionId],
   ]);
+  const otherEmployees = new Map<
+    string,
+    { identity: typeof f.identity; owner: typeof f.owner }
+  >();
   const threadRevocations = new Map<string, AbortController>();
   const registerThread = (threadId: string) => {
     const id = 'root-' + threadId;
@@ -100,6 +104,12 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const selectionIdentity = (value: unknown) => {
     const selection = DEntrySelectionInputSchema.parse(value);
     const threadId = selection.threadId;
+    const other = threadId && otherEmployees.get(threadId);
+    if (
+      other &&
+      other.identity.employeeInstanceId === selection.employeeInstanceId
+    )
+      return other.identity;
     return threadId && roots.has(threadId)
       ? { ...f.identity, threadId }
       : f.identity;
@@ -176,6 +186,60 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
           release.read(reference, signal),
       },
     });
+  async function registerOtherEmployee() {
+    const identity = {
+      ...f.identity,
+      employeeInstanceId: randomUUID(),
+      threadId: randomUUID(),
+    };
+    const root = selected.root.nativeSessionId;
+    roots.set(identity.threadId, root);
+    const other = await hostFixture({ ...selected, identity });
+    other.catalog.items = other.catalog.items.map((row) =>
+      String(row.sessionId) === root
+        ? { ...row, blank: true, cwd: '/work' }
+        : row,
+    );
+    closes.push(() => other.close());
+    const otherControl = createDEntryPrincipalControl(other.node, {
+      carrier: carrier.signal,
+      cleanupTimeoutMs: 3000,
+    });
+    closes.push(() => otherControl.close());
+    const endpoint = {
+      ...f.owner.endpoint,
+      employeeInstanceId: identity.employeeInstanceId,
+    };
+    const owner = {
+      ...f.owner,
+      endpoint,
+      bindingRef: f.owner.bindingRef + '-other',
+      receipt: { ...f.owner.receipt, endpoints: [endpoint] },
+      acquirePrincipal: (
+        _context: unknown,
+        input: Parameters<typeof otherControl.acquire>[0],
+        active: AbortSignal,
+      ) => otherControl.acquire(input, active),
+      async readSessions() {
+        return { ok: true as const, value: { items: other.catalog.items } };
+      },
+      ...(release && {
+        fixedProfile: {
+          revoked: profileSource.signal,
+          async readImmutableGraph() {
+            return release.graph;
+          },
+          readImmutableBundle: (
+            reference: string,
+            _bytes: number,
+            signal: AbortSignal,
+          ) => release.read(reference, signal),
+        },
+      }),
+    } satisfies typeof f.owner;
+    otherEmployees.set(identity.threadId, { identity, owner });
+    return { identity, bindingRef: owner.bindingRef };
+  }
   const otherSession = { ...f.context, sessionId: randomUUID() };
   const authenticate = vi.fn(async (token: string) =>
     token === sessionToken
@@ -203,6 +267,16 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   });
   const pages = createDEntryPageRequests({
     ...f.deps,
+    owners: {
+      async resolve(_context, identity) {
+        const other =
+          identity.threadId && otherEmployees.get(identity.threadId);
+        return other &&
+          identity.employeeInstanceId === other.identity.employeeInstanceId
+          ? other.owner
+          : f.deps.owners.resolve();
+      },
+    },
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
     authenticate,
     async watch(_context, selection) {
@@ -326,10 +400,13 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   >(async (target) => {
     const requested = new URL(target);
     expect(requested.pathname).toBe('/api/v1/d-entry/identity');
+    const selection = DEntrySelectionInputSchema.parse(
+      Object.fromEntries(requested.searchParams),
+    );
     return Response.json({
       identity: {
-        ...f.identity,
-        threadId: requested.searchParams.get('threadId'),
+        ...selectionIdentity(selection),
+        threadId: selection.threadId ?? null,
       },
     });
   });
@@ -442,6 +519,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     probe,
     publish,
     registerThread,
+    registerOtherEmployee,
     selectionIdentity,
     invokeThread,
     profileBorrows,

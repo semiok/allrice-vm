@@ -271,7 +271,8 @@ export function installEmployeeProductOwner(ctx: Context) {
         },
       };
       function notice(error: string) {
-        if (!signal!.aborted) sidebar.update({ ...initial, error });
+        const current = sidebar.getSnapshot();
+        if (!signal!.aborted && current) sidebar.update({ ...current, error });
       }
       sidebar.update(initial);
       bindEmployeeSidebar(ctx, {
