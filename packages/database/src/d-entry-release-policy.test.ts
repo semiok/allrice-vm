@@ -40,12 +40,21 @@ const first = id(6);
 const second = id(7);
 const version = id(8);
 const assignedEmployee = id(9);
-const selection = (
-  employeeInstanceId = first,
+const selection = (organizationId = org, personId = person) => ({
+  organizationId,
+  personId,
+});
+const instance = (
+  instanceId = first,
   organizationId = org,
-  personId = person,
-  generation: '4.0' | '3.x' = '4.0',
-) => ({ employeeInstanceId, organizationId, personId, generation });
+  ownerId = person,
+) => ({
+  id: instanceId,
+  organization_id: organizationId,
+  owner_id: ownerId,
+  workspace_id: workspace,
+  employee_id: assignedEmployee,
+});
 
 const signal = () => new AbortController().signal;
 function fixture(
@@ -54,6 +63,7 @@ function fixture(
   defaultGeneration: DEntryRolloutPolicy['defaultGeneration'] = '3.x',
   platformVersion = false,
   tenantVersionVerified = true,
+  instances = [instance()],
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
   const sql = vi.fn(
@@ -75,16 +85,19 @@ function fixture(
       if (query.includes('from person_virtual_machines')) return vm;
       if (query.includes('join allrice_audit_events audit'))
         return [{ verified: tenantVersionVerified }];
-      if (query.includes('from allrice_employee_instances'))
-        return [
-          {
-            owner_id: String(params[2]).toLowerCase(),
-            organization_id: String(params[1]).toLowerCase(),
-            workspace_id: workspace,
-            employee_id: assignedEmployee,
+      if (query.includes('from allrice_employee_instances')) {
+        const [organizations, ownerId] = params as [string[], string];
+        return instances
+          .filter(
+            (row) =>
+              organizations.includes(row.organization_id) &&
+              row.owner_id === ownerId,
+          )
+          .map((row) => ({
+            ...row,
             platform_version: platformVersion,
-          },
-        ];
+          }));
+      }
       throw Error('Unexpected fixture query');
     },
   );
@@ -108,13 +121,8 @@ beforeEach(() => {
   }));
 });
 
-it('pages distinct 4.0 people without splitting same-person selections or including 3.x', async () => {
-  fixture([
-    selection(second),
-    selection(),
-    selection(first, secondOrg, other),
-    selection(first, org, id(9), '3.x'),
-  ]);
+it('pages distinct 4.0 people without splitting a person released in multiple organizations', async () => {
+  fixture([selection(secondOrg), selection(), selection(secondOrg, other)]);
   const roster = await readPersonVmDiskPreparationRoster(signal());
   expect(roster.page(0, 1)).toEqual({ personIds: [person], nextOffset: 1 });
   expect(roster.page(1, 1)).toEqual({
@@ -124,17 +132,32 @@ it('pages distinct 4.0 people without splitting same-person selections or includ
   expect(() => roster.page(0, 0)).toThrow('Invalid disk preparation page');
 });
 
-it('does not authorize policy UUID spellings rejected by the foreground matcher', async () => {
+it('uses the person release contract’s canonical UUID spelling', async () => {
   const spelled = 'a0000000-0000-4000-8000-000000000008';
-  fixture([selection(spelled.toUpperCase())]);
-  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
-  fixture([selection(first, org, spelled.toUpperCase())]);
+  fixture([selection(org, spelled.toUpperCase())], [], '3.x', false, true, [
+    instance(first, org, spelled),
+    instance(second, org, other),
+  ]);
   expect(
     (await readPersonVmDiskPreparationRoster(signal())).page(0, 16).personIds,
-  ).toEqual([]);
+  ).toEqual([spelled]);
   expect(
     await readPersonVmDiskPreparationTarget(spelled.toUpperCase(), signal()),
-  ).toBeNull();
+  ).toMatchObject({
+    personId: spelled,
+    organizationId: org,
+    employeeInstanceId: first,
+  });
+  expect(await readPersonVmDiskPreparationTarget(other, signal())).toBeNull();
+});
+
+it('does not prepare without a current employee of the released person and organization', async () => {
+  fixture([selection()], [], '3.x', false, true, [
+    instance(first, org, other),
+    instance(second, secondOrg, person),
+  ]);
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  expect(data.employee).not.toHaveBeenCalled();
 });
 
 it('fails closed on a published policy that defaults everyone to 4.0', async () => {
@@ -147,7 +170,7 @@ it('fails closed on a published policy that defaults everyone to 4.0', async () 
   ).rejects.toThrow('D entry published policy is unavailable');
 });
 
-it('reads policy, membership and employee version in one short snapshot without a session', async () => {
+it('resolves the released person’s employee from the same snapshot as policy, membership and version', async () => {
   const { begin, seen, sql } = fixture([selection()]);
   expect(await readPersonVmDiskPreparationTarget(person, signal())).toEqual({
     personId: person,
@@ -162,10 +185,13 @@ it('reads policy, membership and employee version in one short snapshot without 
   expect(begin.mock.calls[0]?.[0]).toBe(
     'isolation level repeatable read read only',
   );
-  expect(
-    seen.find(({ query }) => query.includes('from allrice_employee_instances'))
-      ?.params,
-  ).toEqual([first, org, person]);
+  const candidates = seen.find(({ query }) =>
+    query.includes('from allrice_employee_instances'),
+  );
+  expect(candidates?.params).toEqual([[org], person]);
+  expect(candidates?.query).toContain('a.user_id=i.owner_id and a.active');
+  expect(candidates?.query).toContain('i.archived_at is null');
+  expect(candidates?.query).toContain('order by i.organization_id,i.id');
   const subject = {
     actor: { type: 'user', id: person },
     organizationId: org,
@@ -176,7 +202,10 @@ it('reads policy, membership and employee version in one short snapshot without 
 });
 
 it('requires a writable current membership and a live assignment', async () => {
-  fixture([selection(), selection(second)]);
+  fixture([selection()], [], '3.x', false, true, [
+    instance(),
+    instance(second),
+  ]);
   data.principal.mockResolvedValueOnce({ writable: false });
   data.employee.mockRejectedValueOnce(
     new EmployeeInstanceError('instance_archived'),
@@ -187,22 +216,30 @@ it('requires a writable current membership and a live assignment', async () => {
 });
 
 it('denies ambiguous enterprise ownership and respects the existing person disk owner', async () => {
-  const selections = [selection(), selection(second, secondOrg)];
-  fixture(selections);
+  const selections = [selection(), selection(secondOrg)];
+  const instances = [instance(), instance(second, secondOrg)];
+  fixture(selections, [], '3.x', false, true, instances);
   await expect(
     readPersonVmDiskPreparationTarget(person, signal()),
   ).rejects.toMatchObject({
     code: 'ORGANIZATION_CONFLICT',
   });
-  fixture(selections, [
-    {
-      organization_id: secondOrg,
-      phase: 'stopped',
-      disk_retained: true,
-      native_created: false,
-      instance_id: null,
-    },
-  ]);
+  fixture(
+    selections,
+    [
+      {
+        organization_id: secondOrg,
+        phase: 'stopped',
+        disk_retained: true,
+        native_created: false,
+        instance_id: null,
+      },
+    ],
+    '3.x',
+    false,
+    true,
+    instances,
+  );
   expect(
     await readPersonVmDiskPreparationTarget(person, signal()),
   ).toMatchObject({
@@ -330,7 +367,14 @@ it('reports an older platform version with no mapping after deployment moves to 
     'version-source-unverified',
   );
   const proof = seen.find(({ query }) => query.includes('as verified'));
-  expect(proof?.params).toEqual([org, workspace, assignedEmployee, version]);
+  expect(proof?.params).toEqual([
+    org,
+    workspace,
+    assignedEmployee,
+    version,
+    first,
+    person,
+  ]);
   expect(proof?.query).toContain('audit.resource_id=v.id');
   expect(proof?.query).toContain("'admin_published_immutable_manifest'");
   expect(data.publication).not.toHaveBeenCalled();
@@ -342,7 +386,10 @@ it.each([
 ])(
   'skips the same person regardless of the ordering of known and unknown sources (%s, %s)',
   async (left, right) => {
-    fixture([selection(left), selection(right)], [], '3.x', false, false);
+    fixture([selection()], [], '3.x', false, false, [
+      instance(left),
+      instance(right),
+    ]);
     data.employee.mockImplementation(async (_scope, employeeId) => ({
       id: employeeId,
       workspaceId: workspace,
