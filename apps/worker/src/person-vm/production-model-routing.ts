@@ -87,7 +87,16 @@ function rejectCredentialText(value: string) {
     process.env.ALLRICE_OPENAI_API_KEY,
     process.env.ALLRICE_DEEPSEEK_API_KEY,
   ];
-  if (hostKeys.some((key) => key && key.trim() && value.includes(key.trim())))
+  if (
+    hostKeys.some((raw) => {
+      const key = raw?.trim();
+      // Match an exact accidental paste even for short local placeholders.
+      // Only match embedded values when the key is long enough to distinguish it.
+      return (
+        key && (value === key || (key.length >= 16 && value.includes(key)))
+      );
+    })
+  )
     throw new ModelGatewayError('BINDING_INVALID');
 }
 

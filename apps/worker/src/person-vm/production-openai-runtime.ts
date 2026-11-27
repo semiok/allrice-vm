@@ -162,13 +162,15 @@ export async function createProductionOpenAiRuntime(
                   : {}),
                 ...(provider === 'openai' && model === 'gpt-6.2-astra'
                   ? {
-                      contextWindow: 1050000,
+                      contextWindow: 1_050_000,
+                      maxTokens: 128_000,
                       input: ['text', 'image'],
                       reasoningEfforts: {
                         low: 'low',
                         medium: 'medium',
                         high: 'high',
                         xhigh: 'xhigh',
+                        max: 'max',
                       },
                     }
                   : {}),

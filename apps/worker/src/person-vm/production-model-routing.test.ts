@@ -219,6 +219,24 @@ it('refuses a configured Host key pasted into any Guest model or session selecto
     });
 });
 
+it('does not confuse a short credential placeholder with part of an approved model ID', async () => {
+  const { responses } = routeFixture();
+  vi.stubEnv('ALLRICE_DEEPSEEK_API_KEY', 'pro');
+  const signal = new AbortController().signal;
+  const routing = await createProductionModelRouting(
+    signal,
+    'routing-fixture',
+    async () => {
+      throw new Error('fixture does not read images');
+    },
+  );
+  cleanups.push(routing.close);
+  expect(routing.select(responses.vm, responses.native)).toEqual(
+    modelRoutes.responses,
+  );
+  expect(routing.provider(responses).requireTransportProof).toBe(true);
+});
+
 it('isolates a missing opt-in OpenAI default key and publishes true Astra capabilities', async () => {
   const { base, chat } = routeFixture();
   vi.stubEnv('ALLRICE_DSH_MODEL_PROVIDER', 'openai');
@@ -236,12 +254,11 @@ it('isolates a missing opt-in OpenAI default key and publishes true Astra capabi
   ).toMatchObject({
     provider: 'openai',
     id: 'gpt-6.2-astra',
-    context: { contextWindow: 1050000 },
+    context: { contextWindow: 1_050_000 },
     inputModalities: ['text', 'image'],
+    defaultMaxTokens: 128_000,
     reasoning: {
-      efforts: expect.arrayContaining([
-        expect.objectContaining({ id: 'high' }),
-      ]),
+      efforts: expect.arrayContaining([expect.objectContaining({ id: 'max' })]),
     },
   });
   await expect(

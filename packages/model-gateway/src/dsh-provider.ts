@@ -69,7 +69,7 @@ export function createDshGatewayProvider(
           }),
         }
       : {}),
-    ...(fetchOwned ? { requireTransportProof: true as const } : {}),
+    ...(confirmTransportClosed ? { requireTransportProof: true as const } : {}),
     fetchOwned,
     assertDispatchCurrent,
     confirmTransportClosed,
