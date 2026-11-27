@@ -68,7 +68,7 @@ export function createAssignedNativeWebStartup(input: {
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
-    'cliPath' | 'startupTimeoutMs'
+    'cliPath' | 'startupTimeoutMs' | 'terminalEnabled'
   > & {
     publicUrl(endpoint: Endpoint, binding: PersonVmBinding): string;
   };

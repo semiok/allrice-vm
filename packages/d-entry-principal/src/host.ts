@@ -1,9 +1,11 @@
+import { pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
   Remote,
   TypertRemoteService,
   isTypertRemoteMethod,
   isRemoteJsonValue,
+  RemoteError,
   remoteErrorOf,
   type PeerScope,
   type RemoteStream,
@@ -39,6 +41,7 @@ import {
 } from './policy.js';
 import type {
   CloseCommand,
+  DEntryPageInput,
   DEntryPrincipal,
   DEntryScopeIssue,
   DEntryPageNativeCall,
@@ -954,33 +957,64 @@ class PrincipalService extends TypertRemoteService {
     signal: AbortSignal,
   ): RemoteStream<
     DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError,
-    CloseCommand
+    CloseCommand | DEntryPageInput
   > {
     const { args, invocation } = this.raw('allricePrincipal/streamScoped');
     const raw = object.parse(args.call);
     const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
     const gate = signalGate(signal);
-    const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
-    const pump = commands(input, gate.stop);
-    void pump.catch(() => gate.stop());
+    const input = invocation
+      .uplink<CloseCommand | DEntryPageInput>()
+      [Symbol.asyncIterator]();
     let iterator: AsyncIterator<unknown> | undefined,
       pending: Promise<IteratorResult<unknown>> | undefined;
     let closing: Promise<void> | undefined;
     let eventReady = false;
     const events = raw.kind === 'events';
     const page = raw.kind === 'page';
+    const endpoint = page ? z.string().parse(raw.endpoint) : undefined;
+    const inbox = endpoint === undefined ? undefined : pageUplink(endpoint);
     let pageMethod: ReturnType<PrincipalService['pageMethod']> | undefined;
+    let inputFailure: unknown;
+    const pump = pumpPageInput(input, (command) => {
+      if (
+        !inbox ||
+        (command.type === 'input' &&
+          pageMethod &&
+          !pageMethod.descriptor.uplink)
+      )
+        throw new RemoteError(
+          'gateway/protocol',
+          'Native stream does not accept input',
+          { endpoint: endpoint ?? '' },
+        );
+      inbox.add(command);
+    })
+      .catch((error: unknown) => {
+        inputFailure = error;
+      })
+      .finally(gate.stop);
     const active = AbortSignal.any([scope.abort.signal, gate.abort.signal]);
+    if (inbox) {
+      if (active.aborted) inbox.close();
+      else active.addEventListener('abort', inbox.close, { once: true });
+    }
     const setup = scope.own(async () => {
       active.throwIfAborted();
       if (page) {
         iterator = await scope.current(async () => {
           pageMethod = this.pageMethod(scope, raw, 'stream');
-          const { endpoint, args } = pageMethod;
+          const { endpoint, args, descriptor } = pageMethod;
+          if (!descriptor.uplink && inbox && inbox.hasItems())
+            throw new RemoteError(
+              'gateway/protocol',
+              'Native stream does not accept input',
+              { endpoint },
+            );
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
-            empty,
+            (descriptor.uplink && inbox) || empty,
             endpoint === 'remoteAccess/follow'
               ? scope.currentPeer()
               : scope.parent,
@@ -1067,6 +1101,7 @@ class PrincipalService extends TypertRemoteService {
             throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
           scope.children.delete(child);
         });
+        if (inbox) inbox.close();
         gate.stop();
         return closing;
       },
@@ -1161,10 +1196,16 @@ class PrincipalService extends TypertRemoteService {
             .parse(next.value);
         yield { type: 'item', scopeId: scope.issue.scopeId, value };
       }
+      if (inputFailure !== undefined) throw inputFailure;
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
-      if (page && !active.aborted && !signal.aborted) {
+      if (
+        page &&
+        !scope.abort.signal.aborted &&
+        !signal.aborted &&
+        (!active.aborted || error === inputFailure)
+      ) {
         await child.close();
         const failure = this.ctx.typertGateway.wireStream.failure(error);
         yield {

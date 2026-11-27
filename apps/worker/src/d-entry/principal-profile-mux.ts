@@ -18,6 +18,7 @@ import {
   DEntryPageUnarySchema,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { DEntryPageInput } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import {
@@ -260,7 +261,14 @@ async function runStreams(
   signal: AbortSignal,
 ) {
   const send = sendTo(peer);
-  const streams = new Map<string, { cancel(): void; work: Promise<void> }>();
+  const streams = new Map<
+    string,
+    {
+      cancel(): void;
+      sendInput(input: DEntryPageInput): Promise<void>;
+      work: Promise<void>;
+    }
+  >();
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
   const active = AbortSignal.any([signal, stop.signal]);
@@ -268,37 +276,34 @@ async function runStreams(
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = Promise.resolve()
-      .then(async () => {
-        await page.assertCurrent(child);
-        let source: AsyncIterable<{ scopeId: string; value: unknown }>;
-        if (frame.endpoint === '$events') {
-          emptyPayload.parse(frame.payload);
-          source = page.scope.stream(
-            {
-              kind: 'events',
-              scopeId,
-              payload: REMOTE_EVENT_STREAM_PAYLOAD,
-            },
-            child,
-          );
-        } else {
-          const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
-          const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
-            frame.payload,
-          );
-          if (!isRemoteJsonValue(args)) throw denied();
-          source = page.scope.streamPage(
-            {
-              kind: 'page',
-              scopeId,
-              endpoint,
-              args: args as Record<string, JsonValue>,
-            },
-            child,
-          );
-        }
-        for await (const item of source) {
+    const source = (async () => {
+      await page.assertCurrent(child);
+      child.throwIfAborted();
+      if (frame.endpoint === '$events') {
+        emptyPayload.parse(frame.payload);
+        return page.scope.stream(
+          { kind: 'events', scopeId, payload: REMOTE_EVENT_STREAM_PAYLOAD },
+          child,
+        );
+      }
+      const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
+      const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
+        frame.payload,
+      );
+      if (!isRemoteJsonValue(args)) throw denied();
+      return page.scope.streamPage(
+        {
+          kind: 'page',
+          scopeId,
+          endpoint,
+          args: args as Record<string, JsonValue>,
+        },
+        child,
+      );
+    })();
+    const work = source
+      .then(async (stream) => {
+        for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
           await page.assertCurrent(child);
@@ -321,7 +326,21 @@ async function runStreams(
         }
       })
       .finally(() => streams.delete(id));
-    streams.set(id, { cancel: () => controller.abort(), work });
+    streams.set(id, {
+      work,
+      cancel: () => controller.abort(),
+      async sendInput(input) {
+        const stream = await source.catch(() => undefined);
+        if (!stream || child.aborted) return;
+        if (!('send' in stream)) {
+          if (input.type === 'input') throw denied();
+          controller.abort();
+          return;
+        }
+        await page.assertCurrent(child);
+        if (streams.has(id) && !child.aborted) stream.send(input);
+      },
+    });
     void work.catch((error) => stop.abort(error));
   }
   try {
@@ -334,9 +353,21 @@ async function runStreams(
       if (binary) throw denied();
       const frame = parseRemoteStreamClientMessage(String(message));
       const prior = streams.get(frame.streamId);
-      if (frame.type === 'open' && !prior) open(frame);
-      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
-      else throw denied();
+      if (frame.type === 'open') {
+        if (prior) throw denied();
+        open(frame);
+      } else if (frame.type === 'cancel') {
+        prior?.cancel();
+      } else if (frame.type === 'end') {
+        await prior?.sendInput({ type: 'input-end' });
+      } else {
+        if (frame.value !== undefined && !isRemoteJsonValue(frame.value))
+          throw denied();
+        await prior?.sendInput({
+          type: 'input',
+          value: frame.value as JsonValue | undefined,
+        });
+      }
     }
   } finally {
     stop.abort();

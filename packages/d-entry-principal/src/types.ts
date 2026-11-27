@@ -46,6 +46,9 @@ export type DEntryScopeIssue =
       root?: DEntryPrincipalIssue['root'];
     }>;
 export type CloseCommand = 'close';
+export type DEntryPageInput =
+  | Readonly<{ type: 'input'; value?: JsonValue }>
+  | Readonly<{ type: 'input-end' }>;
 export type NonOwnerBaseline = Extract<RemoteAccessBaseline, { owner: false }>;
 export type ScopeFrame =
   | Readonly<{
@@ -170,7 +173,9 @@ export interface DEntryPrincipalControlScope {
   streamPage(
     call: DEntryPageNativeCall,
     signal: AbortSignal,
-  ): AsyncIterable<DEntryPageNativeItem>;
+  ): AsyncIterable<DEntryPageNativeItem> & {
+    send(input: DEntryPageInput): void;
+  };
   close(): Promise<void>;
 }
 export interface DEntryPrincipalActivity {

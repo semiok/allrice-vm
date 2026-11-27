@@ -60,7 +60,6 @@ const pluginMarket = new Set(['pluginMarket']);
 const dynamicPlugins = new Set(['dynamicCordisRunner']);
 const runtimeUpgrade = new Set(['runtimeUpgrade', 'updater', 'dshUpdater']);
 const credentialManagement = new Set(['credentials', 'credentialsController']);
-const interactiveTerminal = new Set(['terminal', 'terminalController']);
 const filePreview = new Set(['workspaceFiles', 'officeToPdf']);
 
 function inCategory(endpoint: Method, values: ReadonlySet<string>) {
@@ -69,10 +68,7 @@ function inCategory(endpoint: Method, values: ReadonlySet<string>) {
 
 /** The sealed file preview controllers remain unavailable on the page. */
 export function isRetainedPageRestriction(endpoint: Method) {
-  return (
-    inCategory(endpoint, interactiveTerminal) ||
-    inCategory(endpoint, filePreview)
-  );
+  return inCategory(endpoint, filePreview);
 }
 
 /** A category rule for generated DSH methods. */
@@ -136,16 +132,7 @@ export function sensitivePageCapability(
   }
 }
 
-/** The sealed employee profile does not register a terminal controller.
- * Report its capability on an upgrade even though the profile owns disablement. */
-export function sensitivePageUpgradeCapability(endpoint: Method) {
-  return (
-    sensitivePageCapability(endpoint) ??
-    (inCategory(endpoint, interactiveTerminal)
-      ? 'interactive-shell'
-      : undefined)
-  );
-}
+export const sensitivePageUpgradeCapability = sensitivePageCapability;
 
 /** Notifications may refresh authorized reads. Platform lifecycle requests,
  * installation output and credential notifications remain managed. */

@@ -1245,6 +1245,68 @@ it('keeps workspace file preview and private relay calls out of native dispatch'
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
 
+it('carries native terminal input, resize and output across the owned VM stream', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const web = createRequire(
+    new URL('../../../web/package.json', import.meta.url),
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(
+      web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+    ).href
+  );
+  host.typert.register(TYPERT);
+  const life = await open(f);
+  expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
+  const descriptor = host.typert.local.get('terminal', 'attach');
+  const inputCodec = descriptor?.uplink?.codec.create();
+  if (!inputCodec) throw Error('Native terminal input schema missing');
+  const wire = host.typertGateway.wireStream;
+  const dispatch = wire.open.bind(wire);
+  const inputs: unknown[] = [];
+  const attach = vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    if (args[0] !== 'terminal/attach') return dispatch(...args);
+    return (async function* () {
+      for await (const raw of args[2]) {
+        inputs.push(inputCodec.parse(raw));
+      }
+      yield { type: 'ack', sequence: 2 };
+      yield { type: 'output', sequence: 3, data: 'guest-file\r\n' };
+    })();
+  });
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const receive = messages(peer);
+  const streamId = 'terminal';
+  const payload = { args: { agentId: 'root', id: 'terminal-fixture' } };
+  send(peer, { type: 'open', streamId, endpoint: 'terminal/attach', payload });
+  const write = { type: 'write', sequence: 1, data: 'ls\r' };
+  const resize = { type: 'resize', sequence: 2, cols: 100, rows: 32 };
+  send(peer, { type: 'item', streamId, value: write });
+  send(peer, { type: 'item', streamId, value: resize });
+  send(peer, { type: 'end', streamId });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'ack', sequence: 2 },
+  });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'output', sequence: 3, data: 'guest-file\r\n' },
+  });
+  expect(await receive(streamId)).toMatchObject({ type: 'end' });
+  expect(inputs).toEqual([write, resize]);
+  expect(attach).toHaveBeenCalledWith(
+    'terminal/attach',
+    payload,
+    expect.any(Object),
+    expect.any(Object),
+    expect.any(AbortSignal),
+  );
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
 it('reattaches native binary reply bytes using the generated field path', async () => {
   const f = await fixture();
   const life = await open(f);

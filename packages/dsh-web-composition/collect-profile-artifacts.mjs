@@ -22,6 +22,7 @@ export async function collectProfileArtifacts({
   installAnchor,
   resolutionAnchor = installAnchor,
   host,
+  terminalEnabled = true,
 }) {
   const require = createRequire(resolutionAnchor);
   const fromNative = (name) =>
@@ -48,7 +49,18 @@ export async function collectProfileArtifacts({
   const overlay = join(profileDir, 'build-only.patch.yml');
   await writeFile(
     overlay,
-    '- id: web-runtime\n  config:\n    openBrowser: false\n    printUrl: false\n    surfaceContext: true\n',
+    JSON.stringify([
+      {
+        id: 'web-runtime',
+        config: { openBrowser: false, printUrl: false, surfaceContext: true },
+      },
+      ...(terminalEnabled
+        ? []
+        : [
+            { id: 'terminal-controller', disabled: true },
+            { id: 'ui-sidebar-terminal', disabled: true },
+          ]),
+    ]),
   );
   const profile = loadProfileDirectory(
     'allrice-artifact',
@@ -99,6 +111,14 @@ export async function collectProfileArtifacts({
     if (web.host !== host)
       throw new Error('Employee profile listener mismatch');
     const graph = modules.graph();
+    const terminalUi = graph.entries.some(
+      ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
+    );
+    if (
+      Boolean(root.get('terminalController')) !== terminalEnabled ||
+      terminalUi !== terminalEnabled
+    )
+      throw new Error('Employee profile terminal configuration mismatch');
     const picker = graph.entries.filter(({ id }) =>
       id.startsWith('@deepseek-ai/dsh-client-ui-directory-picker-'),
     );

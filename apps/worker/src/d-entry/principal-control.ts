@@ -10,6 +10,7 @@ import type {
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   DEntryScopeIssueSchema,
+  type DEntryPageInput,
   type DEntryPageNativeCall,
   type DEntryPageNativeError,
   type DEntryPageNativeItem,
@@ -470,6 +471,10 @@ export function createDEntryPrincipalControl(
               let taken = false;
               return {
                 close: () => child.close(),
+                send(command: DEntryPageInput) {
+                  current.throwIfAborted();
+                  handle.send(command);
+                },
                 async *[Symbol.asyncIterator]() {
                   if (taken) throw Error('PRINCIPAL_STREAM_ALREADY_CONSUMED');
                   taken = true;
@@ -523,14 +528,20 @@ export function createDEntryPrincipalControl(
                   },
                 };
               },
-              async *streamPage(call, active) {
-                let failure: DEntryPageNativeError['error'] | undefined;
-                for await (const frame of stream(call, active)) {
-                  if (failure || frame.type === 'item') throw unknown();
-                  if (frame.type === 'page-error') failure = frame.error;
-                  else yield frame;
-                }
-                if (failure) throw failure;
+              streamPage(call, active) {
+                const child = stream(call, active);
+                return {
+                  send: child.send,
+                  async *[Symbol.asyncIterator]() {
+                    let failure: DEntryPageNativeError['error'] | undefined;
+                    for await (const frame of child) {
+                      if (failure || frame.type === 'item') throw unknown();
+                      if (frame.type === 'page-error') failure = frame.error;
+                      else yield frame;
+                    }
+                    if (failure) throw failure;
+                  },
+                };
               },
               close: activity.close,
             } satisfies DEntryPrincipalControlScope;

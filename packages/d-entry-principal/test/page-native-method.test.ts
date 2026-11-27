@@ -48,6 +48,36 @@ it('uses a live DSH descriptor for new native methods and requires the matching 
   ).toThrow('DSH method unavailable');
 });
 
+it('admits native terminal methods with their ordinary stream uplink descriptor', () => {
+  const create = descriptor('terminal', 'create');
+  const attach = descriptor('terminal', 'attach', {
+    mode: 'stream',
+    uplink: {
+      mode: 'strict',
+      typeSymbol: 'TerminalInput',
+      create: () => z.string(),
+    },
+  });
+  expect(
+    requirePageNativeMethod(
+      { get: () => create },
+      'terminal/create',
+      'unary',
+      {},
+      new Set(),
+    ),
+  ).toBe(create);
+  expect(
+    requirePageNativeMethod(
+      { get: () => attach },
+      'terminal/attach',
+      'stream',
+      {},
+      new Set(),
+    ),
+  ).toBe(attach);
+});
+
 it('excludes the private AllRice registry and refuses managed operations before dispatch', () => {
   const privateMethod = descriptor('allricePrincipal', 'openScope', {
     id: '@allrice/d-entry-principal#allricePrincipal/openScope',
@@ -119,7 +149,6 @@ it('keeps sensitive Host effects and file preview unavailable even when register
     ['dynamicCordisRunner', 'settleUserRun', 'unary'],
     ['pluginMarket', 'setIndexes', 'unary'],
     ['runtimeUpgrade', 'install', 'unary'],
-    ['terminal', 'attach', 'stream'],
     ['workspaceFiles', 'changes', 'stream'],
     ['workspaceFiles', 'readBytes', 'unary'],
     ['officeToPdf', 'render', 'unary'],

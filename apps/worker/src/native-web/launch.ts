@@ -33,6 +33,7 @@ export type NativeWebConfiguration = Readonly<{
   workdir: string;
   cliPath: string;
   startupTimeoutMs: number;
+  terminalEnabled?: boolean;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -261,6 +262,12 @@ export function apply(ctx, config) {
               },
             ],
           },
+          ...(config.terminalEnabled === false
+            ? [
+                { id: 'terminal-controller', disabled: true },
+                { id: 'ui-sidebar-terminal', disabled: true },
+              ]
+            : []),
           ...(commandMemory ?? []),
           ...(modelAdapter
             ? [

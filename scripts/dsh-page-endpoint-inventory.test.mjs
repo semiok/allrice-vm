@@ -145,6 +145,5 @@ it('reports only additions matching sensitive capabilities and ignores removals 
   ).toEqual([
     ['pluginManager/installFromArchive', 'plugin-management'],
     ['credentials/watch', 'provider-configuration'],
-    ['terminal/create', 'interactive-shell'],
   ]);
 });
