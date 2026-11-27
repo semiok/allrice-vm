@@ -1383,7 +1383,7 @@ it('retains the native terminal through a page reconnect and joins owner cleanup
     id: 'retained-pty',
     title: 'Shell',
     cwd: '/work',
-    shell: { path: '/bin/sh', name: 'sh' },
+    shell: { path: '/bin/sh', name: 'sh', args: [] },
     cols: 80,
     rows: 24,
     state: 'running',
@@ -1391,7 +1391,6 @@ it('retains the native terminal through a page reconnect and joins owner cleanup
   };
   const closing = deferred();
   const closed = deferred();
-  const observed = deferred();
   closes.push(async () => closed.resolve());
   const invoke = host.typertGateway.invoke.bind(host.typertGateway);
   const native = vi
@@ -1435,15 +1434,20 @@ it('retains the native terminal through a page reconnect and joins owner cleanup
 
   f.identityRevoked.abort(new DataAccessError('authentication_required'));
   await closing.promise;
-  void f.closeControl().then(() => observed.resolve());
+  const observed = f.closeControl();
   let joined = false;
-  void observed.promise.then(() => {
-    joined = true;
-  });
+  void observed.then(
+    () => {
+      joined = true;
+    },
+    () => {
+      joined = true;
+    },
+  );
   await new Promise<void>((resolve) => setImmediate(resolve));
   expect(joined).toBe(false);
   closed.resolve();
-  await observed.promise;
+  await observed;
   expect(
     native.mock.calls.filter(([call]) => call.method === 'close'),
   ).toHaveLength(1);
