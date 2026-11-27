@@ -496,7 +496,12 @@ suite('4.0 browser cold entry', () => {
       );
       await returnPage.close();
 
-      for (const code of [400, 401, 403, 404]) {
+      for (const [code, title] of [
+        [400, '暂时打不开这条对话'],
+        [401, '请重新登录'],
+        [403, '当前请求未获授权'],
+        [404, '暂时打不开这条对话'],
+      ] as const) {
         const unavailable = await context.newPage();
         try {
           await unavailable.route('**/api/v1/d-entry/native-prewarm', (route) =>
@@ -509,18 +514,19 @@ suite('4.0 browser cold entry', () => {
           await unavailable
             .getByRole('alert')
             .getByRole('heading', {
-              name: signIn ? '请重新登录' : '暂时打不开这条对话',
+              name: title,
               exact: true,
             })
             .waitFor();
-          expect(
-            await unavailable
-              .getByRole('link', {
-                name: signIn ? '重新登录' : '返回员工页',
-                exact: true,
-              })
-              .getAttribute('href'),
-          ).toBe(signIn ? '/login?next=%2Fchatflow%2F4.0' : '/chatflow/4.0');
+          if (code !== 403)
+            expect(
+              await unavailable
+                .getByRole('link', {
+                  name: signIn ? '重新登录' : '返回员工页',
+                  exact: true,
+                })
+                .getAttribute('href'),
+            ).toBe(signIn ? '/login?next=%2Fchatflow%2F4.0' : '/chatflow/4.0');
           expect(
             await unavailable.getByText(extensionHint, { exact: true }).count(),
           ).toBe(0);
@@ -528,6 +534,35 @@ suite('4.0 browser cold entry', () => {
         } finally {
           await unavailable.close();
         }
+      }
+
+      const mismatchedEntry = await context.newPage();
+      try {
+        await mismatchedEntry.route(
+          '**/api/v1/d-entry/native-prewarm',
+          (route) => route.fulfill({ status: 204 }),
+        );
+        await mismatchedEntry.route(
+          (url) =>
+            url.pathname === '/api/v1/sessions' && url.search === '?entry=4.0',
+          (route) =>
+            route.fulfill({ json: { ...employee, threadId: randomUUID() } }),
+        );
+        await mismatchedEntry.goto(
+          f.origin +
+            '/chatflow/4.0?' +
+            new URLSearchParams({ ...employee, new: randomUUID() }),
+        );
+        await mismatchedEntry
+          .getByRole('alert')
+          .getByRole('heading', {
+            name: '暂时打不开这条对话',
+            exact: true,
+          })
+          .waitFor();
+        expect(await mismatchedEntry.locator('iframe').count()).toBe(0);
+      } finally {
+        await mismatchedEntry.close();
       }
 
       const stalledDocument = await context.newPage();

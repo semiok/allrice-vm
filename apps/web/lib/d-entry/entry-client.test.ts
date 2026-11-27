@@ -153,7 +153,7 @@ it('keeps the New operation ID out of the prewarm selector and requires its exac
   vi.stubGlobal('fetch', fetch);
   await expect(
     prepareEmployeeEntry(input, new AbortController().signal, () => {}),
-  ).rejects.toMatchObject({ status: 403 });
+  ).rejects.toMatchObject({ status: 403, reason: 'response-mismatch' });
   expect(
     fetch.mock.calls.map(([path, options]) => [
       path,

@@ -249,6 +249,7 @@ export function EmployeeNativePage({
         | 'cancelled'
         | 'failed'
         | 'asset-timeout'
+        | 'denied'
         | 'selection-unavailable'
         | 'sign-in',
       retainTicket = status === 'cancelled',
@@ -581,11 +582,13 @@ export function EmployeeNativePage({
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;
       if (!prepare) return setFailed(true);
-      const status = error instanceof EmployeeEntryError ? error.status : 0;
-      if (status === 401) finish('sign-in');
-      else if ([400, 403, 404].includes(status))
+      if (!(error instanceof EmployeeEntryError)) return finish('failed');
+      const responseMismatch = error.reason === 'response-mismatch';
+      if (error.status === 401) finish('sign-in');
+      else if (error.status === 403 && !responseMismatch) finish('denied');
+      else if (responseMismatch || [400, 404].includes(error.status))
         finish('selection-unavailable');
-      else finish('failed', status === 408);
+      else finish('failed', error.status === 408);
     });
     return () => {
       window.clearTimeout(timer);
@@ -656,7 +659,7 @@ const messages = {
   cancelled: ['已取消等待', '可以继续打开工作台。'],
   'selection-unavailable': ['暂时打不开这条对话', '可以返回员工页重选。'],
   'sign-in': ['请重新登录', '登录后再打开工作台。'],
-  denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
+  denied: ['当前请求未获授权', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
   unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
 } as const;
