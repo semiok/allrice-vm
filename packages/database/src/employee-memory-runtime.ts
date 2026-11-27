@@ -7,6 +7,7 @@ import {
   ActualNativeCallSelectorProjectionSchema,
   ActualNativeExecutionSelectorProjectionSchema,
   AdoptedHumanSourceProjectionSchema,
+  type AdoptedHumanSourceProjection,
   CurrentEmployeeBusinessProjectionSchema,
   BuiltinEmployeeModuleRequirementProjectionSchema,
   LogicalExecutionBindingProjectionSchema,
