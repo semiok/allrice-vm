@@ -35,6 +35,7 @@ import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
 import {
   issueMemoryContextStorage,
   readMemoryContextStorageOrdinal,
+  restoreMemoryContextStorage,
   type MemoryContextStorageDraft,
 } from './memory-context-store.ts';
 import {
@@ -426,6 +427,7 @@ export async function issueNativeEmployeeMemoryContext(
   context: RequestContext,
   input: NativeMemoryTarget,
   signal: AbortSignal,
+  mode: 'issue' | 'restore' = 'issue',
 ) {
   const target = NativeMemoryTargetSchema.parse(input);
   const document = await caller(
@@ -439,17 +441,26 @@ export async function issueNativeEmployeeMemoryContext(
         execution.nativeSessionRef !== execution.binding.rootSessionRef
       )
         return denied();
-      const saved = await issueMemoryContextStorage(
-        bound.tx,
-        storageKey(bound, execution),
-        () => draft(bound, execution, signal),
-        signal,
-        qualifier(bound, signal),
-      );
+      const key = storageKey(bound, execution);
+      const source = qualifier(bound, signal);
+      const saved =
+        mode === 'restore'
+          ? await restoreMemoryContextStorage(bound.tx, key, signal, source)
+          : await issueMemoryContextStorage(
+              bound.tx,
+              key,
+              () => draft(bound, execution, signal),
+              signal,
+              source,
+            );
       if (
         saved.origin.nativeOwnerRef !== execution.nativeOwnerRef ||
         saved.origin.nativeProfileRef !== execution.nativeProfileRef ||
-        saved.origin.rootNativeSessionRef !== execution.binding.rootSessionRef
+        saved.origin.rootNativeSessionRef !==
+          execution.binding.rootSessionRef ||
+        (mode === 'restore' &&
+          saved.origin.moduleConfigRevisionRef !==
+            execution.moduleConfigRevisionRef)
       )
         return unavailable();
       return saved.document;

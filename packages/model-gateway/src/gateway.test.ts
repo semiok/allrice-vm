@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import {
   createAssistantMessage,
@@ -38,6 +38,38 @@ async function setup(
   cleanup.push(() => gateway.close());
   return { upstream, native, ...gateway };
 }
+it('hashes the same trusted context that reaches the provider, and refuses stale context before claiming', async () => {
+  const sent = vi.fn();
+  const store = new FixtureStore();
+  const context = vi.fn(async () => 'sealed memory index');
+  const f = await gatewayFixture({
+    store,
+    readTrustedContext: context,
+    provider: {
+      classify: () => null,
+      async *stream(_binding, input) {
+        sent(input);
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+  });
+  cleanup.push(() => f.close());
+  await f.collect({ ...f.input(), system: 'original prompt' });
+  expect(sent).toHaveBeenCalledTimes(1);
+  const finalInput: unknown = sent.mock.calls[0]![0];
+  expect(finalInput).toMatchObject({
+    system: 'original prompt\n\nsealed memory index',
+  });
+  expect([...store.calls.values()][0]?.digest).toBe(
+    'sha256:' +
+      createHash('sha256').update(JSON.stringify(finalInput)).digest('hex'),
+  );
+  context.mockRejectedValueOnce(new ModelGatewayError('AUTHORIZATION_DENIED'));
+  await f.collect();
+  expect(context).toHaveBeenCalledTimes(2);
+  expect(sent).toHaveBeenCalledTimes(1);
+  expect(store.calls.size).toBe(1);
+});
 it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
   const f = await setup();
   const status = await new Promise<number | undefined>((resolve, reject) => {

@@ -8,6 +8,7 @@ import {
   nativeExecutionEvidenceSource,
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
+  recoverNativeMemoryRun,
   type NativeExecutionEvidence,
 } from '../src/person-vm/production-native-execution-evidence.js';
 
@@ -32,6 +33,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         };
         const { runId, organizationId, workspaceId, ownerId } = run;
         const userRequest = randomUUID();
+        const loginSessionId = randomUUID();
         const vm = {
           vmId: randomUUID(),
           personId: ownerId,
@@ -82,7 +84,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             organizationId,
             workspaceId,
             requestId: randomUUID(),
-            sessionId: randomUUID(),
+            sessionId: loginSessionId,
             memberships: [],
             authenticatedAt: new Date().toISOString(),
           },
@@ -110,14 +112,32 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         const signal = new AbortController().signal;
         const first = call(1);
         const second = call(2);
+        const spec = {
+          generation: '4.0',
+          source: 'dsh-native-prompt',
+          loginSessionId,
+          threadId: f.session,
+          employeeInstanceId: f.assignment,
+          employeeRelease: f.version,
+          nativeRequestId: userRequest,
+          rootSessionId: adopted.occurrence.sessionId,
+          adapterId: origin.nativeProfileRef,
+          vmId: vm.vmId,
+          personId: ownerId,
+        };
         await db`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec)
           values (${runId},${organizationId},${workspaceId},${ownerId},'running',
-          '{"generation":"4.0"}'::jsonb)`;
+          ${db.json(spec)})`;
         const write = (
           value: ModelCallBinding,
-          human: typeof adopted | null,
+          human:
+            | (Omit<typeof adopted, 'kind'> & {
+                kind: 'ordinary-human-message' | 'adopted-steering';
+              })
+            | null,
           retry = false,
           moduleConfigRevisionRef = 'fixture-memory-config-v2',
+          originalHuman?: Omit<typeof adopted, 'kind'>,
         ) =>
           db.begin(async (tx) => {
             await tx`select id from allrice_runs where id=${runId} for update`;
@@ -134,16 +154,80 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               { ...origin, human, moduleConfigRevisionRef },
               [userRequest],
               retry,
+              originalHuman,
             );
           });
         const receipt = await write(first, adopted);
         if (!receipt) throw Error('First receipt missing');
-        expect(await write(first, adopted, true, 'later-config')).toEqual(
-          receipt,
+        expect(await write(first, adopted, true, 'later-config')).toEqual({
+          ...receipt,
+          firstIssue: false,
+        });
+        expect(receipt.firstIssue).toBe(true);
+        const original = {
+          occurrence: adopted.occurrence,
+          sequence: adopted.sequence,
+          digest: adopted.digest,
+        };
+        const selector = {
+          ...origin,
+          organizationId,
+          workspaceId,
+          ownerId,
+          loginSessionId,
+          moduleConfigRevisionRef: 'fixture-memory-config-v2',
+          original,
+        };
+        await expect(recoverNativeMemoryRun(selector, signal)).resolves.toBe(
+          runId,
         );
+        await expect(
+          recoverNativeMemoryRun(
+            { ...selector, loginSessionId: randomUUID() },
+            signal,
+          ),
+        ).resolves.toBeNull();
+        await expect(
+          recoverNativeMemoryRun(
+            { ...selector, vm: { ...vm, leaseEpoch: 2 } },
+            signal,
+          ),
+        ).resolves.toBeNull();
+        await expect(
+          recoverNativeMemoryRun(
+            {
+              ...selector,
+              original: { ...original, digest: 'sha256:' + 'b'.repeat(64) },
+            },
+            signal,
+          ),
+        ).resolves.toBeNull();
         const ambiguous = await write(second, null, false, 'later-config');
         if (!ambiguous) throw Error('Second receipt missing');
         expect(ambiguous.request).toMatchObject({ b: runId, human: null });
+        const steer = {
+          ...adopted,
+          kind: 'adopted-steering' as const,
+          sequence: 12,
+          occurrence: {
+            ...adopted.occurrence,
+            requestId: randomUUID(),
+            scopeId: randomUUID(),
+            messageId: randomUUID(),
+          },
+        };
+        const steered = await write(
+          call(3),
+          steer,
+          false,
+          'later-config',
+          original,
+        );
+        expect(steered).toMatchObject({
+          firstIssue: false,
+          origin: receipt.origin,
+          request: { b: runId, human: steer },
+        });
         const tool = {
           attemptId: first.native.attemptId!,
           assistantSequence: 9,
@@ -180,7 +264,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           recordNativeExecutionTool(receipt, tool, signal),
           recordNativeExecutionTool(receipt, tool, signal),
         ]);
-        const refused = call(3);
+        const refused = call(4);
         await db`create function refuse_native_evidence_fixture()
           returns trigger language plpgsql as $body$
           begin
@@ -209,6 +293,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           },
           receipt.request,
           ambiguous.request,
+          steered?.request,
           {
             kind: 'tool',
             b: runId,

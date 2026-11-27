@@ -220,6 +220,11 @@ export function createModelGateway(options: {
   store: ModelGatewayStore;
   provider: GatewayProvider;
   admission: ModelGatewayAdmission;
+  /** Host-owned context selected for the authenticated, redeemed attempt. */
+  readTrustedContext?(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+  ): Promise<string | undefined>;
   confirmTransportStopped?(
     ownerId: string,
     signal: AbortSignal,
@@ -393,18 +398,40 @@ export function createModelGateway(options: {
             let operationFailure: unknown;
             let operationFailed = false;
             try {
-              const input = await readInput(request, signal);
+              const received = await readInput(request, signal);
               const kind = binding.native.attemptKind;
               if (
                 kind &&
-                input.purpose !== (kind === 'assistant' ? undefined : kind)
+                received.purpose !== (kind === 'assistant' ? undefined : kind)
               )
                 throw new ModelGatewayError('BINDING_INVALID');
+              let trustedContext: string | undefined;
+              if (options.readTrustedContext && !received.purpose) {
+                await assertDelivery(signal);
+                trustedContext = await options.readTrustedContext(
+                  binding,
+                  signal,
+                );
+                await assertDelivery(signal);
+              }
+              signal.throwIfAborted();
+              const input = trustedContext
+                ? {
+                    ...received,
+                    system: received.system
+                      ? `${received.system}\n\n${trustedContext}`
+                      : trustedContext,
+                  }
+                : received;
+              const serialized = JSON.stringify(input);
+              if (
+                trustedContext &&
+                Buffer.byteLength(serialized) > maxModelInputBytes
+              )
+                throw new ModelGatewayError('INPUT_TOO_LARGE');
               const digest =
                 'sha256:' +
-                createHash('sha256')
-                  .update(JSON.stringify(input))
-                  .digest('hex');
+                createHash('sha256').update(serialized).digest('hex');
               const callId = await options.store.claimCall(binding, digest);
               transport = createMeteredTransport({
                 ...options,

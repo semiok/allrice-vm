@@ -653,6 +653,42 @@ it('keeps the model configuration and rejects competing or non-text input for th
   expect(
     observe([header, start, user], { ...origin, delegated: true }).human,
   ).toBeNull();
+  const steering = {
+    ...userPrompt('steer'),
+    content: [{ type: 'text', text: 'adopted steer' }],
+  };
+  const steerOccurrence = nativePromptOccurrence(promptRoot, steering, 1);
+  const continued = [
+    header,
+    start,
+    user,
+    { seq: 3, type: 'assistant/message', data: {} },
+    { seq: 4, type: 'step/start', data: { turn: 1, step: 2 } },
+    { seq: 5, type: 'user/message', data: steering },
+  ];
+  const augmented = { ...origin, prompts: [occurrence, steerOccurrence] };
+  expect(observe(continued, augmented)).toMatchObject({
+    originalHuman: initial.human,
+    human: { occurrence: steerOccurrence, sequence: 5 },
+    firstMemoryAttempt: false,
+  });
+  const otherSteer = { ...steering, id: 'another-steer' };
+  expect(
+    observe(
+      [...continued, { seq: 6, type: 'user/message', data: otherSteer }],
+      {
+        ...augmented,
+        prompts: [
+          ...augmented.prompts,
+          nativePromptOccurrence(promptRoot, otherSteer, 1),
+        ],
+      },
+    ),
+  ).toMatchObject({
+    originalHuman: initial.human,
+    human: null,
+    firstMemoryAttempt: false,
+  });
 });
 
 it('binds the real same-ID steer and rejects a second claimed native input', async () => {

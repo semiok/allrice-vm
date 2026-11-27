@@ -1,6 +1,9 @@
-import type { RequestContext } from '@allrice/contracts';
+import { createHash } from 'node:crypto';
+import { memoryIndexPolicy, type RequestContext } from '@allrice/contracts';
+import type { NativeExecutionBuild } from './production-native-execution-evidence.js';
 
 export type MemoryRootObservation = Readonly<{
+  mode: 'issue' | 'restore';
   runId: string;
   workspaceId: string;
   employeeInstanceId: string;
@@ -48,7 +51,29 @@ export type MemoryHostPublication = Readonly<{
 /** Private installation input. The revision identifies the exact immutable
  * memory configuration selected by the source, never a model settings digest. */
 export type ProductionNativeMemorySource = Readonly<{
-  moduleConfigRevisionRef: string;
   toolVersions: Readonly<Record<MemoryToolObservation['toolId'], string>>;
   publication: MemoryHostPublication;
 }>;
+
+export function selectNativeMemoryConfiguration(
+  source: ProductionNativeMemorySource,
+  build: NonNullable<NativeExecutionBuild>,
+) {
+  const { memory_read, memory_remember } = source.toolVersions;
+  const selected = [
+    'employee-memory-v2',
+    build.sourceSha,
+    build.sourceTree,
+    build.manifestDigest,
+    build.webBuildId,
+    memoryIndexPolicy,
+    ['mcp__allrice__memory_read', memory_read],
+    ['mcp__allrice__memory_remember', memory_remember],
+  ];
+  return Object.freeze({
+    ...source,
+    moduleConfigRevisionRef:
+      'sha256:' +
+      createHash('sha256').update(JSON.stringify(selected)).digest('hex'),
+  });
+}

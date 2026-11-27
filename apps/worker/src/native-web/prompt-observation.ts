@@ -47,6 +47,9 @@ export const NativeRequestObservationSchema = z
       .strict()
       .nullable(),
     human: NativeAdoptedTextSchema.nullable(),
+    originalHuman: NativeAdoptedTextSchema.omit({ kind: true })
+      .nullable()
+      .optional(),
     firstMemoryAttempt: z.boolean().optional(),
     proofState: z.enum([
       'adopted',

@@ -497,8 +497,7 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
         .digest('hex'),
   };
   const empty = { request: request ?? null, human: null };
-  if (origin.delegated || origin.prompts.length !== 1) return empty;
-  const [prompt] = origin.prompts;
+  if (origin.delegated || !origin.prompts.length) return empty;
   const start = events.findLast(
     (event) =>
       event.seq >= inheritedEventCount &&
@@ -508,22 +507,46 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
   );
   if (!start) return empty;
   const currentTurn = events.slice(start.seq + 1, cursor + 1);
-  const inputs = currentTurn.filter(
-    (event) =>
-      event.type === 'user/message' && event.data.id === prompt.messageId,
+  const occurrences = new Map(
+    origin.prompts.map((prompt) => [prompt.messageId, prompt]),
   );
-  if (inputs.length !== 1) return empty;
-  const digest = adoptedTextDigest(inputs[0].data);
-  return digest
-    ? {
-        ...empty,
-        human: { occurrence: prompt, sequence: inputs[0].seq, digest },
-        firstMemoryAttempt: !currentTurn.some(
-          ({ type }) =>
-            type === 'assistant/message' || type === 'assistant/attempt',
-        ),
+  let group = [];
+  let originalGroup;
+  let latestGroup;
+  for (const event of currentTurn) {
+    if (event.type === 'step/start') {
+      if (group.length) {
+        originalGroup ??= group;
+        latestGroup = group;
+        group = [];
       }
-    : empty;
+    }
+    if (event.type !== 'user/message' || !nativeOriginInput(event.data.source))
+      continue;
+    const occurrence = occurrences.get(event.data.id);
+    const digest = occurrence && adoptedTextDigest(event.data);
+    group.push(digest ? { occurrence, sequence: event.seq, digest } : null);
+    if (occurrence) occurrences.delete(event.data.id);
+  }
+  if (occurrences.size) return empty;
+  if (group.length) {
+    originalGroup ??= group;
+    latestGroup = group;
+  }
+  const originalHuman = originalGroup?.length === 1 ? originalGroup[0] : null;
+  const human = latestGroup?.length === 1 ? latestGroup[0] : null;
+  return {
+    ...empty,
+    human,
+    originalHuman,
+    firstMemoryAttempt:
+      !!originalHuman &&
+      originalGroup === latestGroup &&
+      !currentTurn.some(
+        ({ type }) =>
+          type === 'assistant/message' || type === 'assistant/attempt',
+      ),
+  };
 }
 
 /** Carry only the inbox facts for an exact scoped prompt through the existing
@@ -610,9 +633,10 @@ export function observeNativePrompts(scope, lifetime, capture) {
         const previous = inboxClaims.get(session);
         inboxClaims.set(session, {
           turn,
-          // More than one actual claim in this turn is ambiguous. DSH's
-          // generated instruction/time notices never enter the inbox.
-          messageId: previous?.turn === turn ? null : message.id,
+          pending: true,
+          // Claims are synchronous before the committed step/start event.
+          messageId:
+            previous?.turn === turn && previous.pending ? null : message.id,
         });
       }
       for (const observer of matches(agent, message)) {
@@ -660,8 +684,12 @@ export function observeNativePrompts(scope, lifetime, capture) {
   scope.on(
     'session/event',
     (session, event) => {
-      if (event.type !== 'turn/end') return;
       const native = original(session);
+      if (event.type === 'step/start') {
+        const claim = inboxClaims.get(native);
+        if (claim?.turn === event.data.turn) claim.pending = false;
+      }
+      if (event.type !== 'turn/end') return;
       if (inboxClaims.get(native)?.turn === event.data.turn)
         inboxClaims.delete(native);
       for (const observer of turns
@@ -1612,6 +1640,7 @@ export function applyNativeWebOwner(
                       ),
                       firstMemoryAttempt:
                         origin.request.firstMemoryAttempt === true,
+                      originalHuman: origin.request.originalHuman ?? null,
                     },
                     inheritedPromptIndexes: origin.prompts.flatMap(
                       (prompt, index) =>

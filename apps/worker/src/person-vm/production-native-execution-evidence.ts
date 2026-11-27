@@ -75,8 +75,75 @@ export type NativeExecutionEvidence =
 type Receipt = Readonly<{
   run: Run;
   request: NativeExecutionRequestEvidence;
-  moduleConfigRevisionRef: string | null;
+  origin: NativeExecutionOriginEvidence;
+  firstIssue: boolean;
 }>;
+
+/** Resolve the original B from the private ledger using the exact old adopted
+ * occurrence freshly observed in the live native owner. Never pick latest. */
+export async function recoverNativeMemoryRun(
+  input: {
+    organizationId: string;
+    workspaceId: string;
+    ownerId: string;
+    loginSessionId: string;
+    employeeInstanceId: string;
+    employeeRelease: string;
+    employeeRevision: number;
+    threadId: string;
+    rootOriginRef: string;
+    nativeOwnerRef: string;
+    nativeProfileRef: string;
+    vm: ModelCallBinding['vm'];
+    moduleConfigRevisionRef: string;
+    original: NonNullable<NativeRequestObservation['originalHuman']>;
+  },
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const sql = getDatabase();
+  const human = { ...input.original, kind: 'ordinary-human-message' };
+  const matches = await sql<{ id: string }[]>`
+    select r.id from allrice_runs r join allrice_run_events e on e.run_id=r.id
+      and e.organization_id=r.organization_id and e.workspace_id=r.workspace_id
+    where r.organization_id=${input.organizationId} and r.workspace_id=${input.workspaceId}
+      and r.owner_id=${input.ownerId} and r.visibility='private' and r.state='running'
+      and r.execution_spec @> ${sql.json({
+        source: 'dsh-native-prompt',
+        generation: '4.0',
+        loginSessionId: input.loginSessionId,
+        threadId: input.threadId,
+        employeeInstanceId: input.employeeInstanceId,
+        employeeRelease: input.employeeRelease,
+        nativeRequestId: human.occurrence.requestId,
+        rootSessionId: human.occurrence.sessionId,
+        adapterId: input.nativeProfileRef,
+        vmId: input.vm.vmId,
+        personId: input.ownerId,
+      })}
+      and e.event_type='harness.native' and e.payload->>'b'=r.id::text
+      and e.payload @> ${sql.json({
+        source: nativeExecutionEvidenceSource,
+        kind: 'origin',
+        human,
+        rootOriginRef: input.rootOriginRef,
+        rootSessionRef: human.occurrence.sessionId,
+        nativeOwnerRef: input.nativeOwnerRef,
+        nativeProfileRef: input.nativeProfileRef,
+        employeeInstanceId: input.employeeInstanceId,
+        employeeRelease: input.employeeRelease,
+        employeeRevision: input.employeeRevision,
+        threadId: input.threadId,
+        moduleConfigRevisionRef: input.moduleConfigRevisionRef,
+        vm: input.vm,
+        originalRequestId: human.occurrence.requestId,
+      })}
+      and exists (select 1 from allrice_run_events s where s.run_id=r.id
+        and s.event_type='step.started' and s.id::text=e.payload->>'originalExecutionId')
+    limit 2`;
+  signal.throwIfAborted();
+  return matches.length === 1 ? matches[0]!.id : null;
+}
 
 async function append(
   tx: TransactionSql,
@@ -102,6 +169,7 @@ export async function recordNativeExecutionRequest(
   > & { moduleConfigRevisionRef?: string },
   contributingRequestIds: readonly string[],
   alreadyPersisted: boolean,
+  originalHuman?: NativeRequestObservation['originalHuman'],
 ): Promise<Receipt | null> {
   return transaction
     .savepoint(async (tx) => {
@@ -115,9 +183,24 @@ export async function recordNativeExecutionRequest(
           saved.payload.rootOriginRef !== origin.rootOriginRef ||
           saved.payload.nativeOwnerRef !== origin.nativeOwnerRef ||
           saved.payload.nativeProfileRef !== origin.nativeProfileRef ||
-          saved.payload.employeeRelease !== origin.employeeRelease)
+          saved.payload.employeeInstanceId !== origin.employeeInstanceId ||
+          saved.payload.employeeRelease !== origin.employeeRelease ||
+          saved.payload.employeeRevision !== origin.employeeRevision ||
+          saved.payload.threadId !== origin.threadId ||
+          saved.payload.originalRequestId !== origin.originalRequestId ||
+          saved.payload.vm.vmId !== origin.vm.vmId ||
+          saved.payload.vm.instanceId !== origin.vm.instanceId ||
+          saved.payload.vm.leaseEpoch !== origin.vm.leaseEpoch)
       )
         return null;
+      const storedOrigin: NativeExecutionOriginEvidence = saved?.payload ?? {
+        ...origin,
+        source: nativeExecutionEvidenceSource,
+        kind: 'origin',
+        b: run.runId,
+        originalExecutionId: call.execution.executionId,
+        moduleConfigRevisionRef: origin.moduleConfigRevisionRef ?? null,
+      };
       if (!saved) {
         if (alreadyPersisted) return null;
         const [oldAttempt] = await tx`
@@ -128,14 +211,7 @@ export async function recordNativeExecutionRequest(
         // A Run opened by a build without this evidence cannot acquire an
         // original B provenance snapshot on a later model attempt.
         if (oldAttempt) return null;
-        await append(tx, run, {
-          ...origin,
-          source: nativeExecutionEvidenceSource,
-          kind: 'origin',
-          b: run.runId,
-          originalExecutionId: call.execution.executionId,
-          moduleConfigRevisionRef: origin.moduleConfigRevisionRef ?? null,
-        });
+        await append(tx, run, storedOrigin);
       }
       const sameHuman =
         !saved ||
@@ -154,6 +230,21 @@ export async function recordNativeExecutionRequest(
             origin.human.occurrence.turn &&
           saved.payload.human.occurrence.sessionId ===
             origin.human.occurrence.sessionId);
+      const originalMatches =
+        !!originalHuman &&
+        !!saved?.payload.human &&
+        saved.payload.human.kind === 'ordinary-human-message' &&
+        saved.payload.human.digest === originalHuman.digest &&
+        saved.payload.human.sequence === originalHuman.sequence &&
+        saved.payload.human.occurrence.messageId ===
+          originalHuman.occurrence.messageId &&
+        saved.payload.human.occurrence.scopeId ===
+          originalHuman.occurrence.scopeId &&
+        saved.payload.human.occurrence.sessionId ===
+          originalHuman.occurrence.sessionId &&
+        saved.payload.human.occurrence.requestId ===
+          originalHuman.occurrence.requestId &&
+        saved.payload.human.occurrence.turn === originalHuman.occurrence.turn;
       const request: NativeExecutionRequestEvidence = {
         source: nativeExecutionEvidenceSource,
         kind: 'request',
@@ -165,7 +256,11 @@ export async function recordNativeExecutionRequest(
         turn: call.native.attemptTurn!,
         contributingRequestIds,
         adoptedModelConfiguration: origin.adoptedModelConfiguration,
-        human: sameHuman ? origin.human : null,
+        human:
+          sameHuman ||
+          (originalMatches && origin.human?.kind === 'adopted-steering')
+            ? origin.human
+            : null,
       };
       const [existing] = await tx<{ exact: boolean }[]>`
       select payload=${tx.json(request)} as exact from allrice_run_events
@@ -175,9 +270,8 @@ export async function recordNativeExecutionRequest(
       const receipt = {
         run,
         request,
-        moduleConfigRevisionRef: saved
-          ? saved.payload.moduleConfigRevisionRef
-          : (origin.moduleConfigRevisionRef ?? null),
+        origin: storedOrigin,
+        firstIssue: !saved,
       };
       if (existing) return existing.exact ? receipt : null;
       await append(tx, run, request);

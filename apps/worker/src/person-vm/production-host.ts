@@ -5,7 +5,10 @@ import type {
   ApplicationBuiltinModulesProjection,
   RequestContext,
 } from '@allrice/contracts';
-import type { ProductionNativeMemorySource } from './production-native-memory.js';
+import {
+  selectNativeMemoryConfiguration,
+  type ProductionNativeMemorySource,
+} from './production-native-memory.js';
 import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
@@ -125,7 +128,7 @@ export type ProductionPersonVmHostSources = Readonly<{
     lifetime: AbortSignal;
     modelOwnerId: string;
     nativeExecutionBuild: ApplicationBuiltinModulesProjection['applicationBuild'];
-    nativeMemory?: ProductionNativeMemorySource;
+    nativeMemory?: ReturnType<typeof selectNativeMemoryConfiguration>;
     reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
     issueReference<T>(
       call: ModelCallBinding,
@@ -224,7 +227,6 @@ export function createProductionPersonVmHost(input: {
   const memory =
     input.nativeMemory &&
     Object.freeze({
-      moduleConfigRevisionRef: input.nativeMemory.moduleConfigRevisionRef,
       toolVersions: Object.freeze({ ...input.nativeMemory.toolVersions }),
       publication: Object.freeze({
         root: input.nativeMemory.publication.root.bind(
@@ -237,11 +239,9 @@ export function createProductionPersonVmHost(input: {
     });
   if (
     memory &&
-    [
-      memory.moduleConfigRevisionRef,
-      memory.toolVersions.memory_read,
-      memory.toolVersions.memory_remember,
-    ].some((value) => typeof value !== 'string' || !value || value.length > 256)
+    [memory.toolVersions.memory_read, memory.toolVersions.memory_remember].some(
+      (value) => typeof value !== 'string' || !value || value.length > 256,
+    )
   )
     return Promise.reject(
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
@@ -1018,7 +1018,10 @@ export function createProductionPersonVmHost(input: {
         lifetime,
         modelOwnerId,
         nativeExecutionBuild,
-        nativeMemory: nativeExecutionBuild ? memory : undefined,
+        nativeMemory:
+          nativeExecutionBuild && memory
+            ? selectNativeMemoryConfiguration(memory, nativeExecutionBuild)
+            : undefined,
         async issueReference(call, signal, issue) {
           if (!model?.issueReference)
             throw new ProductionPersonVmHostUnavailable(
@@ -1046,25 +1049,8 @@ export function createProductionPersonVmHost(input: {
       const modelOwner = createModelGateway({
         ownerId: modelOwnerId,
         authority: modelSource.authority,
-        provider: {
-          ...provider,
-          async *stream(call, payload, signal) {
-            const memory = await modelSource.readMemoryIndex?.(call, signal);
-            signal.throwIfAborted();
-            yield* provider.stream(
-              call,
-              memory
-                ? {
-                    ...payload,
-                    system: payload.system
-                      ? `${payload.system}\n\n${memory}`
-                      : memory,
-                  }
-                : payload,
-              signal,
-            );
-          },
-        },
+        provider,
+        readTrustedContext: memory && modelSource.readMemoryIndex,
         store: storeModel,
         confirmTransportStopped: modelSource.transport?.stoppedEvidence,
         admission: {

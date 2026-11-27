@@ -25,6 +25,7 @@ import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
 import {
   issueMemoryContextStorage,
   readMemoryContextStorageOrdinal,
+  restoreMemoryContextStorage,
   type MemoryContextStorageDraft,
   type MemoryContextStorageKey,
 } from './memory-context-store.ts';
@@ -530,9 +531,8 @@ suite(
           { pid: number }[]
         >`select pg_backend_pid() pid`;
         expect(session!.pid).not.toBe(before.pid);
-        // Existing-row reuse is tested here, not a production restore gate.
         const restored = await sql.begin((tx) =>
-          issueMemoryContextStorage(tx, key, draft, live()),
+          restoreMemoryContextStorage(tx, key, live()),
         );
         expect(restored.id).toBe(before.issued.id);
         expect(restored.document).toBe(before.issued.document);
@@ -556,6 +556,9 @@ suite(
           where id=${restored.id} and organization_id=${key.organizationId}
             and budget_ref=${key.budgetRef} returning id`;
         expect(removed).toHaveLength(1);
+        await expect(
+          sql.begin((tx) => restoreMemoryContextStorage(tx, key, live())),
+        ).rejects.toMatchObject(refused);
         await expect(
           sql.begin((tx) =>
             readMemoryContextStorageOrdinal(tx, key, { number: 1 }, live()),

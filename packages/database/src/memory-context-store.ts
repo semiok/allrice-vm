@@ -307,6 +307,26 @@ export async function issueMemoryContextStorage(
   return { id: inserted!.id, origin, document: draft.document, state };
 }
 
+/** Restore only a previously issued snapshot. An unissued B has no index. */
+export async function restoreMemoryContextStorage(
+  tx: MemorySql,
+  keyInput: MemoryContextStorageKey,
+  signal: AbortSignal,
+  qualifyOrigin?: MemoryContextOriginQualifier,
+) {
+  const { key, row } = await lockContext(tx, keyInput, signal);
+  if (!row) return unavailable();
+  const { id, origin, document, state } = await validateStored(
+    tx,
+    key,
+    row,
+    signal,
+    qualifyOrigin,
+  );
+  signal.throwIfAborted();
+  return { id, origin, document, state };
+}
+
 /** No implicit issue, repair, reset or alternative budget key on refusal. Every
  * successful repeated ordinal disclosure costs its complete decoded UTF-8 text.
  * tx is internal to memory; this is not a cross-owner participation API. */
