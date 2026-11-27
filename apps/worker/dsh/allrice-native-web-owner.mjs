@@ -520,7 +520,27 @@ export function observeNativePrompts(scope, lifetime, capture) {
     'agent/inbox/inserted',
     ({ agent, message }) => {
       for (const observer of matches(agent, message)) {
-        if (observer.existing.has(message.id) || observer.itemId) continue;
+        if (
+          observer.existing.has(message.id) ||
+          (observer.itemId && observer.itemId !== message.id) ||
+          observer.turn !== undefined
+        )
+          continue;
+        if (capture?.()) {
+          const inTurn = agent.inbox.nextTurn.some(
+            ({ id }) => id === message.id,
+          );
+          const inStep = agent.inbox.nextStep.some(
+            ({ id }) => id === message.id,
+          );
+          observer.humanKind =
+            inTurn === inStep
+              ? null
+              : inTurn
+                ? 'ordinary-human-message'
+                : 'adopted-steering';
+        }
+        if (observer.itemId) continue;
         observer.itemId = message.id;
         observer.send('inserted ' + JSON.stringify({ messageId: message.id }));
       }
@@ -656,56 +676,70 @@ export function observeNativePrompts(scope, lifetime, capture) {
       },
       { global: true },
     );
-    scope.on('tools/execute', (exec, next) => {
+    scope.on('tools/execute', async (exec, next) => {
       if (
-        capture() &&
-        !lifetime.aborted &&
+        !capture() ||
+        lifetime.aborted ||
+        exec.signal.aborted ||
+        exec.parent !== undefined ||
+        !exec.agent
+      )
+        return next();
+      const session = original(exec.agent.session);
+      const attempt = attempts.get(session);
+      const call = attempt?.calls.get(exec.callId);
+      const observer = attempt?.observer;
+      const definition = original(scope.tools.get(exec.name, exec.agent));
+      if (
+        !definition ||
+        call?.name !== exec.name ||
+        !observer ||
+        original(scope.agents.get(session.id)) !== original(exec.agent) ||
+        !observers.has(observer.id) ||
+        observer.toolRecords >= 8
+      )
+        return next();
+      attempt.calls.set(exec.callId, null);
+      const result = await next();
+      // rc.2 also sends unregistered names and short-circuited failures
+      // through the waterfall. Retain only a successful, still-registered call.
+      if (
+        !result.isError &&
         !exec.signal.aborted &&
-        exec.parent === undefined &&
-        exec.agent
+        capture() &&
+        definition === original(scope.tools.get(exec.name, exec.agent)) &&
+        observers.has(observer.id) &&
+        observer.toolRecords < 8
       ) {
-        const session = original(exec.agent.session);
-        const attempt = attempts.get(session);
-        const call = attempt?.calls.get(exec.callId);
-        const observer = attempt?.observer;
-        if (
-          call?.name === exec.name &&
-          observer &&
-          original(scope.agents.get(session.id)) === original(exec.agent) &&
-          observers.has(observer.id) &&
-          observer.toolRecords < 8
-        ) {
-          attempt.calls.set(exec.callId, null);
-          const fact = JSON.stringify({
-            attemptId: attempt.id,
-            assistantSequence: attempt.assistantSeq,
-            ...call,
-            human: attempt.human,
-          });
-          if (Buffer.byteLength(fact) <= 2400) {
-            try {
-              observer.send('tool ' + fact);
-              observer.toolRecords++;
-            } catch {
-              // Losing collection cannot turn into a failed native tool.
-            }
+        const fact = JSON.stringify({
+          attemptId: attempt.id,
+          assistantSequence: attempt.assistantSeq,
+          ...call,
+          human: attempt.human,
+        });
+        if (Buffer.byteLength(fact) <= 2400) {
+          try {
+            observer.send('tool ' + fact);
+            observer.toolRecords++;
+          } catch {
+            // Losing collection cannot turn into a failed native tool.
           }
         }
       }
-      return next();
+      return result;
     });
   }
   function attest(session, id, cursor, turn, human) {
+    if (!human) return { human: null, proofState: 'no-unique-text' };
     const attempt = attempts.get(original(session));
     if (
-      !human ||
       !attempt ||
       attempt.id !== id ||
       attempt.cursor !== cursor ||
       attempt.turn !== turn ||
       human.occurrence.parentSessionId
     )
-      return null;
+      return { human: null, proofState: 'no-matching-attempt' };
     const { occurrence } = human;
     const key = sourceKey(
       occurrence.sessionId,
@@ -717,12 +751,14 @@ export function observeNativePrompts(scope, lifetime, capture) {
       (observer) =>
         observer.turn === turn &&
         observer.itemId === occurrence.messageId &&
-        observer.contentDigest === human.digest,
+        observer.contentDigest === human.digest &&
+        observer.humanKind,
     );
-    if (claims.length !== 1) return null;
-    attempt.human = human;
+    if (claims.length !== 1)
+      return { human: null, proofState: 'no-matching-claim' };
+    attempt.human = { ...human, kind: claims[0].humanKind };
     attempt.observer = claims[0];
-    return human;
+    return { human: attempt.human, proofState: 'adopted' };
   }
   const read = (value, request) => {
     const notFound = () => new globalThis.Response(null, { status: 404 });
@@ -1368,7 +1404,7 @@ export function applyNativeWebOwner(
                     delegated: origin.delegated,
                     observation: origin.request && {
                       request: origin.request.request,
-                      human: promptFacts.attest(
+                      ...promptFacts.attest(
                         found.session,
                         value.nativeAttemptId,
                         value.cursor,

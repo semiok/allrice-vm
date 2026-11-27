@@ -965,9 +965,11 @@ export function createProductionPersonVmHost(input: {
           },
         },
       });
-      const verifiedBuild = await readApplicationBuiltinModules('worker');
+      const verifiedBuild = await readApplicationBuiltinModules('worker').catch(
+        () => null,
+      );
       lifetime.throwIfAborted();
-      const build = verifiedBuild.applicationBuild;
+      const build = verifiedBuild?.applicationBuild;
       const nativeExecutionBuild =
         build &&
         build.sourceSha === providers.applicationBuild.sourceSha &&

@@ -162,7 +162,15 @@ it.skipIf(!cli)(
         signal,
       );
       if (!attempt?.observation?.human)
-        throw Error('No unique adopted input proof');
+        throw Error(
+          'No unique adopted input proof: ' +
+            JSON.stringify({
+              attempt: !!attempt,
+              configuration: !!attempt?.observation?.request,
+              status: attempt?.observation?.proofState ?? null,
+              prompts: attempt?.prompts.length ?? 0,
+            }),
+        );
       expect(attempt.observation.request).toMatchObject({
         provider: 'openai-codex',
         model: 'fixture-codex',

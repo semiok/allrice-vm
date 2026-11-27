@@ -137,6 +137,7 @@ export async function recordNativeExecutionRequest(
     !saved ||
     (saved.payload.human &&
       origin.human &&
+      saved.payload.human.kind === origin.human.kind &&
       saved.payload.human.digest === origin.human.digest &&
       saved.payload.human.sequence === origin.human.sequence &&
       saved.payload.human.occurrence.messageId ===
@@ -179,6 +180,7 @@ export function matchNativeToolObservation(
   if (
     !human ||
     tool.attemptId !== request.nativeAttemptId ||
+    tool.human.kind !== human.kind ||
     tool.human.sequence !== human.sequence ||
     tool.human.digest !== human.digest ||
     tool.assistantSequence <= request.nativeCursor ||

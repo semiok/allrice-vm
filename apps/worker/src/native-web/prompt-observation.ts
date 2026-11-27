@@ -30,6 +30,7 @@ export type NativePromptOccurrence = z.infer<
 export const NativeAdoptedTextSchema = z
   .object({
     occurrence: NativePromptOccurrenceSchema,
+    kind: z.enum(['ordinary-human-message', 'adopted-steering']),
     sequence: z.number().int().nonnegative(),
     digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   })
@@ -46,6 +47,12 @@ export const NativeRequestObservationSchema = z
       .strict()
       .nullable(),
     human: NativeAdoptedTextSchema.nullable(),
+    proofState: z.enum([
+      'adopted',
+      'no-unique-text',
+      'no-matching-attempt',
+      'no-matching-claim',
+    ]),
   })
   .strict();
 

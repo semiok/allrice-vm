@@ -40,6 +40,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           leaseEpoch: 1,
         };
         const adopted = {
+          kind: 'ordinary-human-message' as const,
           occurrence: {
             sessionId: 'native-root',
             scopeId: randomUUID(),

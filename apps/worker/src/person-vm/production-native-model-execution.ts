@@ -225,33 +225,37 @@ async function persistExecution(
       native.attemptKind === 'assistant' &&
       native.sessionId === native.rootSessionId &&
       native.parentSessionId === null
-        ? await recordNativeExecutionRequest(
-            tx,
-            {
-              runId: execution.runId,
-              organizationId: vm.organizationId,
-              workspaceId: identity.workspaceId,
-              ownerId: vm.personId,
-            },
-            call,
-            {
-              originalRequestId: prompt.requestId,
-              rootOriginRef: pin.rootOriginDigest,
-              rootSessionRef: native.rootSessionId,
-              nativeOwnerRef: native.instanceId,
-              nativeProfileRef: native.profile,
-              applicationBuild: provenance.build,
-              employeeInstanceId: identity.employeeInstanceId,
-              employeeRelease: identity.employeeVersionId,
-              employeeRevision: identity.employeeRevision,
-              threadId: call.allriceThreadRef,
-              vm,
-              human,
-              adoptedModelConfiguration,
-            },
-            contributingRequestIds,
-            !!event,
-          )
+        ? await tx
+            .savepoint((evidenceTx) =>
+              recordNativeExecutionRequest(
+                evidenceTx,
+                {
+                  runId: execution.runId,
+                  organizationId: vm.organizationId,
+                  workspaceId: identity.workspaceId,
+                  ownerId: vm.personId,
+                },
+                call,
+                {
+                  originalRequestId: prompt.requestId,
+                  rootOriginRef: pin.rootOriginDigest,
+                  rootSessionRef: native.rootSessionId,
+                  nativeOwnerRef: native.instanceId,
+                  nativeProfileRef: native.profile,
+                  applicationBuild: provenance.build,
+                  employeeInstanceId: identity.employeeInstanceId,
+                  employeeRelease: identity.employeeVersionId,
+                  employeeRevision: identity.employeeRevision,
+                  threadId: call.allriceThreadRef,
+                  vm,
+                  human,
+                  adoptedModelConfiguration,
+                },
+                contributingRequestIds,
+                !!event,
+              ),
+            )
+            .catch(() => null)
         : null;
     signal.throwIfAborted();
     return evidence;
@@ -905,6 +909,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 .then(async (outcome) => {
                   if (selected.get(key) !== entry) return;
                   if (outcome === 'discarded') return forgetPrompt(key);
+                  toolRequests.delete(scope);
                   // An ended prompt loses its queue occupancy. Keep its exact
                   // claimed source under the shared authority for native descendants.
                   endedPrompts.add(scope);
@@ -1371,13 +1376,15 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                         await host.reserveNativeModelCall(call);
                         admitted.throwIfAborted();
                         if (evidence?.request.human) {
-                          // Only this native assistant attempt can emit current
-                          // tool proof on the corresponding prompt carrier.
-                          toolRequests.set(
-                            scope,
-                            new Map([
-                              [evidence.request.nativeAttemptId, evidence],
-                            ]),
+                          // Model references and tool facts use separate
+                          // transports. A later request cannot evict an older
+                          // receipt before the prompt carrier has drained.
+                          let requests = toolRequests.get(scope);
+                          if (!requests)
+                            toolRequests.set(scope, (requests = new Map()));
+                          requests.set(
+                            evidence.request.nativeAttemptId,
+                            evidence,
                           );
                         }
                         return input.issueCall(
