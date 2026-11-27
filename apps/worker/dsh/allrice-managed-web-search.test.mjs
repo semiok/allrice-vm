@@ -1,4 +1,4 @@
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
 import { apply } from './allrice-managed-web-search.mjs';
 
@@ -31,9 +31,9 @@ it('registers the native provider ID and sends only the local capability', async
     sources: [{ url: 'https://one.example' }],
     truncated: false,
   };
-  const fetch = vi.fn(async () => Response.json(result));
+  const fetch = vi.fn(async () => globalThis.Response.json(result));
   vi.stubGlobal('fetch', fetch);
-  const signal = new AbortController().signal;
+  const signal = new globalThis.AbortController().signal;
   expect(provider.id).toBe('deepseek-official');
   expect(
     await provider.search({ query: 'test', maxResults: 3 }, signal),

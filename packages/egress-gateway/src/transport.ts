@@ -24,6 +24,35 @@ function assertPublicHttpsTarget(target: URL) {
     throw new EgressError('DENIED');
 }
 
+/** A late pre-connect fact is discarded after revocation. The system
+ * resolver does not expose a cancellable getaddrinfo handle. */
+function beforeAbort<T>(
+  signal: AbortSignal,
+  start: () => Promise<T>,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    const done = () => signal.removeEventListener('abort', abort);
+    void Promise.resolve()
+      .then(() => {
+        signal.throwIfAborted();
+        return start();
+      })
+      .then(
+        (value) => {
+          done();
+          resolve(value);
+        },
+        (error: unknown) => {
+          done();
+          reject(error);
+        },
+      );
+  });
+}
+
 /** Validate all DNS answers and pin each socket. No proxy or second lookup. */
 function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
   return {
@@ -33,7 +62,11 @@ function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
     ): Promise<PublicHttpsHop> {
       signal.throwIfAborted();
       assertPublicHttpsTarget(url);
-      const answers = await lookup(url.hostname, { all: true, verbatim: true });
+      const resolveHost = () =>
+        lookup(url.hostname, { all: true, verbatim: true });
+      const answers = await (mode === 'web'
+        ? beforeAbort(signal, resolveHost)
+        : resolveHost());
       signal.throwIfAborted();
       const own = new BlockList();
       for (const item of Object.values(networkInterfaces()).flat()) {
@@ -94,9 +127,6 @@ function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
               settle();
             });
             response.once('error', failed);
-            response.once('aborted', () =>
-              failed(new EgressError('UNAVAILABLE')),
-            );
             const status = response.statusCode ?? 0;
             if (mode === 'web' && redirectStatuses.has(status)) {
               const location = response.headers.location;
@@ -107,9 +137,14 @@ function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
               )
                 failed(new EgressError('INVALID_RESPONSE'));
               else result = { location };
+              // A recognized redirect discards the body intentionally. Join
+              // request and response close before considering the next hop.
               response.destroy();
               return;
             }
+            response.once('aborted', () =>
+              failed(new EgressError('UNAVAILABLE')),
+            );
             if (
               status < 200 ||
               status >= 300 ||
@@ -125,7 +160,8 @@ function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
             response.on('data', (chunk: Buffer) => {
               bytes += chunk.length;
               if (bytes > maxBytes) {
-                response.destroy(new EgressError('LIMIT_EXCEEDED'));
+                failed(new EgressError('LIMIT_EXCEEDED'));
+                response.destroy();
                 return;
               }
               chunks.push(chunk);
@@ -191,7 +227,7 @@ export async function fetchPublicHttps(
   function parse(value: string, base?: URL) {
     if (value.length > 4096) throw new EgressError('DENIED');
     const url = URL.parse(value, base);
-    if (!url) throw new EgressError('DENIED');
+    if (!url || url.href.length > 4096) throw new EgressError('DENIED');
     assertPublicHttpsTarget(url);
     return url;
   }
@@ -199,7 +235,8 @@ export async function fetchPublicHttps(
   let url = parse(input);
   for (let hop = 0; ; hop += 1) {
     signal.throwIfAborted();
-    await options.authorize(url.href, signal);
+    const target = url.href;
+    await beforeAbort(signal, () => options.authorize(target, signal));
     signal.throwIfAborted();
     const result = await transport.read(url, {
       maxBytes: options.maxBytes,

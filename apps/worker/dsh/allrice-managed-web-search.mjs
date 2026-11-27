@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, URL } from 'node:url';
 
 export const name = 'allrice-managed-web-search';
 export const inject = ['agents', 'web'];
@@ -21,23 +21,24 @@ export async function apply(ctx, { cliPath, origin, capability, adapterId }) {
           'WEB_PROVIDER_ERROR',
         );
       signal?.throwIfAborted();
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        signal,
-        redirect: 'error',
-        headers: {
-          authorization: 'Bearer ' + capability,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ adapterId, sessionId, query, maxResults }),
-      }).catch((error) => {
-        signal?.throwIfAborted();
-        throw new WebError(
-          'Managed search is unavailable',
-          'WEB_PROVIDER_ERROR',
-          { cause: error },
-        );
-      });
+      const response = await globalThis
+        .fetch(endpoint, {
+          method: 'POST',
+          signal,
+          redirect: 'error',
+          headers: {
+            authorization: 'Bearer ' + capability,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ adapterId, sessionId, query, maxResults }),
+        })
+        .catch(() => {
+          signal?.throwIfAborted();
+          throw new WebError(
+            'Managed search is unavailable',
+            'WEB_PROVIDER_ERROR',
+          );
+        });
       if (!response.ok) {
         const code = (await response.json().catch(() => null))?.code;
         throw new WebError(
