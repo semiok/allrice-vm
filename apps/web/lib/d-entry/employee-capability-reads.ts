@@ -1,10 +1,13 @@
+import { isDeepStrictEqual } from 'node:util';
 import {
   BrandMediaReadInputSchema,
   brandMediaModule,
   brandMediaRelease,
   type BrandMediaArticle,
+  type BrandMediaReadResult,
 } from '@allrice/contracts';
 import {
+  BrandMediaError,
   DataAccessError,
   EmployeeModuleError,
   ReferenceLibraryError,
@@ -24,7 +27,13 @@ import type { PanelRoute } from './employee-panels-http';
 type Scope = Awaited<ReturnType<typeof requireEmployeePanelsContext>>;
 
 function guardedRead(
-  read: (scope: Scope, request: Request) => Promise<unknown>,
+  read: (
+    scope: Scope,
+    request: Request,
+  ) => Promise<{
+    data: unknown;
+    recheck(current: Scope): Promise<void>;
+  }>,
   businessError = workbenchFileError,
 ) {
   return async (request: Request, { params }: PanelRoute) => {
@@ -40,9 +49,12 @@ function guardedRead(
         !request.headers.get('x-allrice-expected-viewer-id')
       )
         throw new DataAccessError('authorization_denied');
-      const result = await read(scope, request);
-      await scope.current();
-      return Response.json(result, { headers: workbenchFileHeaders });
+      const { data, recheck } = await read(scope, request);
+      const { context } = await scope.current();
+      // A current page identity does not establish current business access.
+      await recheck({ ...scope, context });
+      request.signal.throwIfAborted();
+      return Response.json(data, { headers: workbenchFileHeaders });
     } catch (error) {
       const response =
         error instanceof ReferenceLibraryError
@@ -55,48 +67,67 @@ function guardedRead(
   };
 }
 
-export const readCapabilityScenes = guardedRead(
-  async ({ context, selection }) => {
-    const instanceId = selection.employeeInstanceId;
-    const instance = await getEmployeeInstance(context, instanceId);
-    if (await canUsePersonalEmployeeScenes(instance)) {
-      const catalog = await listPersonalSceneSkills(context, instanceId);
-      if (catalog.instanceId !== instanceId)
-        throw new DataAccessError('authorization_denied');
-      return {
-        source: 'personal' as const,
-        instanceId,
-        revision: catalog.revision,
-        skills: catalog.skills.map(
-          ({ sceneId, name, description, version, revision }) => ({
-            sceneId,
-            name,
-            description,
-            version,
-            revision,
-          }),
-        ),
-      };
-    }
-    const catalog = await listEmployeeSceneSkills(context, instanceId);
+async function sceneCatalog({ context, selection }: Scope) {
+  const instanceId = selection.employeeInstanceId;
+  const instance = await getEmployeeInstance(context, instanceId);
+  if (await canUsePersonalEmployeeScenes(instance)) {
+    const catalog = await listPersonalSceneSkills(context, instanceId);
     if (catalog.instanceId !== instanceId)
       throw new DataAccessError('authorization_denied');
+    return { source: 'personal' as const, catalog };
+  }
+  const catalog = await listEmployeeSceneSkills(context, instanceId);
+  if (catalog.instanceId !== instanceId)
+    throw new DataAccessError('authorization_denied');
+  return { source: 'published' as const, catalog };
+}
+
+function projectSceneCatalog({
+  source,
+  catalog,
+}: Awaited<ReturnType<typeof sceneCatalog>>) {
+  if (source === 'personal')
     return {
-      source: 'published' as const,
-      instanceId,
+      source,
+      instanceId: catalog.instanceId,
+      revision: catalog.revision,
       skills: catalog.skills.map(
-        ({ pin, scene, bundleVersion, bundleChecksum, contentChecksum }) => ({
-          pin,
-          name: scene.name,
-          description: scene.appliesWhen,
-          bundleVersion,
-          bundleChecksum,
-          contentChecksum,
+        ({ sceneId, name, description, version, revision }) => ({
+          sceneId,
+          name,
+          description,
+          version,
+          revision,
         }),
       ),
     };
-  },
-);
+  return {
+    source,
+    instanceId: catalog.instanceId,
+    skills: catalog.skills.map(
+      ({ pin, scene, bundleVersion, bundleChecksum, contentChecksum }) => ({
+        pin,
+        name: scene.name,
+        description: scene.appliesWhen,
+        bundleVersion,
+        bundleChecksum,
+        contentChecksum,
+      }),
+    ),
+  };
+}
+
+export const readCapabilityScenes = guardedRead(async (scope) => {
+  const observed = await sceneCatalog(scope);
+  return {
+    data: projectSceneCatalog(observed),
+    async recheck(current) {
+      // The source readers still own package and reference access.
+      if (!isDeepStrictEqual(observed, await sceneCatalog(current)))
+        throw new DataAccessError('authorization_denied');
+    },
+  };
+});
 
 const moduleTarget = ({ selection }: Scope) => ({
   workspaceId: selection.workspaceId,
@@ -128,19 +159,32 @@ async function currentBrandBinding(scope: Scope) {
   return binding;
 }
 
+async function requireSameBrandBinding(
+  scope: Scope,
+  expected: Awaited<ReturnType<typeof currentBrandBinding>>,
+) {
+  const current = await currentBrandBinding(scope);
+  if (expected && !current) throw new EmployeeModuleError('module_unavailable');
+  if (!isDeepStrictEqual(expected, current))
+    throw new EmployeeModuleError('module_version_conflict');
+}
+
 export const readCapabilityModules = guardedRead(async (scope) => {
   const binding = await currentBrandBinding(scope);
   return {
-    instanceId: scope.selection.employeeInstanceId,
-    modules: binding
-      ? [
-          {
-            displayName: brandMediaModule.displayName,
-            release: binding.release,
-            revision: binding.revision,
-          },
-        ]
-      : [],
+    data: {
+      instanceId: scope.selection.employeeInstanceId,
+      modules: binding
+        ? [
+            {
+              displayName: brandMediaModule.displayName,
+              release: binding.release,
+              revision: binding.revision,
+            },
+          ]
+        : [],
+    },
+    recheck: (current) => requireSameBrandBinding(current, binding),
   };
 }, brandMediaErrorResponse);
 
@@ -164,27 +208,7 @@ function savedArticle({
   };
 }
 
-export const readCapabilityBrandMedia = guardedRead(async (scope, request) => {
-  const query = new URL(request.url).searchParams;
-  query.delete('workspaceId');
-  query.delete('threadId');
-  if (query.has('instanceId'))
-    throw new DataAccessError('authorization_denied');
-  const { cursor, ...fields } = Object.fromEntries(query);
-  const input = BrandMediaReadInputSchema.parse({
-    ...moduleTarget(scope),
-    ...fields,
-    ...(cursor === undefined ? {} : { cursor: JSON.parse(cursor) }),
-  });
-
-  const binding = await currentBrandBinding(scope);
-  if (!binding) throw new EmployeeModuleError('module_unavailable');
-  const result = await readBrandMedia(scope.context, input);
-  const current = await currentBrandBinding(scope);
-  if (!current) throw new EmployeeModuleError('module_unavailable');
-  if (current.revision !== binding.revision)
-    throw new EmployeeModuleError('module_version_conflict');
-
+function projectBrandRecords(result: BrandMediaReadResult) {
   // Preserve saved record identities, titles and calendar facts. Bodies,
   // provenance and asset pins stay with the source reader.
   if (result.view === 'topics')
@@ -210,5 +234,34 @@ export const readCapabilityBrandMedia = guardedRead(async (scope, request) => {
     view: result.view,
     items: result.items.map(savedArticle),
     ...(result.view === 'articles' ? { nextCursor: result.nextCursor } : {}),
+  };
+}
+
+export const readCapabilityBrandMedia = guardedRead(async (scope, request) => {
+  const query = new URL(request.url).searchParams;
+  query.delete('workspaceId');
+  query.delete('threadId');
+  if (query.has('instanceId'))
+    throw new DataAccessError('authorization_denied');
+  const { cursor, ...fields } = Object.fromEntries(query);
+  const input = BrandMediaReadInputSchema.parse({
+    ...moduleTarget(scope),
+    ...fields,
+    ...(cursor === undefined ? {} : { cursor: JSON.parse(cursor) }),
+  });
+
+  const binding = await currentBrandBinding(scope);
+  if (!binding) throw new EmployeeModuleError('module_unavailable');
+  const data = projectBrandRecords(await readBrandMedia(scope.context, input));
+  return {
+    data,
+    async recheck(current) {
+      const records = projectBrandRecords(
+        await readBrandMedia(current.context, input),
+      );
+      if (!isDeepStrictEqual(data, records))
+        throw new BrandMediaError('version_conflict');
+      await requireSameBrandBinding(current, binding);
+    },
   };
 }, brandMediaErrorResponse);

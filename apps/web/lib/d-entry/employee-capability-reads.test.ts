@@ -7,7 +7,7 @@ import {
   type EmployeeModuleBinding,
   type RequestContext,
 } from '@allrice/contracts';
-import { DataAccessError } from '@allrice/database';
+import { BrandMediaError, DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
 import { GET as brandMedia } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/brand-media/route';
 import { GET as modules } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/modules/route';
@@ -112,6 +112,16 @@ beforeEach(() => {
   ports.modules.mockResolvedValue(directory());
 });
 
+function duringFinalPageCheck(change: () => void) {
+  ports.authorize
+    .mockResolvedValueOnce(identity)
+    .mockResolvedValueOnce(identity)
+    .mockImplementationOnce(async () => {
+      change();
+      return identity;
+    });
+}
+
 it.each(['scene-skills', 'modules', 'brand-media'] as const)(
   'rejects an unauthorized thread at the %s GET before reading business data',
   async (route) => {
@@ -170,6 +180,37 @@ it('reads the authorized personal workflow catalog without carrying runtime data
   });
   expect(ports.personalScenes).toHaveBeenCalledWith(context, instanceId);
   expect(ports.publishedScenes).not.toHaveBeenCalled();
+});
+
+it('rejects withdrawn scene access with the same page identity', async () => {
+  ports.personalEligibility.mockResolvedValue(true);
+  const catalog = {
+    instanceId,
+    revision: 4,
+    skills: [
+      {
+        sceneId: randomUUID(),
+        name: 'Private scene',
+        description: 'Protected package',
+      },
+    ],
+  };
+  ports.personalScenes.mockResolvedValue(catalog);
+  const freshContext = { ...context, requestId: randomUUID() };
+  ports.context
+    .mockResolvedValueOnce(context)
+    .mockResolvedValueOnce(context)
+    .mockResolvedValueOnce(freshContext);
+  duringFinalPageCheck(() =>
+    ports.personalScenes.mockResolvedValue({ ...catalog, skills: [] }),
+  );
+  const reply = await get('scene-skills');
+  expect(reply.status).toBe(403);
+  expect(await reply.json()).not.toHaveProperty('skills');
+  expect(ports.personalScenes.mock.calls).toEqual([
+    [context, instanceId],
+    [freshContext, instanceId],
+  ]);
 });
 
 it('reads published workflow metadata through the published source and discards it when the employee changes', async () => {
@@ -243,7 +284,7 @@ it('reports only the exact installed module revision for the scoped owner', asyn
   });
   expect(ports.modules).toHaveBeenCalledWith(context, target);
 
-  ports.modules.mockResolvedValueOnce(
+  ports.modules.mockResolvedValue(
     directory({
       ...binding,
       release: { ...brandMediaRelease, digest: 'sha256:' + '0'.repeat(64) },
@@ -257,6 +298,22 @@ it('reports only the exact installed module revision for the scoped owner', asyn
     directory({ ...binding, ownerId: randomUUID() }),
   );
   expect((await get('modules')).status).toBe(403);
+});
+
+it('withholds an installed module revoked during the final page check', async () => {
+  duringFinalPageCheck(() =>
+    ports.modules.mockResolvedValue(
+      directory({
+        ...binding,
+        revision: binding.revision + 1,
+        revokedAt: '2026-11-27T00:00:00.000Z',
+      }),
+    ),
+  );
+  const reply = await get('modules');
+  expect(reply.status).toBe(403);
+  expect(await reply.json()).not.toHaveProperty('modules');
+  expect(ports.modules).toHaveBeenCalledTimes(2);
 });
 
 const savedTopic = {
@@ -280,7 +337,7 @@ const topicPage = {
 };
 
 it('reads pinned saved brand records without returning old runs, attachments, or generated text', async () => {
-  ports.brand.mockResolvedValueOnce(topicPage);
+  ports.brand.mockResolvedValue(topicPage);
   const reply = await get('brand-media', { view: 'topics' });
   expect(reply.status).toBe(200);
   expect(await reply.json()).toEqual({
@@ -293,6 +350,7 @@ it('reads pinned saved brand records without returning old runs, attachments, or
     view: 'topics',
   });
   expect(ports.modules).toHaveBeenCalledTimes(2);
+  expect(ports.brand).toHaveBeenCalledTimes(2);
 
   const article = {
     ...savedTopic,
@@ -304,7 +362,7 @@ it('reads pinned saved brand records without returning old runs, attachments, or
     plannedAt: '2026-12-01T08:00:00.000Z',
     timezone: 'Asia/Shanghai',
   };
-  ports.brand.mockResolvedValueOnce({
+  ports.brand.mockResolvedValue({
     view: 'calendar',
     items: [
       {
@@ -340,20 +398,31 @@ it.each([
   },
   { state: 'changed', change: { revision: binding.revision + 1 }, status: 409 },
 ])(
-  'withholds completed brand data when its binding was $state during the read',
+  'withholds completed brand data when its binding was $state during the final page check',
   async ({ change, status }) => {
-    ports.brand.mockImplementationOnce(async () => {
+    ports.brand.mockResolvedValue(topicPage);
+    duringFinalPageCheck(() => {
       ports.modules.mockResolvedValue(directory({ ...binding, ...change }));
-      return topicPage;
     });
     const reply = await get('brand-media', { view: 'topics' });
     expect(reply.status).toBe(status);
     expect(reply.headers.get('cache-control')).toBe('private, no-store');
     expect(await reply.json()).not.toHaveProperty('items');
-    expect(ports.brand).toHaveBeenCalledOnce();
+    expect(ports.brand).toHaveBeenCalledTimes(2);
     expect(ports.modules).toHaveBeenCalledTimes(2);
   },
 );
+
+it('withholds saved brand data if the source reader loses access during the final page check', async () => {
+  ports.brand.mockResolvedValue(topicPage);
+  duringFinalPageCheck(() =>
+    ports.brand.mockRejectedValue(new BrandMediaError('source_unavailable')),
+  );
+  const reply = await get('brand-media', { view: 'topics' });
+  expect(reply.status).toBe(409);
+  expect(await reply.json()).not.toHaveProperty('items');
+  expect(ports.brand).toHaveBeenCalledTimes(2);
+});
 
 it.each(['runs', 'help'])(
   'rejects the unexposed brand %s operation',

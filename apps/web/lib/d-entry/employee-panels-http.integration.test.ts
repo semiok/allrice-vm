@@ -64,18 +64,22 @@ import { ReferenceSelectionUnavailableError } from '../chatflow/reference-select
 
 // Next's request-local Cookie carrier is replaced, not authentication. The
 // real production session adapter, opaque token and current DB readers run.
-const cookieBridge = vi.hoisted(() => ({ read: (): string => '' }));
+const cookieBridge = vi.hoisted(() => ({
+  read: (): string | Promise<string> => '',
+}));
 vi.mock('next/headers', () => ({
-  cookies: async () => ({
-    get(name: string) {
-      const part = cookieBridge
-        .read()
-        .split(';')
-        .map((value) => value.trim())
-        .find((value) => value.startsWith(name + '='));
-      return part ? { value: part.slice(name.length + 1) } : undefined;
-    },
-  }),
+  async cookies() {
+    const cookie = await cookieBridge.read();
+    return {
+      get(name: string) {
+        const part = cookie
+          .split(';')
+          .map((value) => value.trim())
+          .find((value) => value.startsWith(name + '='));
+        return part ? { value: part.slice(name.length + 1) } : undefined;
+      },
+    };
+  },
 }));
 const cookieScope = new AsyncLocalStorage<string>();
 cookieBridge.read = () => cookieScope.getStore() ?? '';
@@ -391,6 +395,17 @@ suite(
       };
       await f.db`insert into allrice_settings(scope_type,key,value) values('system','d_entry_rollout_policy',${f.db.json(policy)})
       on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    }
+    async function seedLegacyThread(p: Awaited<ReturnType<typeof person>>) {
+      const id = randomUUID();
+      // A preexisting thread supplies the durable generation without admitting legacy execution.
+      await f.db`insert into allrice_chat_sessions(
+        id, organization_id, workspace_id, owner_id, title, employee_assignment_id,
+        employee_instance_id, employee_version_id, execution_generation
+      ) values(${id},${p.context.organizationId},${p.selection.workspaceId},
+        ${p.context.actor.id},'Legacy thread',${p.selection.employeeInstanceId},
+        ${p.selection.employeeInstanceId},${p.versionId},'3.x')`;
+      return id;
     }
     const signal = () => new AbortController().signal;
     async function bindDirectoryThread(
@@ -2383,15 +2398,7 @@ suite(
     });
     it('selects only authenticated current 4.0 threads across the private directory cursor', async () => {
       const p = await person();
-      const legacy = randomUUID();
-      // Preexisting legacy row. This directory test only needs its durable
-      // writer generation, not a 3.x execution artifact or provider.
-      await f.db`insert into allrice_chat_sessions(
-        id, organization_id, workspace_id, owner_id, title, employee_assignment_id,
-        employee_instance_id, employee_version_id, execution_generation
-      ) values(${legacy},${p.context.organizationId},${p.selection.workspaceId},
-        ${p.context.actor.id},'Legacy thread',${p.selection.employeeInstanceId},
-        ${p.selection.employeeInstanceId},${p.versionId},'3.x')`;
+      const legacy = await seedLegacyThread(p);
       await release(p);
       const create = () =>
         createChatSession(p.context, p.selection, {
@@ -2503,14 +2510,13 @@ suite(
     });
     it('reads the exact database module binding only from a current 4.0 thread and withholds saved brand data after revocation', async () => {
       const p = await person();
-      const legacy = await createChatSession(p.context, p.selection, {
-        executionGeneration: '3.x',
-      });
+      const legacy = await seedLegacyThread(p);
       await release(p);
       const native = await createChatSession(p.context, p.selection, {
         executionGeneration: '4.0',
       });
       const instanceId = p.selection.employeeInstanceId;
+      const cookie = `allrice_session=${p.login.token}`;
       const read = (route: 'modules' | 'brand-media', threadId = native.id) => {
         const query = new URLSearchParams({
           workspaceId: p.selection.workspaceId,
@@ -2521,7 +2527,7 @@ suite(
           route === 'modules'
             ? readCapabilityModules
             : readCapabilityBrandMedia;
-        return cookieScope.run(`allrice_session=${p.login.token}`, () =>
+        return cookieScope.run(cookie, () =>
           handler(
             new Request(
               `${base}/api/v1/d-entry/panels/${instanceId}/${route}?${query}`,
@@ -2558,7 +2564,7 @@ suite(
           },
         ],
       });
-      expect((await read('modules', legacy.id)).status).toBe(403);
+      expect((await read('modules', legacy)).status).toBe(403);
       const topics = await read('brand-media');
       expect(topics.status).toBe(200);
       expect(await topics.json()).toEqual({
@@ -2567,9 +2573,29 @@ suite(
         nextCursor: null,
       });
 
-      await f.db`update allrice_employee_module_bindings set revoked_at=clock_timestamp(),revision=revision+1
-        where organization_id=${p.context.organizationId} and workspace_id=${p.selection.workspaceId}
-          and owner_id=${p.context.actor.id} and instance_id=${instanceId} and module_id=${brandMediaRelease.moduleId}`;
+      let cookieReads = 0;
+      const originalRead = cookieBridge.read;
+      cookieBridge.read = async () => {
+        const value = await originalRead();
+        // The third check is the page authority recheck after the first binding read.
+        if (value === cookie && ++cookieReads === 3) {
+          const changed =
+            await f.db`update allrice_employee_module_bindings set revoked_at=clock_timestamp(),revision=revision+1
+            where organization_id=${p.context.organizationId} and workspace_id=${p.selection.workspaceId}
+              and owner_id=${p.context.actor.id} and instance_id=${instanceId} and module_id=${brandMediaRelease.moduleId}
+            returning revision`;
+          expect(changed).toEqual([{ revision: binding.revision + 1 }]);
+        }
+        return value;
+      };
+      try {
+        const lateRevocation = await read('modules');
+        expect(lateRevocation.status).toBe(403);
+        expect(await lateRevocation.json()).not.toHaveProperty('modules');
+        expect(cookieReads).toBe(3);
+      } finally {
+        cookieBridge.read = originalRead;
+      }
       const revoked = await read('brand-media');
       expect(revoked.status).toBe(403);
       expect(await revoked.json()).not.toHaveProperty('items');
