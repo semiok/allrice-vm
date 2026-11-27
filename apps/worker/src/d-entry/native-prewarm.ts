@@ -648,7 +648,7 @@ export function createPrewarmOperations(
       signal.throwIfAborted();
       const entry = tickets.get(operationId);
       if (!entry || !belongs(entry, context, identity) || timedOut(entry))
-        return status;
+        return { state: 'expired' };
       if (!entry.cancellation.signal.aborted) {
         if (status.state !== 'waiting_for_capacity') return status;
         if (expired(entry) || entry.revoked.aborted)
