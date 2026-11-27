@@ -91,7 +91,7 @@ export async function writeEmployeePanelsBaseline(
     if (sha256(readBase('apps/web/app/chatflow/' + name)) !== expected)
       throw Error('Approved rev2 component bytes changed: ' + name);
   }
-  const snapshot = createLegacySidebarSnapshot(readBase, panelsRev2Head);
+  const snapshot = createLegacySidebarSnapshot(readBase);
   const common = {
     absWorkingDir: repoRoot,
     nodePaths: [resolve(repoRoot, 'apps/web/node_modules')],

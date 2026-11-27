@@ -326,7 +326,7 @@ export async function writeEmployeePanelsReferenceCarrier(
           },
         },
         {
-          ...createLegacySidebarSnapshot(readBase, panelsRev2Head),
+          ...createLegacySidebarSnapshot(readBase),
           name: 'pinned-rev2-reference-carrier',
         },
       ],
