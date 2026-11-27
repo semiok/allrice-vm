@@ -125,11 +125,6 @@ export async function createProductionModelRouting(
   const runtimes: Runtime[] = [fallback];
   const definitions = new Map<string, ModelRouteKey>();
   const retired = new Set<Runtime>();
-  async function revokeRoute(route: ModelRouteKey) {
-    const runtime = runtimeFor(route);
-    retired.add(runtime);
-    await runtime.close();
-  }
   async function close() {
     const results = await Promise.allSettled(
       runtimes.map((runtime) => runtime.close()),
@@ -184,6 +179,11 @@ export async function createProductionModelRouting(
       );
       if (!found) throw new ModelGatewayError('BINDING_INVALID');
       return found;
+    }
+    async function revokeRoute(route: ModelRouteKey) {
+      const runtime = runtimeFor(route);
+      retired.add(runtime);
+      await runtime.close();
     }
     function select(binding: VmOwner, native: ModelCallBinding['native']) {
       return selectScopedModel(rulesFor(binding), native, fallback.route);
