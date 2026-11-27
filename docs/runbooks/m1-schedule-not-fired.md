@@ -72,8 +72,4 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice40-dev-worker.err.log |
 
 ## 确认恢复
 
-`scheduler`、`scheduler_takeover` 告警自动恢复后，用冒烟测试的提醒项确认（**每次重启 Worker 之后都跑**）：
-
-```bash
-~/allrice40-dev/bin/smoke-test --dev --only reminder
-```
+每次重启 Worker 后，核对 `scheduler`、`scheduler_takeover` 告警恢复、两个控制器为 `active`。定时提醒的真实投递单独按已获准的验收范围核对；4.0 发布冒烟只验证原生工作台入口。

@@ -1261,7 +1261,7 @@ class DeployDevMigrations(unittest.TestCase):
               'import json,os,sys\nargs=sys.argv[2:]; out=args[args.index("--out")+1]\n'
               'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
               'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
-        p = self.run_config_tool('smoke-test', '--instance', task, '--only', 'chat', PROBE=probe)
+        p = self.run_config_tool('smoke-test', '--instance', task, PROBE=probe)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(probe) as f:
             args = json.load(f)
@@ -1470,7 +1470,7 @@ def observe_unix_socket(pid, file):
             self.assertFalse(os.path.exists(self.live_plist(role)))
         self.assertEqual(self.read_plist(os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled/worker.plist')), worker)
 
-    def test_smoke_dev_reads_parked_ports_and_artifact(self):
+    def test_smoke_dev_reads_parked_ports(self):
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
         probe = os.path.join(self.tmp, 'smoke-args.json')
         write(os.path.join(self.home, '.local/opt/node-22.23.2/bin/node'), '#!' + sys.executable + '\n'
@@ -1478,14 +1478,12 @@ def observe_unix_socket(pid, file):
               'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
               'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
         out = os.path.join(self.tmp, 'smoke-result')
-        p = self.run_config_tool('smoke-test', '--dev', '--only', 'chat', '--out', out, PROBE=probe)
+        p = self.run_config_tool('smoke-test', '--dev', '--out', out, PROBE=probe)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(probe) as f:
             args = json.load(f)
         self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:3311')
         self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:3312')
-        with open(os.path.join(out, 'result.json')) as f:
-            self.assertEqual(json.load(f)['nativeArtifactId'], 'sha256:' + 'a' * 64)
         self.assert_parked()
 
     def seed_recovery_partition(self):

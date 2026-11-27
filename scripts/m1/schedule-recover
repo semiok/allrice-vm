@@ -54,7 +54,7 @@ case "$mode" in
     [ -z "$execute" ] || [ -n "$manager" ] || die "only the release manager changes the shared Dev (AGENTS.md §9): add --release-manager" 6
     LABEL=ai.bplabs.allrice40-dev-worker; LOCK="$HOME/allrice40-dev/.local/deploy.lock"
     ROOTS="$HOME/allrice40-dev-releases/"
-    OUT="$HOME/allrice40-backups/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --dev --only reminder"
+    OUT="$HOME/allrice40-backups/schedule-recover-$ts"
     if [ -n "$execute" ]; then
       mkdir -p "$(dirname "$LOCK")"
       exec 9>>"$LOCK"
@@ -80,7 +80,7 @@ case "$mode" in
     WEB_LABEL=$(qa_label "$task" web); WEB_CONFIG="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
     WEB_PORT=$("$M1_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["webPort"])' "$INSTANCE") || exit 2
     ROOTS="$dir/|$release/"
-    OUT="$dir/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;
+    OUT="$dir/schedule-recover-$ts" ;;
   *) usage ;;
 esac
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -223,7 +223,7 @@ say "registered verified_process_exit proofs:"
 partitions > "$OUT/partitions-after.json" || die "the proofs are committed, but reading them back failed"
 show "$(cat "$OUT/partitions-after.json")" "-"
 if [ "$was" = gone ]; then
-  say "the Worker was not loaded when this started: left stopped. Start it, wait for both controllers active, then: $SMOKE"; exit 0
+  say "the Worker was not loaded when this started: left stopped. Start it, wait for both controllers active, then verify scheduler recovery and native reminder delivery separately"; exit 0
 fi
 verify_worker "$PLIST" && start_job "$LABEL" "$PLIST" || die "could not start $LABEL; the proofs are in place"
 STOPPED=""
@@ -234,4 +234,4 @@ say "Worker $status, controllers once=$once recurring=$recurring, worker $worker
 [ -n "$up" ] || die "the controllers did not become active within 180 s: see docs/runbooks/m1-schedule-not-fired.md"
 final=$(partitions) || die "the Worker is active, but reading the partitions failed"
 show "$final" "$worker_id"
-say "done. Next: $SMOKE   (reminders already past their time stay missed: reschedule them in the product)"
+say "done. Verify scheduler recovery and native reminder delivery separately (reminders already past their time stay missed: reschedule them in the product)"

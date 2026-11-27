@@ -577,15 +577,21 @@ deploy() {
   if [ $smoke = 1 ]; then
     local out; out="$STATE/smoke/$(date +%Y%m%d-%H%M%S)-${sha:0:8}"
     say "running the smoke test against ${sha:0:8}"
-    local ok=0; "$BIN/smoke-test" --dev --expect-sha "$sha" --out "$out" && ok=1
-    log_deploy kind smoke sha "$sha" result "$([ $ok = 1 ] && echo passed || echo failed)" out "$out"
-    if [ $ok != 1 ]; then
+    local smoke_rc=0 verdict=passed
+    "$BIN/smoke-test" --dev --expect-sha "$sha" --out "$out" || smoke_rc=$?
+    case "$smoke_rc" in
+      0) ;;
+      77) verdict=skipped ;;
+      *) verdict=failed ;;
+    esac
+    log_deploy kind smoke sha "$sha" result "$verdict" out "$out"
+    if [ "$verdict" = failed ]; then
       local hint
       if previous_release >/dev/null; then hint="to switch back run: $DEPLOY_COMMAND --release-manager --rollback"
       else hint="no default rollback target is recorded; fix forward or choose a compatible target: $DEPLOY_COMMAND --release-manager --rollback <release-dir>"; fi
       die "smoke test failed on ${sha:0:8}. Inspect $out/result.json; $hint" 5
     fi
-    say "smoke passed"
+    say "smoke $verdict. See $out/result.json"
   fi
   say "done in $(( $(date +%s) - t0 ))s"
 }

@@ -60,7 +60,7 @@ Worker 新增完整 `[M5] Handler failed` 系统记录，且 `code` 为 `DSH_PI_
 `subscription` / `quota` 在启用槽位显示 `connected`、额度正常后按其原规则恢复；`model_authorization` 必须满足上面的到期版本前移和完整安静窗口，读取未知时保持原故障。需要验证真实对话时，经发布负责人安排冒烟测试：
 
 ```bash
-~/allrice40-dev/bin/smoke-test --dev --only chat
+~/allrice40-dev/bin/smoke-test --dev --hello
 ```
 
 ## 谁来做

@@ -19,7 +19,7 @@ df -h ~                       # 磁盘满是最常见的原因之一
 1. **服务停了**：由发布负责人按 4.0 部署交接记录启动独立 5434 集群，等 `pg_isready -h 127.0.0.1 -p 5434` 返回 accepting connections。
 2. **起不来**：看日志里的 `FATAL`/`PANIC`。磁盘满先按 [m1-disk-space.md](m1-disk-space.md) 腾空间；有 `postmaster.pid` 残留且确认没有 postgres 进程（`pgrep -l postgres`）时才删它。不要删数据目录里的任何别的文件，不要 `pg_resetwal`。
 3. **连接数用满**（日志 `too many clients`）：`select application_name, state, count(*) from pg_stat_activity group by 1,2 order by 3 desc` 看是谁，通常是卡住的测试；只停自己的。
-4. 数据库恢复后，Web 和 Worker 通常自己重连；就绪接口仍不 ready 时，由发布负责人重启（`deploy-lock run`）。**数据库断开过之后，单次定时控制器可能停在 `blocked`**（就绪接口 503、`detail: native_once_blocked`），它不会自己恢复，要重启 Worker，见 [m1-worker-crash.md](m1-worker-crash.md#定时控制器卡住)。Worker 运行中数据库被停掉时，它多半来不及写下定时分区的关闭证明：重启后的 Worker 一直 `cold`、照样 ready，监控报 `scheduler_takeover`，按 [手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)恢复。重启 Worker 之后一律跑 `~/allrice40-dev/bin/smoke-test --dev --only reminder`。
+4. 数据库恢复后，Web 和 Worker 通常自己重连；就绪接口仍不 ready 时，由发布负责人重启（`deploy-lock run`）。**数据库断开过之后，单次定时控制器可能停在 `blocked`**（就绪接口 503、`detail: native_once_blocked`），它不会自己恢复，要重启 Worker，见 [m1-worker-crash.md](m1-worker-crash.md#定时控制器卡住)。Worker 运行中数据库被停掉时，它多半来不及写下定时分区的关闭证明：重启后的 Worker 一直 `cold`、照样 ready，监控报 `scheduler_takeover`，按 [手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)恢复。重启 Worker 后按[确认恢复](m1-schedule-not-fired.md#确认恢复)核对定时控制器和告警。
 5. 数据坏了需要恢复备份，或者迁移之后要退回迁移前：见下面的[恢复备份或迁移前快照](#恢复备份或迁移前快照)。
 
 ## 恢复备份或迁移前快照
@@ -155,7 +155,7 @@ df -h ~                       # 磁盘满是最常见的原因之一
    curl -s -m 5 http://127.0.0.1:3312/health/ready | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["nativeOnceControl"]["state"], d["nativeRecurringControl"]["state"])'
    ```
 
-5. `exit` 退出 shell、释放锁，再跑提醒冒烟（**每次重启 Worker 之后都跑**：看到 `cold` 不等于正常，10-25 就是这样拖了 12 小时）：`~/allrice40-dev/bin/smoke-test --dev --only reminder`。
+5. `exit` 退出 shell、释放锁，再按[确认恢复](m1-schedule-not-fired.md#确认恢复)核对定时控制器和告警。
 
 按 4.0 部署交接记录核对独立集群的 launchd 名称和数据目录，再停启该集群。保留现有 5432 Homebrew PostgreSQL 进程。
 
@@ -190,5 +190,5 @@ ls -la ~/allrice40-backups/db | tail -3
 
 ```bash
 ~/allrice40-dev/bin/monitor run --dry-run | grep -E "postgres|backup|business"
-~/allrice40-dev/bin/smoke-test --dev --only chat
+~/allrice40-dev/bin/smoke-test --dev --hello
 ```

@@ -37,8 +37,9 @@ REL=$(/usr/bin/python3 -c 'import plistlib,os;print(plistlib.load(open(os.path.e
 
 ```bash
 ~/allrice40-dev/bin/monitor run --dry-run | grep images
-~/allrice40-dev/bin/smoke-test --dev --only office,csv,browser
 ```
+
+4.0 发布冒烟只验证原生工作台入口。Office、CSV、云浏览器的真机复核按各自验收范围执行。
 
 ## 后续
 

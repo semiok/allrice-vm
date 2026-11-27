@@ -1,422 +1,163 @@
 #!/usr/bin/env node
-// Six real end-to-end checks as an ordinary employee, through the actual web UI
-// (headless Chrome): chat, continue (a follow-up in --continue-session, an earlier
-// run's session), office (.docx), csv (Python chart), browser (cloud browser),
-// reminder (fires within ~2 minutes). Real model calls — not a unit test.
-//
-//   node smoke-test.mjs --url http://127.0.0.1:3311 [--worker-url http://127.0.0.1:3312] --creds <file>
-//                       [--only chat,reminder] [--out <dir>] [--expect-sha <sha>] [--continue-session <id>]
-//
-// Writes <out>/result.json (with the session each check used) and one screenshot per
-// check; exit code 1 if any check fails. The bash wrapper (smoke-test) picks the session
-// to continue and checks the database afterwards.
 import { createRequire } from 'node:module';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
-  readSmokeReply,
-  readSmokeCsvReply,
-  readSmokeCsvProof,
-  findSmokeCsvDelivery,
-  fetchSmokeCsvPng,
-  validateSmokeCsvPng,
-  decodeSmokeCsvPng,
-} from './smoke-reply.mjs';
-import { startSmokeWork } from './smoke-entry.mjs';
+  access,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { parseArgs } from 'node:util';
+import { SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
 
-const args = Object.fromEntries(
-  process.argv
-    .slice(2)
-    .reduce(
-      (acc, v, i, a) =>
-        v.startsWith('--') ? [...acc, [v.slice(2), a[i + 1]]] : acc,
-      [],
-    ),
-);
-const ALL = ['chat', 'continue', 'office', 'csv', 'browser', 'reminder'];
-const only = args.only
-  ? args.only
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-  : ALL;
-for (const c of only)
-  if (!ALL.includes(c)) {
-    console.error(`unknown check: ${c}`);
-    process.exit(2);
-  }
-if (!args.url || !args.creds) {
+const { values: args } = parseArgs({
+  options: {
+    url: { type: 'string' },
+    'worker-url': { type: 'string' },
+    creds: { type: 'string' },
+    out: { type: 'string' },
+    'expect-sha': { type: 'string' },
+    hello: { type: 'boolean' },
+    'vm-unavailable': { type: 'string' },
+  },
+});
+if (!args.url || !args['worker-url'] || !args.creds || !args.out) {
   console.error(
-    'usage: smoke-test.mjs --url <base> [--worker-url <base>] --creds <file> [--only a,b] [--out dir] [--expect-sha <sha>] [--continue-session <id>]',
+    'usage: smoke-test.mjs --url URL --worker-url URL --creds FILE --out DIR [--expect-sha SHA] [--hello] [--vm-unavailable capacity|host]',
   );
   process.exit(2);
 }
-const base = args.url.replace(/\/$/, '');
-const creds = JSON.parse(fs.readFileSync(args.creds, 'utf8'));
-const out =
-  args.out ??
-  path.join(
-    os.homedir(),
-    'allrice-qa',
-    '_smoke',
-    new Date().toISOString().replace(/[:.]/g, '-'),
-  );
-fs.mkdirSync(out, { recursive: true, mode: 0o700 });
 
-// playwright-core from the shared Dev release (any AllRice release has it).
-const releases = path.join(os.homedir(), 'allrice40-dev-releases');
-const pwDir = fs
-  .readdirSync(releases)
-  .map((r) => path.join(releases, r, 'node_modules/.pnpm'))
-  .filter((p) => fs.existsSync(p))
-  .flatMap((p) =>
-    fs
-      .readdirSync(p)
-      .filter((d) => d.startsWith('playwright-core@'))
-      .map((d) => path.join(p, d, 'node_modules/playwright-core')),
-  )[0];
-if (!pwDir) {
-  console.error('playwright-core not found under ~/allrice40-dev-releases');
-  process.exit(2);
-}
-const { chromium } = createRequire(import.meta.url)(pwDir);
-
-const tag = Date.now().toString(36);
-const t0 = Date.now();
-const log = (...a) =>
-  console.log(`[${((Date.now() - t0) / 1000).toFixed(0).padStart(4)}s]`, ...a);
-const browser = await chromium.launch({
-  executablePath:
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  headless: true,
-});
-const ctx = await browser.newContext({
-  viewport: { width: 1440, height: 900 },
-  locale: 'zh-CN',
-  timezoneId: 'Asia/Shanghai',
-});
-const page = await ctx.newPage();
-const results = [];
-// The version actually serving the run: Web and Worker are read at the start and at the
-// end. Unknown, different between the two, changed during the run, or not the expected
-// version (--expect-sha) all fail the run, so a pass always belongs to one known version.
-const readySha = async (url) => {
-  try {
-    const j = await (await fetch(url)).json();
-    return j.status === 'ready' ? (j.identity?.sourceSha ?? '') : '';
-  } catch {
-    return '';
-  }
-};
-const workerBase = (args['worker-url'] ?? '').replace(/\/$/, '');
-const versions = async () => ({
-  web: await readySha(`${base}/api/health/ready`),
-  worker: workerBase
-    ? await readySha(`${workerBase}/health/ready`)
-    : '(not checked)',
-});
-const versionStart = await versions();
-
-async function login() {
-  await page.goto(`${base}/login`, { waitUntil: 'networkidle' });
-  await page.fill('input[name="username"]', creds.username);
-  await page.fill('input[name="password"]', creds.password);
-  await Promise.all([
-    page.waitForURL((u) => !u.pathname.startsWith('/login'), {
-      timeout: 30_000,
-    }),
-    page.click('button[type="submit"]'),
-  ]);
-  await page.waitForLoadState('networkidle').catch(() => {});
-}
-const newWork = () => startSmokeWork(page, base);
-// Send, then wait until the run's stop button has appeared and stayed gone for 3s.
-async function ask(text, timeoutMs) {
-  await page.locator('textarea').first().fill(text);
-  const sent = Date.now();
-  await page.getByRole('button', { name: '发送', exact: true }).click();
-  const stop = page.locator(
-    'button[aria-label*="停止"], button:has-text("停止")',
-  );
-  let seen = false,
-    gone = 0;
-  while (Date.now() - sent < timeoutMs) {
-    const running = await stop
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (running) {
-      seen = true;
-      gone = 0;
-    } else if (seen) {
-      gone ||= Date.now();
-      if (Date.now() - gone > 3000) break;
-    }
-    await page.waitForTimeout(500);
-  }
-  return {
-    seconds: Math.round((Date.now() - sent) / 1000),
-    finished: seen && gone > 0,
-  };
-}
-const sessionOf = () => {
-  try {
-    return new URL(page.url()).searchParams.get('session');
-  } catch {
-    return null;
-  }
-};
-const replyAfter = (prompt, marker) =>
-  page
-    .locator('[data-chat-scroll]')
-    .evaluate(readSmokeReply, { prompt, marker });
-async function check(name, fn) {
-  if (!only.includes(name)) return;
-  const started = Date.now();
-  const before = sessionOf();
-  log(`${name} …`);
-  let r;
-  try {
-    r = await fn();
-  } catch (e) {
-    r = { pass: false, detail: e.message.split('\n')[0] };
-  }
-  // The session the check worked in; the wrapper records its origin from the database.
-  if (!('sessionId' in r)) {
-    const after = sessionOf();
-    r.sessionId = after && after !== before ? after : null;
-  }
-  r.seconds = Math.round((Date.now() - started) / 1000);
-  await page
-    .screenshot({ path: path.join(out, `${name}.png`), fullPage: true })
-    .catch(() => {});
-  results.push({ check: name, ...r });
-  log(
-    `${name} ${r.skipped ? 'SKIP' : r.pass ? 'PASS' : 'FAIL'} (${r.seconds}s) ${r.detail ?? ''}`,
-  );
-}
-
-try {
-  await login();
-  log('logged in');
-  await check('chat', async () => {
-    await newWork();
-    const q = `冒烟测试 ${tag}：请用一句话介绍你自己。`;
-    const run = await ask(q, 180_000);
-    const { text: reply, timing } = await replyAfter(q);
-    const pass =
-      run.finished &&
-      /用时/.test(timing) &&
-      reply.replace(/\s+/g, '').length > 20;
-    return {
-      pass,
-      detail: pass
-        ? ''
-        : `finished=${run.finished} reply=${reply.slice(0, 120).replace(/\s+/g, ' ')}`,
-    };
-  });
-  await check('continue', async () => {
-    const earlier = args['continue-session'];
-    if (!earlier) {
-      // Nothing to continue yet: leave a session for the next run.
-      await newWork();
-      const run = await ask(`冒烟测试 ${tag}：请用一句话介绍你自己。`, 180_000);
-      return {
-        pass: run.finished,
-        skipped: true,
-        sessionId: run.finished ? sessionOf() : null,
-        detail: run.finished
-          ? 'no earlier smoke session; started one for the next run'
-          : 'no earlier smoke session, and starting one did not finish',
-      };
-    }
-    await page
-      .goto(`${base}/chatflow?session=${encodeURIComponent(earlier)}`, {
-        waitUntil: 'networkidle',
-      })
-      .catch(() => {});
-    await page.waitForTimeout(1500);
-    if (sessionOf() !== earlier)
-      return {
-        pass: false,
-        sessionId: earlier,
-        detail: `could not open session ${earlier}`,
-      };
-    const q = `冒烟测试 ${tag}：接着上面的对话，用一句话说说你上一条回复讲了什么。`;
-    const run = await ask(q, 180_000);
-    const { text: reply, timing } = await replyAfter(q);
-    const pass =
-      run.finished &&
-      /用时/.test(timing) &&
-      reply.replace(/\s+/g, '').length > 20;
-    return {
-      pass,
-      sessionId: earlier,
-      continued: true,
-      prompt: q,
-      detail: pass
-        ? ''
-        : `finished=${run.finished} reply=${reply.slice(0, 120).replace(/\s+/g, ' ')}`,
-    };
-  });
-  await check('office', async () => {
-    await newWork();
-    const q = `冒烟测试 ${tag}：生成一份 Word 文档，标题《冒烟测试》，正文两句话，直接给我下载。`;
-    const run = await ask(q, 420_000);
-    const { text, links } = await replyAfter(q);
-    const reply = [text, ...links].join('\n');
-    const pass = run.finished && /\.docx/.test(reply);
-    return {
-      pass,
-      detail: pass
-        ? ''
-        : `finished=${run.finished} reply=${reply.slice(0, 160).replace(/\s+/g, ' ')}`,
-    };
-  });
-  await check('csv', async () => {
-    await newWork();
-    const file = path.join(out, `渠道数据-${tag}.csv`);
-    fs.writeFileSync(
-      file,
-      '日期,渠道,曝光,点击,下单\n2026-10-01,微信,1200,80,9\n2026-10-01,抖音,1500,95,7\n2026-10-02,微信,1100,70,8\n2026-10-02,抖音,1600,99,6\n2026-10-03,小红书,900,60,5\n',
-    );
-    await page.locator('input[type="file"]').first().setInputFiles(file);
-    await page.waitForTimeout(2500);
-    const q = `冒烟测试 ${tag}：按渠道汇总这个 CSV，画一张柱状图。`;
-    const run = await ask(q, 420_000);
-    if (!run.finished) return { pass: false, detail: 'csv_run_not_finished' };
-    const sessionId = sessionOf();
-    const observed = await page
-      .locator('[data-chat-scroll]')
-      .evaluate(readSmokeCsvReply, { prompt: q });
-    const proof = readSmokeCsvProof({
-      ...observed,
-      sessionId,
-      prompt: q,
-      account: creds.username,
-    });
-    // Reuse the parser already installed with the same release as Playwright.
-    // Installed M1 tools themselves have no workspace node_modules.
-    const webRequire = createRequire(
-      path.join(path.resolve(pwDir, '../../../../..'), 'apps/web/package.json'),
-    );
-    const { fromMarkdown } = await import(
-      pathToFileURL(webRequire.resolve('mdast-util-from-markdown')).href
-    );
-    const delivery = findSmokeCsvDelivery({
-      observed,
-      proof,
-      sessionId,
-      base,
-      fromMarkdown,
-    });
-    const response = await page.evaluate(fetchSmokeCsvPng, delivery.href);
-    if (!response.ok) throw Error(`csv_png_download_http_${response.status}`);
-    const bytes = Buffer.from(response.bytes);
-    const png = validateSmokeCsvPng(bytes, delivery.object, response.mediaType);
-    const decoded = await page.evaluate(decodeSmokeCsvPng, [...bytes]);
-    if (decoded.width !== png.width || decoded.height !== png.height)
-      throw Error('csv_png_decode_mismatch');
-    return {
-      pass: true,
-      sessionId,
-      userMessageId: proof.userMessageId,
-      assistantMessageId: proof.assistantMessageId,
-      runId: proof.runId,
-      png: { objectId: delivery.id, evidence: delivery.kind, ...png },
-    };
-  });
-  await check('browser', async () => {
-    await newWork();
-    const q = `冒烟测试 ${tag}：请用云端浏览器打开 https://example.com ，告诉我页面标题。`;
-    const run = await ask(q, 300_000);
-    const { text: reply } = await replyAfter(q);
-    const pass = run.finished && /Example Domain/.test(reply);
-    return {
-      pass,
-      detail: pass
-        ? ''
-        : `finished=${run.finished} reply=${reply.slice(0, 160).replace(/\s+/g, ' ')}`,
-    };
-  });
-  await check('reminder', async () => {
-    await newWork();
-    const marker = `冒烟提醒-${tag}`;
-    const q = `1 分钟后提醒我：${marker}。`;
-    const run = await ask(q, 180_000);
-    const { text, automation } = await replyAfter(q);
-    const created = [text, automation].join('\n');
-    if (!run.finished || !/(待执行|一次性)/.test(created))
-      return {
-        pass: false,
-        detail: `not scheduled: ${created.slice(0, 160).replace(/\s+/g, ' ')}`,
-      };
-    const session = page.url();
-    const deadline = Date.now() + 180_000;
-    while (Date.now() < deadline) {
-      await page.waitForTimeout(10_000);
-      await page.goto(session, { waitUntil: 'networkidle' }).catch(() => {});
-      // The model words the delivered reminder freely, so do not match its text:
-      // a fired task adds an "自动化任务 … 查看任务" run entry to the conversation,
-      // followed by a reply that carries this run's unique marker.
-      const { delivered } = await replyAfter(q, marker);
-      if (delivered) return { pass: true };
-    }
-    return { pass: false, detail: 'reminder did not fire within 3 minutes' };
-  });
-} catch (e) {
-  results.push({
-    check: 'setup',
-    pass: false,
-    detail: e.message.split('\n')[0],
-  });
-  await page
-    .screenshot({ path: path.join(out, 'setup-error.png'), fullPage: true })
-    .catch(() => {});
-} finally {
-  await browser.close();
-}
-const versionEnd = await versions();
-{
-  const seen = [versionStart.web, versionEnd.web];
-  if (workerBase) seen.push(versionStart.worker, versionEnd.worker);
-  // `--expect-sha` given without a value fails rather than falling back to Web's version.
-  const expected = (
-    'expect-sha' in args ? (args['expect-sha'] ?? '') : (versionStart.web ?? '')
-  ).toLowerCase();
-  // Every report must be the same full SHA; a short SHA (7+ hex digits) then names it.
-  const sha = seen[0] ?? '';
-  const pass =
-    /^[0-9a-f]{40}$/.test(sha) &&
-    seen.every((v) => v === sha) &&
-    (expected === sha ||
-      (/^[0-9a-f]{7,39}$/.test(expected) && sha.startsWith(expected)));
-  results.push({
-    check: 'version',
-    pass,
-    detail: pass
-      ? expected
-      : `expected ${expected || '?'}; web ${versionStart.web || '?'} -> ${versionEnd.web || '?'}, worker ${versionStart.worker || '?'} -> ${versionEnd.worker || '?'}`,
-  });
-}
-const failed = results.filter((r) => !r.pass);
-const summary = {
-  url: base,
-  account: creds.username,
+class SmokeFailure extends Error {}
+const sha = /^[a-f0-9]{40}$/;
+const declaredLimit =
+  args['vm-unavailable'] ?? process.env.ALLRICE_SMOKE_VM_UNAVAILABLE;
+const prerequisites = new Map([
+  ['capacity', '没有可用的真实 VM 名额'],
+  ['host', '真实 VM 宿主未就绪'],
+]);
+const receipt = {
   at: new Date().toISOString(),
-  expectedSha: args['expect-sha'] ?? null,
-  versionStart,
-  versionEnd,
-  passed: results.length - failed.length,
-  failed: failed.length,
-  results,
-  out,
+  status: 'failed',
+  stages: {},
+  step: 'services',
 };
-fs.writeFileSync(
-  path.join(out, 'result.json'),
-  JSON.stringify(summary, null, 1),
+await mkdir(args.out, { recursive: true, mode: 0o700 });
+
+async function readySha(base, path) {
+  const response = await fetch(new URL(path, base), {
+    signal: AbortSignal.timeout(10_000),
+  });
+  const result = await response.json();
+  const version = result.identity?.sourceSha;
+  if (!response.ok || result.status !== 'ready' || !sha.test(version ?? ''))
+    throw new SmokeFailure('服务未就绪或缺少发布提交');
+  return version;
+}
+
+async function versions() {
+  const [web, worker] = await Promise.all([
+    readySha(args.url, '/api/health/ready'),
+    readySha(args['worker-url'], '/health/ready'),
+  ]);
+  if (web !== worker || (args['expect-sha'] && web !== args['expect-sha']))
+    throw new SmokeFailure('Web、Worker 与预期发布提交不一致');
+  return { web, worker };
+}
+
+async function playwright() {
+  const installed = join(homedir(), 'allrice40-dev-releases');
+  for (const name of await readdir(installed).catch((error) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  })) {
+    const require = createRequire(
+      join(installed, name, 'apps/web/package.json'),
+    );
+    let module;
+    try {
+      module = require.resolve('playwright-core');
+    } catch (error) {
+      if (error.code !== 'MODULE_NOT_FOUND') throw error;
+      continue;
+    }
+    return require(module);
+  }
+  throw new SmokeSkip('缺少可用的发布浏览器依赖');
+}
+
+let browser;
+try {
+  receipt.versionStart = await versions();
+  if (declaredLimit !== undefined) {
+    if (!prerequisites.has(declaredLimit))
+      throw new SmokeFailure('未知的 VM 前提缺口');
+    throw new SmokeSkip(prerequisites.get(declaredLimit));
+  }
+  receipt.step = 'browser';
+  const executablePath =
+    process.env.ALLRICE_TEST_CHROME_EXECUTABLE ??
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  try {
+    await access(executablePath);
+  } catch (error) {
+    if (error.code === 'ENOENT')
+      throw new SmokeSkip('找不到用于原生冒烟的 Chromium');
+    throw error;
+  }
+  const { chromium } = await playwright();
+  browser = await chromium.launch({ executablePath, headless: true });
+  const page = await browser.newPage({
+    viewport: { width: 1440, height: 900 },
+    locale: 'zh-CN',
+  });
+  const credentials = JSON.parse(await readFile(args.creds, 'utf8'));
+  await smokeNativeEntry(page, args.url, credentials, receipt, {
+    hello: args.hello,
+  });
+  receipt.status = 'passed';
+} catch (error) {
+  if (error instanceof SmokeSkip) receipt.status = 'skipped';
+  // Dry operational evidence must not contain credentials, request bodies or scope URLs.
+  receipt.reason =
+    error instanceof SmokeSkip ||
+    error instanceof SmokeFailure ||
+    (error.constructor === Error &&
+      /^[\p{Script=Han} 0-9A-Za-z（）]+$/u.test(error.message))
+      ? error.message
+      : '原生冒烟步骤失败';
+} finally {
+  if (receipt.versionStart) {
+    try {
+      receipt.versionEnd = await versions();
+      if (receipt.versionStart.web !== receipt.versionEnd.web)
+        throw new SmokeFailure('冒烟期间发布提交变化');
+    } catch {
+      receipt.status = 'failed';
+      receipt.reason = '冒烟结束时服务提交未通过复核';
+    }
+  }
+  try {
+    await browser?.close();
+  } catch {
+    receipt.status = 'failed';
+    receipt.reason = '冒烟浏览器未正常退出';
+  }
+  const file = join(args.out, 'result.json');
+  await writeFile(file + '.tmp', JSON.stringify(receipt, null, 2) + '\n', {
+    mode: 0o600,
+  });
+  await rename(file + '.tmp', file);
+}
+console.log(
+  receipt.status === 'skipped'
+    ? '跳过：' + receipt.reason
+    : receipt.status === 'passed'
+      ? '4.0 原生冒烟通过'
+      : '4.0 原生冒烟失败 [' + receipt.step + ']：' + receipt.reason,
 );
-log(`${summary.passed}/${results.length} passed — ${out}`);
-process.exit(failed.length ? 1 : 0);
+process.exitCode =
+  receipt.status === 'skipped' ? 77 : receipt.status === 'passed' ? 0 : 1;
