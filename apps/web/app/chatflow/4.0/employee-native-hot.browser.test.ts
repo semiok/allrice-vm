@@ -449,12 +449,27 @@ suite('4.0 browser entry with a running employee', () => {
       exerciseNavigation = false;
       expect(birthRequests).toBe(3);
       const abandoned = await context.newPage();
+      const sockets: string[] = [];
+      abandoned.on('websocket', (socket) => {
+        sockets.push('connect');
+        socket.on('close', () => sockets.push('closed'));
+      });
       await abandoned.goto(url);
       const abandonedFrame = abandoned
         .locator('iframe[title="员工工作区"]')
         .contentFrame();
       await abandonedFrame.getByRole('textbox').waitFor();
       await expect.poll(() => abandoned.getByRole('status').count()).toBe(0);
+      const oldDocument = abandonedFrame.locator('body');
+      expect(
+        await oldDocument.evaluate(() =>
+          (
+            window as unknown as {
+              __ALLRICE_EMPLOYEE_DOCUMENT__: { claim(): boolean };
+            }
+          ).__ALLRICE_EMPLOYEE_DOCUMENT__.claim(),
+        ),
+      ).toBe(true);
       const target = {
         ...f.selection,
         threadId: randomUUID(),
@@ -480,7 +495,8 @@ suite('4.0 browser entry with a running employee', () => {
           window.dispatchEvent(new Event('pagehide'));
         };
       }, target.threadId);
-      await abandonedFrame.locator('body').evaluate(
+      const offsetBeforeRetire = requests.length;
+      await oldDocument.evaluate(
         (_, message) => {
           const scopeId = document.querySelector<HTMLScriptElement>(
             'script[data-scope-id]',
@@ -489,9 +505,31 @@ suite('4.0 browser entry with a running employee', () => {
         },
         { type: pageNavigate, selection: target },
       );
+      await expect.poll(() => sockets.slice()).toEqual(['connect', 'closed']);
+      await expect
+        .poll(() => {
+          const pending = requests.slice(offsetBeforeRetire);
+          return ['identity', 'prewarm'].map(
+            (phase) =>
+              pending.find((request) => request.phase === phase)?.selection,
+          );
+        })
+        .toEqual([target, target]);
+      expect(new URL(abandoned.url()).searchParams.get('threadId')).toBe(
+        f.selection.threadId,
+      );
+      expect(sockets).toEqual(['connect', 'closed']);
+      await oldDocument.evaluate(() =>
+        (
+          window as unknown as {
+            __ALLRICE_EMPLOYEE_DOCUMENT__: { finish(state: 'closed'): void };
+          }
+        ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed'),
+      );
       await abandoned.waitForFunction(
         () => document.documentElement.dataset.abandonedIdentity === 'true',
       );
+      expect(sockets).toEqual(['connect', 'closed']);
       await abandoned.close();
 
       cold = true;
