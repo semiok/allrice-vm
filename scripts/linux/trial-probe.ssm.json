@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Run the installed AllRice Linux trial acceptance probe",
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "runAcceptance",
+      "precondition": { "StringEquals": ["platformType", "Linux"] },
+      "inputs": {
+        "timeoutSeconds": "240",
+        "runCommand": [
+          "exec /opt/allrice40/node/bin/node /opt/allrice40/trial/bin/host-acceptance.mjs"
+        ]
+      }
+    }
+  ]
+}
