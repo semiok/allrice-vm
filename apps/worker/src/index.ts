@@ -1,5 +1,6 @@
 import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
 import { createProductionPersonVmSources } from './person-vm/production-sources.js';
+import { createProductionPersonVmDeleteHttp } from './person-vm/production-delete-http.js';
 import {
   openProductionRecoverySocket,
   type ProductionShutdownStatus,
@@ -541,7 +542,19 @@ const dEntryPageRpc = createDEntryPageRpc(
   httpAborter.signal,
 );
 const dEntryProfile = createDEntryProfile(dEntryPages, httpAborter.signal);
+const personVmDeleteHttp = createProductionPersonVmDeleteHttp({
+  authenticate: authenticatePlatformSession,
+  lifetime: httpAborter.signal,
+  async execute(context, request, signal) {
+    const result = await personVmHost;
+    signal.throwIfAborted();
+    if (result.state !== 'installed')
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    return result.host.deletePersonVm(context, request, signal);
+  },
+});
 const server = createServer(async (request, response) => {
+  if (await personVmDeleteHttp.handle(request, response)) return;
   if (await dEntryProfile.handle(request, response)) return;
   if (await dEntryPageRpc.handle(request, response)) return;
   if (await dEntryHttp(request, response, stopping)) return;
@@ -1058,6 +1071,10 @@ function shutdown(signal: string) {
             if (!(result.error instanceof ProductionPersonVmHostUnavailable))
               throw result.error;
           },
+        },
+        {
+          name: 'person_vm_delete_http',
+          run: () => personVmDeleteHttp.close(),
         },
       ],
       waitForProducerRoots: () => producerLifecycle.waitForCurrentRoots(),

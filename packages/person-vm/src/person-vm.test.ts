@@ -793,7 +793,9 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
           return super.withLease<T>(person, options, async (lease) => {
             const result = await work({
               ...lease,
-              save: async (row, event) => {
+              save: async (row, details) => {
+                const event =
+                  details && 'audit' in details ? details.audit : undefined;
                 if (
                   charged &&
                   stage === 'publish' &&
@@ -801,7 +803,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
                   event.result === 'succeeded'
                 )
                   expire();
-                await lease.save(row, event);
+                await lease.save(row, details);
               },
             });
             if (charged && stage === 'release') expire();

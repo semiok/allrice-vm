@@ -43,6 +43,8 @@ import {
   type PersonVmRuntimePort,
   type PersonVmScheduledIdleAuthority,
   type PersonVmWebRoster,
+  type PlatformVmDeletionRequest,
+  type PlatformVmDeletionResult,
 } from '@allrice/person-vm';
 import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
@@ -55,7 +57,10 @@ import {
   personNativeWebRoster,
 } from '../native-web/composition.js';
 import { dEntryNativePublicUrl } from '../native-web/launch.js';
-import { createProductionPersonVmAuthority } from './production-authority.js';
+import {
+  authorizeProductionPersonVmDeletion,
+  createProductionPersonVmAuthority,
+} from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
@@ -159,6 +164,11 @@ export interface ProductionPersonVmHost {
     request: PersonVmWakePreparation,
     signal: AbortSignal,
   ): Promise<PrepareStopWithWakeResult>;
+  deletePersonVm(
+    context: RequestContext,
+    request: PlatformVmDeletionRequest,
+    signal: AbortSignal,
+  ): Promise<PlatformVmDeletionResult>;
   assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
@@ -684,6 +694,7 @@ export function createProductionPersonVmHost(input: {
           ),
       };
       const vm = new PersonVmService({
+        authorizePlatformDeletion: authorizeProductionPersonVmDeletion,
         store,
         authority: current.authority,
         native: providers.native,
@@ -1104,6 +1115,19 @@ export function createProductionPersonVmHost(input: {
               reason: 'SCHEDULE_WAKE_UNAVAILABLE',
             } as const;
           return scheduledWake.prepareStopWithWake(request, active);
+        },
+        deletePersonVm(
+          context: RequestContext,
+          request: PlatformVmDeletionRequest,
+          signal: AbortSignal,
+        ) {
+          return own(() =>
+            vm.deleteForPlatform(
+              context,
+              request,
+              AbortSignal.any([signal, lifetime]),
+            ),
+          );
         },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;

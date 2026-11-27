@@ -111,6 +111,7 @@ files:
   db:
     - apps/worker/src/person-vm/scheduled-wake.integration.test.ts
     - apps/web/lib/d-entry/history-authority.integration.test.ts
+    - apps/worker/src/person-vm/production-delete.integration.test.ts
     - packages/egress-gateway/src/admission.integration.test.ts
     - packages/egress-gateway/src/managed-model.integration.test.ts
     - packages/model-gateway/src/postgres-store.integration.test.ts
