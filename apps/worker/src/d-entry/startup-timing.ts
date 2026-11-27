@@ -1,5 +1,7 @@
 /** Report phase durations without identity, session, artifact or RPC payloads. */
-export function dEntryStartupTiming(operation: 'page-open' | 'editor-proof') {
+export function dEntryStartupTiming(
+  operation: 'page-open' | 'editor-proof' | 'principal-wire',
+) {
   const startedAt = performance.now();
   const phases: Record<string, number> = {};
   let emitted = false;
