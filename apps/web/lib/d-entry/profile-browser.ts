@@ -279,7 +279,8 @@ export function nativeProfileDocument(
         if (new URL(input).href !== expected.href || peer)
           throw Error('Native connection is unavailable');
         const socket =
-          container.dataset.sharedMux === '1'
+          container.dataset.sharedMux === '1' &&
+          window.frameElement?.getAttribute('data-page-mux') === 'v1'
             ? borrowPageMux(scopeId)
             : new WebSocket(
                 nativeMuxUrl(

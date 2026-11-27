@@ -142,6 +142,9 @@ export function EmployeeNativePage({
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
+    const retainedDocument = activation.retainFrame
+      ? frame.current?.contentDocument
+      : undefined;
     if (!activation.retainFrame) {
       frameSelection.current = undefined;
       setSource(undefined);
@@ -189,7 +192,11 @@ export function EmployeeNativePage({
           try {
             const win = frame.current.contentWindow;
             const previous = frame.current.contentDocument;
-            if (win && previous?.URL === 'about:blank') {
+            if (
+              win &&
+              previous &&
+              (previous.URL === 'about:blank' || previous === retainedDocument)
+            ) {
               discardingPendingDocument = true;
               win.stop();
               win.location.replace('about:blank');
@@ -573,6 +580,7 @@ export function EmployeeNativePage({
         <iframe
           ref={frame}
           title="员工工作区"
+          data-page-mux="v1"
           src={source}
           onLoad={(event) => loaded.current?.(event.currentTarget)}
           referrerPolicy="no-referrer"

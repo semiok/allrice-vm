@@ -123,7 +123,7 @@ it.skipIf(!browserExecutable).each([false, true])(
           response
             .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
             .end(
-              `<!doctype html><iframe style="width:100%;height:100vh"></iframe>
+              `<!doctype html><iframe data-page-mux="v1" style="width:100%;height:100vh"></iframe>
                 <script>${parentModule.outputFiles[0]!.text}</script>
                 <script>
                   const frame = document.querySelector('iframe');
