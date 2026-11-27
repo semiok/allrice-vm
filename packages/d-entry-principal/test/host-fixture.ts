@@ -19,7 +19,9 @@ import {
 import TypertRegistry, {
   type TypertContribution,
 } from '@deepseek-ai/dsh-typert-registry';
-import RemoteAccess from '@deepseek-ai/dsh-api-remote-access';
+import RemoteAccess, {
+  type RemoteAccessService,
+} from '@deepseek-ai/dsh-api-remote-access';
 import { TYPERT as AccessMetadata } from '@deepseek-ai/dsh-api-remote-access/typert';
 import Gateway, {
   type TypertRemoteEventDispatch,
@@ -157,26 +159,24 @@ class Catalog extends TypertRemoteService {
   constructor(ctx: Context) {
     super(ctx, 'sessionController', { namespace: 'session' });
   }
+  private allows({ sessionId }: SessionSummary) {
+    // This fixture runs the Host service even when typechecked in the Web
+    // workspace, whose Cordis augmentation names the Client service instead.
+    const access = this.ctx.remoteAccess as unknown as RemoteAccessService;
+    return access.allows({ kind: 'session', id: sessionId });
+  }
   @Remote('list')
   async list(_request: object, signal: AbortSignal) {
     await this.beforeList?.(signal);
     signal.throwIfAborted();
-    return {
-      items: this.items.filter(
-        ({ sessionId }) =>
-          !this.ctx.invocation ||
-          this.ctx.remoteAccess.allows({ kind: 'session', id: sessionId }),
-      ),
-    };
+    return { items: this.items.filter((row) => this.allows(row)) };
   }
   @Remote({ mode: 'stream' })
   async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
     signal.throwIfAborted();
     const projections = Object.fromEntries(
       this.items
-        .filter(({ sessionId }) =>
-          this.ctx.remoteAccess.allows({ kind: 'session', id: sessionId }),
-        )
+        .filter((row) => this.allows(row))
         .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
     );
     yield { type: 'baseline', value: { projections } };
