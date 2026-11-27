@@ -520,7 +520,7 @@ it('E3 projects the frozen personal employee name/style and allows personal Skil
   expect(text).toContain(
     'save the personal display name or default expression style',
   );
-  expect(text).toContain('use exact preview/confirmation in employee details');
+  expect(text).toContain('Use exact preview/confirmation in employee details');
   expect(text).toContain('workspace_personal_skill_install');
   expect(text).toContain('workspace_personal_skill_version');
   expect(text).toContain('employee-customization Skill');
@@ -543,6 +543,6 @@ it('E3 projects the frozen personal employee name/style and allows personal Skil
   expect(other).toContain('do not send name or edit business methods');
   expect(other).not.toContain('"小米"');
   expect(other).not.toContain(
-    'use exact preview/confirmation in employee details',
+    'Use exact preview/confirmation in employee details',
   );
 });
