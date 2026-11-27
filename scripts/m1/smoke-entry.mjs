@@ -121,13 +121,19 @@ export async function smokeNativeEntry(
       '登录页未保持同源',
     );
     await guarded(
-      page.locator('input[name="username"]').fill(credentials.username),
+      page
+        .locator('input[name="username"]')
+        .fill(credentials.username, { timeout }),
     );
     await guarded(
-      page.locator('input[name="password"]').fill(credentials.password),
+      page
+        .locator('input[name="password"]')
+        .fill(credentials.password, { timeout }),
     );
     await guarded(
-      page.getByRole('button', { name: '登录', exact: true }).click(),
+      page
+        .getByRole('button', { name: '登录', exact: true })
+        .click({ timeout }),
     );
     await guarded(
       page.waitForURL(

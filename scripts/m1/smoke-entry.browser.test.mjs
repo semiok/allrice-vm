@@ -28,7 +28,7 @@ async function fixture(mode) {
     const path = url.pathname;
     const method = request.method;
     traffic.push({ path, method });
-    function write(status, body, media = 'text/html') {
+    function write(status, body, media = 'text/html; charset=utf-8') {
       response.writeHead(status, { 'Content-Type': media });
       response.end(body);
     }
