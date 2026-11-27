@@ -22,7 +22,6 @@ import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import Llm from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
-import { z } from 'zod';
 import {
   deferred,
   summary,
@@ -1398,8 +1397,10 @@ it('carries native terminal input, resize and output across the owned VM stream'
   const life = await open(f);
   expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
   const descriptor = host.typert.local.get('terminal/attach');
-  const inputCodec = descriptor?.uplink?.codec.create();
-  if (!inputCodec) throw Error('Native terminal input schema missing');
+  const codec = descriptor?.uplink?.codec;
+  if (codec?.mode !== 'strict')
+    throw Error('Native terminal input schema missing');
+  const inputCodec = codec.create();
   const wire = host.typertGateway.wireStream;
   const dispatch = wire.open.bind(wire);
   const inputs: unknown[] = [];

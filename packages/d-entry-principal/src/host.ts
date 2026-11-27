@@ -963,9 +963,8 @@ class PrincipalService extends TypertRemoteService {
     const raw = object.parse(args.call);
     const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
     const gate = signalGate(signal);
-    const input = invocation
-      .uplink<CloseCommand | DEntryPageInput>()
-      [Symbol.asyncIterator]();
+    const commands = invocation.uplink<CloseCommand | DEntryPageInput>();
+    const input = commands[Symbol.asyncIterator]();
     let iterator: AsyncIterator<unknown> | undefined,
       pending: Promise<IteratorResult<unknown>> | undefined;
     let closing: Promise<void> | undefined;

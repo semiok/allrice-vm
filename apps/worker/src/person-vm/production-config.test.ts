@@ -427,11 +427,13 @@ describe('private production Host configuration', () => {
   });
   it('enables the terminal by default and honors an explicit sealed opt-out', async () => {
     const config = value();
-    const { terminalEnabled: _, ...web } = config.web;
-    await seal({ ...config, web });
+    await seal({
+      ...config,
+      web: { ...config.web, terminalEnabled: undefined },
+    });
     const defaults = await readProductionHostConfiguration(signal());
     expect(defaults.configuration.web.terminalEnabled).toBe(true);
-    await seal({ ...config, web: { ...web, terminalEnabled: false } });
+    await seal({ ...config, web: { ...config.web, terminalEnabled: false } });
     const disabled = await readProductionHostConfiguration(signal());
     expect(disabled.configuration.web.terminalEnabled).toBe(false);
   });
