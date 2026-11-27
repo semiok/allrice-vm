@@ -5,7 +5,12 @@ import {
 } from '@allrice/contracts';
 import type postgres from 'postgres';
 type Tx = postgres.TransactionSql;
-type Scope = { organizationId: string; workspaceId: string };
+type Scope = {
+  organizationId: string;
+  workspaceId: string;
+  personIds?: readonly string[];
+  employeeId?: string;
+};
 
 /** Existing cloud grants remain the execution authority. A revoked/paused grant
  * suppresses automatic preparation, including after restart or republishing. */
@@ -41,6 +46,8 @@ export async function prepareTenantCloudGrants(tx: Tx, scope: Scope) {
         and (m.workspace_id is null or m.workspace_id=a.workspace_id) and m.active and m.role in ('admin','member')
       join allrice_users u on u.id=a.user_id and u.status='active'
       where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and a.active
+        ${scope.personIds ? tx`and a.user_id=any(${tx.array([...scope.personIds])}::uuid[])` : tx``}
+        ${scope.employeeId ? tx`and a.employee_id=${scope.employeeId}` : tx``}
         and (v.manifest->'capabilityBindings'->'toolNames' ? ${kind === 'compute' ? 'cloud.process.execute' : 'browser.workspace'}
           or (${kind === 'compute'} and v.manifest->'capabilityBindings'->'toolNames' ? 'python.execute'))`;
     for (const user of users) {

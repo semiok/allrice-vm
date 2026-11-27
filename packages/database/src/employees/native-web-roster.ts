@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type postgres from 'postgres';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import { getDatabase } from '../core/client.ts';
 import { DataAccessError } from '../data.ts';
@@ -29,7 +30,9 @@ export async function preparePersonNativeWebRoster(
   context: RequestContext,
   sql = getDatabase(),
 ): Promise<PersonNativeWebRoster> {
-  return readRoster(context, sql, true);
+  return sql.begin(
+    async (tx) => (await readRoster(context, tx, 'prepare')).roster,
+  );
 }
 
 /** Same current authority and complete roster, without materializing assignments.
@@ -38,84 +41,196 @@ export async function readPersonNativeWebRoster(
   context: RequestContext,
   sql = getDatabase(),
 ): Promise<PersonNativeWebRoster> {
-  return readRoster(context, sql, false);
+  return sql.begin(
+    async (tx) => (await readRoster(context, tx, 'read')).roster,
+  );
 }
 
-async function readRoster(
-  context: RequestContext,
-  sql: ReturnType<typeof getDatabase>,
-  materialize: boolean,
-): Promise<PersonNativeWebRoster> {
-  if (context.actor.type !== 'user')
-    throw new DataAccessError('authentication_required');
-  const personId = UuidSchema.parse(context.actor.id),
-    organizationId = UuidSchema.parse(context.organizationId);
-  return sql.begin(async (tx) => {
-    const workspaces = await tx<{ id: string }[]>`
+type RosterOwner = { personId: string; organizationId: string };
+type Tx = postgres.TransactionSql;
+
+function rosterWorkspaces(
+  tx: Tx,
+  { personId, organizationId }: RosterOwner,
+  whenEnabled = false,
+) {
+  return tx<{ id: string }[]>`
       select w.id from allrice_workspaces w
       join allrice_organizations o on o.id=w.organization_id and o.archived_at is null
-      join allrice_users u on u.id=${personId} and u.status='active'
+      join allrice_users u on u.id=${personId} and (u.status='active' or (${whenEnabled} and u.status='disabled'))
       where w.organization_id=${organizationId} and w.archived_at is null
         and exists(select 1 from allrice_memberships m
           where m.organization_id=w.organization_id and m.user_id=u.id and m.active
             and m.role in ('admin','member') and (m.workspace_id is null or m.workspace_id=w.id))
       order by w.id`;
-    if (!workspaces.length) throw new DataAccessError('authorization_denied');
-    const entries: PersonNativeWebRoster['entries'][number][] = [];
-    for (const workspace of workspaces) {
-      const scope = { ...context, workspaceId: workspace.id };
-      // Existing admission identity lock also rechecks session expiry/revocation,
-      // current membership and organization; stale context.memberships is ignored.
-      await lockEmployeeInstanceAdmissionIdentity(tx, scope);
-      // Match employee-instances: assignment serializes publication/revocation.
-      // Publication locks employee before assignment; do not invert it here.
-      const assignments = await tx<{ id: string; materialized: boolean }[]>`
-        select a.id,exists(select 1 from allrice_employee_instances i
-          join allrice_employee_instance_revisions r on r.instance_id=i.id and r.revision=1
-          -- A personal custom employee owns its root instance directly.
-          where i.id=a.id and i.assignment_id=a.id
-            and i.organization_id=a.organization_id and i.workspace_id=a.workspace_id
-            and i.owner_id=a.user_id) materialized from allrice_employee_assignments a
+}
+
+function hasAssignmentRoot(tx: Tx) {
+  return tx`exists(select 1 from allrice_employee_instances i
+    join allrice_employee_instance_revisions r on r.instance_id=i.id and r.revision=1
+    where i.id=a.id and i.assignment_id=a.id
+      and i.organization_id=a.organization_id and i.workspace_id=a.workspace_id
+      and i.owner_id=a.user_id)`;
+}
+
+function rosterAssignments(
+  tx: Tx,
+  { personId, organizationId }: RosterOwner,
+  workspaceId: string,
+  lock = false,
+) {
+  return tx<{ id: string; employee_id: string; materialized: boolean }[]>`
+        select a.id,a.employee_id,${hasAssignmentRoot(tx)} materialized
+        from allrice_employee_assignments a
         join allrice_employees e on e.id=a.employee_id and e.organization_id=a.organization_id
           and e.workspace_id=a.workspace_id and e.status='active'
         join allrice_employee_versions v on v.id=a.employee_version_id and v.employee_id=e.id
           and v.organization_id=a.organization_id and v.workspace_id=a.workspace_id
-        where a.organization_id=${organizationId} and a.workspace_id=${workspace.id}
+        where a.organization_id=${organizationId} and a.workspace_id=${workspaceId}
           and a.user_id=${personId} and a.active
           and not exists(select 1 from allrice_platform_employee_tenant_assignments d
             where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id
               and d.tenant_employee_id=e.id and not d.active)
-        order by a.id for share of a`;
-      for (const assignment of assignments) {
-        if (materialize) await ensureGeneralEmployeeInstance(tx, assignment.id);
-        else if (!assignment.materialized)
-          throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
-      }
-      const allowed = new Set(assignments.map(({ id }) => id));
-      for (const instance of await listEmployeeInstances(
-        scope,
-        workspace.id,
-        tx,
-      )) {
-        if (!allowed.has(instance.assignmentId)) continue;
-        const current = await getEmployeeInstance(scope, instance.id, tx);
-        entries.push(
-          Object.freeze({
-            workspaceId: workspace.id,
-            employeeInstanceId: current.id,
-            employeeRevision: current.revision,
-            employeeVersionId: current.source.employeeVersionId,
-          }),
-        );
-      }
-    }
-    entries.sort((a, b) =>
-      a.employeeInstanceId.localeCompare(b.employeeInstanceId),
+        order by a.id ${lock ? tx`for share of a` : tx``}`;
+}
+
+/** Capacity only. These are the administrator's existing include/default
+ * choices that synchronization would materialize for a writable member. */
+function pendingAssignments(
+  tx: Tx,
+  { personId, organizationId }: RosterOwner,
+  workspaceId: string,
+) {
+  return tx<
+    { id: string | null; employee_id: string; materialized: boolean }[]
+  >`
+    select a.id,d.tenant_employee_id employee_id,${hasAssignmentRoot(tx)} materialized
+    from allrice_platform_employee_tenant_assignments d
+    join allrice_employees e on e.id=d.tenant_employee_id
+      and e.organization_id=d.organization_id and e.workspace_id=d.workspace_id and e.status='active'
+    join allrice_employee_versions v on v.id=d.tenant_employee_version_id and v.employee_id=e.id
+      and v.organization_id=e.organization_id and v.workspace_id=e.workspace_id
+    left join allrice_employee_assignments a on a.organization_id=d.organization_id
+      and a.workspace_id=d.workspace_id and a.employee_id=e.id and a.user_id=${personId}
+    where d.organization_id=${organizationId} and d.workspace_id=${workspaceId} and d.active
+      and not exists(select 1 from allrice_platform_employee_tenant_assignments withdrawn
+        where withdrawn.organization_id=d.organization_id and withdrawn.workspace_id=d.workspace_id
+          and withdrawn.tenant_employee_id=e.id and not withdrawn.active)
+      and (a.selection_mode='include' or (d.inherit_by_default and coalesce(a.selection_mode,'inherit')='inherit'))`;
+}
+
+export type NativeWebCapacityEntry = {
+  assignmentId: string | null;
+  employeeId: string;
+  workspaceId: string;
+};
+
+/** The when-enabled projection belongs only to authorized writers holding the
+ * person's fence. It neither admits a disabled user nor materializes an intent. */
+export async function readNativeWebEmployeeIds(
+  tx: Tx,
+  owner: RosterOwner,
+  whenEnabled = false,
+) {
+  const entries = new Map<string, NativeWebCapacityEntry>();
+  for (const { id: workspaceId } of await rosterWorkspaces(
+    tx,
+    owner,
+    whenEnabled,
+  )) {
+    const assignments = await rosterAssignments(tx, owner, workspaceId);
+    const pending = whenEnabled
+      ? await pendingAssignments(tx, owner, workspaceId)
+      : [];
+    const sources = new Map(
+      [...pending, ...assignments].map((entry) => [entry.employee_id, entry]),
     );
-    const facts = { personId, organizationId, entries: Object.freeze(entries) };
-    return Object.freeze({
+    const byId = new Map<string, string>();
+    function include(
+      id: string,
+      assignmentId: string | null,
+      employeeId: string,
+    ) {
+      entries.set(id, { assignmentId, employeeId, workspaceId });
+    }
+    for (const assignment of sources.values()) {
+      const { id, employee_id: employeeId } = assignment;
+      if (id) byId.set(id, employeeId);
+      if (!assignment.materialized)
+        include(
+          whenEnabled || id === null ? `root:${employeeId}` : id,
+          id,
+          employeeId,
+        );
+    }
+    if (!byId.size) continue;
+    const instances = await tx<{ id: string; assignment_id: string }[]>`
+      select id,assignment_id from allrice_employee_instances
+      where organization_id=${owner.organizationId} and workspace_id=${workspaceId}
+        and owner_id=${owner.personId} and archived_at is null
+        and assignment_id=any(${tx.array([...byId.keys()])}::uuid[])`;
+    for (const { id, assignment_id } of instances) {
+      const employeeId = byId.get(assignment_id)!;
+      include(
+        whenEnabled && id === assignment_id ? `root:${employeeId}` : id,
+        assignment_id,
+        employeeId,
+      );
+    }
+  }
+  return entries;
+}
+
+async function readRoster(
+  context: RequestContext,
+  tx: Tx,
+  mode: 'prepare' | 'read',
+) {
+  if (context.actor.type !== 'user')
+    throw new DataAccessError('authentication_required');
+  const personId = UuidSchema.parse(context.actor.id),
+    organizationId = UuidSchema.parse(context.organizationId);
+  const owner = { personId, organizationId };
+  const workspaces = await rosterWorkspaces(tx, owner);
+  if (!workspaces.length) throw new DataAccessError('authorization_denied');
+  const entries: PersonNativeWebRoster['entries'][number][] = [];
+  for (const workspace of workspaces) {
+    const scope = { ...context, workspaceId: workspace.id };
+    // Lock the actual session and membership before the assignment rows.
+    await lockEmployeeInstanceAdmissionIdentity(tx, scope);
+    const assignments = await rosterAssignments(tx, owner, workspace.id, true);
+    for (const assignment of assignments) {
+      if (mode === 'prepare')
+        await ensureGeneralEmployeeInstance(tx, assignment.id);
+      else if (!assignment.materialized)
+        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    }
+    const allowed = new Set(assignments.map(({ id }) => id));
+    for (const instance of await listEmployeeInstances(
+      scope,
+      workspace.id,
+      tx,
+    )) {
+      if (!allowed.has(instance.assignmentId)) continue;
+      const current = await getEmployeeInstance(scope, instance.id, tx);
+      entries.push(
+        Object.freeze({
+          workspaceId: workspace.id,
+          employeeInstanceId: current.id,
+          employeeRevision: current.revision,
+          employeeVersionId: current.source.employeeVersionId,
+        }),
+      );
+    }
+  }
+  entries.sort((a, b) =>
+    a.employeeInstanceId.localeCompare(b.employeeInstanceId),
+  );
+  const facts = { personId, organizationId, entries: Object.freeze(entries) };
+  return {
+    roster: Object.freeze({
       ...facts,
       digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
-    });
-  });
+    }),
+  };
 }

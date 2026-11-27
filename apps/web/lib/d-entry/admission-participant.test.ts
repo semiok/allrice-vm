@@ -256,7 +256,7 @@ describe('D entry consumer preparation: outcome only after actual owner close', 
       await rejected;
       expect(acquire).not.toHaveBeenCalled();
       expect(f.events).toContain(
-        (phase === 'queued' ? 'queued' : 'activate') + ':rejected',
+        (phase === 'queued' ? 'queued' : 'activate') + ':fulfilled',
       );
       expect(f.finish).toHaveBeenCalledTimes(1);
     },

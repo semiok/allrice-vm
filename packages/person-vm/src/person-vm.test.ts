@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   PersonVmError,
   PERSON_VM_COLD_MS,
@@ -8,7 +8,10 @@ import {
 import { PersonVmService } from './person-vm.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { runCommand } from './process.ts';
-import type { PersonVmBootstrapScope } from './guest-bootstrap.ts';
+import type {
+  PersonVmBootstrapScope,
+  PersonVmStartingScope,
+} from './guest-bootstrap.ts';
 import {
   context,
   harness,
@@ -19,6 +22,138 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  it.each([
+    'fresh disk and attach',
+    'previous disk',
+    'idempotent create',
+    'borrowed attachment',
+    'image changes before probe',
+    'image changes during probe',
+    'existing home',
+    'unjoined probe',
+  ] as const)(
+    'limits the first HOME receipt to an exact fresh start: %s',
+    async (state) => {
+      const h = harness();
+      const rc = context();
+      const employee = {
+        workspaceId: rc.workspaceId ?? randomUUID(),
+        employeeInstanceId: randomUUID(),
+        employeeRevision: 1,
+        employeeVersionId: randomUUID(),
+      };
+      const roster = {
+        personId: rc.actor.id,
+        organizationId: rc.organizationId,
+        entries: [employee],
+      };
+      const selectedEmployee = {
+        personId: roster.personId,
+        organizationId: roster.organizationId,
+        ...employee,
+      };
+      const port = { hostPort: 32171, guestPort: 32171 };
+      const { create, attach, inspectMount } = h.disk;
+      vi.spyOn(h.disk, 'create').mockImplementation(async (ref, scoped) => {
+        await create(ref, scoped);
+        if (state !== 'idempotent create')
+          return { device: 'synthetic', inode: ref.vmId };
+      });
+      if (state === 'borrowed attachment')
+        vi.spyOn(h.disk, 'attach').mockImplementation((disk, scoped) =>
+          attach(disk, scoped),
+        );
+      let probed = false;
+      if (
+        state === 'image changes before probe' ||
+        state === 'image changes during probe'
+      )
+        vi.spyOn(h.disk, 'inspectMount').mockImplementation(
+          (disk, active, expected) => {
+            if (state === 'image changes before probe' || probed)
+              return Promise.resolve({ state: 'unknown' });
+            return inspectMount!(disk, active, expected);
+          },
+        );
+      const observeHomes = vi.fn(
+        async (scope: PersonVmStartingScope, mount: string) => {
+          await scope.assertCurrent();
+          const during = await h.store.read(rc.actor.id);
+          expect(during?.instanceId).toBe(scope.binding.instanceId);
+          expect(during?.leaseOwner).toBeTruthy();
+          expect(during?.phase).toBe('starting');
+          expect(mount).toBe('/synthetic/' + scope.binding.vmId);
+          probed = true;
+          if (state === 'unjoined probe')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          return state !== 'existing home';
+        },
+      );
+      h.native.prepareWebEndpoints = vi.fn<
+        NonNullable<typeof h.native.prepareWebEndpoints>
+      >(async (binding, roster) => ({
+        binding,
+        rosterDigest: roster.digest,
+        slots: [port],
+        endpoints: roster.entries.map((entry) => ({ ...entry, ...port })),
+      }));
+      h.native.assertWebEndpoints = vi.fn(async () => {});
+      h.runtime.retireAfterNativeStop = vi.fn(async () => {});
+      const stage = vi.spyOn(h.runtime, 'memoryGuestPlan');
+      const service = new PersonVmService({
+        ...h.options,
+        nativeWeb: {
+          async prepare() {
+            return {
+              ...roster,
+              digest: `sha256:${createHash('sha256').update(JSON.stringify(roster)).digest('hex')}`,
+            };
+          },
+        },
+        readUnusedEmployeeHomes: observeHomes,
+      });
+      const previous =
+        state === 'previous disk' ? await service.create(rc, signal()) : null;
+      const starting = service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          selectedEmployee,
+          target: {
+            vmId: previous?.vmId ?? null,
+            instanceId: null,
+            leaseEpoch: 1,
+            assertAuthority: async () => {},
+          },
+        },
+        signal(),
+      );
+      if (state === 'unjoined probe') {
+        await expect(starting).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(observeHomes).toHaveBeenCalledOnce();
+        expect(stage).not.toHaveBeenCalled();
+        expect(h.log).toContain('native:stop');
+        return;
+      }
+      await expect(starting).resolves.toMatchObject({ ready: true });
+      const startup = stage.mock.calls[0]?.[2];
+      expect(startup?.selectedEmployee).toEqual(selectedEmployee);
+      expect(startup?.unusedEmployeeHomes).toBe(
+        state === 'fresh disk and attach' ? true : undefined,
+      );
+      expect(observeHomes).toHaveBeenCalledTimes(
+        [
+          'fresh disk and attach',
+          'existing home',
+          'image changes during probe',
+        ].includes(state)
+          ? 1
+          : 0,
+      );
+    },
+  );
   it('rejects a changed prewarm epoch under the lease before any disk or native side effect', async () => {
     const store = new MemoryStore(),
       h = harness(store),
@@ -326,6 +461,287 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(h.log.slice(before)).toEqual([]);
     expect((await h.service.start(rc, signal())).ready).toBe(true);
   });
+  it.each([
+    'mount conflict',
+    'pre-dispatch failure',
+    'borrowed mount',
+  ] as const)(
+    'a retained preflight does not own resources for %s',
+    async (mode) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      if (mode === 'borrowed mount')
+        await h.disk.attach({ vmId: binding.vmId, tier: 'warm' }, signal());
+      const attach = vi.spyOn(h.disk, 'attach');
+      const detach = vi.spyOn(h.disk, 'detach');
+      const proof = vi.fn(async () => {});
+      const observeOwnedMount = vi.fn();
+      if (mode === 'mount conflict')
+        vi.spyOn(h.disk, 'inspectMount').mockResolvedValue({
+          state: 'unknown',
+        });
+      if (mode === 'pre-dispatch failure')
+        attach.mockRejectedValueOnce(new PersonVmError('PROVIDER_FAILED'));
+      const vm = new PersonVmService({
+        ...h.options,
+        observeOwnedMount,
+        native: { ...h.native, assertRetainedStartup: proof },
+      });
+      const preflight = vm.reconcileStoppedEntryForPrewarm(
+        rc,
+        binding,
+        signal(),
+        true,
+      );
+      if (mode === 'borrowed mount') {
+        await expect(preflight).resolves.toBe(true);
+        expect(proof).toHaveBeenCalledOnce();
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+      } else {
+        await expect(preflight).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(proof).not.toHaveBeenCalled();
+      }
+      await vm.settleRetainedStartupMounts(signal());
+      expect(attach).toHaveBeenCalledTimes(
+        mode === 'pre-dispatch failure' ? 1 : 0,
+      );
+      expect(detach).not.toHaveBeenCalled();
+      expect(observeOwnedMount).not.toHaveBeenCalled();
+      if (mode === 'borrowed mount')
+        await h.disk.detach({ vmId: binding.vmId, tier: 'warm' }, signal());
+    },
+  );
+  it.each(['next request', 'Worker shutdown', 'attach receipt lost'] as const)(
+    'joins a dispatched retained attachment through %s without a native owner cache',
+    async (mode) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      const physicalStatus = vi.fn(async () => {
+        throw Error('native homes has not been prepared');
+      });
+      const observeOwnedMount = vi.fn();
+      const proof = vi.fn(async () => {
+        h.log.push('native:proof');
+      });
+      const detach = vi.spyOn(h.disk, 'detach');
+      const failure = new PersonVmError('PROVIDER_FAILED');
+      if (mode === 'attach receipt lost') {
+        const attach = h.disk.attach;
+        vi.spyOn(h.disk, 'attach').mockImplementationOnce(async (...args) => {
+          await attach(...args);
+          throw failure;
+        });
+      } else detach.mockRejectedValueOnce(failure);
+      const vm = new PersonVmService({
+        ...h.options,
+        observeOwnedMount,
+        native: {
+          ...h.native,
+          status: physicalStatus,
+          assertRetainedStartup: proof,
+        },
+      });
+      const preflight = () =>
+        vm.reconcileStoppedEntryForPrewarm(rc, binding, signal(), true);
+      if (mode === 'attach receipt lost') {
+        await expect(preflight()).rejects.toBe(failure);
+        await vm.settleRetainedStartupMounts(signal());
+        expect(detach).toHaveBeenCalledOnce();
+        expect(proof).not.toHaveBeenCalled();
+      } else {
+        await expect(preflight()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+        const checkpoint = h.log.length;
+        if (mode === 'next request') {
+          await expect(preflight()).resolves.toBe(true);
+          expect(h.log.slice(checkpoint)).toEqual([
+            'disk:detach',
+            'disk:attach',
+            'native:proof',
+            'disk:detach',
+          ]);
+        } else {
+          vm.fenceWorkerStartup();
+          vi.spyOn(h.disk, 'inspectMount').mockResolvedValueOnce({
+            state: 'unknown',
+          });
+          await expect(
+            vm.settleRetainedStartupMounts(signal()),
+          ).rejects.toMatchObject({
+            code: 'CLEANUP_INCOMPLETE',
+          });
+          expect(detach).toHaveBeenCalledOnce();
+          expect(h.mounts.has(binding.vmId)).toBe(true);
+          await vm.settleRetainedStartupMounts(signal());
+          expect(h.log.slice(checkpoint)).toEqual(['disk:detach']);
+        }
+      }
+      expect(h.mounts.size).toBe(0);
+      expect(physicalStatus).not.toHaveBeenCalled();
+      expect(observeOwnedMount).not.toHaveBeenCalled();
+      expect(await h.store.read(binding.personId)).toMatchObject({
+        vmId: binding.vmId,
+        instanceId: binding.instanceId,
+        leaseEpoch: binding.leaseEpoch,
+        phase: 'stopped',
+      });
+    },
+  );
+  it.each([
+    ['lifecycle reentry', 'warm', 'stopped', 'later generation'],
+    ['shutdown', 'warm', 'stopped', 'later generation'],
+    ['lifecycle reentry', 'cold', 'stopped', 'later generation'],
+    ['shutdown', 'cold', 'stopped', 'later generation'],
+    ['shutdown', 'cold', 'retained delete', 'later generation'],
+    ['shutdown', 'cold', 'erased delete', 'later generation'],
+    ['lifecycle reentry', 'cold', 'stopped', 'same generation'],
+    ['shutdown', 'cold', 'retained delete', 'same generation'],
+    ['shutdown', 'cold', 'erased delete', 'same generation'],
+  ] as const)(
+    'retires only a proved absent detach receipt on %s (%s tier, %s, %s)',
+    async (mode, tier, end, generation) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      const physicalDetach = h.disk.detach;
+      const detach = vi
+        .spyOn(h.disk, 'detach')
+        .mockImplementationOnce(async (...args) => {
+          await physicalDetach(...args);
+          throw new PersonVmError('PROVIDER_FAILED');
+        });
+      const proof = vi.fn(async () => {});
+      const first = new PersonVmService({
+        ...h.options,
+        native: { ...h.native, assertRetainedStartup: proof },
+      });
+      const second = new PersonVmService(h.options);
+      await expect(
+        first.reconcileStoppedEntryForPrewarm(rc, binding, signal(), true),
+      ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+      expect(h.mounts.size).toBe(0);
+      expect(detach).toHaveBeenCalledOnce();
+
+      const settle = () =>
+        mode === 'shutdown'
+          ? first.settleRetainedStartupMounts(signal())
+          : first.stop(rc, signal());
+      let next = binding;
+      if (generation === 'later generation') {
+        // A's missing detach receipt does not prevent another lifecycle
+        // owner obtaining its own, later exact binding.
+        await expect(second.start(rc, signal())).resolves.toMatchObject({
+          vmId: binding.vmId,
+          ready: true,
+        });
+        next = await second.resolve(rc, signal());
+        expect(next.leaseEpoch).toBe(binding.leaseEpoch + 1);
+        expect(next.instanceId).not.toBe(binding.instanceId);
+        await expect(settle()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(detach).toHaveBeenCalledOnce();
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+        await expect(second.resolve(rc, signal())).resolves.toEqual(next);
+
+        h.states.set(binding.vmId, 'stopped');
+        await second.stop(rc, signal());
+        expect(detach).toHaveBeenCalledTimes(2);
+      }
+      if (tier === 'cold') {
+        h.advance(PERSON_VM_COLD_MS + 1);
+        await expect(second.reconcileIdle(rc, signal())).resolves.toMatchObject(
+          {
+            phase: 'cold',
+          },
+        );
+      }
+      if (end !== 'stopped') {
+        h.authorizeDiskDelete(true);
+        await second.delete(
+          rc,
+          { deleteDisk: end === 'erased delete' },
+          signal(),
+        );
+      }
+      const final = (await h.store.read(binding.personId))!;
+      const detached = detach.mock.calls.length;
+      const disk = { vmId: binding.vmId, tier };
+      expect(final).toMatchObject({
+        instanceId: next.instanceId,
+        leaseEpoch: next.leaseEpoch,
+      });
+      if (end === 'erased delete') {
+        expect(final).toMatchObject({ phase: 'deleted', diskRetained: false });
+        expect(h.disks.has(binding.vmId)).toBe(false);
+        const inspect = vi.spyOn(h.disk, 'inspectMount');
+        await expect(settle()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(inspect).not.toHaveBeenCalled();
+        expect(detach).toHaveBeenCalledTimes(detached);
+        expect(await h.store.read(binding.personId)).toEqual(final);
+        return;
+      }
+      await h.disk.attach(disk, signal());
+      await expect(settle()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(h.mounts.has(binding.vmId)).toBe(true);
+      expect(detach).toHaveBeenCalledTimes(detached);
+      await physicalDetach(disk, signal());
+
+      const inspect = vi.spyOn(h.disk, 'inspectMount');
+      inspect.mockResolvedValueOnce({ state: 'unknown' });
+      if (generation === 'same generation')
+        inspect.mockResolvedValueOnce({ state: 'unknown' });
+      await expect(settle()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(detach).toHaveBeenCalledTimes(detached);
+      const beforeSettlement = h.log.length;
+      await settle();
+      expect(h.log.slice(beforeSettlement)).toEqual([]);
+      expect(inspect).toHaveBeenCalledTimes(
+        generation === 'same generation' ? 4 : 2,
+      );
+      expect(inspect).toHaveBeenLastCalledWith(
+        { vmId: binding.vmId, tier: 'warm' },
+        expect.any(AbortSignal),
+        expect.objectContaining({ acrossTier: true }),
+      );
+      expect(detach).toHaveBeenCalledTimes(detached);
+      await first.settleRetainedStartupMounts(signal());
+      expect(inspect).toHaveBeenCalledTimes(
+        generation === 'same generation' ? 4 : 2,
+      );
+      expect(proof).toHaveBeenCalledOnce();
+      expect(h.mounts.size).toBe(0);
+      expect(h.disks.has(binding.vmId)).toBe(true);
+      expect(final).toMatchObject({
+        instanceId: next.instanceId,
+        leaseEpoch: next.leaseEpoch,
+        phase:
+          end === 'retained delete'
+            ? 'deleted'
+            : tier === 'cold'
+              ? 'cold'
+              : 'stopped',
+        diskTier: tier,
+        diskRetained: true,
+      });
+      expect(await h.store.read(binding.personId)).toEqual(final);
+    },
+  );
   it.each(['stopped', 'absent', 'unknown'] as const)(
     'failure cleanup native=%s才可退役；未知不调用/不detach',
     async (state) => {

@@ -16,6 +16,7 @@ import { getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import { requirePlatformAdmin, isPlatformAdmin } from './platform-authority.ts';
 import { resolvePlatformPreviewContext } from './platform-employees/preview-context.ts';
+import { captureNativeWebRosterChange } from './employees/native-web-capacity.ts';
 import { materializePlatformEmployeeRevision } from './employees/platform-employees.ts';
 import { synchronizeTenantEmployeeAccess } from './tenant-employee-access.ts';
 import { createChatSession } from './workspace/service.ts';
@@ -235,16 +236,30 @@ export async function ensureQualityEmployee(
       await tx`select tenant_employee_id,tenant_employee_version_id from allrice_platform_employee_tenant_assignments
       where employee_id=${revision.platform_employee_id} and workspace_id=${workspaceId} and active`;
     if (!d) denied();
+    const checkRoster = await captureNativeWebRosterChange(tx, {
+      organizationId,
+      workspaceId,
+      personIds: [owner],
+    });
     await tx`insert into allrice_employee_assignments(organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by,selection_mode)
       values(${organizationId},${workspaceId},${d.tenant_employee_id},${d.tenant_employee_version_id},${owner},false,true,${owner},'include')
       on conflict(organization_id,workspace_id,user_id,employee_id) do update set selection_mode='include'
       where allrice_employee_assignments.active and allrice_employee_assignments.selection_mode<>'exclude'`;
+    await checkRoster({ employeeId: d.tenant_employee_id });
     await notifyNativeRosterInsert(tx, 'allrice_employee_assignments', {
       organizationId,
       workspaceId,
       personId: owner,
     });
-    await synchronizeTenantEmployeeAccess(tx, { organizationId, workspaceId });
+    await synchronizeTenantEmployeeAccess(
+      tx,
+      { organizationId, workspaceId },
+      {
+        employeeId: d.tenant_employee_id,
+        personIds: [owner],
+        newAssignmentPeople: [],
+      },
+    );
     const [a] =
       await tx`select id,employee_id,employee_version_id from allrice_employee_assignments where organization_id=${organizationId}
       and workspace_id=${workspaceId} and user_id=${owner} and employee_id=${d.tenant_employee_id} and active`;

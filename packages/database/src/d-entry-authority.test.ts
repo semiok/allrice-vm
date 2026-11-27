@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import {
   createDEntryAuthorityFeed,
+  DEntryTicketObserverClosed,
   watchDEntryNativeAuthority,
   watchDEntryNativeRosterAuthority,
   watchDEntryHistoryAuthority,
@@ -102,6 +103,41 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('distinguishes the closed original ticket observer from revoked authority during a thread observation', async () => {
+    const source = feed();
+    const observed = deferred();
+    const resume = deferred();
+    vi.spyOn(source, 'observeThroughCommit').mockImplementationOnce(
+      async () => {
+        observed.resolve();
+        await resume.promise;
+      },
+    );
+    const signal = new AbortController().signal;
+    const owner = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      source,
+      async () => {},
+    );
+    const pending = owner.assertTicketThread!(signal);
+    try {
+      await Promise.race([observed.promise, pending]);
+      await owner.close();
+      expect(owner.revoked.aborted).toBe(false);
+    } finally {
+      resume.resolve();
+      await Promise.allSettled([pending]);
+      await owner.close();
+    }
+    await expect(pending).rejects.toBeInstanceOf(DEntryTicketObserverClosed);
+    await expect(owner.assertTicketThread!(signal)).rejects.toMatchObject({
+      code: 'authorization_denied',
+    });
+  });
+
   it('retires a stuck marker connection at the deadline and waits for the actual query to settle', async () => {
     const source = feed();
     const controller = new AbortController();

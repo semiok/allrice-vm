@@ -37,6 +37,20 @@ export class MemoryStore implements PersonVmStore {
     string,
     { preparation?: string; settled: Promise<void> }
   >();
+  private versions = new Map<string, string>();
+  private version = 0;
+  private touch(id: string) {
+    const rowVersion = String(++this.version);
+    this.versions.set(id, rowVersion);
+    return rowVersion;
+  }
+  readWithVersion(id: string) {
+    const row = this.rows.get(id);
+    const rowVersion = this.versions.get(id);
+    return row
+      ? { ...structuredClone(row), ...(rowVersion && { rowVersion }) }
+      : null;
+  }
   async read(id: string) {
     const row = this.rows.get(id);
     return row ? structuredClone(row) : null;
@@ -77,12 +91,19 @@ export class MemoryStore implements PersonVmStore {
     });
     const row = await this.read(personId);
     const owner = randomUUID();
-    if (this.rows.has(personId)) this.rows.get(personId)!.leaseOwner = owner;
+    const signal = new AbortController().signal;
     try {
+      options.beforeClaim?.(row, owner, signal);
+      const previous = this.rows.get(personId);
+      if (previous) {
+        previous.leaseOwner = owner;
+        this.touch(personId);
+      }
       return (await work({
         row,
         joinedOfflinePreparation,
-        signal: new AbortController().signal,
+        ownerToken: owner,
+        signal,
         assertAdmissionOpen: async () => {},
         guard: async () => {},
         hasCompletedDiskDeletion: async ({ personId, organizationId, vmId }) =>
@@ -105,6 +126,7 @@ export class MemoryStore implements PersonVmStore {
             ...structuredClone(value),
             leaseOwner: owner,
           });
+          this.touch(personId);
         },
         audit: async (value, event) => {
           this.audits.push({
@@ -118,8 +140,16 @@ export class MemoryStore implements PersonVmStore {
     } finally {
       this.busy.delete(personId);
       const saved = this.rows.get(personId);
-      if (saved) saved.leaseOwner = null;
-      settle();
+      try {
+        if (saved?.leaseOwner === owner) {
+          saved.leaseOwner = null;
+          const rowVersion = this.touch(personId);
+          options.observeRelease?.(owner, rowVersion, 'written');
+          options.observeRelease?.(owner, rowVersion, 'joined');
+        }
+      } finally {
+        settle();
+      }
     }
   }
   async recover<T>(): Promise<T> {
@@ -157,6 +187,20 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
         : disks.has(id)
           ? { state: 'ready', disk: { vmId: id, tier: diskTiers.get(id)! } }
           : { state: 'absent' },
+    inspectMount: async (ref, _signal, expected) => {
+      const image = { device: 'synthetic', inode: ref.vmId };
+      if (
+        !disks.has(ref.vmId) ||
+        (diskTiers.get(ref.vmId) !== ref.tier && !expected?.acrossTier) ||
+        (expected &&
+          (expected.image.device !== image.device ||
+            expected.image.inode !== image.inode))
+      )
+        return { state: 'unknown' };
+      return mounts.has(ref.vmId)
+        ? { state: 'attached', mount: '/synthetic/' + ref.vmId, image }
+        : { state: 'absent', image };
+    },
     create: async (ref) => {
       log.push('disk:create');
       if (partialDisks.has(ref.vmId))
@@ -165,10 +209,11 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
       disks.add(ref.vmId);
       diskTiers.set(ref.vmId, ref.tier);
     },
-    attach: async (ref) => {
-      log.push('disk:attach');
+    attach: async (ref, _signal, beforeDispatch) => {
       if (!disks.has(ref.vmId) || diskTiers.get(ref.vmId) !== ref.tier)
         throw new PersonVmError('PROVIDER_FAILED');
+      if (!mounts.has(ref.vmId)) beforeDispatch?.();
+      log.push('disk:attach');
       mounts.add(ref.vmId);
       return '/synthetic/' + ref.vmId;
     },

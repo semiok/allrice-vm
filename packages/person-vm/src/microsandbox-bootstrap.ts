@@ -11,6 +11,7 @@ import {
 import type {
   PersonVmBootstrapScope,
   PersonVmGuestCommand,
+  PersonVmGuestBootstrapPort,
   PersonVmJobExit,
   PersonVmManagedJob,
   PersonVmMemoryGuestPlan,
@@ -172,7 +173,7 @@ function operationScopedProbe(
 async function spawnMicrosandboxJob(
   input: Parameters<typeof spawnMicrosandboxManagedProbe>[0],
   commandSpec: PersonVmGuestCommand,
-  lifetime: 'bootstrap-retained' | 'probe-operation',
+  lifetime: 'bootstrap-retained' | 'hot-retained' | 'probe-operation',
 ): Promise<PersonVmManagedProbeJob> {
   const { scope, name, command } = input;
   commandInput(commandSpec);
@@ -317,6 +318,7 @@ export async function bootstrapMicrosandbox(input: {
     cliSha256?: string;
   }>;
   command: NativeCommand;
+  employee?: Parameters<PersonVmGuestBootstrapPort['bootstrap']>[2];
 }): Promise<
   Pick<
     PersonVmBootstrapScope,
@@ -337,6 +339,24 @@ export async function bootstrapMicrosandbox(input: {
     paths.add(file.path);
   }
   guestPath(plan.launcher);
+  const employee = input.employee;
+  const files = employee ? structuredClone(employee.files) : plan.files;
+  if (employee) {
+    const prefix = '/work/.allrice/employees/' + employee.employeeInstanceId;
+    const staged = new Set<string>();
+    for (const file of files) {
+      guestPath(file.path);
+      if (
+        !file.path.startsWith(prefix + '/dsh/') ||
+        paths.has(file.path) ||
+        staged.has(file.path) ||
+        file.mode !== 0o600 ||
+        typeof file.contents !== 'string'
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+      staged.add(file.path);
+    }
+  }
   commandInput(plan.initialize);
   commandInput({ executable: plan.launcher, args: [], env: plan.env });
   const controls = input.readonlyCommandMemoryDirectory;
@@ -397,7 +417,7 @@ export async function bootstrapMicrosandbox(input: {
     const job = await spawnMicrosandboxJob(
       input,
       commandSpec,
-      'bootstrap-retained',
+      employee ? 'hot-retained' : 'bootstrap-retained',
     );
     return Object.freeze({
       binding: job.binding,
@@ -412,7 +432,14 @@ export async function bootstrapMicrosandbox(input: {
     try {
       result = await job.wait(scope.signal);
     } catch (error) {
-      await job.cancelAndWait(AbortSignal.timeout(input.cleanupTimeoutMs));
+      try {
+        await job.cancelAndWait(AbortSignal.timeout(input.cleanupTimeoutMs));
+      } catch (cleanup) {
+        if (!employee) throw cleanup;
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError([error, cleanup]),
+        });
+      }
       throw error;
     }
     if (result.exitCode !== 0 || result.timedOut)
@@ -420,11 +447,12 @@ export async function bootstrapMicrosandbox(input: {
   }
   await scope.assertCurrent();
   const stage = await mkdtemp(join(input.stagingRoot, 'bootstrap-'));
+  const removeStage = () => rm(stage, { recursive: true, force: true });
   try {
     // Each step has a live fence before its side effects. That fence also
     // closes the preceding joined step. The final step has its own closing
     // fence before it can hand the launcher back to the runtime.
-    if (controls)
+    if (controls && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
@@ -432,13 +460,9 @@ export async function bootstrapMicrosandbox(input: {
     // cp preserves Unix permissions but doesn't create missing file parents.
     await run({
       executable: '/bin/mkdir',
-      args: [
-        '-p',
-        '--',
-        ...new Set(plan.files.map((file) => dirname(file.path))),
-      ],
+      args: ['-p', '--', ...new Set(files.map((file) => dirname(file.path)))],
     });
-    for (const [index, file] of plan.files.entries()) {
+    for (const [index, file] of files.entries()) {
       await scope.assertCurrent();
       const hostFile = join(stage, String(index));
       await writeFile(hostFile, file.contents, { mode: file.mode, flag: 'wx' });
@@ -447,12 +471,13 @@ export async function bootstrapMicrosandbox(input: {
         scope.signal,
       );
     }
-    await run(
-      controls
-        ? { ...plan.initialize, executable: '/usr/local/bin/node' }
-        : plan.initialize,
-    );
-    if (sandbox)
+    if (!employee)
+      await run(
+        controls
+          ? { ...plan.initialize, executable: '/usr/local/bin/node' }
+          : plan.initialize,
+      );
+    if (sandbox && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: sandbox.cliSha256
@@ -466,9 +491,19 @@ export async function bootstrapMicrosandbox(input: {
           : ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
       });
     await scope.assertCurrent();
-  } finally {
-    await rm(stage, { recursive: true, force: true });
+  } catch (error) {
+    try {
+      await removeStage();
+    } catch (cleanup) {
+      if (error instanceof PersonVmError && error.code === 'CLEANUP_INCOMPLETE')
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError([error, cleanup]),
+        });
+      throw cleanup;
+    }
+    throw error;
   }
+  await removeStage();
   return Object.freeze({
     readNativeWebGuestAddress: async (signal = scope.signal) => {
       const active = AbortSignal.any([scope.signal, signal]);

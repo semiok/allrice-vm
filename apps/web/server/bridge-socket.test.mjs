@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { readFile, readdir } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createRequire } from 'node:module';
+import { createConnection } from 'node:net';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { URL } from 'node:url';
@@ -190,12 +191,13 @@ async function connect(g, token, host) {
 
 async function rejected(
   g,
-  { token, url = g.url, protocol = bridgeSocketProtocol, origin } = {},
+  { token, url = g.url, protocol = bridgeSocketProtocol, origin, host } = {},
 ) {
   const ws = new WebSocket(url, protocol, {
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...(origin ? { origin } : {}),
+      ...(host ? { host } : {}),
     },
   });
   ws.on('error', () => undefined);
@@ -626,9 +628,21 @@ suite(
       expect(code).toBe(4009);
     });
 
-    it.runIf(process.env.ALLRICE_P11_NEXT_BUILD === '1')(
-      'built Next wrapper preserves portal auth, HTTP and Bridge upgrade on the same port',
-      async () => {
+    it.runIf(process.env.ALLRICE_P11_NEXT_BUILD === '1').each([
+      { mode: 'standard', httpOnly: false },
+      { mode: 'HTTP only', httpOnly: true },
+    ])(
+      'built Next wrapper preserves portal HTTP and the chosen Bridge mode ($mode)',
+      async ({ httpOnly }) => {
+        const { scripts } = JSON.parse(
+          await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+        );
+        const launcher = scripts[httpOnly ? 'start:http' : 'start'].split(' ');
+        expect(launcher.slice(0, httpOnly ? 3 : 2)).toEqual(
+          httpOnly
+            ? ['node', 'server.mjs', '--http-only']
+            : ['node', 'server.mjs'],
+        );
         const temporary = new AllRiceHttpServer();
         temporary.listen(0, '127.0.0.1');
         await once(temporary, 'listening');
@@ -637,7 +651,8 @@ suite(
         const child = spawn(
           process.execPath,
           [
-            new URL('../server.mjs', import.meta.url).pathname,
+            new URL(`../${launcher[1]}`, import.meta.url).pathname,
+            ...(httpOnly ? [launcher[2]] : []),
             '--hostname',
             '127.0.0.1',
             '--port',
@@ -675,6 +690,31 @@ suite(
           30_000,
         );
         expect(child.exitCode, output).toBeNull();
+        const coldUpgrade = httpOnly
+          ? createConnection({ host: '127.0.0.1', port, allowHalfOpen: true })
+          : undefined;
+        if (coldUpgrade) {
+          cleanups.push(async () => coldUpgrade.destroy());
+          coldUpgrade.on('error', () => undefined);
+          coldUpgrade.setEncoding('utf8');
+          let response = '';
+          coldUpgrade.on('data', (chunk) => {
+            response += chunk;
+          });
+          const eof = once(coldUpgrade, 'end', {
+            signal: globalThis.AbortSignal.timeout(5000),
+          });
+          coldUpgrade.write(
+            'GET /api/health/live HTTP/1.1\r\n' +
+              'Host: allrice-dsh.bplabs.xyz\r\n' +
+              'Connection: Upgrade\r\nUpgrade: allrice-test\r\n\r\n',
+          );
+          await eof;
+          expect(response).toBe(
+            'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          );
+          expect(coldUpgrade.writable).toBe(true);
+        }
         const status = await new Promise((resolve, reject) => {
           const req = httpRequest(
             {
@@ -693,11 +733,27 @@ suite(
         });
         expect(status).toBe(200);
         const d = await device();
-        const c = await connect(
-          { url: `ws://127.0.0.1:${port}${bridgeSocketPath}` },
-          d.token,
-          'allrice-dsh.bplabs.xyz',
-        );
+        const endpoint = { url: `ws://127.0.0.1:${port}${bridgeSocketPath}` };
+        if (httpOnly) {
+          expect(
+            await rejected(endpoint, {
+              token: d.token,
+              host: 'allrice-dsh.bplabs.xyz',
+            }),
+          ).toBe(404);
+          expect(
+            await database`select device_id from allrice_bridge_connections
+            where device_id=${d.id}`,
+          ).toEqual([]);
+          expect(coldUpgrade?.writableEnded).toBe(false);
+          expect(child.kill('SIGTERM')).toBe(true);
+          await waitUntil(
+            () => child.exitCode !== null || child.signalCode !== null,
+          );
+          expect(child.exitCode, output).toBe(0);
+          return;
+        }
+        const c = await connect(endpoint, d.token, 'allrice-dsh.bplabs.xyz');
         expect(await c.call()).toMatchObject({
           status: 200,
           body: { dispatch: null },

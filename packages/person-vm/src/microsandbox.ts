@@ -1,3 +1,4 @@
+import { UuidSchema } from '@allrice/contracts';
 import { constants } from 'node:fs';
 import {
   lstat,
@@ -54,7 +55,9 @@ import type {
 import {
   assertWebEndpointInspection,
   assertPreparedWebEndpoints,
+  commitWebUpgrade,
   prepareWebEndpoints,
+  readWebUpgrade,
   type PersonVmWebEndpointReceipt,
   type PersonVmWebRoster,
 } from './web-endpoints.ts';
@@ -65,7 +68,12 @@ const CANONICAL_SOCKET_HASH_BYTES = 12;
 const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
 const GUEST_WORK_DIRECTORY = '/work';
-type NativePaths = { home: string; config: string; userHome: string };
+type NativePaths = {
+  home: string;
+  config: string;
+  userHome: string;
+  upgrade?: PersonVmWebEndpointReceipt['upgrade'];
+};
 
 function assertSocketHome(home: string) {
   const controlSocket = join(
@@ -89,6 +97,13 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<'absent' | 'stopped' | 'running' | 'unknown'>;
+  /** Observe the original compute in an attached, retained disk without
+   * preparing its config, changing its manifest or installing an owner. */
+  assertRetainedStartup?(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ): Promise<void>;
   create(
     binding: PersonVmBinding,
     receipt: PersonVmEgressReceipt,
@@ -99,7 +114,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     roster: PersonVmWebRoster,
     signal: AbortSignal,
-    options?: { runningOnly: true },
+    options?: { runningOnly?: true; retained?: true },
   ): Promise<PersonVmWebEndpointReceipt>;
   assertWebEndpoints?(
     receipt: PersonVmWebEndpointReceipt,
@@ -126,6 +141,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
   startWithWebEndpoints?(
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
+    egress?: PersonVmEgressReceipt,
   ): Promise<void>;
   stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   releaseDiskHome?(
@@ -163,6 +179,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
       memoryMiB?: number;
+      employeePortSlots?: number;
       runner?: CommandRunner;
       jobCleanupTimeoutMs?: number;
     },
@@ -230,8 +247,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       join(this.options.socketRoot, '0'.repeat(VM_ID_PATH_BYTES)),
     );
   }
-  private name(binding: PersonVmBinding) {
+  private legacyName(binding: PersonVmBinding) {
     return `allrice-${binding.vmId}`;
+  }
+  private name(binding: PersonVmBinding, paths = this.homes.get(binding.vmId)) {
+    return this.legacyName(binding) + (paths?.upgrade ? '-web' : '');
   }
   private async command(
     binding: PersonVmBinding,
@@ -476,61 +496,69 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       },
     });
   }
+  private async hasSocketAlias(home: string, target: string) {
+    try {
+      const directory = await lstat(this.options.socketRoot);
+      if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700)
+        throw new PersonVmError('PROVIDER_FAILED');
+      const alias = await lstat(home);
+      if (!alias.isSymbolicLink() || (await readlink(home)) !== target)
+        throw new PersonVmError('PROVIDER_FAILED');
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return false;
+    }
+  }
+  private async ensureSocketAlias(home: string, target: string) {
+    await privateDirectory(this.options.socketRoot);
+    if (!(await this.hasSocketAlias(home, target)))
+      await symlink(target, home, 'dir');
+  }
   async prepare(binding: PersonVmBinding, mount: string, signal: AbortSignal) {
     const home = join(this.options.socketRoot, binding.vmId);
     assertSocketHome(home);
-    await privateDirectory(this.options.socketRoot);
     const target = join(mount, 'microsandbox');
     await privateDirectory(target);
     // Rejoin an elected cache cutover before the CLI can open its cache path.
     await this.options.refreshBoundPublicCache?.(binding, mount, signal, true);
     const userHome = join(mount, 'host-home');
     await privateDirectory(userHome);
-    try {
-      const stat = await lstat(home);
-      if (!stat.isSymbolicLink() || (await readlink(home)) !== target)
-        throw new PersonVmError('PROVIDER_FAILED');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      await symlink(target, home, 'dir');
-    }
+    await this.ensureSocketAlias(home, target);
     const config = join(mount, 'msb-config.json');
     await writeFile(config, this.configurationBytes(home, target), {
       mode: 0o600,
     });
-    this.homes.set(binding.vmId, { home, config, userHome });
+    this.homes.set(binding.vmId, {
+      home,
+      config,
+      userHome,
+      upgrade: await readWebUpgrade(home, binding),
+    });
     const version = await this.command(binding, ['--version'], signal);
     if (!/\b0\.7\.16\b/.test(version))
       throw new PersonVmError('PROVIDER_FAILED');
   }
-  /** For a fixed Host-authored read command, inside a physical lease that has
-   * independently verified this already attached disk. Reopen the original
-   * configuration without populating launch ownership or preparing the disk. */
-  async readAttachedProbe(
-    scope: PersonVmStartingScope,
+  private async readAttachedPaths(
+    binding: PersonVmBinding,
     mount: string,
-    commandSpec: PersonVmGuestCommand,
+    restoreSocketAlias = false,
   ) {
-    const { binding, signal } = scope;
     const home = join(this.options.socketRoot, binding.vmId);
     const target = join(mount, 'microsandbox');
-    const paths = {
+    const paths: NativePaths = {
       home,
       userHome: join(mount, 'host-home'),
       config: join(mount, 'msb-config.json'),
     };
     assertSocketHome(home);
-    await scope.assertCurrent();
-    signal.throwIfAborted();
-    for (const directory of [this.options.socketRoot, target, paths.userHome]) {
+    for (const directory of [target, paths.userHome]) {
       const stat = await lstat(directory);
       if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700)
         throw new PersonVmError('PROVIDER_FAILED');
     }
-    if (
-      !(await lstat(home)).isSymbolicLink() ||
-      (await readlink(home)) !== target
-    )
+    const hasAlias = await this.hasSocketAlias(home, target);
+    if (!hasAlias && !restoreSocketAlias)
       throw new PersonVmError('PROVIDER_FAILED');
     const config = await open(
       paths.config,
@@ -549,12 +577,33 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     } finally {
       await config.close();
     }
+    paths.upgrade = await readWebUpgrade(target, binding, !hasAlias);
+    // On guarded retained startup only, recreate the normal short Host alias
+    // after verifying the on-disk configuration and manifest. Use the same
+    // public list path against the original MSB_HOME.
+    if (!hasAlias) await this.ensureSocketAlias(home, target);
+    return paths;
+  }
+  /** For a fixed Host-authored read command, inside a physical lease that has
+   * independently verified this already attached disk. Reopen the original
+   * configuration without populating launch ownership or preparing the disk. */
+  async readAttachedProbe(
+    scope: PersonVmStartingScope,
+    mount: string,
+    commandSpec: PersonVmGuestCommand,
+  ) {
+    const { binding, signal } = scope;
+    await scope.assertCurrent();
+    signal.throwIfAborted();
+    const paths = await this.readAttachedPaths(binding, mount);
     const directory = this.options.readonlyDshDirectory;
-    const artifact = await this.artifact(binding, signal, false, home);
+    const artifact = await this.artifact(binding, signal, false, paths.home);
     if (!directory || !artifact) throw new PersonVmError('PROVIDER_FAILED');
     const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
       this.runWithPaths(paths, args, active, nonzero);
-    const name = this.name(binding);
+    if (paths.upgrade === 'pending')
+      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    const name = this.name(binding, paths);
     if (!/\b0\.7\.16\b/.test(await command(['--version'], signal)))
       throw new PersonVmError('PROVIDER_FAILED');
     const inspect = JSON.parse(
@@ -594,8 +643,17 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     }
   }
   async status(binding: PersonVmBinding, signal: AbortSignal) {
+    return this.namedStatus(binding, this.name(binding), signal);
+  }
+  private async namedStatus(
+    binding: PersonVmBinding,
+    name: string,
+    signal: AbortSignal,
+    paths = this.homes.get(binding.vmId),
+  ) {
+    if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     const rows: unknown = JSON.parse(
-      await this.command(binding, ['list', '--format', 'json'], signal),
+      await this.runWithPaths(paths, ['list', '--format', 'json'], signal),
     );
     if (!Array.isArray(rows)) throw new PersonVmError('PROVIDER_FAILED');
     const matches = rows.filter(
@@ -603,7 +661,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         value &&
         typeof value === 'object' &&
         'name' in value &&
-        value.name === this.name(binding),
+        value.name === name,
     );
     if (matches.length === 0) return 'absent' as const;
     if (matches.length !== 1) throw new PersonVmError('PROVIDER_FAILED');
@@ -612,6 +670,49 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (status === 'Stopped' || status === 'Created' || status === 'Crashed')
       return 'stopped' as const;
     return 'unknown' as const;
+  }
+  private async assertRetainedState(
+    binding: PersonVmBinding,
+    paths: NativePaths,
+    state: Awaited<ReturnType<MicrosandboxPersonVm['status']>>,
+    signal: AbortSignal,
+  ) {
+    if (paths.upgrade === 'pending') {
+      if (
+        (state !== 'absent' && state !== 'stopped') ||
+        (await this.namedStatus(
+          binding,
+          this.legacyName(binding),
+          signal,
+          paths,
+        )) !== 'stopped'
+      )
+        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    } else if (state !== 'stopped') {
+      throw new PersonVmError('PROVIDER_FAILED');
+    }
+  }
+  async assertRetainedStartup(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const paths = await this.readAttachedPaths(binding, mount, true);
+    if (
+      !/\b0\.7\.16\b/.test(
+        await this.runWithPaths(paths, ['--version'], signal),
+      )
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+    const state = await this.namedStatus(
+      binding,
+      this.name(binding, paths),
+      signal,
+      paths,
+    );
+    await this.assertRetainedState(binding, paths, state, signal);
+    signal.throwIfAborted();
   }
   async create(
     binding: PersonVmBinding,
@@ -678,6 +779,19 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       '--workdir',
       '/',
     ];
+    args.push(
+      ...this.mountArguments(artifact, '--mount-dir'),
+      ...this.networkArguments(receipt, web),
+    );
+    // No native idle-timeout: detached DSH jobs may be active without touching it.
+    await this.command(binding, args, signal);
+    await this.assertArtifact(binding, signal);
+  }
+  private mountArguments(
+    artifact: Awaited<ReturnType<MicrosandboxPersonVm['artifact']>>,
+    directoryOption: '--mount-dir' | '--volume',
+  ) {
+    const args: string[] = [];
     const directory = this.options.readonlyDshDirectory;
     if (directory) {
       if (artifact?.disk)
@@ -687,20 +801,27 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         );
       else
         args.push(
-          '--mount-dir',
+          directoryOption,
           `${directory.hostDirectory}:${directory.guestDirectory}:ro`,
         );
     }
     const controls = this.options.readonlyCommandMemoryDirectory;
     if (controls)
       args.push(
-        '--mount-dir',
+        directoryOption,
         `${controls.hostDirectory}:${controls.guestDirectory}:ro`,
       );
+    return args;
+  }
+  private networkArguments(
+    receipt: PersonVmEgressReceipt,
+    web?: PersonVmWebEndpointReceipt,
+  ) {
+    const args: string[] = [];
     for (const port of receipt.gatewayPorts)
       args.push('--net-rule', `allow:egress@host:tcp:${port}`);
     if (web) {
-      for (const endpoint of web.endpoints)
+      for (const endpoint of web.slots ?? web.endpoints)
         args.push(
           '--net-rule',
           `allow:ingress@127.0.0.1/32:tcp:${endpoint.guestPort}`,
@@ -708,9 +829,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
           `127.0.0.1:${endpoint.hostPort}:${endpoint.guestPort}`,
         );
     }
-    // No native idle-timeout: detached DSH jobs may be active without touching it.
-    await this.command(binding, args, signal);
-    await this.assertArtifact(binding, signal);
+    return args;
   }
 
   private async ensureWorkDirectory(scope: PersonVmStartingScope) {
@@ -763,20 +882,32 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     roster: PersonVmWebRoster,
     signal: AbortSignal,
-    options?: { runningOnly: true },
+    options?: { runningOnly?: true; retained?: true },
   ) {
     const paths = this.homes.get(binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     const state = await this.status(binding, signal);
     if (options?.runningOnly && state !== 'running')
       throw new PersonVmError('RUNTIME_NOT_READY');
+    if (
+      options?.retained ||
+      paths.upgrade === 'pending' ||
+      (paths.upgrade === 'complete' && state === 'absent')
+    )
+      await this.assertRetainedState(binding, paths, state, signal);
     const receipt = await prepareWebEndpoints({
       directory: paths.home,
       binding,
       roster,
-      state,
+      employeePortSlots: this.options.employeePortSlots,
+      state:
+        state === 'absent' && paths.upgrade === 'pending' ? 'stopped' : state,
       signal,
     });
+    if (receipt.upgrade === 'pending') {
+      paths.upgrade = receipt.upgrade;
+      return receipt;
+    }
     if (state !== 'absent') {
       const inspection: unknown = JSON.parse(
         await this.command(
@@ -832,9 +963,86 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   async startWithWebEndpoints(
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
+    egress?: PersonVmEgressReceipt,
   ) {
+    if (receipt.upgrade === 'pending') {
+      if (!egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
+      return this.restoreWebUpgrade(receipt, egress, signal);
+    }
     await this.startNative(receipt.binding, signal);
     await this.assertArtifact(receipt.binding, signal, true, receipt);
+  }
+  private async restoreWebUpgrade(
+    web: PersonVmWebEndpointReceipt,
+    egress: PersonVmEgressReceipt,
+    signal: AbortSignal,
+  ) {
+    const { binding } = web;
+    const paths = this.homes.get(binding.vmId);
+    if (!paths || paths.upgrade !== 'pending' || !web.slots)
+      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    const source = this.legacyName(binding);
+    const target = this.name(binding);
+    if ((await this.namedStatus(binding, source, signal)) !== 'stopped')
+      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    await assertPreparedWebEndpoints(paths.home, binding, web);
+    const state = await this.namedStatus(binding, target, signal);
+    if (state === 'absent') {
+      const name = 'before-web-slots';
+      const reference = `${source}:${name}`;
+      const entries: unknown = JSON.parse(
+        await this.command(
+          binding,
+          ['snap', 'ls', '--group', source, '--format', 'json'],
+          signal,
+        ),
+      );
+      if (!Array.isArray(entries)) throw new PersonVmError('PROVIDER_FAILED');
+      if (
+        !entries.some(
+          (entry) => entry?.name === name && entry?.group === source,
+        )
+      )
+        await this.command(
+          binding,
+          ['snap', 'create', name, '--sandbox', source, '--integrity'],
+          signal,
+        );
+      await this.command(binding, ['snap', 'verify', reference], signal);
+      const artifact = await this.artifact(binding, signal, false);
+      await this.command(
+        binding,
+        [
+          'restore',
+          reference,
+          '--name',
+          target,
+          '--cpus',
+          '2',
+          '--memory',
+          `${this.memoryMiB}M`,
+          '--net-default',
+          'deny',
+          ...this.mountArguments(artifact, '--volume'),
+          ...this.networkArguments(egress, web),
+        ],
+        signal,
+      );
+    } else if (state === 'stopped') {
+      const inspection: unknown = JSON.parse(
+        await this.command(
+          binding,
+          ['inspect', target, '--format', 'json'],
+          signal,
+        ),
+      );
+      assertWebEndpointInspection(inspection, target, web, false);
+      await this.startNative(binding, signal);
+    } else throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    await this.assertArtifact(binding, signal, true, web);
+    signal.throwIfAborted();
+    await commitWebUpgrade(paths.home, web);
+    paths.upgrade = 'complete';
   }
   async stop(binding: PersonVmBinding, signal: AbortSignal) {
     const state = await this.status(binding, signal);
@@ -863,7 +1071,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     await this.command(binding, ['ping', this.name(binding)], signal);
     await this.assertArtifact(binding, signal);
   }
-  async bootstrap(scope: PersonVmStartingScope, plan: PersonVmMemoryGuestPlan) {
+  async bootstrap(
+    scope: PersonVmStartingScope,
+    plan: PersonVmMemoryGuestPlan,
+    employee?: Parameters<PersonVmGuestBootstrapPort['bootstrap']>[2],
+  ) {
     const paths = this.homes.get(scope.binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     const readonly = this.options.readonlyDshDirectory;
@@ -885,10 +1097,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     ) {
       artifact = await this.assertArtifact(scope.binding, scope.signal);
     }
-    await this.ensureWorkDirectory(scope);
+    if (employee) UuidSchema.parse(employee.employeeInstanceId);
+    else await this.ensureWorkDirectory(scope);
     return bootstrapMicrosandbox({
       scope,
       plan,
+      ...(employee && { employee }),
       name: this.name(scope.binding),
       stagingRoot: paths.userHome,
       readonlyCommandMemoryDirectory: controls?.guestDirectory,

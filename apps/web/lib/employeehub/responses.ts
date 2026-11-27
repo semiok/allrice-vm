@@ -70,6 +70,16 @@ export function employeeHubErrorResponse(error: unknown) {
       message: dEntryFirstEmployeeLimitMessage,
       retryable: false,
     });
+  if (
+    error instanceof EmployeeInstanceError &&
+    error.code === 'employee_port_slots_full'
+  )
+    return apiProblem({
+      status: 409,
+      code: 'QUOTA_EXCEEDED',
+      message: error.message,
+      retryable: false,
+    });
   if (error instanceof EmployeeInstanceError)
     return apiProblem({
       status: 409,

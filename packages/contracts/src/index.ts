@@ -217,6 +217,7 @@ export * from './d-entry.ts';
 export * from './host-history.ts';
 export {
   readPlatformPersonVmConfiguration,
+  MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS,
   type PlatformPersonVmConfiguration,
 } from './platform-person-vm-configuration.ts';
 export * from './employee-memory-port.ts';
