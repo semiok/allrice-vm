@@ -49,5 +49,5 @@ export function projectLocaleResult(
   }
   if (!isRemoteJsonValue(result))
     throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
-  return result;
+  return result as JsonValue;
 }
