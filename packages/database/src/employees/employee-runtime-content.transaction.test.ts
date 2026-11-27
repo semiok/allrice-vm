@@ -222,7 +222,7 @@ describe('employee runtime content preparation transaction forwarding', () => {
       tx.sql,
     );
     expect(pool).not.toHaveBeenCalled();
-    expect(personalSource).toHaveBeenCalledWith(f.input.instance, tx.sql);
+    expect(personalSource).toHaveBeenCalledWith(f.input.instance);
     expect(content.layers[0]?.common).toEqual([f.reference]);
     expect(
       tx.statements.some((text) =>
@@ -254,7 +254,7 @@ describe('employee runtime content preparation transaction forwarding', () => {
       );
     const content = await prepareEmployeeRuntimeContent(f.context, f.input);
     expect(pool).toHaveBeenCalledTimes(2);
-    expect(personalSource).toHaveBeenCalledWith(f.input.instance, freeze.sql);
+    expect(personalSource).toHaveBeenCalledWith(f.input.instance);
     expect(content.layers[0]?.common).toEqual([f.reference]);
     expect(
       freeze.statements.some((text) =>

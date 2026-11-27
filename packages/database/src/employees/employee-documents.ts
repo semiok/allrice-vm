@@ -6,7 +6,6 @@ import {
   EmployeePersonaPinSchema,
   EmployeeRunPersonaSourceSchema,
   EmployeePersonaTaskSchema,
-  isBaseRiceInstanceDefinition,
   type EmployeeInstanceSnapshot,
   type EmployeeExecutionSnapshot,
   type EmployeeDocuments,
@@ -35,22 +34,6 @@ type Sql = ReturnType<typeof getDatabase> | TransactionSql;
 type PersonaVersion = NonNullable<
   Awaited<ReturnType<typeof readEmployeePersonaVersion>>
 >;
-function personaEligibility(
-  instance: EmployeeInstanceSnapshot,
-  engine: PersonaVersion,
-) {
-  return instance.kind === 'custom' ||
-    ('platformKey' in engine &&
-      engine.platformKey === 'rice' &&
-      engine.definition.key === 'rice' &&
-      isBaseRiceInstanceDefinition(instance, {
-        key: engine.manifest.key,
-        versionId: engine.source.employeeVersionId,
-        definition: engine.manifest,
-      }))
-    ? ('full_identity' as const)
-    : ('expression_only' as const);
-}
 function renderRunPersona(
   instance: EmployeeInstanceSnapshot,
   employeeId: string,
@@ -67,7 +50,8 @@ function renderRunPersona(
     instanceId: instance.id,
     ownerId: instance.ownerId,
     profileRevision: instance.revision,
-    profileEligibility: personaEligibility(instance, engine),
+    profileEligibility:
+      instance.kind === 'custom' ? 'full_identity' : 'expression_only',
     basis: basis.source,
     engine: engine.source,
     ...(task ? { task } : {}),

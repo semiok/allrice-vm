@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -12,7 +13,6 @@ import {
   updateChatSession,
   sendChatMessage,
   SessionActiveError,
-  ensureDefaultEmployee,
   createChatSession,
 } from './workspace/service.ts';
 import {
@@ -266,7 +266,7 @@ suite('session archive: actual isolated PostgreSQL, no model', () => {
   it('counts readable work beyond page one and paginates each employee without skipping microseconds', async () => {
     const f = await createCompletedRunFixture(fixture.db);
     const foreign = await createCompletedRunFixture(fixture.db);
-    await ensureDefaultEmployee(f.neighbor, f.workspace);
+    await createTestEmployeeAssignment(f.neighbor, f.workspace);
     const privateOther = await createChatSession(f.neighbor, {
       workspaceId: f.workspace,
       title: 'Private other user',

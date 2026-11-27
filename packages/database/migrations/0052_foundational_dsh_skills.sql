@@ -1,4 +1,4 @@
--- Seed the first two reviewed, platform-managed DSH-native Skills for Rice.
+-- Seed the first two reviewed, platform-managed DSH-native Skills.
 -- Canonical authoring sources live under /skills; tenant copies are only
 -- materialized when a platform employee revision is published.
 

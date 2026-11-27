@@ -79,11 +79,7 @@ import {
 } from './platform-repair-verification.ts';
 import { startMaintenanceRepairGrant } from './platform-maintenance-repair.ts';
 import { createCompletedRunFixture } from './completed-run.fixture.ts';
-import {
-  savePlatformEmployeeDraft,
-  publishPlatformEmployee,
-} from './employees/platform-employees.ts';
-import { PlatformEmployeeDefinitionSchema } from '@allrice/contracts';
+import { publishTestPlatformQualityEmployee } from './platform-quality-employee.fixture.ts';
 import {
   claimNextJob,
   startClaimedJob,
@@ -491,6 +487,7 @@ suite('immutable report-bound maintenance authority', () => {
       getMaintenanceReportAuthority(ordinary, r.reportId),
     ).rejects.toThrow();
   });
+  let publishedQualityFixture = false;
   async function exerciseMaintenanceAuthority(
     mode: 'authority' | 'native-input',
   ) {
@@ -508,34 +505,16 @@ suite('immutable report-bound maintenance authority', () => {
       vi.stubEnv('ALLRICE_' + f + '_ENABLED', '1');
     await fixture.db`update allrice_model_connections set status='ready' where id='52000000-0000-4000-8000-000000000001'`;
     await fixture.db`update allrice_model_providers set enabled=true where provider_key='codex'`;
-    const [r] =
-      await fixture.db`select r.* from allrice_platform_employee_revisions r join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-    const definition = PlatformEmployeeDefinitionSchema.parse({
-      ...r!.definition,
-      identity: {
-        ...r!.definition.identity,
-        mission: 'MAINTENANCE_PERSONA_LITERAL {{missing}}',
-      },
-      capabilities: {
-        ...r!.definition.capabilities,
-        nativeSkillIds: [],
-        toolNames: [
-          'workspace.project',
-          'browser.workspace',
-          'cloud.process.execute',
-        ],
-      },
-    });
-    // Use the development publication flow only during fixture preparation.
+    // Publication is a development-only step in this production-mode fixture.
     const priorEnvironment = process.env.ALLRICE_ENV;
     vi.stubEnv('ALLRICE_ENV', 'development');
     try {
-      await savePlatformEmployeeDraft(r!.employee_id, { definition });
-      const publication = await publishPlatformEmployee(r!.employee_id, {
-        scope: 'assigned',
-      });
-      expect(publication.errors).toEqual([]);
-      expect(publication.valid).toBe(true);
+      if (!publishedQualityFixture) {
+        await publishTestPlatformQualityEmployee({
+          mission: 'MAINTENANCE_PERSONA_LITERAL {{missing}}',
+        });
+        publishedQualityFixture = true;
+      }
     } finally {
       vi.stubEnv('ALLRICE_ENV', priorEnvironment);
     }

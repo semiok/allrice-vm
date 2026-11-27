@@ -166,7 +166,7 @@ export function installTaskProgress(ctx, send, configuration = {}) {
                 id: 'runtime-progress',
                 header: '需要确认',
                 question:
-                  '近期操作反复失败或没有新结果，Rice 已暂停新调用。是否调整后继续？',
+                  '近期操作反复失败或没有新结果，员工已暂停新调用。是否调整后继续？',
                 detail: `原因：${status.reason === 'repeated_failure' ? '重复失败' : '重复无进展'}。最近操作：${(status.recent ?? []).map((f) => `${f.tool}（${f.outcome}）`).join('、')}。已有内容、工件和用量记录会保留；继续不代表批准文件修改或其他操作。`,
                 options: [
                   {

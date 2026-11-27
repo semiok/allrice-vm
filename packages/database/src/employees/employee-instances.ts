@@ -34,7 +34,6 @@ import {
 import { getDatabase } from '../core/client.ts';
 import { DataAccessError } from '../data.ts';
 import { readContentPrincipal } from '../content-maintenance.ts';
-import { isBaseRiceInstance } from './employee-instance-policy.ts';
 import {
   employeeManifest,
   employeeManifestChecksum,
@@ -678,7 +677,6 @@ export class EmployeeInstanceError extends Error {
     public readonly code:
       | 'instance_conflict'
       | 'instance_archived'
-      | 'default_protected'
       | 'd_entry_first_employee_limit',
   ) {
     super(code);
@@ -1102,35 +1100,14 @@ export async function updateEmployeeInstance(
       id,
       value,
       (current, before) =>
-        'operation' in value
-          ? {}
-          : before.kind === 'general'
-            ? {
-                ...current,
-                ...value.profile,
-                ...(value.profile.appearance !== undefined
-                  ? {
-                      appearance: {
-                        ...current.appearance,
-                        ...value.profile.appearance,
-                      },
-                    }
-                  : {}),
-              }
-            : value.profile,
-      async (before) => {
-        const rice = await isBaseRiceInstance(before, tx);
-        if ('operation' in value) {
-          if (!rice) throw new DataAccessError('authorization_denied');
-          return;
-        }
-        const allowed: readonly string[] = rice
-          ? EmployeeInstanceProfileSchema.keyof().options
-          : ['expressionStyle'];
+        before.kind === 'general'
+          ? { ...current, ...value.profile }
+          : value.profile,
+      (before) => {
         if (
           before.kind === 'general' &&
-          (!Object.keys(value.profile).length ||
-            Object.keys(value.profile).some((key) => !allowed.includes(key)))
+          (Object.keys(value.profile).length !== 1 ||
+            value.profile.expressionStyle === undefined)
         )
           throw new DataAccessError('authorization_denied');
       },
@@ -1149,7 +1126,7 @@ async function writeInstanceProfile(
     current: EmployeeInstanceProfile,
     before: EmployeeInstance,
   ) => EmployeeInstanceProfile,
-  authorize?: (before: EmployeeInstance) => Promise<void>,
+  authorize?: (before: EmployeeInstance) => Promise<void> | void,
 ) {
   await authority(scope, tx, true);
   const before = await getEmployeeInstance(scope, id, tx);
@@ -1262,11 +1239,7 @@ export async function updateEmployeeProfileFromChat(input: {
       },
       (current) => ({ ...current, ...patch }),
       async (before) => {
-        if (
-          before.kind === 'general' &&
-          args.name !== undefined &&
-          !(await isBaseRiceInstance(before, tx))
-        )
+        if (before.kind === 'general' && args.name !== undefined)
           throw new EmployeeProfileChatError('general_profile_style_only');
         await assertEmployeeChatRun(
           tx,
@@ -1296,10 +1269,6 @@ export async function changeEmployeeInstanceLifecycle(
     const [row] = await tx<
       InstanceRow[]
     >`select * from allrice_employee_instances where id=${id} for update`;
-    // Default identity is immutable provenance, not a mutable display name or
-    // assignment selection. Refuse before receipts, revisions or cancellation.
-    if (value.operation === 'archive' && (await isBaseRiceInstance(before, tx)))
-      throw new EmployeeInstanceError('default_protected');
     const [prior] =
       await tx`select response,request_input=${tx.json(value)}::jsonb matches
       from allrice_employee_instance_revisions where instance_id=${id} and request_id=${value.requestId}`;
@@ -1320,17 +1289,14 @@ export async function changeEmployeeInstanceLifecycle(
         const sourceProfile = EmployeeInstanceProfileSchema.parse(
           source.profile,
         );
-        const rice = await isBaseRiceInstance(before, tx);
         const retained = { ...current };
         delete retained.expressionStyle;
-        profile = rice
-          ? sourceProfile
-          : {
-              ...retained,
-              ...(sourceProfile.expressionStyle
-                ? { expressionStyle: sourceProfile.expressionStyle }
-                : {}),
-            };
+        profile = {
+          ...retained,
+          ...(sourceProfile.expressionStyle
+            ? { expressionStyle: sourceProfile.expressionStyle }
+            : {}),
+        };
       } else profile = source.profile;
     } else if (row.archived_at)
       throw new EmployeeInstanceError('instance_conflict');
@@ -1537,9 +1503,7 @@ export async function assertEmployeeInstanceAdmission(
     )
       throw new EmployeeInstanceError('instance_conflict');
     const eligibility =
-      snapshot.kind === 'custom' || (await isBaseRiceInstance(snapshot, tx))
-        ? 'full_identity'
-        : 'expression_only';
+      snapshot.kind === 'custom' ? 'full_identity' : 'expression_only';
     if (pin.source.profileEligibility !== eligibility)
       throw Error('employee_persona_snapshot_invalid');
   }

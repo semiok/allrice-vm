@@ -2,6 +2,7 @@
  * ONLY the missing module/B/call/human-source/restore producers are represented
  * by the explicitly named owner contract fixture below. Its relation and
  * private assembly mock are never installed in production or a public port. */
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as turn } from 'node:timers/promises';
 import type { Sql, TransactionSql } from 'postgres';
@@ -50,7 +51,6 @@ import {
 } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
 import { insertEmployeeMemoryPair } from './workspace/employee-memory-mutation.ts';
 import type { EmployeeMemoryScope } from './workspace/employee-memory.ts';
 
@@ -605,7 +605,7 @@ suite(
         principal,
       ))!;
       const context = { ...authenticated, workspaceId: principal.workspaceId };
-      const assignment = await ensureDefaultEmployee(
+      const assignment = await createTestEmployeeAssignment(
         context,
         principal.workspaceId,
       );

@@ -153,6 +153,10 @@ export async function ensureQualityEmployee(
 ) {
   const prepare = async (tx: Tx) => {
     const owner = await requirePlatformAdmin(context, tx);
+    const selected = UuidSchema.safeParse(
+      process.env.ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID,
+    );
+    if (!selected.success) throw new DataAccessError('not_found');
     const { context: internal } = await resolvePlatformPreviewContext(
       tx,
       { environment: 'platform', workspaceId: null, ownerId: owner },
@@ -168,7 +172,7 @@ export async function ensureQualityEmployee(
       (Revision & { platform_employee_id: string })[]
     >`select r.*,e.id platform_employee_id
       from allrice_platform_employees e join allrice_platform_employee_revisions r on r.id=e.current_published_revision_id
-      where e.employee_key='rice' and e.status='published' and r.status='published' for share of e,r`;
+      where e.id=${selected.data} and e.status='published' and r.status='published' for share of e,r`;
     if (!revision?.runtime_profile) throw new DataAccessError('not_found');
     const definition = PlatformEmployeeDefinitionSchema.parse(
       revision.definition,
@@ -245,10 +249,15 @@ export async function ensureQualityEmployee(
       await tx`select id,employee_id,employee_version_id from allrice_employee_assignments where organization_id=${organizationId}
       and workspace_id=${workspaceId} and user_id=${owner} and employee_id=${d.tenant_employee_id} and active`;
     if (!a) denied();
-    await tx`insert into allrice_platform_quality_deployments(workspace_id,organization_id,owner_id,employee_id,assignment_id,employee_version_id,employee_revision_id)
+    const [tracked] =
+      await tx`insert into allrice_platform_quality_deployments(workspace_id,organization_id,owner_id,employee_id,assignment_id,employee_version_id,employee_revision_id)
       values(${workspaceId},${organizationId},${owner},${a.employee_id},${a.id},${a.employee_version_id},${revision.id})
       on conflict(workspace_id) do update set employee_version_id=excluded.employee_version_id,employee_revision_id=excluded.employee_revision_id
-      where allrice_platform_quality_deployments.owner_id=excluded.owner_id and allrice_platform_quality_deployments.assignment_id=excluded.assignment_id`;
+      where allrice_platform_quality_deployments.owner_id=excluded.owner_id and allrice_platform_quality_deployments.assignment_id=excluded.assignment_id
+      returning assignment_id`;
+    // Admission and historical runs use this reservation. Publish a new
+    // revision of the same employee to update quality in this workspace.
+    if (!tracked) denied();
     return {
       internal,
       revisionId: revision.id,

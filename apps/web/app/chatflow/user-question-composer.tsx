@@ -142,7 +142,7 @@ export function UserQuestionComposer({
         >
           <header className={styles.userQuestionHeader}>
             <div>
-              <span>{question.header ?? 'Rice 需要你确认'}</span>
+              <span>{question.header ?? '员工需要你确认'}</span>
               <h2 id={`user-question-${pending.questionId}-${index}`}>
                 {question.question}
               </h2>

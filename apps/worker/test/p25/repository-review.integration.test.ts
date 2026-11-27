@@ -1,3 +1,4 @@
+import { publishTestPlatformQualityEmployee } from '../../../../packages/database/src/platform-quality-employee.fixture.ts';
 import type { RepositoryReviewArtifactRef } from '../../../../packages/database/src/platform-repository-review-contracts.ts';
 import { createReadPathProbe } from '../../../../packages/database/src/read-path-probe.fixture.ts';
 import { readRetiredExecutionHistory } from './retired-execution-history.fixture.ts';
@@ -253,34 +254,18 @@ suite(
       await createCompletedRunFixture(f.db);
       await f.db`update allrice_model_connections set status='ready' where id='52000000-0000-4000-8000-000000000001'`;
       await f.db`update allrice_model_providers set enabled=true where provider_key='codex'`;
-      const [revision] =
-        await f.db`select r.* from allrice_platform_employee_revisions r join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-      platformEmployeeId = revision!.employee_id as string;
-      const toolNames = [
-        'workspace.project',
-        'browser.workspace',
-        'workspace.export.create',
-      ];
-      const definition = PlatformEmployeeDefinitionSchema.parse({
-        ...revision!.definition,
+      platformEmployeeId = await publishTestPlatformQualityEmployee({
+        name: 'REVIEW_PERSONA_NAME',
+        mission: 'REVIEW_PERSONA_LITERAL {{missing}}',
+        workStyle: '# IDENTITY.md - free literal',
         // The synthetic review workflow includes local.process.execute.
-        securityPolicy: {
-          ...revision!.definition.securityPolicy,
-          bridgeAccess: 'read_write',
-        },
-        capabilities: {
-          ...revision!.definition.capabilities,
-          nativeSkillIds: [],
-          explicitToolNames: toolNames,
-          toolNames,
-        },
+        bridgeAccess: 'read_write',
+        toolNames: [
+          'workspace.project',
+          'browser.workspace',
+          'workspace.export.create',
+        ],
       });
-      await savePlatformEmployeeDraft(revision!.employee_id, { definition });
-      const publication = await publishPlatformEmployee(revision!.employee_id, {
-        scope: 'assigned',
-      });
-      expect(publication.errors).toEqual([]);
-      expect(publication.valid).toBe(true);
     }, 120000);
     afterAll(async () => {
       try {
@@ -581,12 +566,7 @@ suite(
           workspaceId: s.internal.workspaceId!,
           expectedRevision: instance.revision,
           requestId: randomUUID(),
-          profile: {
-            name: 'REVIEW_PERSONA_NAME',
-            mission: 'REVIEW_PERSONA_LITERAL {{missing}}',
-            workStyle: '# IDENTITY.md - free literal',
-            expressionStyle: 'structured',
-          },
+          profile: { expressionStyle: 'structured' },
         });
         await f.db`insert into allrice_memories(organization_id,workspace_id,employee_id,owner_id,instance_id,content,visibility,source_type,trust_level,lifecycle_state,memory_class)
           values(${s.internal.organizationId},${s.internal.workspaceId!},(select employee_id from allrice_employee_assignments where id=${s.employee.assignmentId}),${s.admin.actor.id},${instance.id},'REVIEW_PRIVATE_CONFIRMED_MEMORY','private','user','user_confirmed','durable','user_preference')`;
@@ -1012,6 +992,10 @@ suite(
           );
           expect(persona.name).toEqual({
             value: 'REVIEW_PERSONA_NAME',
+            source: 'platform_default',
+          });
+          expect(persona.expressionStyle).toMatchObject({
+            value: 'structured',
             source: 'personal_override',
           });
           expect(frozenPrompt.employeeDocuments).toMatchObject({

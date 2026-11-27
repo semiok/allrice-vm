@@ -152,35 +152,6 @@ describe('EmployeeProfileDetails', () => {
       }
     },
   );
-  it('edits the authorized Rice persona without opening the legacy personal content and scene actions', () => {
-    const details = employeeDetailsFixture();
-    details.profile.kind = 'general';
-    details.profile.name = '已改名的员工';
-    details.profile.isDefaultRice = true;
-    details.profile.personalFields = [];
-    details.profile.editableFields =
-      EmployeeInstanceProfileSchema.keyof().options;
-    const props = {
-      details,
-      onPreview: () => {},
-      onEdit: () => {},
-      onPrepare: () => {},
-      workflowContent: <p>本人文件入口</p>,
-      workflowReadContent: <p>本人读取入口</p>,
-    };
-    const html = renderToStaticMarkup(<EmployeeProfileDetails {...props} />);
-    expect(html).toContain('>编辑<');
-    for (const text of ['AI 新增', 'AI 调整', '本人文件入口', '本人读取入口'])
-      expect(html).not.toContain(text);
-    const shared = renderToStaticMarkup(
-      <EmployeeProfileDetails {...props} view="shared" />,
-    );
-    expect(shared).not.toContain('>编辑<');
-    delete details.profile.editableFields;
-    expect(
-      renderToStaticMarkup(<EmployeeProfileDetails {...props} />),
-    ).not.toContain('>编辑<');
-  });
   it('keeps inherited and unavailable content free of personal adjustment actions', () => {
     const details = employeeDetailsFixture();
     details.profile.kind = 'custom';

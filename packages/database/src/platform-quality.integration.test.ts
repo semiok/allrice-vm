@@ -5,10 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalStorageAdapter } from '@allrice/storage';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import {
-  PlatformEmployeeDefinitionSchema,
-  type RequestContext,
-} from '@allrice/contracts';
+import { type RequestContext } from '@allrice/contracts';
 import * as client from './core/client.ts';
 import {
   createRuntimeFixtureDatabase,
@@ -17,12 +14,10 @@ import {
 import { createCompletedRunFixture } from './completed-run.fixture.ts';
 import { ensureBootstrapPortalPrincipal } from './identity.ts';
 import { executionRequestConstraints } from './browser-execution-choice.ts';
-import {
-  savePlatformEmployeeDraft,
-  publishPlatformEmployee,
-} from './employees/platform-employees.ts';
+import { publishTestPlatformQualityEmployee } from './platform-quality-employee.fixture.ts';
 import {
   createPlatformQualityCheck,
+  ensureQualityEmployee,
   getPlatformQualityCheck,
   cancelPlatformQualityCheck,
   getPlatformQualityExecution,
@@ -119,27 +114,7 @@ suite(
         vi.stubEnv(`ALLRICE_${f}_ENABLED`, '1');
       await fixture.db`update allrice_model_connections set status='ready' where id='52000000-0000-4000-8000-000000000001'`;
       await fixture.db`update allrice_model_providers set enabled=true where provider_key='codex'`;
-      // Publish a new revision and preserve the original seed.
-      const [r] =
-        await fixture.db`select r.* from allrice_platform_employee_revisions r join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-      const definition = PlatformEmployeeDefinitionSchema.parse({
-        ...r!.definition,
-        capabilities: {
-          ...r!.definition.capabilities,
-          nativeSkillIds: [],
-          toolNames: [
-            'workspace.project',
-            'browser.workspace',
-            'cloud.process.execute',
-          ],
-        },
-      });
-      await savePlatformEmployeeDraft(r!.employee_id, { definition });
-      const publication = await publishPlatformEmployee(r!.employee_id, {
-        scope: 'assigned',
-      });
-      expect(publication.errors).toEqual([]);
-      expect(publication.valid).toBe(true);
+      await publishTestPlatformQualityEmployee();
       // Configuration uses the real native enrollment boundary; no Host or
       // receipt is needed for the shared business-reservation checks below.
       vi.stubEnv('ALLRICE_NATIVE_RECURRING_ENABLED', '1');
@@ -200,6 +175,46 @@ suite(
       await startClaimedJob(workerId, job!.id, lease.leaseToken);
       return lease;
     }
+    it('refuses to choose a platform employee when the explicit setting is absent or invalid', async () => {
+      const previous = process.env.ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID;
+      const before =
+        await fixture.db`select * from allrice_platform_quality_deployments`;
+      try {
+        for (const selection of [undefined, 'not-an-id', randomUUID()]) {
+          vi.stubEnv('ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID', selection);
+          await expect(ensureQualityEmployee(admin)).rejects.toMatchObject({
+            code: 'not_found',
+          });
+        }
+      } finally {
+        vi.stubEnv('ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID', previous);
+      }
+      expect(
+        await fixture.db`select * from allrice_platform_quality_deployments`,
+      ).toEqual(before);
+    });
+
+    it('keeps the workspace reservation when configuration names a different published employee', async () => {
+      const previous = process.env.ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID;
+      const initial = await ensureQualityEmployee(admin);
+      const before =
+        await fixture.db`select * from allrice_platform_quality_deployments where assignment_id=${initial.assignmentId}`;
+      try {
+        await publishTestPlatformQualityEmployee();
+        await expect(ensureQualityEmployee(admin)).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+      } finally {
+        vi.stubEnv('ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID', previous);
+      }
+      expect(
+        await fixture.db`select * from allrice_platform_quality_deployments where workspace_id=${initial.internal.workspace_id}`,
+      ).toEqual(before);
+      await expect(ensureQualityEmployee(admin)).resolves.toMatchObject({
+        assignmentId: initial.assignmentId,
+      });
+    });
+
     it('concurrent identical requests produce one real private employee Run, preserving company rows and frozen pins', async () => {
       const before =
         await fixture.db`select * from allrice_memberships where organization_id=${company.org}`;

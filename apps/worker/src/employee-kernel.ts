@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
   EmployeeKernelRequestSchema,
-  isBaseRiceInstanceDefinition,
   type ContextCheckpoint,
   type BootstrapContext,
   type EmployeeKernelRequest,
@@ -23,8 +22,7 @@ export function employeeInstanceInstructions(
 ) {
   if (snapshot?.schemaVersion !== 2 || !snapshot.instance) return [];
   const { instance } = snapshot;
-  const rice = isBaseRiceInstanceDefinition(instance, snapshot.employee);
-  const personalName = instance.kind === 'custom' || rice;
+  const personalName = instance.kind === 'custom';
   return [
     ...(snapshot.capabilitySnapshot.bindings.toolNames.includes(
       'workspace.personal_skill.version',
@@ -36,11 +34,6 @@ export function employeeInstanceInstructions(
     ...(snapshot.content?.personalScenes
       ? [
           'For requests to develop, save, update or restore a reusable Workflow, load the employee-customization Skill through the native skill tool before taking actions. Workflows belong only to their creator and this employee instance. Use exact preview/confirmation in employee details and real human source checks; report saved/effective only from a successful receipt. Never substitute memory, profile, generic Skill installation or shared scope, invent missing tools or a second publication step.',
-        ]
-      : []),
-    ...(rice
-      ? [
-          'This is the basic Rice instance. Its owner can edit name, description, appearance and identity in employee details, or clear overrides to follow platform defaults. Chat changes only name/style. Personal Skills use their authorized tools; personal Workflows use exact file preview and confirmation in employee details.',
         ]
       : []),
     ...(snapshot.capabilitySnapshot.bindings.toolNames.includes(

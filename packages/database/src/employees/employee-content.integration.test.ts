@@ -1260,7 +1260,7 @@ suite(
             content: {
               text: personal
                 ? personalWorkflowHistoryUnavailableMessage
-                : 'Rice 暂时无法完成这次请求，请稍后重试。',
+                : '暂时无法完成这次请求，请稍后重试。',
             },
           });
         },

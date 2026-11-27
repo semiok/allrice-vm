@@ -1068,7 +1068,7 @@ function RuntimeTurn(props: {
 
       <div className={styles.dialogueMessage} data-role="assistant">
         <header>
-          <span>Rice</span>
+          <span>员工</span>
           <time>{time(props.turn.assistantMessage.occurredAt)}</time>
         </header>
         <RuntimeAnswer text={props.turn.answerText} />
@@ -1411,9 +1411,7 @@ function CapabilitySourceView(props: { onOpenEmployees: () => void }) {
         </article>
         <article>
           <strong>业务 Skill</strong>
-          <span>
-            告诉 Rice 何时、按什么方法工作，但不会自行扩大 Tool 权限。
-          </span>
+          <span>告诉员工何时、按什么方法工作，但不会自行扩大 Tool 权限。</span>
         </article>
       </div>
 

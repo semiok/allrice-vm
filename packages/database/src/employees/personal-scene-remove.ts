@@ -40,7 +40,7 @@ export async function removePersonalSceneSkill(
   const work = async (tx: ContentSql) => {
     const authorize = async () => {
       const instance = await getEmployeeInstance(context, instanceId, tx);
-      if (!(await canUsePersonalEmployeeScenes(instance, tx)))
+      if (!canUsePersonalEmployeeScenes(instance))
         throw new DataAccessError('not_found');
     };
     await authorize();

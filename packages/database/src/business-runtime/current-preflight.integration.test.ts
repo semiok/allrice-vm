@@ -1,4 +1,5 @@
 /** Real isolated PG/authentication/source composition. No native process or B. */
+import { createTestEmployeeAssignment } from '../employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as turn } from 'node:timers/promises';
 import {
@@ -27,10 +28,7 @@ import {
   ensureBootstrapPortalPrincipal,
   revokeSession,
 } from '../identity.ts';
-import {
-  createChatSession,
-  ensureDefaultEmployee,
-} from '../workspace/service.ts';
+import { createChatSession } from '../workspace/service.ts';
 import {
   ensureGeneralEmployeeInstance,
   getEmployeeInstance,
@@ -124,7 +122,7 @@ suite(
         ...authenticated,
         workspaceId: principal.workspaceId,
       };
-      const assigned = await ensureDefaultEmployee(
+      const assigned = await createTestEmployeeAssignment(
         context,
         principal.workspaceId,
       );

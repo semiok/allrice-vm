@@ -27,10 +27,8 @@ import {
   authenticateSession,
   revokeSession,
 } from '../../../../packages/database/src/identity.ts';
-import {
-  listWorkspaceMemories,
-  ensureDefaultEmployee,
-} from '../../../../packages/database/src/workspace/service.ts';
+import { listWorkspaceMemories } from '../../../../packages/database/src/workspace/service.ts';
+import { createTestEmployeeAssignment } from '../../../../packages/database/src/employee-assignment.fixture.ts';
 import { GET as adminMemories } from '../api/v1/admin/organizations/[organizationId]/employee-memories/route';
 import { GET as adminMemoryDetail } from '../api/v1/admin/organizations/[organizationId]/employee-memories/[id]/route';
 import { GET as adminMemorySource } from '../api/v1/admin/organizations/[organizationId]/employee-memories/[id]/source/route';
@@ -110,18 +108,19 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
       organizationId: identity.org,
       workspaceId: otherWorkspace,
     }))!;
-    otherInstance = (await ensureDefaultEmployee(otherOwner, otherWorkspace))!
-      .id;
+    otherInstance = (
+      await createTestEmployeeAssignment(otherOwner, otherWorkspace)
+    ).id;
     await ensureGeneralEmployeeInstance(f.db, otherInstance);
     candidate = await remember('真实候选：看数据时先看表格，再看文字说明。');
-    const readerAssignment = await ensureDefaultEmployee(
+    const readerAssignment = await createTestEmployeeAssignment(
       reader,
       identity.workspace,
     );
-    await ensureGeneralEmployeeInstance(f.db, readerAssignment!.id);
+    await ensureGeneralEmployeeInstance(f.db, readerAssignment.id);
     shared = await seedPending(reader, {
       workspaceId: identity.workspace,
-      instanceId: readerAssignment!.id,
+      instanceId: readerAssignment.id,
       summary: '他人的工作区可见候选',
     });
     await f.db`update allrice_memories set visibility='workspace' where id=${shared.id}`;

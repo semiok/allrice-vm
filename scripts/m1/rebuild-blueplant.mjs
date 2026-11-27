@@ -268,7 +268,7 @@ step(
   `source: ${source.departments.length} departments, ${people.length} people (skipped ${[...skipUsers].join(',')})`,
 );
 
-// Source AI employees beyond Rice, by key with their published definition.
+// Explicitly requested source employees, by key and published definition.
 const sourceEmployees = extraAssign.map((name) => {
   const row = psql(
     'source',
@@ -521,19 +521,11 @@ commit;
     step(`accounts enabled to match the source: ${enabled}`);
   }
 
-  // 8. Platform employees by key. Rice ships with the platform; the others are rebuilt
-  //    from the source's published definition, resuming a half-finished earlier run.
+  // 8. Rebuild only the requested employees from their published definitions.
   const platform = async () =>
     (await call('GET', '/api/v1/admin/platform-employees')).employees ?? [];
-  const wanted = [{ name: 'Rice', key: 'rice' }, ...sourceEmployees];
-  for (const want of wanted) {
+  for (const want of sourceEmployees) {
     let entry = (await platform()).find((e) => e.employeeKey === want.key);
-    if (!entry && !want.definition) {
-      problems.push(
-        `platform employee ${want.key} missing (run content sync / qa-bootstrap first)`,
-      );
-      continue;
-    }
     if (!entry) {
       await call('POST', '/api/v1/admin/platform-employees', {
         key: want.key,
@@ -549,10 +541,6 @@ commit;
       await call('GET', `/api/v1/admin/platform-employees/${entry.id}`)
     ).employee;
     if (detail.publishedRevision ?? detail.currentPublished) continue;
-    if (!want.definition) {
-      problems.push(`platform employee ${want.key} has no published revision`);
-      continue;
-    }
     const draft = detail.currentDraft;
     const saved = await call(
       'PUT',
@@ -603,7 +591,7 @@ commit;
     `${assignments}?${new URLSearchParams({ workspaceId, target: JSON.stringify({ type: 'all' }) })}`,
   );
   const employees = await platform();
-  for (const want of wanted) {
+  for (const want of sourceEmployees) {
     const id = employees.find((e) => e.employeeKey === want.key)?.id;
     const entry =
       id && (catalog.employees ?? []).find((e) => e.employeeId === id);

@@ -2674,7 +2674,7 @@ suite('reading a receipt while late native trace changes its group', () => {
       }
       const submitted = answerReceipt(page, 'submitted');
       await submitted
-        .getByText('等待 Rice 接收这次回答', { exact: true })
+        .getByText('等待员工接收这次回答', { exact: true })
         .waitFor();
       await page.evaluate(() => window.processAdopt());
       const received = submitted.getByRole('button', {

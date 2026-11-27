@@ -459,7 +459,7 @@ export async function savePersonalSceneSkillInTransaction(
     );
   const authorize = async () => {
     const instance = await getEmployeeInstance(context, instanceId, tx);
-    if (!(await canUsePersonalEmployeeScenes(instance, tx)))
+    if (!canUsePersonalEmployeeScenes(instance))
       throw new DataAccessError('not_found');
   };
   await authorize();

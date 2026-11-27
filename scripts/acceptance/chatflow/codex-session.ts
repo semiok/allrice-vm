@@ -37,7 +37,9 @@ const rows = await sql<
 const binding = rows[0];
 if (!binding) {
   await sql.end();
-  throw new Error(`default Rice assignment for ${platformEmail} was not found`);
+  throw new Error(
+    `default employee assignment for ${platformEmail} was not found`,
+  );
 }
 
 const identitySession = await createSession(binding.user_id);

@@ -1,17 +1,7 @@
 import { assembleEmployeeKernel } from '../../../../apps/worker/src/employee-kernel.js';
 import { resolveEmployeeExecution } from './employeehub.ts';
 
-import { sceneSkillFixture } from './employee-scene-skills.fixture.ts';
 import type { RequestContext } from '@allrice/contracts';
-import {
-  listPersonalSceneSkills,
-  savePersonalSceneSkill,
-  getPersonalSceneSkillResource,
-} from './personal-scene-skills.ts';
-import {
-  inspectPersonalSceneSkill,
-  listPersonalSceneReads,
-} from './personal-scene-reads.ts';
 import { heartbeatJob } from '../execution/queue.ts';
 
 import { memoryPairDigest } from '../workspace/employee-memory.ts';
@@ -27,10 +17,7 @@ import {
   rejectConversationSteer,
 } from '../conversation/conversation-input.ts';
 
-import {
-  loadPersonalRuntimeSceneSkill,
-  prepareEmployeeContentContext,
-} from './employee-runtime-content.ts';
+import { prepareEmployeeContentContext } from './employee-runtime-content.ts';
 import { getEmployeeDetails } from './employee-content.ts';
 import {
   preparePersonNativeWebRoster,
@@ -152,28 +139,14 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     if (!context) throw Error('fixture_login');
     return { ...p, login, context };
   }
-  async function setup(profileWrite = false, basicRice = false) {
+  async function setup(profileWrite = false) {
     const slug = `instance-${randomUUID()}`;
     const admin = await principal(undefined, 'admin'),
       a = await principal(slug),
       b = await principal(slug);
     vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', admin.user.email);
-    const original = await createEmployeeAdministrationFixture(fixture.db);
-    const [rice] = basicRice
-      ? await fixture.db`select id from allrice_platform_employees where employee_key='rice'`
-      : [];
-    const source = basicRice
-      ? {
-          ...original,
-          employeeId: rice!.id as string,
-          definition: {
-            ...original.definition,
-            key: 'rice',
-            name: 'Platform assistant',
-          },
-        }
-      : original;
-    if (profileWrite || basicRice)
+    const source = await createEmployeeAdministrationFixture(fixture.db);
+    if (profileWrite)
       await savePlatformEmployeeDraft(source.employeeId, {
         definition: {
           ...source.definition,
@@ -182,7 +155,7 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
             toolNames: ['workspace.skill.read', 'workspace.export.create'],
           },
         },
-        ...(!basicRice ? { expectedRevisionId: source.revisionId } : {}),
+        expectedRevisionId: source.revisionId,
       });
     await source.preview(source.employeeId);
     expect((await source.publish(source.employeeId)).valid).toBe(true);
@@ -208,18 +181,10 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     await change('assign');
     const assignment = (
       await getEmployeeWorkspace(a.context, a.workspaceId)
-    ).employees.find(
-      (e) =>
-        e.employeeKey ===
-        (basicRice ? 'default-assistant' : source.definition.key),
-    )!;
+    ).employees.find((e) => e.employeeKey === source.definition.key)!;
     const bAssignment = (
       await getEmployeeWorkspace(b.context, b.workspaceId)
-    ).employees.find(
-      (e) =>
-        e.employeeKey ===
-        (basicRice ? 'default-assistant' : source.definition.key),
-    )!;
+    ).employees.find((e) => e.employeeKey === source.definition.key)!;
     const input = (name: string) => ({
       workspaceId: a.workspaceId,
       assignmentId: assignment.id,
@@ -1791,450 +1756,23 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
       ),
     ).not.toContain(i.id);
   });
-  it('E3 lets only the real platform Rice owner change name/style through HTTP and chat with CAS, receipts and immutable Run profiles', async () => {
-    const f = await setup(true, true),
-      id = f.assignment.id;
-    e3HttpAuth.context = f.a.context;
-    // Load the real Web boundary at runtime, as the existing file API fixtures
-    // do; its Bundler module graph is checked by the Web project.
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-instances/[id]/route.ts';
-    const { PATCH: patchInstance } = await import(routePath);
-    const patch = (
-      profile: Record<string, string>,
-      expectedRevision: number,
-      requestId = randomUUID(),
-    ) =>
-      patchInstance(
-        new Request(`https://allrice.test/api/v1/employee-instances/${id}`, {
-          method: 'PATCH',
-          headers: {
-            origin: 'https://allrice.test',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            workspaceId: f.a.workspaceId,
-            requestId,
-            expectedRevision,
-            profile,
-          }),
-        }),
-        { params: Promise.resolve({ id }) },
-      );
-    const first = await profileRun(f, id, '请把名字改为小米，回答简短一点。');
-    const call = {
-      ...first,
-      arguments: {
-        expectedRevision: 1,
-        name: '小米',
-        expressionStyle: 'concise',
-      },
-    };
-    const saved = await updateEmployeeProfileFromChat(call);
-    expect(saved.profile).toEqual({ name: '小米', expressionStyle: 'concise' });
-    expect(await updateEmployeeProfileFromChat(call)).toEqual(saved);
-    expect((await getEmployeeDetails(f.a.context, id)).profile).toMatchObject({
-      name: '小米',
-      expressionStyle: 'concise',
-    });
-    const requestId = randomUUID();
-    const response = await patch({ name: '小饭' }, 2, requestId);
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body.instance.profile).toEqual({
-      name: '小饭',
-      expressionStyle: 'concise',
-    });
-    expect(await (await patch({ name: '小饭' }, 2, requestId)).json()).toEqual(
-      body,
-    );
-    expect((await patch({ name: 'stale' }, 2)).status).toBe(409);
-    expect(
-      (await patch({ capabilities: 'grant extra capabilities' }, 3)).status,
-    ).toBe(400);
-    const next = await profileRun(f, id, '看看资料。');
-    expect(next.frozen.instance.profile).toEqual({
-      name: '小饭',
-      expressionStyle: 'concise',
-    });
-    const [old] =
-      await fixture.db`select execution_snapshot from allrice_employee_runs where run_id=${first.context.runId}`;
-    expect(old!.execution_snapshot).toEqual(first.frozen);
-    const listed = await listChatSessions(f.a.context, f.a.workspaceId, {
-      includeEmployeeGroups: true,
-    });
-    expect(
-      listed.sessions
-        .filter((s) => s.employeeInstanceId === id)
-        .map((s) => s.employeeName),
-    ).toEqual(['小饭', '小饭']);
-    expect(
-      listed.employeeGroups!.find((g) => g.employeeInstanceId === id)
-        ?.employeeName,
-    ).toBe('小饭');
-    const restored = await changeEmployeeInstanceLifecycle(f.a.context, id, {
-      workspaceId: f.a.workspaceId,
-      requestId: randomUUID(),
-      expectedRevision: 3,
-      operation: 'restore',
-      sourceRevision: 2,
-    });
-    expect(restored.profile).toEqual(saved.profile);
-    e3HttpAuth.context = f.b.context;
-    expect((await patch({ name: 'foreign' }, 4)).status).not.toBe(200);
-    expect((await getEmployeeInstance(f.a.context, id)).profile).toEqual(
-      saved.profile,
-    );
-    expect(
-      (await getEmployeeInstance(f.b.context, f.bAssignment.id)).profile,
-    ).toEqual({});
-  });
 
   function personaDocument(text: string | undefined) {
     expect(text?.startsWith('# 人设\n')).toBe(true);
     expect(Buffer.byteLength(text!, 'utf8')).toBeLessThanOrEqual(16384);
     return JSON.parse(text!.slice('# 人设\n'.length));
   }
-  it('U1 Rice full persona reaches owner details, workspace and the next kernel without changing frozen history or grants', async () => {
-    const f = await setup(true, true),
-      id = f.assignment.id;
-    const before = await profileRun(f, id, 'Synthetic baseline');
-    const oldRows =
-      await fixture.db`select execution_snapshot,prompt_snapshot from allrice_employee_runs where run_id=${before.context.runId}`;
-    expect(
-      personaDocument(oldRows[0]!.prompt_snapshot.employeeDocuments.persona)
-        .name,
-    ).toEqual({ value: 'Platform assistant', source: 'platform_default' });
-    const profile = {
-      name: '本人 Rice',
-      description: 'Personal description',
-      appearance: {
-        avatarType: 'initials',
-        avatarValue: '禾',
-        accentColor: 'coral',
-      },
-      role: 'Personal role',
-      mission: 'Personal mission',
-      workStyle: 'Personal working style',
-      expressionStyle: 'structured',
-    };
-    e3HttpAuth.context = f.a.context;
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-instances/[id]/route.ts';
-    const { PATCH } = await import(routePath);
-    const response = await PATCH(
-      new Request(`https://allrice.test/api/v1/employee-instances/${id}`, {
-        method: 'PATCH',
-        headers: {
-          origin: 'https://allrice.test',
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          workspaceId: f.a.workspaceId,
-          expectedRevision: 1,
-          requestId: randomUUID(),
-          profile,
-        }),
-      }),
-      { params: Promise.resolve({ id }) },
-    );
-    expect(response.status).toBe(200);
-    expect((await response.json()).instance.profile).toEqual(profile);
-    const [current] =
-      await fixture.db`select profile from allrice_employee_instances where id=${id}`;
-    expect(current!.profile).toEqual(profile);
-    const details = (await getEmployeeDetails(f.a.context, id)).profile;
-    expect(details).toMatchObject({
-      name: profile.name,
-      description: profile.description,
-      appearance: profile.appearance,
-      expressionStyle: profile.expressionStyle,
-      isDefaultRice: true,
-      identity: {
-        role: profile.role,
-        mission: profile.mission,
-        workStyle: profile.workStyle,
-      },
-    });
-    // Identity fields are nested in the read projection, not duplicated at top-level.
-    expect(details.personalFields.sort()).toEqual(Object.keys(profile).sort());
-    expect(details.editableFields?.sort()).toEqual(Object.keys(profile).sort());
-    expect(details.defaults?.name).toBe('Platform assistant');
-    expect(details.defaults?.role).not.toBe(profile.role);
-    const hub = await getEmployeeWorkspace(f.a.context, f.a.workspaceId);
-    expect(
-      hub.employees.flatMap((e) => e.instances ?? []).find((i) => i.id === id)
-        ?.profile,
-    ).toEqual(profile);
-    const next = await profileRun(f, id, 'Synthetic next task');
-    expect(next.frozen.instance.profile).toEqual(profile);
-    const resolved = await resolveEmployeeExecution({
-      organizationId: f.a.organizationId,
-      workspaceId: f.a.workspaceId,
-      ownerId: f.a.user.id,
-      runId: next.context.runId,
-    });
-    const persona = personaDocument(
-      resolved.promptSnapshot.employeeDocuments?.persona,
-    );
-    for (const [field, value] of Object.entries(profile)) {
-      if (field === 'appearance') continue;
-      expect(persona[field]).toMatchObject({
-        value,
-        source: 'personal_override',
-      });
-    }
-    for (const [field, value] of Object.entries(profile.appearance)) {
-      expect(persona.appearance[field]).toEqual({
-        value,
-        source: 'personal_override',
-      });
-    }
-    expect(persona.source).toMatchObject({
-      kind: 'employee_run',
-      ownerId: f.a.user.id,
-      instanceId: id,
-      profileRevision: 2,
-      profileEligibility: 'full_identity',
-    });
-    expect(persona.source).toEqual(next.frozen.persona.source);
-    expect(resolved.promptSnapshot).not.toHaveProperty('personalIdentity');
-    const kernel = assembleEmployeeKernel({
-      employeeAssignmentId: id,
-      employeeVersionId: next.frozen.employee.versionId,
-      sessionId: next.sessionId,
-      userMessageId: next.userMessageId,
-      assistantMessageId: randomUUID(),
-      resolved,
-    });
-    const [stored] =
-      await fixture.db`select prompt_snapshot from allrice_employee_runs where run_id=${next.context.runId}`;
-    expect(stored!.prompt_snapshot.employeeDocuments).toEqual(
-      resolved.promptSnapshot.employeeDocuments,
-    );
-    expect(kernel.employeeDocuments).toEqual(
-      resolved.promptSnapshot.employeeDocuments,
-    );
-    for (const instructions of [
-      kernel.systemInstructions,
-      kernel.rootSystemInstructions,
-    ]) {
-      expect(instructions).toContain(f.source.definition.systemPrompt);
-      // Source authority is global in the native Host (prompt-authority.test.mjs).
-      expect(instructions).toContain(
-        'Read its values and per-field sources literally.',
-      );
-      expect(instructions).toContain(
-        'current task instructions retain their normal priority.',
-      );
-      expect(instructions).not.toContain(profile.name);
-      expect(instructions).not.toContain(profile.mission);
-      expect(instructions).not.toContain(
-        'Explicit personal identity preferences',
-      );
-    }
-    expect(next.frozen.capabilitySnapshot).toEqual(
-      before.frozen.capabilitySnapshot,
-    );
-    expect(next.frozen.employee).toEqual(before.frozen.employee);
-    expect(
-      await fixture.db`select execution_snapshot,prompt_snapshot from allrice_employee_runs where run_id=${before.context.runId}`,
-    ).toEqual(oldRows);
-    // Current owner permission remains required for the full identity write.
-    await expect(
-      updateEmployeeInstance(f.b.context, id, {
-        workspaceId: f.b.workspaceId,
-        expectedRevision: 2,
-        requestId: randomUUID(),
-        profile,
-      }),
-    ).rejects.toBeDefined();
-    const restored = await changeEmployeeInstanceLifecycle(f.a.context, id, {
-      workspaceId: f.a.workspaceId,
-      expectedRevision: 2,
-      requestId: randomUUID(),
-      operation: 'restore',
-      sourceRevision: 1,
-    });
-    expect(restored.profile).toEqual({});
-  });
 
-  it('U1 Rice explicit reset preserves memory, Skills, scenes and receipts while following current platform defaults', async () => {
-    const f = await setup(true, true),
-      id = f.assignment.id;
-    const profile = {
-      name: 'Owner override',
-      mission: 'Owner mission',
-      expressionStyle: 'concise',
-    };
-    await updateEmployeeInstance(f.a.context, id, {
-      workspaceId: f.a.workspaceId,
-      expectedRevision: 1,
-      requestId: randomUUID(),
-      profile,
-    });
-    const scene = await savePersonalSceneSkill(f.a.context, id, {
-      workspaceId: f.a.workspaceId,
-      requestId: randomUUID(),
-      expectedRevision: 0,
-      expectedContentRef: null,
-      scene: {
-        id: randomUUID(),
-        name: 'Retained scene',
-        appliesWhen: 'Synthetic test',
-      },
-      procedure: {
-        kind: 'procedure',
-        title: 'Retained procedure',
-        ...sceneSkillFixture(),
-      },
-      references: [],
-      changeSummary: 'Synthetic setup',
-    });
-    const memory = await createPersonalEmployeeMemory(f.a.context, {
-      workspaceId: f.a.workspaceId,
-      instanceId: id,
-      idempotencyKey: randomUUID(),
-      summary: 'Retained personal memory',
-      details: null,
-    });
-    // Synthetic pre-existing ordinary Skill binding, independent of profile reset.
-    const installationId = randomUUID(),
-      versionId = randomUUID();
-    await fixture.db.begin(async (tx) => {
-      await tx`insert into allrice_personal_skill_installations(id,organization_id,owner_id,name,state,current_version_id) values(${installationId},${f.a.organizationId},${f.a.user.id},'retained-skill','installed',${versionId})`;
-      await tx`insert into allrice_personal_skill_versions(id,organization_id,owner_id,installation_id,version,source,original_text,definition,definition_checksum) values(${versionId},${f.a.organizationId},${f.a.user.id},${installationId},1,'{}','Synthetic retained source','{}',${'sha256:' + 'a'.repeat(64)})`;
-      await tx`insert into allrice_personal_skill_bindings(organization_id,workspace_id,owner_id,instance_id,installation_id,enabled) values(${f.a.organizationId},${f.a.workspaceId},${f.a.user.id},${id},${installationId},false)`;
-    });
-    const retained = async () => ({
-      memory:
-        await fixture.db`select * from allrice_memories where id=${memory.id}`,
-      installations:
-        await fixture.db`select * from allrice_personal_skill_installations where id=${installationId}`,
-      versions:
-        await fixture.db`select * from allrice_personal_skill_versions where id=${versionId}`,
-      bindings:
-        await fixture.db`select * from allrice_personal_skill_bindings where instance_id=${id}`,
-      scene: await listPersonalSceneSkills(f.a.context, id),
-      resource: await getPersonalSceneSkillResource(
-        f.a.context,
-        id,
-        scene.contentRef,
-        'assets/template.csv',
-      ),
-      originalProfile:
-        await fixture.db`select * from allrice_employee_instance_revisions where instance_id=${id} and revision<=2 order by revision`,
-    });
-    const prior = await retained();
-    const draft = await savePlatformEmployeeDraft(f.source.employeeId, {
-      definition: {
-        ...f.source.definition,
-        name: 'New platform default',
-        description: 'New platform description',
-      },
-    });
-    await f.source.preview(f.source.employeeId);
-    expect(
-      (
-        await publishPlatformEmployee(f.source.employeeId, {
-          scope: 'assigned',
-          expectedRevisionId: draft!.currentDraft!.id,
-        })
-      ).valid,
-    ).toBe(true);
-    const defaults = (await getEmployeeDetails(f.a.context, id)).profile
-      .defaults!;
-    expect(defaults.name).toBe('New platform default');
-    expect((await getEmployeeDetails(f.a.context, id)).profile.name).toBe(
-      profile.name,
-    );
-    // Empty PATCH retains the existing rejection; it cannot silently clear state.
-    await expect(
-      updateEmployeeInstance(f.a.context, id, {
-        workspaceId: f.a.workspaceId,
-        expectedRevision: 2,
-        requestId: randomUUID(),
-        profile: {},
-      }),
-    ).rejects.toBeDefined();
-    e3HttpAuth.context = f.a.context;
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-instances/[id]/route.ts';
-    const { PATCH } = await import(routePath);
-    const args = {
-      workspaceId: f.a.workspaceId,
-      expectedRevision: 2,
-      requestId: randomUUID(),
-      operation: 'reset_profile',
-    };
-    const reset = (body: unknown = args) =>
-      PATCH(
-        new Request(`https://allrice.test/api/v1/employee-instances/${id}`, {
-          method: 'PATCH',
-          headers: {
-            origin: 'https://allrice.test',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(body),
-        }),
-        { params: Promise.resolve({ id }) },
-      );
-    expect((await reset({ ...args, profile: {} })).status).toBe(400);
-    const response = await reset();
-    expect(response.status).toBe(200);
-    const receipt = await response.json();
-    expect(receipt.instance).toMatchObject({ id, revision: 3, profile: {} });
-    expect(await (await reset()).json()).toEqual(receipt);
-    expect(await retained()).toEqual(prior);
-    const current = (await getEmployeeDetails(f.a.context, id)).profile;
-    expect(current).toMatchObject({
-      name: defaults.name,
-      description: defaults.description,
-      isDefaultRice: true,
-      personalFields: [],
-    });
-    expect(current.identity).toMatchObject({
-      role: defaults.role,
-      mission: defaults.mission,
-      workStyle: defaults.workStyle,
-    });
-    expect(defaults.expressionStyle).toBe(
-      f.source.definition.identity.expressionStyle,
-    );
-    expect(current.expressionStyle).toBe(defaults.expressionStyle);
-    expect(current.overrides).toEqual({});
-    expect((await getEmployeeInstance(f.a.context, id)).profile).toEqual({});
-    expect((await reset({ ...args, requestId: randomUUID() })).status).toBe(
-      409,
-    );
-    e3HttpAuth.context = f.b.context;
-    expect((await reset()).status).not.toBe(200);
-    e3HttpAuth.context = f.a.context;
-    await fixture.db`update allrice_memberships set active=false where organization_id=${f.a.organizationId} and user_id=${f.a.user.id}`;
-    expect((await reset()).status).toBe(403);
-  });
-
-  it('U1 does not grant full persona or default reset to professional general or custom by the name Rice', async () => {
+  it('U1 keeps full persona edits limited to a personal employee', async () => {
     const f = await setup(true),
       id = f.assignment.id,
-      custom = await f.custom('Rice');
-    await fixture.db`update allrice_employee_instances set profile=${fixture.db.json({ name: 'Rice' })} where id=${id}`;
+      custom = await f.custom('Test employee');
+    await fixture.db`update allrice_employee_instances set profile=${fixture.db.json({ name: 'Test employee' })} where id=${id}`;
     const professional = (await getEmployeeDetails(f.a.context, id)).profile;
-    expect(professional.isDefaultRice).toBe(false);
     expect(professional.editableFields).toEqual(['expressionStyle']);
     const ownCustom = (await getEmployeeDetails(f.a.context, custom.id))
       .profile;
-    expect(ownCustom.isDefaultRice).toBe(false);
     expect(ownCustom.editableFields).toContain('mission');
-    for (const target of [id, custom.id])
-      await expect(
-        updateEmployeeInstance(f.a.context, target, {
-          workspaceId: f.a.workspaceId,
-          expectedRevision: 1,
-          requestId: randomUUID(),
-          operation: 'reset_profile',
-        }),
-      ).rejects.toMatchObject({ code: 'authorization_denied' });
     await expect(
       updateEmployeeInstance(f.a.context, id, {
         workspaceId: f.a.workspaceId,
@@ -2249,92 +1787,30 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     );
   });
 
-  it('U1 default Rice archive protection uses real identity before receipts or Run cancellation', async () => {
-    const f = await setup(true, true),
-      id = f.assignment.id;
-    await updateEmployeeInstance(f.a.context, id, {
-      workspaceId: f.a.workspaceId,
-      expectedRevision: 1,
-      requestId: randomUUID(),
-      profile: { name: 'Not called Rice' },
-    });
-    const run = await profileRun(f, id, 'Synthetic active task');
-    const state = async () => ({
-      instance:
-        await fixture.db`select * from allrice_employee_instances where id=${id}`,
-      revisions:
-        await fixture.db`select * from allrice_employee_instance_revisions where instance_id=${id} order by revision`,
-      jobs: await fixture.db`select * from allrice_jobs where run_id=${run.context.runId}`,
-      run: await fixture.db`select * from allrice_runs where id=${run.context.runId}`,
-    });
-    const before = await state();
-    expect((await getEmployeeDetails(f.a.context, id)).profile).toMatchObject({
-      isDefaultRice: true,
-      canArchive: false,
-    });
-    const args = {
-      workspaceId: f.a.workspaceId,
-      expectedRevision: 2,
-      requestId: randomUUID(),
-      operation: 'archive',
-    };
-    await expect(
-      changeEmployeeInstanceLifecycle(f.a.context, id, args),
-    ).rejects.toMatchObject({ code: 'default_protected' });
-    e3HttpAuth.context = f.a.context;
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-instances/[id]/lifecycle/route.ts';
-    const { POST } = await import(routePath);
-    const archive = () =>
-      POST(
-        new Request(
-          `https://allrice.test/api/v1/employee-instances/${id}/lifecycle`,
-          {
-            method: 'POST',
-            headers: {
-              origin: 'https://allrice.test',
-              'content-type': 'application/json',
-            },
-            body: JSON.stringify(args),
-          },
-        ),
-        { params: Promise.resolve({ id }) },
-      );
-    const response = await archive();
-    expect(response.status).toBe(409);
-    expect((await response.json()).error.code).toBe(
-      'DEFAULT_EMPLOYEE_PROTECTED',
-    );
-    expect(await state()).toEqual(before);
-    e3HttpAuth.context = f.b.context;
-    expect([403, 404]).toContain((await archive()).status);
-    expect(await state()).toEqual(before);
-    expect(
-      (await getEmployeeInstanceHistory(f.a.context, id)).revisions,
-    ).toHaveLength(2);
-  });
-
   it.each(['general', 'custom'] as const)(
-    'U1 allows non-default %s named Rice to archive and restore its current profile',
+    'U1 allows %s to archive and restore its current profile',
     async (kind) => {
       const f = await setup(true),
-        id = kind === 'general' ? f.assignment.id : (await f.custom('Rice')).id;
+        id =
+          kind === 'general'
+            ? f.assignment.id
+            : (await f.custom('Test employee')).id;
       // Legacy label cannot confer the protected platform identity on a professional.
       if (kind === 'general')
-        await fixture.db`update allrice_employee_instances set profile=${fixture.db.json({ name: 'Rice' })} where id=${id}`;
+        await fixture.db`update allrice_employee_instances set profile=${fixture.db.json({ name: 'Test employee' })} where id=${id}`;
       const updated = await updateEmployeeInstance(f.a.context, id, {
         workspaceId: f.a.workspaceId,
         expectedRevision: 1,
         requestId: randomUUID(),
         profile: {
           ...(kind === 'custom'
-            ? { name: 'Rice', mission: 'Preserved personal mission' }
+            ? { name: 'Test employee', mission: 'Preserved personal mission' }
             : {}),
           expressionStyle: 'structured',
         },
       });
       expect((await getEmployeeDetails(f.a.context, id)).profile).toMatchObject(
-        { isDefaultRice: false, canArchive: true },
+        { canArchive: true },
       );
       const archive = {
         workspaceId: f.a.workspaceId,
@@ -2387,11 +1863,14 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     },
   );
 
-  it.each([false, true] as const)(
-    'normal new Run admission has no legacy methods (Rice=%s)',
-    async (rice) => {
-      const f = await setup(true, rice),
-        id = rice ? f.assignment.id : (await f.custom('Current owner')).id;
+  it.each(['general', 'custom'] as const)(
+    '%s admission has no legacy methods',
+    async (kind) => {
+      const f = await setup(true),
+        id =
+          kind === 'general'
+            ? f.assignment.id
+            : (await f.custom('Current owner')).id;
       const run = await chatRun(f, id, '以后按这份办法来做。');
       expect(
         run.frozen.capabilitySnapshot.bindings.toolNames.filter(
@@ -2405,7 +1884,7 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
         user: expect.any(String),
         memory: expect.any(String),
       });
-      if (rice) {
+      if (kind === 'general') {
         const details = (await getEmployeeDetails(f.a.context, id)).profile;
         const persona = personaDocument(
           resolved.promptSnapshot.employeeDocuments?.persona,
@@ -2418,7 +1897,7 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
           ownerId: f.a.user.id,
           instanceId: id,
           profileRevision: 1,
-          profileEligibility: 'full_identity',
+          profileEligibility: 'expression_only',
         });
       }
       const kernel = assembleEmployeeKernel({
@@ -2447,234 +1926,6 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     },
   );
 
-  it('U1 keeps the legacy unconfirmed content HTTP boundary closed for Rice', async () => {
-    const f = await setup(true, true),
-      id = f.assignment.id;
-    e3HttpAuth.context = f.a.context;
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-content/route.ts';
-    const { POST: postInstanceContent } = await import(routePath);
-    const response = await postInstanceContent(
-      new Request(
-        `https://allrice.test/api/v1/employee-instances/${id}/content`,
-        {
-          method: 'POST',
-          headers: {
-            origin: 'https://allrice.test',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            workspaceId: f.a.workspaceId,
-            requestId: randomUUID(),
-            setId: randomUUID(),
-            operation: 'save_draft',
-            expectedRevision: 0,
-            ownership: {
-              scope: 'personal',
-              organizationId: f.a.organizationId,
-              ownerId: f.a.user.id,
-            },
-            target: { kind: 'instance', instanceId: id },
-            manifest: {
-              schemaVersion: 1,
-              common: [],
-              scenes: [],
-              declaredConflicts: [],
-            },
-            textEdits: [],
-            changeSummary: 'Synthetic authorized personal method',
-          }),
-        },
-      ),
-    );
-    expect(response.status).toBe(403);
-    expect(
-      await fixture.db`select id from allrice_employee_content_sets where instance_id=${id}`,
-    ).toHaveLength(0);
-  });
-
-  it('U1 gives Rice and owner custom the same exact personal package HTTP, resource and runtime reads', async () => {
-    const f = await setup(true, true),
-      custom = await f.custom('My workflow employee');
-    e3HttpAuth.context = f.a.context;
-    const routePath =
-      '../../../../apps/web/app/api/v1/employee-instances/[id]/scene-skills/route.ts';
-    const { POST, GET } = await import(routePath);
-    const body = {
-      workspaceId: f.a.workspaceId,
-      requestId: randomUUID(),
-      expectedRevision: 0,
-      expectedContentRef: null,
-      scene: {
-        id: randomUUID(),
-        name: 'Synthetic workflow',
-        appliesWhen: 'Synthetic test only',
-      },
-      procedure: {
-        kind: 'procedure',
-        title: 'Synthetic procedure',
-        ...sceneSkillFixture(),
-      },
-      references: [],
-      changeSummary: 'Owner package',
-    };
-    const save = (id: string, requestId = randomUUID()) =>
-      POST(
-        new Request(
-          `https://allrice.test/api/v1/employee-instances/${id}/scene-skills`,
-          {
-            method: 'POST',
-            headers: {
-              origin: 'https://allrice.test',
-              'content-type': 'application/json',
-            },
-            body: JSON.stringify({ ...body, requestId }),
-          },
-        ),
-        { params: Promise.resolve({ id }) },
-      );
-    expect((await save(f.assignment.id)).status).toBe(200);
-    const riceSkills = await listPersonalSceneSkills(
-      f.a.context,
-      f.assignment.id,
-    );
-    expect(riceSkills.skills).toHaveLength(1);
-    const ref = riceSkills.skills[0]!.contentRef;
-    expect(typeof ref).toBe('string');
-    if (!ref)
-      throw new Error('Rice personal package must expose an exact contentRef');
-    const readHttp = (selection: Record<string, string>) =>
-      GET(
-        new Request(
-          `https://allrice.test/api/v1/employee-instances/${f.assignment.id}/scene-skills?${new URLSearchParams(selection)}`,
-        ),
-        { params: Promise.resolve({ id: f.assignment.id }) },
-      );
-    const directory = await readHttp({});
-    expect(directory.status).toBe(200);
-    expect((await directory.json()).skills[0].contentRef).toBe(ref);
-    const exactHttp = await readHttp({
-      contentRef: ref,
-      resourcePath: 'assets/template.csv',
-    });
-    expect(exactHttp.status).toBe(200);
-    expect(
-      Buffer.from((await exactHttp.json()).contentBase64, 'base64').toString(),
-    ).toContain('synthetic');
-    const skill = await inspectPersonalSceneSkill(
-      f.a.context,
-      f.assignment.id,
-      ref,
-    );
-    expect(skill.contentRef).toBe(ref);
-    const resource = await getPersonalSceneSkillResource(
-      f.a.context,
-      f.assignment.id,
-      ref,
-      'assets/template.csv',
-    );
-    expect(Buffer.from(resource.contentBase64, 'base64').toString()).toContain(
-      'synthetic',
-    );
-    await expect(
-      inspectPersonalSceneSkill(f.b.context, f.assignment.id, ref),
-    ).rejects.toThrow();
-    const run = await chatRun(f, f.assignment.id, '使用本人工作场景。');
-    expect(run.frozen.content.personalScenes).toBe(true);
-    const worker = {
-      jobId: run.context.jobId,
-      workerId: run.context.worker.id,
-      attempt: run.worker.attempt,
-      leaseToken: run.worker.leaseToken,
-    };
-    await acquireConversationRuntime({
-      ...run.scope,
-      workerId: worker.workerId,
-      configChecksum: `sha256:${'c'.repeat(64)}`,
-      compactThresholdTokens: 40000,
-    });
-    await loadPersonalRuntimeSceneSkill(
-      run.scope,
-      run.runtime.generationId,
-      { sceneId: body.scene.id },
-      worker,
-    );
-    await loadPersonalRuntimeSceneSkill(
-      run.scope,
-      run.runtime.generationId,
-      { contentRef: ref, resourcePath: 'assets/template.csv' },
-      worker,
-    );
-    const [read] =
-      await fixture.db`select content_scene_state from allrice_employee_runs where run_id=${run.context.runId}`;
-    expect(read!.content_scene_state.reads[0].personal).toMatchObject({
-      contentRef: ref,
-      contentRead: true,
-      resources: [{ path: 'assets/template.csv' }],
-    });
-    expect(
-      await listPersonalSceneReads(f.a.context, f.assignment.id),
-    ).toBeDefined();
-    await run.finish();
-    expect((await save(custom.id)).status).toBe(200);
-    expect(
-      (await listPersonalSceneSkills(f.a.context, custom.id)).skills,
-    ).toHaveLength(1);
-    await fixture.db`update allrice_employee_content_publications set invalidated_at=clock_timestamp()
-      where set_id in (select id from allrice_employee_content_sets where instance_id=${f.assignment.id})`;
-    await expect(
-      inspectPersonalSceneSkill(f.a.context, f.assignment.id, ref),
-    ).rejects.toThrow();
-    await expect(
-      getPersonalSceneSkillResource(
-        f.a.context,
-        f.assignment.id,
-        ref,
-        'assets/template.csv',
-      ),
-    ).rejects.toThrow();
-    expect(
-      (await readHttp({ contentRef: ref, resourcePath: 'assets/template.csv' }))
-        .status,
-    ).toBe(404);
-    expect(
-      (await listPersonalSceneSkills(f.a.context, custom.id)).skills,
-    ).toHaveLength(1);
-    expect(
-      (
-        await fixture.db`select content_scene_state from allrice_employee_runs where run_id=${run.context.runId}`
-      )[0]!.content_scene_state,
-    ).toEqual(read!.content_scene_state);
-  });
-
-  it('upgrades Rice through its established tenant alias without allowing the alias to rename the platform identity', async () => {
-    const source = await createEmployeeAdministrationFixture(fixture.db);
-    const [rice] =
-      await fixture.db`select id from allrice_platform_employees where employee_key='rice'`;
-    const employeeId = rice!.id as string;
-    const definition = { ...source.definition, key: 'rice' };
-    await savePlatformEmployeeDraft(employeeId, { definition });
-    await source.preview(employeeId);
-    expect((await source.publish(employeeId)).valid).toBe(true);
-    const assigned = async () => fixture.db`
-      select e.id, e.employee_key, e.name from allrice_employees e
-      join allrice_platform_employee_tenant_assignments d on d.tenant_employee_id=e.id
-      where d.employee_id=${employeeId} and d.workspace_id=${source.workspaceId}`;
-    const before = await assigned();
-    expect(before).toHaveLength(1);
-    expect(before[0]!.employee_key).toBe('default-assistant');
-    await savePlatformEmployeeDraft(employeeId, {
-      definition: { ...definition, name: 'Updated Rice' },
-    });
-    await source.preview(employeeId);
-    expect((await source.publish(employeeId)).valid).toBe(true);
-    expect(await assigned()).toEqual([{ ...before[0], name: 'Updated Rice' }]);
-    await expect(
-      savePlatformEmployeeDraft(employeeId, {
-        definition: { ...definition, key: 'default-assistant' },
-      }),
-    ).rejects.toThrow('platform_employee_materialized_key_immutable');
-  });
   it('keeps an unpublished draft rename from blocking repeated deployment of the published identity', async () => {
     const source = await createEmployeeAdministrationFixture(fixture.db);
     await source.preview();

@@ -336,7 +336,7 @@ export async function parseDocument(input: {
   }
   throw new HandlerError(
     'TOOL_FILE_TYPE_UNSUPPORTED',
-    '当前支持 PDF、DOCX、XLSX、PPTX、Markdown、文本和 JSON；图片请作为消息附件直接发送给 Rice。',
+    '当前支持 PDF、DOCX、XLSX、PPTX、Markdown、文本和 JSON；图片请作为消息附件直接发送给员工。',
     false,
   );
 }

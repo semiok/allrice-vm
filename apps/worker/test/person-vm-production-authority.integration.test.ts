@@ -1,4 +1,5 @@
 /** Real isolated DB/session/271 readers; no Host, native job, B or model starts. */
+import { createTestEmployeeAssignment } from '../../../packages/database/src/employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import {
   afterAll,
@@ -19,7 +20,6 @@ import {
   ensureBootstrapPortalPrincipal,
   revokeSession,
 } from '../../../packages/database/src/identity.ts';
-import { ensureDefaultEmployee } from '../../../packages/database/src/workspace/service.ts';
 import {
   ensureGeneralEmployeeInstance,
   getEmployeeInstance,
@@ -95,7 +95,10 @@ suite(
         ...authenticated,
         workspaceId: p.workspaceId,
       };
-      const assigned = await ensureDefaultEmployee(context, p.workspaceId);
+      const assigned = await createTestEmployeeAssignment(
+        context,
+        p.workspaceId,
+      );
       if (!assigned) throw Error('original real assignment required');
       await ensureGeneralEmployeeInstance(db.db, assigned.id);
       const instance = await getEmployeeInstance(context, assigned.id);

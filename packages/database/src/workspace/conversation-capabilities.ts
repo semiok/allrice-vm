@@ -70,7 +70,6 @@ export async function qualifyConversationProjectTools(
   sql: Sql | TransactionSql,
   scope: Scope,
   toolNames: string[],
-  baseRice: boolean,
 ) {
   if (!toolNames.includes('workspace.project')) return toolNames;
   const [row] = await sql<{ account_capability_snapshot: unknown }[]>`
@@ -80,9 +79,7 @@ export async function qualifyConversationProjectTools(
       and visibility='private' and archived_at is null
   `;
   if (!row) throw new DataAccessError('authorization_denied');
-  // Retain #784's legacy default-Rice reduction for pre-feature conversations.
-  // Never backfill them from the current account switch or rewrite old Runs.
-  let enabled = !baseRice;
+  let enabled = true;
   if (row.account_capability_snapshot !== null) {
     const result = SnapshotSchema.safeParse(row.account_capability_snapshot);
     if (

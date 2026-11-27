@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import {
   afterAll,
@@ -35,10 +36,7 @@ import {
 } from './employees/employee-instances.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 import { seedPersonalMemoryPair } from './workspace/employee-memory-pair.fixture.ts';
-import {
-  createManagedEmployeeMemory,
-  ensureDefaultEmployee,
-} from './workspace/service.ts';
+import { createManagedEmployeeMemory } from './workspace/service.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -102,7 +100,7 @@ suite('memory public management port: real transactions without a Run', () => {
       (await createSession(principal.user.id)).token,
       principal,
     ))!;
-    const assignment = await ensureDefaultEmployee(
+    const assignment = await createTestEmployeeAssignment(
       context,
       principal.workspaceId,
     );

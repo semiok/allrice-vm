@@ -82,7 +82,7 @@ export const defaultRuntimeEventRegistry = new RuntimeEventRendererRegistry()
     <RuntimeRow event={event}>
       <strong>
         {event.type === 'turn.started'
-          ? 'Rice 正在处理'
+          ? '员工正在处理'
           : event.type === 'turn.completed'
             ? '本轮已完成'
             : event.type === 'turn.canceled'

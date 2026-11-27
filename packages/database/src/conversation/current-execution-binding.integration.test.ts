@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from '../employee-assignment.fixture.ts';
 import { legacyRuntimePackageFixture as buildEmployeeRuntimePackage } from '../platform-employees/legacy-runtime-package.fixture.ts';
 const oldGeneration = 'dsh-0.1.5-rc.3-a4c74a9' as const;
 /** Real SQL admission/dispatch only. No native Host, provider, Dev API or live
@@ -28,7 +29,6 @@ import { createEmployeeAdministrationFixture } from '../employee-administration.
 import { createSession, authenticateSession } from '../identity.ts';
 import {
   createAssignedChatSession,
-  ensureDefaultEmployee,
   sendChatMessage,
 } from '../workspace/service.ts';
 import { resolveEmployeeExecution } from '../employees/employeehub.ts';
@@ -79,7 +79,7 @@ const tools = [
   'workspace.skill.read',
 ];
 type SourceKind =
-  | 'default-rice'
+  | 'tenant-definition'
   | 'legacy-package2'
   | 'current-package2'
   | 'current-package2-retired-memory'
@@ -327,7 +327,7 @@ integration(
       }
     });
 
-    function packageFor(kind: Exclude<SourceKind, 'default-rice'>) {
+    function packageFor(kind: Exclude<SourceKind, 'tenant-definition'>) {
       const pkg = structuredClone(packages[kind]);
       if (kind === 'current-package2-retired-memory') {
         // Construct the original historical package, before any reader sees it.
@@ -380,13 +380,13 @@ integration(
     }
 
     async function subject(kind: SourceKind, legacyBirth = false) {
-      const pkg = kind === 'default-rice' ? undefined : packageFor(kind);
+      const pkg = kind === 'tenant-definition' ? undefined : packageFor(kind);
       const f = await createRunAuthorityFixture(fixture.db, {
         configure: false,
         memberRole: 'member',
         runtimePackage: pkg,
         legacyPublication:
-          kind === 'default-rice'
+          kind === 'tenant-definition'
             ? undefined
             : {
                 platformEmployeeId: platformSource.employeeId,
@@ -417,7 +417,7 @@ integration(
         },
         businessCreationOrigin: legacyBirth && kind === 'current-package2',
       });
-      if (pkg && kind !== 'default-rice') {
+      if (pkg && kind !== 'tenant-definition') {
         const [publication] =
           await fixture.db`select r.revision,r.runtime_profile
           from allrice_employee_version_sources p join allrice_platform_employee_revisions r on r.id=p.platform_revision_id
@@ -434,28 +434,20 @@ integration(
         workspaceId: f.workspace,
       });
       if (!context) throw Error('isolated_login_required');
-      let assignment = f.assignment,
-        employee = f.employee,
-        version = f.version;
-      if (kind === 'default-rice' && !legacyBirth) {
-        await ensureDefaultEmployee(context, f.workspace);
-        // Provisioning preserves the fixture's existing default employee. Read
-        // the Rice assignment it actually inserted, not its returned default.
-        const [row] =
-          await fixture.db`select a.id,a.employee_id,a.employee_version_id
-          from allrice_employee_assignments a join allrice_employees e on e.id=a.employee_id
-          where a.organization_id=${f.org} and a.workspace_id=${f.workspace}
-            and a.user_id=${f.user} and a.active and e.employee_key='default-assistant'`;
-        if (!row) throw Error('default_rice_required');
+      let assignment: string = f.assignment,
+        employee: string = f.employee,
+        version: string = f.version;
+      if (kind === 'tenant-definition' && !legacyBirth) {
+        const row = await createTestEmployeeAssignment(context, f.workspace);
         assignment = row.id;
-        employee = row.employee_id;
-        version = row.employee_version_id;
+        employee = row.employeeId;
+        version = row.employeeVersionId;
       }
       const [versionRow] =
         await fixture.db`select manifest,config_checksum from allrice_employee_versions where id=${version}`;
       const manifest = EmployeeDefinitionSchema.parse(versionRow!.manifest);
-      if (kind === 'default-rice') {
-        expect(manifest.key).toBe('default-assistant');
+      if (kind === 'tenant-definition') {
+        expect(manifest.key).toBe(`test-employee-${f.user}`);
         expect(versionRow!.config_checksum).toBe(
           employeeManifestChecksum(manifest),
         );
@@ -620,7 +612,7 @@ integration(
     }, 30_000);
 
     it.each([
-      'default-rice',
+      'tenant-definition',
 
       'current-package2',
 
@@ -637,14 +629,14 @@ integration(
           configChecksum: f.configChecksum,
           packageSchema: f.manifest.runtimePackage?.schemaVersion ?? null,
           declaredGeneration:
-            kind === 'default-rice'
+            kind === 'tenant-definition'
               ? null
               : kind.startsWith('legacy-')
                 ? oldGeneration
                 : newNativeGeneration,
         });
-        if (kind === 'default-rice') {
-          expect(f.manifest.key).toBe('default-assistant');
+        if (kind === 'tenant-definition') {
+          expect(f.manifest.key).toBe(`test-employee-${f.user}`);
           expect(f.manifest.runtimePackage).toBeNull();
         }
         if (kind.includes('package1'))

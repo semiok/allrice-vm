@@ -260,7 +260,7 @@ describe('historical transcript capability gating', () => {
         {
           ...messages[0]!,
           status: 'pending',
-          content: { text: 'Rice 正在处理…' },
+          content: { text: '员工正在处理…' },
         },
       ],
       undefined,
@@ -271,7 +271,7 @@ describe('historical transcript capability gating', () => {
     expect(html.match(/>思考中…</g)).toHaveLength(1);
     expect(html).toContain('data-executing="true"');
     expect(html).not.toContain('data-shimmer-text');
-    expect(html).not.toContain('Rice');
+    expect(html).not.toContain('员工正在处理');
     expect(html).not.toContain('子智能体任务');
   });
   it('shows native compaction with the running process open and its detail collapsed, then clears the status after completion or failure', () => {
@@ -307,7 +307,7 @@ describe('historical transcript capability gating', () => {
           {
             ...messages[0]!,
             status: 'pending',
-            content: { text: 'Rice 正在处理…' },
+            content: { text: '员工正在处理…' },
           },
         ],
         undefined,
@@ -364,7 +364,7 @@ describe('historical transcript capability gating', () => {
         {
           ...messages[0]!,
           status: 'pending',
-          content: { text: 'Rice 正在处理…' },
+          content: { text: '员工正在处理…' },
         },
       ],
       undefined,
@@ -401,7 +401,7 @@ describe('historical transcript capability gating', () => {
     expect(html).toContain('data-streaming="true"');
     expect(html).not.toContain('思考中');
     expect(html).not.toContain('正在生成回复');
-    expect(html).not.toContain('Rice 正在处理');
+    expect(html).not.toContain('员工正在处理');
   });
   it('shows elapsed time once without allowing an empty work process to expand', () => {
     const html = render(
@@ -601,11 +601,11 @@ describe('historical transcript capability gating', () => {
           ...messages[0]!,
           status: 'failed',
           errorCode,
-          content: { text: 'Rice 暂时无法完成这次请求，请稍后重试。' },
+          content: { text: '暂时无法完成这次请求，请稍后重试。' },
         },
       ]);
       expect(html.split(next)).toHaveLength(2);
-      for (const word of ['Rice 暂时无法', '待核实', 'Token', 'Codex'])
+      for (const word of ['暂时无法完成这次请求', '待核实', 'Token', 'Codex'])
         expect(html).not.toContain(word);
     },
   );
@@ -652,7 +652,7 @@ describe('historical transcript capability gating', () => {
       payload: { replyId: 'reply-1', text: reply },
     };
     // The server kept the reply, then the run ended with an unknown outcome.
-    for (const text of [reply, 'Rice 暂时无法完成这次请求，请稍后重试。']) {
+    for (const text of [reply, '暂时无法完成这次请求，请稍后重试。']) {
       const html = render(
         false,
         [
@@ -677,11 +677,11 @@ describe('historical transcript capability gating', () => {
   });
 
   it.each([
-    [null, 'Rice 的这次执行已取消。', '这次任务已停止。'],
+    [null, '本次执行已取消。', '这次任务已停止。'],
     [
       'APPROVAL_REJECTED',
-      '你已拒绝这一步操作，Rice 已停止该工作流。',
-      '你已拒绝这一步操作，Rice 已停止该工作流。',
+      '你拒绝了这一步操作，任务已停止。',
+      '你拒绝了这一步操作，任务已停止。',
     ],
     [
       'INPUT_NOT_ADOPTED',
@@ -695,7 +695,7 @@ describe('historical transcript capability gating', () => {
         { ...messages[0]!, status: 'failed', errorCode, content: { text } },
       ]);
       expect(html).toContain(shown);
-      for (const word of ['未完成', '请稍后再试', 'Rice 的这次执行'])
+      for (const word of ['未完成', '请稍后再试', '本次执行已取消'])
         expect(html).not.toContain(word);
     },
   );

@@ -1,3 +1,4 @@
+import { employeeManifest } from './employees/employee-config.ts';
 import { createReadPathProbe } from './read-path-probe.fixture.ts';
 import { authorizeFixturePlatformAdministrator } from './platform-authority.fixture.ts';
 import { updateWorkAutomation } from './work-automation.ts';
@@ -65,10 +66,7 @@ import { BridgeJournal } from '../../../apps/rice-bridge/src/journal.js';
 import { RuntimeBridgeOperationClient } from '../../../apps/rice-bridge/src/operation-client.js';
 import { createRuntimeBridgeHttpHandler } from '../../../apps/web/lib/bridge/operation-http.js';
 import { LocalStorageAdapter } from '../../storage/src/local.ts';
-import {
-  employeeManifestChecksum,
-  riceManifest,
-} from './employees/employee-config.ts';
+import { employeeManifestChecksum } from './employees/employee-config.ts';
 import { updateQueuedMessage } from './conversation/queued-messages.ts';
 import { sendChatMessage, getChatSessionHistory } from './workspace/service.ts';
 import { claimNextJob, cancelRun } from './execution/queue.ts';
@@ -1756,7 +1754,11 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     'P08 real message → Worker → approval → HTTP Bridge / files / recovery: %s',
     async (scenario) => {
       vi.stubEnv('ALLRICE_CHANGESET_ENABLED', '1');
-      const manifest = riceManifest();
+      const manifest = employeeManifest({
+        key: 'test-employee',
+        name: 'Test employee',
+        description: 'Bridge runtime test',
+      });
       if (manifest.schemaVersion !== 2) throw Error('v2 fixture required');
       manifest.capabilityBindings.toolNames.push('local.fs.write');
       const f = await artifactFixture(manifest);
@@ -2316,7 +2318,13 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     45000,
   );
   async function queuedFixture() {
-    const f = await artifactFixture(riceManifest());
+    const f = await artifactFixture(
+      employeeManifest({
+        key: 'test-employee',
+        name: 'Test employee',
+        description: 'Bridge runtime test',
+      }),
+    );
     f.context.memberships = f.policyPayload.memberships;
     const workerId = f.execution.worker.id;
     const turnId = `native-${f.sessionId}:turn:1`;
@@ -2613,7 +2621,13 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     expect(clock?.completed_at).not.toBeNull();
   });
   it('P10 persists strict Run input and cross-turn adoption without creating a later task', async () => {
-    const f = await artifactFixture(riceManifest());
+    const f = await artifactFixture(
+      employeeManifest({
+        key: 'test-employee',
+        name: 'Test employee',
+        description: 'Bridge runtime test',
+      }),
+    );
     f.context.memberships = f.policyPayload.memberships;
     const workerId = f.execution.worker.id;
     const turnId = `native-${f.sessionId}:turn:1`;
@@ -2754,7 +2768,7 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     ).toBe(false);
     expect(
       adoptedHistory.messages.some(
-        (m) => m.content.text === '已补充给正在工作的 Rice。',
+        (m) => m.content.text === '已补充给正在工作的员工。',
       ),
     ).toBe(false);
     const unanswered = {
@@ -2805,7 +2819,13 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     ).rejects.toThrow('artifact_not_found');
   });
   it('P10 binds plan acceptance and feedback to immutable versions, distinct Runs and exact-once queue insertion', async () => {
-    const f = await artifactFixture(riceManifest());
+    const f = await artifactFixture(
+      employeeManifest({
+        key: 'test-employee',
+        name: 'Test employee',
+        description: 'Bridge runtime test',
+      }),
+    );
     f.context.memberships = f.policyPayload.memberships;
     const plan = await f.publish(
       'plan',
@@ -3399,7 +3419,13 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
   it.skipIf(process.env.ALLRICE_WORKBENCH_BROWSER_TEST !== '1')(
     'P07 real Chromium and PostgreSQL: read-only Cline diff, stale versions and inert previews',
     async () => {
-      const f = await artifactFixture(riceManifest());
+      const f = await artifactFixture(
+        employeeManifest({
+          key: 'test-employee',
+          name: 'Test employee',
+          description: 'Bridge runtime test',
+        }),
+      );
       f.context.memberships = f.policyPayload.memberships;
       const original = 'export const answer = 41;\nconsole.log(answer);\n',
         revised = 'export const answer = 42;\nconsole.log(answer);\n';

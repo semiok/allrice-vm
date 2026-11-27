@@ -9,7 +9,9 @@ qa-instance renew met220-check --ttl 6h
 qa-instance down met220-check
 ```
 
-`up` 必填 owner/card；租期从分配成功开始，构建/初始化失败仍保留现场和名额。`renew` 从现在续期，单次最长 24 小时；不会把 createdAt 改成续租时间。没有租期的旧实例显示 legacy，不自动删除。旧 ref 缺少 Rice 模板时直接失败，不回退工具目录里的旧模板。
+`up` 必填 owner/card；租期从分配成功开始，构建/初始化失败仍保留现场和名额。`renew` 从现在续期，单次最长 24 小时；不会把 createdAt 改成续租时间。没有租期的旧实例显示 legacy，不自动删除。
+
+选定的 ref 必须含 `scripts/m1/qa-bootstrap.mjs`。验收账号按人开通 4.0 后，通过首建接口创建本人的测试员工。
 
 满额时只有已经过期、Web/Worker launchd 均不存在、端口无监听、没有工作目录/命令路径/打开文件关联实例的残留进程且没有其他 up/down/renew/schedule-recover 持锁的实例才会回收。进程检查失败、仅 loaded 的 launchd、端口探测超时均保守视为不能回收。先保存 `instance.json` 的已知非凭据字段和 `logs/**/*.log` 普通文件（不跟软链接），再用原 down 流程；日志枚举/复制或数据库操作失败保留文件。归档不含 creds、环境文件、plist、数据/授权目录。
 

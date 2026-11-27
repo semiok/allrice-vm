@@ -14,7 +14,7 @@ export { shortDateTime } from './short-date-time';
 
 type Operation = BrowserWorkspaceView['operations'][number];
 
-/** An employee name inside Chinese text: Latin names get spaces, as in 「与 Rice 工作」. */
+/** An employee name inside Chinese text: Latin names get spaces, as in 「与员工工作」. */
 export function employeeInText(employee: string) {
   return `${/^[A-Za-z0-9]/.test(employee) ? ' ' : ''}${employee}${/[A-Za-z0-9]$/.test(employee) ? ' ' : ''}`;
 }

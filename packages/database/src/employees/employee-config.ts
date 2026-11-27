@@ -42,8 +42,6 @@ export function applyEmployeeUserProfilePolicy(
   });
 }
 
-export const riceEmployeeKey = 'default-assistant';
-
 export function codexEmployeeProvider() {
   return DshExecutionSnapshotSchema.parse({
     provider: 'dsh',
@@ -78,20 +76,6 @@ function profilePolicyInstruction(profile: PartnerProfile) {
       'Proceed within the granted capabilities without asking for routine confirmation, but still pause for ambiguity, irreversible changes, high-impact decisions, or missing authorization.',
   }[profile.approvalPolicy];
   return `${proactive} ${approval}`;
-}
-
-export function riceManifest(
-  skillVersionIds: string[] = [],
-  partnerProfile: PartnerProfile = DefaultPartnerProfile,
-): EmployeeManifest {
-  return employeeManifest({
-    key: riceEmployeeKey,
-    name: 'Rice',
-    description: 'AllRice 的第一个通用 AI 员工，负责对话、记忆检索和技能协作。',
-    role: '通用工作伙伴',
-    skillVersionIds,
-    partnerProfile,
-  });
 }
 
 export function employeeManifest(input: {
@@ -267,7 +251,6 @@ export function employeeManifest(input: {
     ...(input.taskSuggestions !== undefined
       ? { taskSuggestions: input.taskSuggestions }
       : {}),
-    isDefaultRice: input.key === riceEmployeeKey,
     identity,
     systemPrompt:
       input.systemPromptOverride ??

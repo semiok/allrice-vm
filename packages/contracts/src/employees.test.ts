@@ -15,7 +15,7 @@ import {
 
 describe('runtime package PERSONA source format', () => {
   const foundation = {
-    name: 'Rice',
+    name: 'Test employee',
     description: 'Synthetic platform source',
     appearance: { avatarType: 'initials', avatarValue: 'R' },
     identity: {
@@ -183,10 +183,10 @@ describe('EmployeeHub contracts', () => {
     const skillVersionId = randomUUID();
     const manifest = EmployeeManifestSchema.parse({
       schemaVersion: 1,
-      key: 'default-assistant',
-      name: 'Rice',
+      key: 'test-employee',
+      name: 'Test employee',
       description: 'General AI employee',
-      systemPrompt: 'Act as Rice inside the authorized tenant context.',
+      systemPrompt: 'Work inside the authorized tenant context.',
       provider: {
         provider: 'codex',
         authMode: 'chatgpt_subscription',
@@ -197,7 +197,7 @@ describe('EmployeeHub contracts', () => {
       capabilities: ['model:invoke'],
       skillVersionIds: [skillVersionId],
     });
-    expect(manifest.name).toBe('Rice');
+    expect(manifest.name).toBe('Test employee');
     expect(manifest.provider.provider).toBe('codex');
     expect(manifest.skillVersionIds).toEqual([skillVersionId]);
     expect(manifest.partnerProfile.role).toBe('通用工作伙伴');
@@ -212,7 +212,6 @@ describe('EmployeeHub contracts', () => {
       description: '使用受限 DSH runtime 完成研究工作。',
       appearance: { avatarType: 'emoji', avatarValue: '🔎' },
       applicableScenarios: ['公开资料研究'],
-      isDefaultRice: false,
       identity: {
         role: '研究伙伴',
         mission: '核实资料并形成结论。',
@@ -331,7 +330,6 @@ describe('EmployeeHub contracts', () => {
       description: '审查合同风险并输出修改建议。',
       appearance: { avatarType: 'emoji', avatarValue: '📄' },
       applicableScenarios: ['合同审查'],
-      isDefaultRice: false,
       identity: {
         role: '合同审查员',
         mission: '识别风险并给出可执行修改建议。',
@@ -409,10 +407,10 @@ describe('EmployeeHub contracts', () => {
     const policySnapshotId = randomUUID();
     const definition = EmployeeManifestSchema.parse({
       schemaVersion: 1,
-      key: 'default-assistant',
-      name: 'Rice',
+      key: 'test-employee',
+      name: 'Test employee',
       description: 'General AI employee',
-      systemPrompt: 'Act as Rice inside the authorized tenant context.',
+      systemPrompt: 'Work inside the authorized tenant context.',
       provider: {
         provider: 'codex',
         authMode: 'chatgpt_subscription',
@@ -489,8 +487,8 @@ describe('EmployeeHub contracts', () => {
     const workspaceId = randomUUID();
     const definition = EmployeeManifestSchema.parse({
       schemaVersion: 1,
-      key: 'default-assistant',
-      name: 'Rice',
+      key: 'test-employee',
+      name: 'Test employee',
       description: 'General AI employee',
       systemPrompt: 'Act only inside the frozen capability snapshot.',
       provider: {

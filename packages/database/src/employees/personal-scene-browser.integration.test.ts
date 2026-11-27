@@ -31,7 +31,6 @@ import {
   changeAdminTenantEmployee,
 } from '../tenant-employees.ts';
 import { getEmployeeWorkspace } from '../workspace/service.ts';
-import { savePlatformEmployeeDraft } from './platform-employees.ts';
 import { createEmployeeInstance } from './employee-instances.ts';
 import {
   getPersonalSceneSkill,
@@ -75,7 +74,6 @@ suite('browser exact Workflow source confirmation', () => {
   let publication: Awaited<
     ReturnType<typeof createEmployeeAdministrationFixture>
   >;
-  let riceId: string;
   async function principal(slug = `scene-web-${randomUUID()}`) {
     const p = await ensureBootstrapPortalPrincipal(
       {
@@ -108,18 +106,6 @@ suite('browser exact Workflow source confirmation', () => {
     publication = await createEmployeeAdministrationFixture(f.db);
     await publication.preview();
     expect((await publication.publish()).valid).toBe(true);
-    const [rice] =
-      await f.db`select id from allrice_platform_employees where employee_key='rice'`;
-    riceId = rice!.id;
-    await savePlatformEmployeeDraft(riceId, {
-      definition: {
-        ...publication.definition,
-        key: 'rice',
-        name: 'Base assistant',
-      },
-    });
-    await publication.preview(riceId);
-    expect((await publication.publish(riceId)).valid).toBe(true);
   }, 120000);
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -130,10 +116,10 @@ suite('browser exact Workflow source confirmation', () => {
     vi.unstubAllEnvs();
     await f?.close();
   }, 30000);
-  async function setup(kind: 'rice' | 'custom' | 'professional' = 'custom') {
+  async function setup(kind: 'custom' | 'professional' = 'custom') {
     const owner = await principal(),
       peer = await principal(owner.slug);
-    const employeeId = kind === 'rice' ? riceId : publication.employeeId;
+    const employeeId = publication.employeeId;
     const e = (
       await listAdminTenantEmployees(
         admin,
@@ -151,9 +137,7 @@ suite('browser exact Workflow source confirmation', () => {
     const assigned = (
       await getEmployeeWorkspace(owner.context, owner.workspaceId)
     ).employees.find(
-      (item) =>
-        item.employeeKey ===
-        (kind === 'rice' ? 'default-assistant' : publication.definition.key),
+      (item) => item.employeeKey === publication.definition.key,
     )!;
     const instance =
       kind === 'custom'
@@ -292,7 +276,7 @@ suite('browser exact Workflow source confirmation', () => {
     return PersonalSceneConfirmResponseSchema.parse(await response.json())
       .receipt;
   }
-  it.each(['rice', 'custom'] as const)(
+  it.each(['custom'] as const)(
     'scene removal: %s revokes all package versions, preserves other scenes and exact audit, and never revives on replay',
     async (kind) => {
       const s = await setup(kind);
@@ -606,7 +590,7 @@ suite('browser exact Workflow source confirmation', () => {
     ).toBe(body('v1'));
   });
 
-  it.each(['rice', 'custom'] as const)(
+  it.each(['custom'] as const)(
     'owner %s previews without writes and confirms exact bytes, provenance and idempotent receipt',
     async (kind) => {
       const s = await setup(kind),

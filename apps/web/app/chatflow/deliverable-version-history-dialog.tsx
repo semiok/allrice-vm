@@ -25,7 +25,7 @@ export function DeliverableVersionHistoryDialog({
   return (
     <DshDialog
       ariaLabel={`${file.fileName} 的版本历史`}
-      eyebrow="Rice 交付物"
+      eyebrow="交付物"
       className={eyebrow.readable}
       onClose={onClose}
       title="版本历史"

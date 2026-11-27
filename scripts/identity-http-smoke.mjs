@@ -4,7 +4,14 @@ const baseUrl = process.env.ALLRICE_SMOKE_BASE_URL;
 const organizationId = process.env.ALLRICE_SMOKE_ORGANIZATION_ID;
 const workspaceId = process.env.ALLRICE_SMOKE_WORKSPACE_ID;
 const secondWorkspaceId = process.env.ALLRICE_SMOKE_SECOND_WORKSPACE_ID;
-if (!baseUrl || !organizationId || !workspaceId || !secondWorkspaceId) {
+const employeeId = process.env.ALLRICE_SMOKE_EMPLOYEE_ID;
+if (
+  !baseUrl ||
+  !organizationId ||
+  !workspaceId ||
+  !secondWorkspaceId ||
+  !employeeId
+) {
   throw new Error(
     'All identity/workspace smoke environment variables are required',
   );
@@ -119,21 +126,42 @@ await jsonRequest(
   403,
 );
 
-const workspaceResponse = await jsonRequest('/api/v1/workspace', {
-  headers: tenantHeaders(inviteeCookie),
+const readWorkspace = async () =>
+  (
+    await (
+      await jsonRequest('/api/v1/workspace', {
+        headers: tenantHeaders(inviteeCookie),
+      })
+    ).json()
+  ).workspace;
+const emptyWorkspace = await readWorkspace();
+if (emptyWorkspace.employee !== null || emptyWorkspace.employees.length !== 0)
+  throw new Error('A new company member received an implicit employee');
+const sessionView = await (
+  await jsonRequest('/api/v1/auth/session', {
+    headers: tenantHeaders(inviteeCookie),
+  })
+).json();
+const userId =
+  sessionView.context?.actor?.type === 'user' && sessionView.context.actor.id;
+if (!userId) throw new Error('Smoke member identity missing');
+await jsonRequest(`/api/v1/employees/${employeeId}/assignments`, {
+  method: 'PUT',
+  headers: {
+    ...tenantHeaders(loginCookie),
+    'content-type': 'application/json',
+  },
+  body: JSON.stringify({ workspaceId, userIds: [userId] }),
 });
-const workspace = (await workspaceResponse.json()).workspace;
+const workspace = await readWorkspace();
+const assignment = workspace.employees.find(
+  (candidate) => candidate.employeeId === employeeId,
+);
 if (
   workspace.workspaceId !== workspaceId ||
-  workspace.employee.version.name !== 'Rice' ||
-  workspace.employee.version.model !==
-    (process.env.ALLRICE_DSH_CODEX_MODEL ??
-      process.env.ALLRICE_CODEX_MODEL ??
-      'gpt-5.6-luna') ||
-  workspace.employees?.[0]?.currentVersion?.manifest?.name !== 'Rice'
-) {
-  throw new Error('default employee workspace was not provisioned correctly');
-}
+  assignment?.currentVersion?.manifest?.name !== 'Smoke test employee'
+)
+  throw new Error('The explicit smoke employee assignment is missing');
 
 const sessionResponse = await jsonRequest(
   '/api/v1/sessions',
@@ -143,7 +171,11 @@ const sessionResponse = await jsonRequest(
       ...tenantHeaders(inviteeCookie),
       'content-type': 'application/json',
     },
-    body: JSON.stringify({ workspaceId, title: 'Persistent smoke session' }),
+    body: JSON.stringify({
+      workspaceId,
+      employeeAssignmentId: assignment.id,
+      title: 'Persistent smoke session',
+    }),
   },
   201,
 );
@@ -432,6 +464,7 @@ console.info(
       organizationId,
       workspaceId,
       secondWorkspaceId,
+      employeeId,
       inviteeEmail,
       inviteePassword,
       sessionId: session.id,

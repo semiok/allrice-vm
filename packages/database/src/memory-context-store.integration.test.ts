@@ -1,6 +1,7 @@
 /** Real PG storage tests with an explicitly synthetic authority contract.
  * The fixture is NOT a 271/273 producer, public transaction participation port,
  * or native root/child/source acceptance. No fixture enters production code. */
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import type { TransactionSql } from 'postgres';
@@ -37,7 +38,6 @@ import {
   memoryPairContent,
   memoryPairDigest,
 } from './workspace/employee-memory-primitives.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -235,7 +235,7 @@ suite(
         (await createSession(principal.user.id)).token,
         principal,
       ))!;
-      const assignment = await ensureDefaultEmployee(
+      const assignment = await createTestEmployeeAssignment(
         context,
         principal.workspaceId,
       );

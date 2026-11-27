@@ -25,7 +25,6 @@ export const EmployeeDetailsProfileSchema = z
     canMaintainPersonal: z.boolean(),
     // Current owner-view capabilities; never frozen as a Run's authority.
     editableFields: z.array(EmployeeInstanceProfileSchema.keyof()).optional(),
-    isDefaultRice: z.boolean().optional(),
     canArchive: z.boolean().optional(),
     defaults: EmployeeInstanceProfileSchema.optional(),
     // Raw owner presence, not a permissions grant or an effective-value diff.

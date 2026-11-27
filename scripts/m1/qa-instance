@@ -359,7 +359,7 @@ cmd_up() {
   write_instance building || die "cannot record the reserved worktree of $task"
   PENDING_WORKTREE=""
   git -C "$REPO" worktree add -q --detach "$release" "$sha"
-  [ -f "$release/scripts/m1/rice-standard.json" ] || die 'ref has no Rice template; refusing the installed tools template'
+  [ -f "$release/scripts/m1/qa-bootstrap.mjs" ] || die 'ref has no QA bootstrap script'
 
   say "installing and building (log: $dir/logs/build.log)"
   ( cd "$release" && pnpm install --frozen-lockfile && \
@@ -464,11 +464,9 @@ PY
   done
   [ $ok = 1 ] || die "services not ready after 120s; see $dir/logs/*.err.log"
 
-  say "preparing tenant (company, account, Rice)"
+  say "preparing QA company, account and personal employee"
   write_instance started
-  local drop
-  drop=$(psql -h 127.0.0.1 -d "$db" -Atc "select string_agg(id::text, ',') from allrice_platform_dsh_skills where required_tool_refs ?| array['cloud.process.execute','cloud.mcp.call','python.execute','workspace.reconciliation.export']")
-  node "$BIN/qa-bootstrap.mjs" --rice "$release/scripts/m1/rice-standard.json" --port "$web" --company "QA-$task" --username "qa-$task" --creds "$dir/creds.json" --no-cloud --drop-skills "$drop" > "$dir/logs/bootstrap.log" 2>&1 \
+  node "$release/scripts/m1/qa-bootstrap.mjs" --env "$dir/.env" --port "$web" --company "QA-$task" --username "qa-$task" --creds "$dir/creds.json" > "$dir/logs/bootstrap.log" 2>&1 \
     || die "tenant bootstrap failed, see $dir/logs/bootstrap.log"
 
   write_instance ready

@@ -139,7 +139,7 @@ export async function prepareEmployeeRuntimeContent(
       instanceId: input.instance.id,
       employeeId: input.employeeId,
       employeeVersionId: input.employeeVersionId,
-      ...((await canUsePersonalEmployeeScenes(input.instance, freezeSql))
+      ...(canUsePersonalEmployeeScenes(input.instance)
         ? { personalScenes: true as const }
         : {}),
     },
@@ -222,8 +222,7 @@ async function readRuntimeContent(
     );
     if (
       snapshot.personalScenes &&
-      (!(await canUsePersonalEmployeeScenes(instance, sql)) ||
-        snapshot.layers.length)
+      (!canUsePersonalEmployeeScenes(instance) || snapshot.layers.length)
     )
       return unavailable();
     const [version] = await sql<

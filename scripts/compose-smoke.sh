@@ -122,6 +122,42 @@ if [[ "$(printf '%s' "${bootstrap_json}" | jq -r '.accountCreated')" != "true" ]
   exit 1
 fi
 
+# Prove that database preparation did not provision employees. The old HTTP
+# capability checks use one employee explicitly created in this disposable DB.
+employee_catalog_empty="$(docker compose --project-name "${compose_project}" exec -T postgres \
+  psql -U "${POSTGRES_USER:-allrice}" -d "${POSTGRES_DB:-allrice}" -Atqc \
+  'select not exists(select 1 from allrice_platform_employees) and not exists(select 1 from allrice_employees) and not exists(select 1 from allrice_employee_assignments)' | tr -d '\r')"
+if [[ "${employee_catalog_empty}" != "t" ]]; then
+  echo "Database preparation populated an employee catalog" >&2
+  exit 1
+fi
+fixture_employee_id="$(docker compose --project-name "${compose_project}" exec -T \
+  -e ALLRICE_PLATFORM_ADMIN_EMAILS worker \
+  node --input-type=module - "${bootstrap_organization_id}" "${bootstrap_workspace_id}" "$(printf '%s' "${bootstrap_json}" | jq -r '.userId')" <<'JS'
+import { DefaultPartnerProfile } from './packages/contracts/dist/index.js';
+import { authenticateSession, closeDatabase, createEmployee, createSession } from './packages/database/dist/index.js';
+const [organizationId, workspaceId, userId] = process.argv.slice(2);
+try {
+  const login = await createSession(userId);
+  const context = await authenticateSession(login.token, { organizationId, workspaceId });
+  if (!context) throw Error('Smoke administrator authentication failed');
+  const assignment = await createEmployee(context, {
+    workspaceId,
+    name: 'Smoke test employee',
+    description: 'Explicit employee for the disposable Compose test.',
+    partnerProfile: DefaultPartnerProfile,
+  });
+  process.stdout.write(assignment.employeeId);
+} finally {
+  await closeDatabase();
+}
+JS
+)"
+if [[ -z "${fixture_employee_id}" ]]; then
+  echo "Explicit smoke employee setup failed" >&2
+  exit 1
+fi
+
 second_workspace_id="$({
   docker compose --project-name "${compose_project}" exec -T postgres \
     psql -U "${POSTGRES_USER:-allrice}" -d "${POSTGRES_DB:-allrice}" -Atqc \
@@ -148,6 +184,7 @@ identity_output="$(ALLRICE_SMOKE_BASE_URL="http://127.0.0.1:${proxy_port}" \
 ALLRICE_SMOKE_ORGANIZATION_ID="${bootstrap_organization_id}" \
 ALLRICE_SMOKE_WORKSPACE_ID="${bootstrap_workspace_id}" \
 ALLRICE_SMOKE_SECOND_WORKSPACE_ID="${second_workspace_id}" \
+ALLRICE_SMOKE_EMPLOYEE_ID="${fixture_employee_id}" \
   node scripts/identity-http-smoke.mjs)"
 printf '%s\n' "${identity_output}" | sed '/^ALLRICE_SMOKE_STATE=/d'
 smoke_state="$(printf '%s\n' "${identity_output}" | sed -n 's/^ALLRICE_SMOKE_STATE=//p')"

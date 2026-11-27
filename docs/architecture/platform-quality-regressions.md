@@ -15,6 +15,11 @@ DOCX/XLSX/PPTX features, concurrency and corrupt output.
 
 ## Execution and recording
 
+Set `ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID` to a published platform employee's
+UUID to run the administrative quality checks. The first deployment reserves that
+employee's assignment in the administrator's private test workspace. Publish a
+new revision of the same employee to update an existing quality environment.
+
 Capture the source **before** executing the mapped tests. Keep reports outside
 tracked source. Collect only after the original runner exits; do not regenerate
 a passing report or attach an older report to a new SHA.

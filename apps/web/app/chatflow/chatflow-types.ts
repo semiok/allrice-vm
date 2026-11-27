@@ -55,7 +55,6 @@ export interface EmployeeVersion {
     name: string;
     schemaVersion?: number;
     key?: string;
-    isDefaultRice?: boolean;
     description?: string;
     appearance?: { accentColor?: EmployeeAccentColor };
     runtimePolicy?: {

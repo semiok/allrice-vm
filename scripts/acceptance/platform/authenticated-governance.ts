@@ -64,22 +64,10 @@ try {
   }
   await request(platformSession.token, '/api/v1/admin/model-governance');
   const quality = await request<{
-    quality: {
-      employees: Array<{
-        employeeKey: string;
-        suite: { id: string; cases: unknown[] } | null;
-      }>;
-    };
+    quality: { employees: unknown[] };
   }>(platformSession.token, '/api/v1/admin/employee-quality');
-  const rice = quality.quality.employees.find(
-    (employee) => employee.employeeKey === 'rice',
-  );
-  if (!rice) {
-    throw new Error('the published Rice employee is required');
-  }
-  if (!rice.suite || rice.suite.cases.length < 7) {
-    throw new Error('Rice must have an independent Eval Suite');
-  }
+  if (!Array.isArray(quality.quality.employees))
+    throw new Error('employee quality catalog is unavailable');
   const providerEvidence = await sql<
     { harness: 'codex' | 'dsh'; provider: string; succeeded: number }[]
   >`
@@ -106,9 +94,7 @@ try {
       'recent successful DSH evidence for Codex subscription and an API Provider is required',
     );
   }
-  process.stdout.write(
-    '[MET-62] platform, model governance and Rice Eval Suite passed\n',
-  );
+  process.stdout.write('[MET-62] platform and model governance passed\n');
 
   const nonPlatformUser = users.find(
     (user) =>

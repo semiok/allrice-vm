@@ -1,22 +1,11 @@
 #!/usr/bin/env node
-// Prepare a usable tenant on an AllRice web instance through the real admin APIs
-// (no browser): publish the standard Rice, create a company + employee account,
-// auto-assign Rice. Idempotent. Talks to http://127.0.0.1:<port> with the admin
-// portal Host/Origin so the normal portal authentication and same-origin checks apply.
-//
-//   node qa-bootstrap.mjs --port <webPort> --company <name> --username <user> --creds <file>
-//                         [--env ~/allrice40-dev/.env] [--rice <file>]  (default: rice-standard.json next to this script)
-//                         [--no-cloud --drop-skills <id,id>]
-// --no-cloud publishes Rice without the cloud-sandbox tools (and the given skills
-// that require them), for instances whose cloud execution is switched off.
-//
-// The employee password is generated once and written to --creds (0600); it is
-// never printed. Re-running reuses the company/account; a lost password is reset.
+// Set up a company and member on an isolated QA instance. The platform admin
+// releases only that person into 4.0; the member creates their own employee.
+// The password and stable creation request ID are stored in --creds (0600).
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { URLSearchParams, fileURLToPath } from 'node:url';
 
 const args = Object.fromEntries(
   process.argv
@@ -35,9 +24,6 @@ const company = args.company;
 const username = args.username;
 const credsPath = args.creds;
 const envPath = args.env ?? `${home}/allrice40-dev/.env`;
-// The standard definition ships next to this script, so it matches the installed tools.
-const ricePath =
-  args.rice ?? fileURLToPath(new URL('./rice-standard.json', import.meta.url));
 if (!port || !company || !username || !credsPath) {
   console.error(
     'usage: qa-bootstrap.mjs --port <webPort> --company <name> --username <user> --creds <file>',
@@ -55,9 +41,10 @@ const env = Object.fromEntries(
       return [l.slice(0, i), l.slice(i + 1).replace(/^['"]|['"]$/g, '')];
     }),
 );
-let cookie = '';
+const admin = { host: ADMIN_HOST, cookie: '' };
+const member = { host: 'allrice.bplabs.xyz', cookie: '' };
 
-function request(method, path, body) {
+function request(session, method, path, body, scope) {
   return new Promise((resolve, reject) => {
     const data =
       body === undefined ? undefined : Buffer.from(JSON.stringify(body));
@@ -68,11 +55,15 @@ function request(method, path, body) {
         method,
         path,
         headers: {
-          host: ADMIN_HOST,
-          origin: `https://${ADMIN_HOST}`,
+          host: session.host,
+          origin: `https://${session.host}`,
+          ...(scope && {
+            'x-allrice-organization-id': scope.organizationId,
+            'x-allrice-workspace-id': scope.workspaceId,
+          }),
           'sec-fetch-site': 'same-origin',
           accept: 'application/json',
-          ...(cookie ? { cookie } : {}),
+          ...(session.cookie ? { cookie: session.cookie } : {}),
           ...(data
             ? {
                 'content-type': 'application/json',
@@ -89,8 +80,10 @@ function request(method, path, body) {
           const set = res.headers['set-cookie'];
           if (set) {
             const jar = new Map(
-              cookie
-                ? cookie.split('; ').map((c) => c.split(/=(.*)/s).slice(0, 2))
+              session.cookie
+                ? session.cookie
+                    .split('; ')
+                    .map((c) => c.split(/=(.*)/s).slice(0, 2))
                 : [],
             );
             for (const c of set) {
@@ -98,7 +91,7 @@ function request(method, path, body) {
               const [k, v] = kv.split(/=(.*)/s);
               jar.set(k, v);
             }
-            cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+            session.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
           }
           const text = Buffer.concat(chunks).toString();
           let json;
@@ -107,7 +100,7 @@ function request(method, path, body) {
           } catch {
             json = undefined;
           }
-          resolve({ status: res.statusCode, json, text });
+          resolve({ status: res.statusCode, json });
         });
       },
     );
@@ -119,142 +112,50 @@ function request(method, path, body) {
     req.end();
   });
 }
-async function call(method, path, body, ok = [200, 201]) {
-  const r = await request(method, path, body);
-  if (!ok.includes(r.status))
-    throw new Error(`${method} ${path} -> ${r.status} ${r.text.slice(0, 300)}`);
-  return r.json;
+async function call(session, method, path, body, ok = [200, 201], scope) {
+  const response = await request(session, method, path, body, scope);
+  if (!ok.includes(response.status))
+    throw new Error(`${method} ${path} -> ${response.status}`);
+  return response.json;
 }
 const step = (s) => console.log(`[bootstrap] ${s}`);
 
 // 1. Platform admin login (env credentials on the admin portal host).
-await call('POST', '/api/v1/auth/login', {
+await call(admin, 'POST', '/api/v1/auth/login', {
   username: env.ALLRICE_PLATFORM_ADMIN_USER,
   password: env.ALLRICE_PLATFORM_ADMIN_PASSWORD,
 });
 step('admin logged in');
 
-// 2. Standard Rice: publish the reviewed definition unless already published with it.
-const list = await call('GET', '/api/v1/admin/platform-employees');
-const employees = list.employees ?? list.items ?? list;
-const rice = employees.find((e) => e.employeeKey === 'rice');
-if (!rice)
-  throw new Error(
-    'platform employee "rice" not found (did db:prepare / content:sync run?)',
-  );
-const standard = JSON.parse(fs.readFileSync(ricePath, 'utf8'));
-if ('no-cloud' in args) {
-  const CLOUD_TOOLS = new Set([
-    'cloud.process.execute',
-    'cloud.mcp.call',
-    'python.execute',
-    'workspace.reconciliation.export',
-  ]);
-  const dropSkills = new Set(
-    (args['drop-skills'] ?? '').split(',').filter(Boolean),
-  );
-  const c = standard.capabilities;
-  c.toolNames = c.toolNames.filter((t) => !CLOUD_TOOLS.has(t));
-  c.explicitToolNames = (c.explicitToolNames ?? []).filter(
-    (t) => !CLOUD_TOOLS.has(t),
-  );
-  c.nativeSkillIds = (c.nativeSkillIds ?? []).filter(
-    (id) => !dropSkills.has(id),
-  );
-  step(
-    `no-cloud Rice: ${c.toolNames.length} tools, ${c.nativeSkillIds.length} skills`,
-  );
-}
-let detail = await call('GET', `/api/v1/admin/platform-employees/${rice.id}`);
-const published =
-  detail.employee.publishedRevision ?? detail.employee.currentPublished ?? null;
-// Every top-level field of the standard definition is managed here and must match
-// exactly (key order ignored); fields the standard does not list are left alone.
-const canonical = (v) =>
-  Array.isArray(v)
-    ? v.map(canonical)
-    : v && typeof v === 'object'
-      ? Object.fromEntries(
-          Object.keys(v)
-            .sort()
-            .map((k) => [k, canonical(v[k])]),
-        )
-      : v;
-const sameAsStandard = (rev) =>
-  Boolean(rev?.definition) &&
-  Object.keys(standard).every(
-    (k) =>
-      JSON.stringify(canonical(rev.definition[k] ?? null)) ===
-      JSON.stringify(canonical(standard[k])),
-  );
-let publishedRevisionId = published?.id ?? null;
-if (!sameAsStandard(published) || !publishedRevisionId) {
-  const saved = await call(
-    'PUT',
-    `/api/v1/admin/platform-employees/${rice.id}`,
-    {
-      definition: standard,
-      expectedRevisionId: detail.employee.currentDraft?.id ?? null,
-    },
-  );
-  if (saved.validation && !saved.validation.valid)
-    throw new Error(
-      'standard Rice invalid: ' + saved.validation.errors.join('; '),
-    );
-  const check = await call(
-    'POST',
-    `/api/v1/admin/platform-employees/${rice.id}/review`,
-    { scope: 'assigned' },
-  );
-  if (!check.valid)
-    throw new Error('review failed: ' + (check.errors ?? []).join('; '));
-  const result = await call(
-    'POST',
-    `/api/v1/admin/platform-employees/${rice.id}/publish`,
-    {
-      scope: 'assigned',
-      expectedRevisionId: check.revisionId,
-      expectedPublishedRevisionId: check.publishedRevisionId,
-      expectedPackageChecksum: check.packageChecksum,
-      policyVersions: check.policyVersions,
-    },
-  );
-  if (!result.valid)
-    throw new Error('publish failed: ' + (result.errors ?? []).join('; '));
-  publishedRevisionId = result.revisionId;
-  step(`standard Rice published (revision ${publishedRevisionId})`);
-} else step('standard Rice already published');
-
-// 3. Company (reuse by name).
-const orgs = await call('GET', '/api/v1/admin/organizations');
+// 2. Company (reuse by name).
+const orgs = await call(admin, 'GET', '/api/v1/admin/organizations');
 let org = (orgs.organizations ?? orgs.items ?? []).find(
   (o) => o.name === company,
 );
 if (!org) {
-  const created = await call('POST', '/api/v1/admin/organizations', {
+  const created = await call(admin, 'POST', '/api/v1/admin/organizations', {
     name: company,
     businessContext: `${company}：AllRice 验收与冒烟测试用公司，不放真实业务数据。`,
   });
   org = { id: created.organizationId };
   step(`company created: ${company}`);
 } else step(`company exists: ${company}`);
-const orgDetail = await call('GET', `/api/v1/admin/organizations/${org.id}`);
-const workspaceId =
-  orgDetail.organization?.workspaceId ??
-  orgDetail.workspaceId ??
-  orgDetail.organization?.workspaces?.[0]?.id;
-if (!workspaceId)
-  throw new Error(
-    'could not resolve company workspace id: ' +
-      JSON.stringify(orgDetail).slice(0, 300),
-  );
+const orgDetail = await call(
+  admin,
+  'GET',
+  `/api/v1/admin/organizations/${org.id}`,
+);
+const workspaceId = orgDetail.organization?.defaultWorkspaceId;
+if (orgDetail.organization?.id !== org.id || !workspaceId)
+  throw new Error('could not resolve QA default workspace');
 
-// 4. Employee account: create (reusing the password in --creds when present), or reset
+// 3. Member account: create (reusing the password in --creds when present), or reset
 // the password when our creds file is missing.
 let creds = fs.existsSync(credsPath)
   ? JSON.parse(fs.readFileSync(credsPath, 'utf8'))
   : null;
 const people = await call(
+  admin,
   'GET',
   `/api/v1/admin/organizations/${org.id}/people`,
 );
@@ -270,7 +171,7 @@ if (!person) {
       password: 'Qa-' + crypto.randomBytes(12).toString('base64url'),
     };
   }
-  await call('POST', `/api/v1/admin/organizations/${org.id}/people`, {
+  await call(admin, 'POST', `/api/v1/admin/organizations/${org.id}/people`, {
     people: [
       {
         username,
@@ -289,6 +190,7 @@ if (!person) {
     password: 'Qa-' + crypto.randomBytes(12).toString('base64url'),
   };
   await call(
+    admin,
     'POST',
     `/api/v1/admin/organizations/${org.id}/people/${person.userId}/password`,
     { password: creds.password },
@@ -296,42 +198,122 @@ if (!person) {
   );
   step(`account exists, password reset: ${username}`);
 } else step(`account exists: ${username}`);
-fs.writeFileSync(credsPath, JSON.stringify({ ...creds, company, port }), {
-  mode: 0o600,
-});
-
-// 5. Auto-assign Rice to everyone in the company (same request the admin UI sends).
-const assignments = `/api/v1/admin/organizations/${org.id}/ai-employees`;
-const target = JSON.stringify({ type: 'all' });
-const catalog = await call(
+const memberDirectory = await call(
+  admin,
   'GET',
-  `${assignments}?${new URLSearchParams({ workspaceId, target })}`,
+  `/api/v1/admin/organizations/${org.id}/people`,
 );
-const entry = (catalog.employees ?? []).find((e) => e.employeeId === rice.id);
-if (!entry)
-  throw new Error(
-    'Rice missing from the company AI catalog: ' +
-      JSON.stringify(catalog).slice(0, 300),
-  );
-if (entry.inheritedByDefault === true) step('Rice already auto-assigned');
-else {
-  await call('POST', assignments, {
-    workspaceId,
-    employeeId: entry.employeeId,
-    revisionId: entry.revisionId,
-    expectedVersion: entry.deployment?.version ?? null,
-    action: 'default',
-    target: { type: 'all' },
-    defaultEnabled: true,
+const matching = (memberDirectory.people ?? []).filter(
+  (item) => item.username === username,
+);
+const personId = matching[0]?.userId;
+if (matching.length !== 1 || !personId)
+  throw new Error('could not resolve unique QA member');
+
+const scope = { organizationId: org.id, workspaceId };
+const policyPath = '/api/v1/admin/d-entry-release-policy';
+const policy = await call(admin, 'GET', policyPath);
+if (
+  !policy.selections.some(
+    (row) => row.organizationId === org.id && row.personId === personId,
+  )
+) {
+  await call(admin, 'PUT', policyPath, {
+    ...policy,
+    selections: [...policy.selections, { organizationId: org.id, personId }],
   });
-  step('Rice auto-assigned to the company');
 }
+
+const previousRequest =
+  creds.organizationId === org.id &&
+  creds.workspaceId === workspaceId &&
+  creds.personId === personId
+    ? creds.employeeCreationRequestId
+    : undefined;
+const requestId = previousRequest ?? crypto.randomUUID();
+const saved = {
+  username: creds.username,
+  password: creds.password,
+  company,
+  port,
+  ...scope,
+  personId,
+  employeeCreationRequestId: requestId,
+};
+function writeCredentials(value) {
+  const temporary = `${credsPath}.${crypto.randomUUID()}`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(value), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(temporary, credsPath);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+writeCredentials(saved);
+
+const login = await call(member, 'POST', '/api/v1/auth/login', {
+  username: creds.username,
+  password: creds.password,
+});
+if (login.user?.id !== personId) throw new Error('QA member login mismatch');
+const instancesPath = '/api/v1/employee-instances';
+const before = await call(
+  member,
+  'GET',
+  `${instancesPath}?workspaceId=${workspaceId}`,
+  undefined,
+  [200],
+  scope,
+);
+if (
+  !Array.isArray(before.instances) ||
+  (!previousRequest && before.instances.length)
+)
+  throw new Error('new QA member does not have an empty employee roster');
+const input = {
+  workspaceId,
+  expectedOwnerId: personId,
+  requestId,
+  profile: { name: '验收员工' },
+};
+const { instance } = await call(
+  member,
+  'POST',
+  instancesPath,
+  input,
+  [201],
+  scope,
+);
+if (
+  !instance?.id ||
+  instance.kind !== 'custom' ||
+  instance.ownerId !== personId ||
+  instance.organizationId !== org.id ||
+  instance.workspaceId !== workspaceId
+)
+  throw new Error('created QA employee does not match the member scope');
+const after = await call(
+  member,
+  'GET',
+  `${instancesPath}?workspaceId=${workspaceId}`,
+  undefined,
+  [200],
+  scope,
+);
+if (after.instances.length !== 1 || after.instances[0]?.id !== instance.id)
+  throw new Error('QA employee roster did not match the creation receipt');
+writeCredentials({ ...saved, employeeInstanceId: instance.id });
+
 console.log(
   JSON.stringify({
     ok: true,
     company,
-    organizationId: org.id,
-    workspaceId,
+    ...scope,
+    personId,
+    employeeInstanceId: instance.id,
     username,
     credsPath,
   }),

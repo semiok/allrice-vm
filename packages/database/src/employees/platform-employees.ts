@@ -269,7 +269,7 @@ export async function listPlatformEmployees() {
       ), array[]::uuid[]) as assigned_workspace_ids
     from allrice_platform_employees employee
     where employee.status <> 'archived'
-    order by (employee.employee_key = 'rice') desc, employee.name, employee.id
+    order by employee.name, employee.id
   `;
   return hydrateEmployees(rows);
 }
@@ -309,32 +309,53 @@ export async function createPlatformEmployeeDraft(
           where employee.id = ${parsed.sourceEmployeeId}
             and employee.status <> 'archived'
         `
-      : await transaction<{ definition: unknown }[]>`
-          select revision.definition
-          from allrice_platform_employees employee
-          join allrice_platform_employee_revisions revision
-            on revision.id = coalesce(
-              employee.current_draft_revision_id,
-              employee.current_published_revision_id
-            )
-          where employee.employee_key = 'rice'
-            and employee.status <> 'archived'
-        `;
+      : [];
     const source = sourceRows[0];
-    if (!source) throw new Error('platform_employee_clone_source_not_found');
-    const sourceDefinition = PlatformEmployeeDefinitionSchema.parse(
-      source.definition,
-    );
+    if (parsed.sourceEmployeeId && !source)
+      throw new Error('platform_employee_clone_source_not_found');
+    const sourceDefinition = source
+      ? PlatformEmployeeDefinitionSchema.parse(source.definition)
+      : null;
+    const description = `${parsed.name} 的平台管理员草稿。`;
     const definition = prepareEmployeeEditorDefinition(
       PlatformEmployeeDefinitionSchema.parse({
         ...sourceDefinition,
+        ...(!sourceDefinition && {
+          schemaVersion: 1,
+          appearance: { avatarType: 'initials', avatarValue: parsed.name },
+          identity: {
+            role: parsed.name,
+            mission: '按用户明确的要求完成工作。',
+            workStyle: '简明、准确。',
+            behaviorRules: [],
+            safetyBoundaries: [],
+            expressionStyle: 'concise',
+            outputLanguage: 'zh-CN',
+          },
+          capabilities: {
+            nativeSkillIds: [],
+            workflowRevisionIds: [],
+            knowledgeRevisionIds: [],
+            toolNames: [],
+            explicitToolNames: [],
+            connectorRefs: [],
+          },
+          securityPolicy: {
+            dataScopes: ['workspace', 'employee', 'user'],
+            approvalPolicy: 'confirm_side_effects',
+            bridgeAccess: 'none',
+            connectorIdentityModes: [],
+            deniedCapabilities: [],
+          },
+        }),
         modelPolicy: await platformEmployeeModelPolicy(),
         systemPrompt: normalizeDraftPlatformPolicy(
-          sourceDefinition.systemPrompt,
+          sourceDefinition?.systemPrompt ??
+            'You are an AI employee in AllRice. Your name and role are defined by PERSONA.md.',
         ),
         key: parsed.key,
         name: parsed.name,
-        description: `${parsed.name} 的平台管理员草稿。`,
+        description,
       }),
       await listPlatformNativeSkills(transaction),
     );
@@ -374,7 +395,7 @@ export async function createPlatformEmployeeDraft(
     action: 'employee.created',
     actorLabel,
     details: {
-      sourceEmployeeId: parsed.sourceEmployeeId ?? 'rice',
+      sourceEmployeeId: parsed.sourceEmployeeId ?? null,
       key: parsed.key,
       name: parsed.name,
     },
@@ -1234,8 +1255,6 @@ export async function archivePlatformEmployee(
   const { reason } = ArchivePlatformEmployeeInputSchema.parse(input);
   const employee = await getPlatformEmployee(employeeId);
   if (!employee) throw new Error('platform_employee_not_found');
-  if (employee.employeeKey === 'rice')
-    throw new Error('platform_employee_rice_cannot_be_archived');
   await disablePlatformEmployee(employeeId, { reason }, actorLabel);
   const sql = getDatabase();
   await sql`
@@ -1535,16 +1554,12 @@ export async function compilePlatformEmployee(
   });
 }
 
-function materializedEmployeeKey(platformKey: string) {
-  return platformKey === 'rice' ? 'default-assistant' : platformKey;
-}
-
 function tenantManifest(
   definition: PlatformEmployeeDefinition,
   runtimePackage: EmployeeRuntimePackage,
 ) {
   return employeeManifest({
-    key: materializedEmployeeKey(definition.key),
+    key: definition.key,
     name: definition.name,
     description: definition.description,
     role: definition.identity.role,
@@ -1604,15 +1619,9 @@ async function assertStableMaterializedEmployeeKey(
     join allrice_employees e on e.id=d.tenant_employee_id
       and e.organization_id=d.organization_id and e.workspace_id=d.workspace_id
     where d.employee_id=${employeeId}`;
-  // Rice retains its tenant alias. Use the deployed immutable definition, not
+  // Use the deployed immutable definition, not
   // the current draft: drafts may have changed before the first deployment.
-  if (
-    rows.some(
-      (row) =>
-        row.platform_key !== key ||
-        row.employee_key !== materializedEmployeeKey(key),
-    )
-  )
+  if (rows.some((row) => row.platform_key !== key || row.employee_key !== key))
     throw new Error('platform_employee_materialized_key_immutable');
 }
 
@@ -1728,7 +1737,7 @@ export async function materializePlatformEmployeeRevision(
         });
       }
     }
-    const tenantKey = materializedEmployeeKey(input.definition.key);
+    const tenantKey = input.definition.key;
     const employees = await transaction<{ id: string }[]>`
       insert into allrice_employees (
         organization_id, workspace_id, employee_key, name, status

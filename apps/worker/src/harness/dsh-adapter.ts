@@ -1984,7 +1984,7 @@ export class DshHarnessAdapter implements HarnessAdapter {
           type: 'native.event',
           presentation: 'context',
           status: 'started',
-          label: 'Rice 需要你确认',
+          label: '员工需要你确认',
           ...(summary ? { summary } : {}),
           sourceEventId:
             durable && questionId

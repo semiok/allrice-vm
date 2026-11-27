@@ -1,4 +1,5 @@
 /** Real baseline callers/PG/Storage only. No native module/B/VM producer. */
+import { createTestEmployeeAssignment } from '../employee-assignment.fixture.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   setImmediate as turn,
@@ -39,7 +40,6 @@ import {
   createPersonalEmployeeMemory,
   correctPersonalEmployeeMemory,
   deleteManagedEmployeeMemory,
-  ensureDefaultEmployee,
 } from '../workspace/service.ts';
 import { memoryPairDigest } from '../workspace/employee-memory.ts';
 import { runtimePolicyDigest } from '../runtime-policy.ts';
@@ -96,7 +96,10 @@ suite('host caller transaction bindings with original SQL owners', () => {
       (await createSession(person.user.id)).token,
     ))!;
     owner = { ...owner, workspaceId: person.workspaceId };
-    const employee = await ensureDefaultEmployee(owner, person.workspaceId);
+    const employee = await createTestEmployeeAssignment(
+      owner,
+      person.workspaceId,
+    );
     if (!employee) throw new Error('Baseline employee fixture required');
     instanceId = employee.id;
     const principal = await ensureBootstrapPortalPrincipal(

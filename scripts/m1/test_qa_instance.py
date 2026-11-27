@@ -61,8 +61,8 @@ if command == 'git':
             sys.exit(44)
         release = Path(args[-2])
         (release / 'scripts/m1').mkdir(parents=True)
-        if not os.environ.get('QA_TEST_MISSING_RICE'):
-            (release / 'scripts/m1/rice-standard.json').write_text('{"version":"ref","toolNames":["memory.search"]}')
+        if not os.environ.get('QA_TEST_MISSING_BOOTSTRAP'):
+            (release / 'scripts/m1/qa-bootstrap.mjs').write_text('// ref bootstrap')
     elif 'worktree' in args and 'remove' in args:
         if os.environ.get('QA_TEST_GIT_REMOVE_FAIL'):
             sys.exit(45)
@@ -83,8 +83,7 @@ elif command == 'node':
         identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
             environment='dev', sourceSha=sha, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
     elif args[0].endswith('/qa-bootstrap.mjs'):
-        template = args[args.index('--rice') + 1] if '--rice' in args else str(Path(args[0]).with_name('rice-standard.json'))
-        if json.loads(Path(template).read_text()).get('version') != 'ref':
+        if Path(args[0]).read_text() != '// ref bootstrap':
             sys.exit(43)
 elif command == 'launchctl':
     verb, target = args[0], args[-1]
@@ -272,7 +271,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         shutil.copyfile(os.path.join(HERE, 'lib.sh'), os.path.join(self.tmp, 'lib.sh'))
         shutil.copyfile(os.path.join(HERE, 'service_target.py'), os.path.join(self.tmp, 'service_target.py'))
         shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(self.tmp, 'qa-lease.py'))
-        Path(self.tmp, 'rice-standard.json').write_text('{"version":"installed-old","toolNames":["workspace.memory.search"]}')
+        Path(self.tmp, 'qa-bootstrap.mjs').write_text('// installed bootstrap')
         self.dispatch_script = os.path.join(self.tmp, 'qa-instance-cli')
         Path(self.dispatch_script).write_text(definitions + host_stubs + marker + dispatch)
         dev = os.path.join(self.home, 'allrice40-dev')
@@ -372,7 +371,8 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertIn(f'ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:{worker}\n', dotenv)
         self.assertNotIn('ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012', dotenv)
         bootstrap = next(e for e in events if e['command'] == 'node' and e['args'][0].endswith('/qa-bootstrap.mjs'))
-        self.assertEqual(bootstrap['args'][bootstrap['args'].index('--rice') + 1], release + '/scripts/m1/rice-standard.json')
+        self.assertEqual(bootstrap['args'][0], release + '/scripts/m1/qa-bootstrap.mjs')
+        self.assertEqual(bootstrap['args'][bootstrap['args'].index('--env') + 1], str(self.instance / '.env'))
 
     def test_identity_failure_stops_before_database_creation_or_services(self):
         result, events = self.up(identity_fail=True)
@@ -827,14 +827,14 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertTrue(Path(self.home, 'allrice-qa/_allrice40-one/instance.json').exists())
 
-    def test_missing_owner_card_or_ref_template_refuses_before_build(self):
+    def test_missing_owner_card_or_ref_bootstrap_refuses_before_build(self):
         for args in [[], ['--owner', 'test'], ['--card', 'MET-220']]:
             result = self.cli('up', 'met-218-test', *args)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(Path(self.events).exists())
-        result = self.cli('up', 'met-218-test', '--owner', 'test', '--card', 'MET-220', QA_TEST_MISSING_RICE='1')
+        result = self.cli('up', 'met-218-test', '--owner', 'test', '--card', 'MET-220', QA_TEST_MISSING_BOOTSTRAP='1')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('ref has no Rice template', result.stderr)
+        self.assertIn('ref has no QA bootstrap script', result.stderr)
         events = [json.loads(line) for line in Path(self.events).read_text().splitlines()]
         self.assertFalse(any(e['command'] in ['pnpm', 'createdb', 'node'] for e in events))
 

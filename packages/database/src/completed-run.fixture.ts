@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { createEmployeeAdministrationFixture } from './employee-administration.fixture.ts';
 import { assignPublishedPlatformEmployeeToWorkspace } from './employees/platform-employees.ts';
 /** Synthetic completed Run; callers must provide their dedicated schema. */
@@ -6,10 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import type postgres from 'postgres';
 import type { RequestContext, Role } from '@allrice/contracts';
-import {
-  ensureDefaultEmployee,
-  getChatSessionHistory,
-} from './workspace/service.ts';
+import { getChatSessionHistory } from './workspace/service.ts';
 
 export async function createCompletedRunFixture(
   db: ReturnType<typeof postgres>,
@@ -54,7 +52,10 @@ export async function createCompletedRunFixture(
     reviewer = await member('member'),
     neighbor = await member('member');
   await authorizeFixturePlatformAdministrator(db, reviewer.actor.id);
-  const defaultAssignment = await ensureDefaultEmployee(owner, workspace);
+  const defaultAssignment = await createTestEmployeeAssignment(
+    owner,
+    workspace,
+  );
   if (defaultAssignment)
     await ensureGeneralEmployeeInstance(db, defaultAssignment.id);
   let publishedVersion: string | null = null;

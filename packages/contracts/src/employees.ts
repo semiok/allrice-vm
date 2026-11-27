@@ -214,21 +214,12 @@ const instanceProfileWriteFields = {
   expectedRevision: z.number().int().positive(),
   requestId: UuidSchema,
 };
-export const UpdateEmployeeInstanceInputSchema = z.union([
-  z
-    .object({
-      ...instanceProfileWriteFields,
-      profile: EmployeeInstanceProfileSchema,
-    })
-    .strict(),
-  // An empty patch is never a reset. Clear only this owner's profile overrides.
-  z
-    .object({
-      ...instanceProfileWriteFields,
-      operation: z.literal('reset_profile'),
-    })
-    .strict(),
-]);
+export const UpdateEmployeeInstanceInputSchema = z
+  .object({
+    ...instanceProfileWriteFields,
+    profile: EmployeeInstanceProfileSchema,
+  })
+  .strict();
 
 const instanceLifecycleFields = {
   workspaceId: UuidSchema,
@@ -518,7 +509,6 @@ export const EmployeeDefinitionSchema = z
     appearance: EmployeeAppearanceSchema,
     applicableScenarios: z.array(z.string().trim().min(1).max(300)).max(24),
     taskSuggestions: TaskSuggestionsSchema.optional(),
-    isDefaultRice: z.boolean(),
     identity: EmployeeIdentitySchema,
     systemPrompt: z.string().min(1).max(100_000),
     provider: EmployeeProviderSnapshotSchema,

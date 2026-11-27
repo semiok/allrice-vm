@@ -83,22 +83,8 @@ suite(
       vi.unstubAllEnvs();
       await f?.close();
     });
-    async function setup(cloud = false, basicRice = false) {
-      const original = await createEmployeeAdministrationFixture(f.db);
-      const [rice] = basicRice
-        ? await f.db`select id from allrice_platform_employees where employee_key='rice'`
-        : [];
-      const source = basicRice
-        ? {
-            ...original,
-            employeeId: rice!.id as string,
-            definition: {
-              ...original.definition,
-              key: 'rice',
-              name: 'Platform assistant',
-            },
-          }
-        : original;
+    async function setup(cloud = false) {
+      const source = await createEmployeeAdministrationFixture(f.db);
       await savePlatformEmployeeDraft(source.employeeId, {
         definition: {
           ...source.definition,
@@ -111,7 +97,7 @@ suite(
             ],
           },
         },
-        ...(!basicRice ? { expectedRevisionId: source.revisionId } : {}),
+        expectedRevisionId: source.revisionId,
       });
       await source.preview(source.employeeId);
       expect((await source.publish(source.employeeId)).valid).toBe(true);
@@ -125,11 +111,7 @@ suite(
       ))!;
       const assignment = (
         await getEmployeeWorkspace(context, source.workspaceId)
-      ).employees.find(
-        (e) =>
-          e.employeeKey ===
-          (basicRice ? 'default-assistant' : source.definition.key),
-      )!;
+      ).employees.find((e) => e.employeeKey === source.definition.key)!;
       const custom = await createEmployeeInstance(context, {
         workspaceId: source.workspaceId,
         assignmentId: assignment.id,
@@ -275,11 +257,11 @@ suite(
         { params: Promise.resolve({ id: instanceId, installationId }) },
       );
     }
-    it.each(['rice', 'custom', 'professional'] as const)(
+    it.each(['custom', 'professional'] as const)(
       'browser uninstall removes only the current %s employee binding and preserves the owner library',
       async (kind) => {
         // User action: “卸载；这位员工将不再使用这个技能。”
-        const x = await setup(false, kind === 'rice');
+        const x = await setup();
         await install(x, x.custom.id);
         const item = PersonalSkillItemSchema.parse(
           (await install(x, x.assignment.id)).item,
@@ -418,8 +400,8 @@ suite(
         ).toBe(400);
       expect(await listPersonalSkills(x.context)).toEqual(before);
     });
-    it('E3 allows real Rice binding and HTTP enable with ordinary frozen reads and unchanged revocation', async () => {
-      const x = await setup(false, true);
+    it('E3 allows an existing employee binding and HTTP enable with ordinary frozen reads and unchanged revocation', async () => {
+      const x = await setup();
       const { item } = await install(x, x.custom.id);
       const task = await x.run(
         x.assignment.id,
@@ -2126,10 +2108,10 @@ suite(
       expect(await listPersonalSkills(x.context)).toEqual([]);
       await task.finish();
     });
-    it.each(['rice', 'general', 'custom'] as const)(
+    it.each(['general', 'custom'] as const)(
       'installs through the real Broker handler for %s and freezes exact provenance without new grants',
       async (kind) => {
-        const x = await setup(false, kind === 'rice'),
+        const x = await setup(),
           instanceId = kind === 'custom' ? x.custom.id : x.assignment.id;
         const { item } = await install(x, instanceId);
         expect(item.bindings).toMatchObject([

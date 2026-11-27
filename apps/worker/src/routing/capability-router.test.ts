@@ -23,12 +23,11 @@ function base(input?: {
   const now = '2026-08-25T00:00:00.000Z';
   const definition = {
     schemaVersion: 2 as const,
-    key: 'rice',
-    name: 'Rice',
+    key: 'test-employee',
+    name: 'Test employee',
     description: 'General employee',
     appearance: { avatarType: 'initials' as const, avatarValue: 'R' },
     applicableScenarios: [],
-    isDefaultRice: true,
     identity: {
       role: '通用员工',
       mission: '完成工作',
@@ -96,7 +95,7 @@ function base(input?: {
     schemaVersion: 2,
     employee: {
       id: employeeId,
-      key: 'rice',
+      key: 'test-employee',
       versionId: randomUUID(),
       revision: 1,
       definitionChecksum: `sha256:${'a'.repeat(64)}`,

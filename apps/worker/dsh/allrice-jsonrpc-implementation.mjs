@@ -918,8 +918,8 @@ export async function createAllRiceRuntime(
               : releaseMs > 0
                 ? Math.min(remainingMs, releaseMs)
                 : remainingMs;
-          // A child progress pause may arrive while Rice is asking an ordinary
-          // question. Serialize them; never replace or accidentally answer it.
+          // A child progress pause may arrive while the parent session is
+          // asking an ordinary question. Serialize them; never replace or accidentally answer it.
           while (this.pendingUserQuestions.has(sessionId)) {
             request.signal?.throwIfAborted();
             const pending = this.pendingUserQuestions.get(sessionId);

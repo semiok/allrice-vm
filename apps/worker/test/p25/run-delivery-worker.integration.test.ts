@@ -681,7 +681,7 @@ suite('MET-210 root Run delivery through real admission and Worker', () => {
     const current = employeeManifest({
       key: f.definition.key,
       name: 'OLD_NULL_TENANT',
-      description: 'Historical createEmployee/ensureDefaultEmployee shape',
+      description: 'Historical employee provider snapshot',
     });
     if (current.schemaVersion !== 2) throw Error('expected v2 factory shape');
     const { personaSource, ...oldNull } = current;

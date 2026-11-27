@@ -331,7 +331,6 @@ suite(
       expect(result.details.profile.canMaintainPersonal).toBe(false);
       expect(result.details.profile.editableFields).toEqual([]);
       expect(result.details.profile.canArchive).toBe(false);
-      expect(result.details.profile.isDefaultRice).toBeUndefined();
       expect(result.details.content.layers).toHaveLength(2);
       expect(
         result.details.content.layers.every(

@@ -1,4 +1,3 @@
-import { notifyNativeRosterInsert } from '../employees/native-roster-notification.ts';
 import { hasDEntryPersonRelease } from '@allrice/contracts';
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import {
@@ -125,21 +124,9 @@ import { DataAccessError, getStoredFile } from '../data.ts';
 import { getDatabase } from '../core/client.ts';
 import { workbenchFileSchemaReady } from '../workbench-file-access.ts';
 import {
-  employeeManifestChecksum,
-  riceEmployeeKey,
-  riceManifest,
-} from '../employees/employee-config.ts';
-import {
   defaultContextCompactThreshold,
   sessionCompactionStatus,
 } from '../conversation/usage.ts';
-// Bump when the built-in Rice prompt contract changes so existing assignments
-// receive the new version while historical Sessions remain pinned.
-// Built-in Rice manifests are immutable once published. Bump this whenever
-// the default employee capability contract changes so existing sessions stay
-// frozen while newly provisioned sessions receive the updated tool set.
-const riceVersion = 11;
-
 type ChatSession = z.infer<typeof ChatSessionSchema>;
 type ChatMessage = z.infer<typeof ChatMessageSchema>;
 type EmployeeAssignment = z.infer<typeof EmployeeAssignmentSchema>;
@@ -320,138 +307,27 @@ function mapAssignment(row: AssignmentRow): EmployeeAssignment {
   };
 }
 
-export async function ensureDefaultEmployee(
+async function readSelectedEmployeeAssignment(
   context: RequestContext,
   requestedWorkspaceId?: string,
 ) {
   const workspaceId = await resolveWorkspaceId(context, requestedWorkspaceId);
   const userId = requireUser(context);
-  const manifest = riceManifest();
-  const checksum = employeeManifestChecksum(manifest);
-  const sql = getDatabase();
-  const assignment = await sql.begin(async (transaction) => {
-    await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
-    const [managed] =
-      await transaction`select id from allrice_platform_employee_tenant_assignments
-      where organization_id=${context.organizationId} and workspace_id=${workspaceId}
-      union all select id from allrice_organizations where id=${context.organizationId} and managed_employee_roster limit 1`;
-    if (
-      managed ||
-      hasDEntryPersonRelease(await readDEntryReleasePolicy(transaction, true), {
-        organizationId: context.organizationId,
-        personId: userId,
-      })
-    ) {
-      // Managed and person-released workspaces may deliberately be empty.
-      // Reading them must not recreate a default employee or revive an assignment.
-      const [current] = await transaction<AssignmentRow[]>`
-        select a.id assignment_id,a.employee_id,a.employee_version_id,a.user_id,a.organization_id,a.workspace_id,a.is_default,
-          v.version,v.name,v.model,v.system_prompt,v.capabilities,v.published_at,v.config_checksum
-        from allrice_employee_assignments a join allrice_employees e on e.id=a.employee_id and e.status='active'
-        join allrice_employee_versions v on v.id=a.employee_version_id
-        where a.organization_id=${context.organizationId} and a.workspace_id=${workspaceId} and a.user_id=${userId} and a.active
-          and not exists(select 1 from allrice_platform_employee_tenant_assignments d
-            where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id and d.tenant_employee_id=a.employee_id and not d.active)
-        order by a.is_default desc,a.assigned_at,a.id limit 1`;
-      return current;
-    }
-    const employees = await transaction<{ id: string }[]>`
-      insert into allrice_employees (
-        organization_id, workspace_id, employee_key, name
-      ) values (
-        ${context.organizationId}, ${workspaceId},
-        ${riceEmployeeKey}, ${manifest.name}
-      )
-      on conflict (organization_id, workspace_id, employee_key)
-      do update set name = excluded.name, updated_at = now()
-      returning id
-    `;
-    const employeeId = employees[0]?.id;
-    if (!employeeId) throw new Error('default employee provisioning failed');
-    await transaction`
-      insert into allrice_employee_versions (
-        organization_id, workspace_id, employee_id, version, name, model,
-        system_prompt, capabilities, config_checksum, description, manifest,
-        provider_snapshot, skill_version_ids
-      ) values (
-        ${context.organizationId}, ${workspaceId}, ${employeeId},
-        ${riceVersion}, ${manifest.name},
-        ${manifest.provider.model}, ${manifest.systemPrompt},
-        ${transaction.json(manifest.capabilities)}, ${checksum},
-        ${manifest.description}, ${transaction.json(manifest)},
-        ${transaction.json(manifest.provider)},
-        ${transaction.json(manifest.skillVersionIds)}
-      )
-      on conflict (employee_id, version) do nothing
-    `;
-    const versions = await transaction<
-      { id: string; config_checksum: string; version: number }[]
-    >`
-      select id, config_checksum, version from allrice_employee_versions
-      where employee_id = ${employeeId}
-      order by version desc
-      limit 1
-    `;
-    const version = versions[0];
-    if (!version) throw new Error('published Rice version is missing');
-    const [changed] = await transaction<{ user_id: string }[]>`
-      insert into allrice_employee_assignments (
-        organization_id, workspace_id, employee_id, employee_version_id,
-        user_id, is_default, active
-      ) values (
-        ${context.organizationId}, ${workspaceId}, ${employeeId},
-        ${version.id}, ${userId},
-        not exists (
-          select 1 from allrice_employee_assignments current_default
-          where current_default.organization_id = ${context.organizationId}
-            and current_default.workspace_id = ${workspaceId}
-            and current_default.user_id = ${userId}
-            and current_default.active and current_default.is_default
-        ),
-        true
-      )
-      on conflict (organization_id, workspace_id, user_id, employee_id)
-      do update set active = true,
-        employee_version_id = case
-          when exists (
-            select 1 from allrice_employee_versions current_version
-            where current_version.id = allrice_employee_assignments.employee_version_id
-              and (
-                current_version.model = 'allrice/basic-assistant-v1'
-                or current_version.version < ${riceVersion}
-              )
-          ) then excluded.employee_version_id
-          else allrice_employee_assignments.employee_version_id
-        end,
-        updated_at = now() where allrice_employee_assignments.selection_mode<>'exclude'
-      returning user_id
-    `;
-    if (changed)
-      await notifyNativeRosterInsert(
-        transaction,
-        'allrice_employee_assignments',
-        {
-          organizationId: context.organizationId,
-          workspaceId,
-          personId: changed.user_id,
-        },
-      );
-    const rows = await transaction<AssignmentRow[]>`
-      select
-        a.id as assignment_id, a.employee_id, a.employee_version_id,
-        a.user_id, a.organization_id, a.workspace_id, a.is_default,
-        v.version, v.name, v.model, v.system_prompt, v.capabilities,
-        v.published_at, v.config_checksum
-      from allrice_employee_assignments a
-      join allrice_employee_versions v on v.id = a.employee_version_id
-      where a.organization_id = ${context.organizationId}
-        and a.workspace_id = ${workspaceId}
-        and a.user_id = ${userId}
-        and a.active and a.is_default
-    `;
-    return rows[0];
-  });
-  return assignment ? mapAssignment(assignment) : null;
+  const [row] = await getDatabase()<AssignmentRow[]>`
+    select a.id assignment_id,a.employee_id,a.employee_version_id,a.user_id,
+      a.organization_id,a.workspace_id,a.is_default,
+      v.version,v.name,v.model,v.system_prompt,v.capabilities,v.published_at,v.config_checksum
+    from allrice_employee_assignments a
+    join allrice_employees e on e.id=a.employee_id and e.status='active'
+    join allrice_employee_versions v on v.id=a.employee_version_id
+    where a.organization_id=${context.organizationId} and a.workspace_id=${workspaceId}
+      and a.user_id=${userId} and a.active
+      and not exists(select 1 from allrice_platform_employee_tenant_assignments d
+        where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id
+          and d.tenant_employee_id=a.employee_id and not d.active)
+    order by a.is_default desc,a.assigned_at,a.id limit 1
+  `;
+  return row ? mapAssignment(row) : null;
 }
 
 function mapSession(row: SessionRow): ChatSession {
@@ -550,7 +426,7 @@ export async function createChatSession(
   }
   const assignment = parsed.employeeAssignmentId
     ? null
-    : await ensureDefaultEmployee(context, parsed.workspaceId);
+    : await readSelectedEmployeeAssignment(context, parsed.workspaceId);
   const assignmentId = parsed.employeeAssignmentId ?? assignment?.id;
   if (!assignmentId) throw new DataAccessError('not_found');
   return createAssignedChatSession(
@@ -1803,7 +1679,7 @@ async function persistChatMessageInTransaction(
       ) values (
         ${context.organizationId}, ${workspaceId}, ${session.id},
         ${requireUser(context)}, 'assistant',
-        ${transaction.json({ text: 'Rice 正在处理…', citations: [] })},
+        ${transaction.json({ text: '员工正在处理…', citations: [] })},
         ${session.visibility}, ${userMessage.id}, 'pending', null
       )
       returning *
@@ -2294,7 +2170,7 @@ export async function sendChatMessage(
   if (result.assistantMessage.status === 'failed') {
     const retries = await sql<MessageRow[]>`
       update allrice_messages
-      set content = ${sql.json({ text: 'Rice 正在重试…', citations: [] })},
+      set content = ${sql.json({ text: '员工正在重试…', citations: [] })},
           status = 'pending', error_code = null, completed_at = null
       where id = ${result.assistantMessage.id}
       returning *
@@ -2348,7 +2224,7 @@ export async function sendChatMessage(
     await sql`
       update allrice_messages
       set content = ${sql.json({
-        text: 'Rice 暂时无法开始这次执行，请稍后重试。',
+        text: '暂时无法开始这次执行，请稍后重试。',
         citations: [],
       })}, status = 'failed', error_code = 'EMPLOYEE_ENQUEUE_FAILED',
         completed_at = now()
@@ -3379,7 +3255,7 @@ export async function getEmployeeWorkspace(
   instanceId?: string,
 ) {
   const workspaceId = await resolveWorkspaceId(context, requestedWorkspaceId);
-  const assignment = await ensureDefaultEmployee(context, requestedWorkspaceId);
+  const assignment = await readSelectedEmployeeAssignment(context, workspaceId);
   const { listEmployeeHub } = await import('../employees/employeehub.ts');
   const employeeHub = await listEmployeeHub(context, workspaceId);
   const defaultMemoryInstance = employeeHub.assignments

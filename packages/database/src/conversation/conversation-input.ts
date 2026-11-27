@@ -319,7 +319,7 @@ export async function consumeConversationSteer(input: {
       set content = ${transaction.json({
         text: command.message.startsWith('allrice:user-question:v1:')
           ? ''
-          : '已补充给正在工作的 Rice。',
+          : '已补充给正在工作的员工。',
         citations: [],
       })}, status = 'completed', completed_at = now(), error_code = null
       where id = ${command.assistant_message_id} and status = 'pending'

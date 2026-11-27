@@ -121,8 +121,7 @@ suite(
       value: {
         expectedRevision: number;
         requestId: string;
-        profile?: EmployeeInstanceProfile;
-        operation?: 'reset_profile';
+        profile: EmployeeInstanceProfile;
       },
     ) {
       const routePath =
@@ -149,7 +148,7 @@ suite(
       return EmployeeInstanceSchema.parse(body.instance);
     }
 
-    async function setup(rice = false) {
+    async function setup() {
       const source = await createEmployeeAdministrationFixture(fixture.db);
       const viewer = await login(
         source.ownerId,
@@ -160,13 +159,9 @@ suite(
         'ALLRICE_PLATFORM_ADMIN_EMAILS',
         `${source.ownerId}@example.test`,
       );
-      const [riceRow] = rice
-        ? await fixture.db`select id from allrice_platform_employees where employee_key='rice'`
-        : [];
-      const platformId = rice ? (riceRow!.id as string) : source.employeeId;
+      const platformId = source.employeeId;
       const definition: PlatformEmployeeDefinition = {
         ...source.definition,
-        key: rice ? 'rice' : source.definition.key,
         name: '平台人设一',
         appearance: {
           avatarType: 'emoji',
@@ -182,17 +177,13 @@ suite(
       };
       await savePlatformEmployeeDraft(platformId, {
         definition,
-        ...(!rice ? { expectedRevisionId: source.revisionId } : {}),
+        expectedRevisionId: source.revisionId,
       });
       await source.preview(platformId);
       expect((await source.publish(platformId)).valid).toBe(true);
       const assignment = (
         await getEmployeeWorkspace(viewer.context, source.workspaceId)
-      ).employees.find(
-        (employee) =>
-          employee.employeeKey ===
-          (rice ? 'default-assistant' : definition.key),
-      );
+      ).employees.find((employee) => employee.employeeKey === definition.key);
       if (!assignment) throw Error('fixture_assignment_missing');
       await ensureGeneralEmployeeInstance(fixture.db, assignment.id);
       async function publish(
@@ -323,81 +314,10 @@ suite(
       );
     });
 
-    it('merges only Rice appearance leaves, preserves receipts and resets the entire profile through the original operation', async () => {
-      const f = await setup(true),
-        id = f.assignment.id;
-      const first = await saved(
-        await patch(f.viewer, id, {
-          expectedRevision: 1,
-          requestId: randomUUID(),
-          profile: {
-            name: '本人 Rice',
-            appearance: {
-              avatarType: 'image',
-              avatarValue: 'https://example.test/me.png',
-              accentColor: 'blue',
-            },
-          },
-        }),
-      );
-      const requestId = randomUUID();
-      const change = {
-        expectedRevision: first.revision,
-        requestId,
-        profile: { appearance: { accentColor: 'coral' as const } },
-      };
-      const colored = await saved(await patch(f.viewer, id, change));
-      expect(colored.profile).toEqual({
-        name: '本人 Rice',
-        appearance: {
-          avatarType: 'image',
-          avatarValue: 'https://example.test/me.png',
-          accentColor: 'coral',
-        },
-      });
-      expect(await saved(await patch(f.viewer, id, change))).toEqual(colored);
-      expect(
-        (
-          await patch(f.viewer, id, {
-            ...change,
-            profile: { appearance: { accentColor: 'green' } },
-          })
-        ).status,
-      ).toBe(409);
-      expect(
-        (
-          await patch(f.viewer, id, {
-            expectedRevision: 1,
-            requestId: randomUUID(),
-            profile: { name: 'stale' },
-          })
-        ).status,
-      ).toBe(409);
-      const resetRequest = {
-        expectedRevision: colored.revision,
-        requestId: randomUUID(),
-        operation: 'reset_profile' as const,
-      };
-      const reset = await saved(await patch(f.viewer, id, resetRequest));
-      expect(reset.profile).toEqual({});
-      expect((await details(f.viewer, id)).profile).toMatchObject({
-        name: f.definition.name,
-        appearance: f.definition.appearance,
-        expressionStyle: 'structured',
-        overrides: {},
-      });
-      const next = { ...f.definition, name: '后来平台人设' };
-      await f.publish(next);
-      expect(await saved(await patch(f.viewer, id, resetRequest))).toEqual(
-        reset,
-      );
-      expect((await details(f.viewer, id)).profile.name).toBe(next.name);
-    });
-
     it('keeps custom replacement, real owner authorization and shared privacy instead of granting permissions from a name or source DTO', async () => {
       const f = await setup();
       const custom = await f.custom({
-        name: 'Rice',
+        name: 'Test employee',
         mission: '本人职责',
         appearance: { accentColor: 'blue' },
       });
@@ -418,28 +338,10 @@ suite(
       });
       expect(
         (
-          await patch(f.viewer, custom.id, {
-            expectedRevision: 2,
-            requestId: randomUUID(),
-            operation: 'reset_profile',
-          })
-        ).status,
-      ).toBe(403);
-      expect(
-        (
           await patch(f.viewer, f.assignment.id, {
             expectedRevision: 1,
             requestId: randomUUID(),
-            profile: { name: 'Rice' },
-          })
-        ).status,
-      ).toBe(403);
-      expect(
-        (
-          await patch(f.viewer, f.assignment.id, {
-            expectedRevision: 1,
-            requestId: randomUUID(),
-            operation: 'reset_profile',
+            profile: { name: 'Test employee' },
           })
         ).status,
       ).toBe(403);

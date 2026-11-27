@@ -489,21 +489,12 @@ it('keeps independent checkpoint and exact uncovered message receipts, and decli
   ).not.toBe(covered.segments[0]!.digest);
 });
 
-it('E3 projects the frozen basic Rice name/style and allows personal Skills and scene packages without altering professional general instructions', () => {
+it('E3 projects the frozen personal employee name/style and allows personal Skills and scene packages without altering professional general instructions', () => {
   const snapshot = {
     schemaVersion: 2,
-    employee: {
-      key: 'default-assistant',
-      versionId: 'version',
-      definition: {
-        schemaVersion: 2,
-        key: 'default-assistant',
-        isDefaultRice: true,
-      },
-    },
     content: { personalScenes: true },
     instance: {
-      kind: 'general',
+      kind: 'custom',
       source: { kind: 'platform', employeeVersionId: 'version' },
       revision: 3,
       profile: {
@@ -529,9 +520,7 @@ it('E3 projects the frozen basic Rice name/style and allows personal Skills and 
   expect(text).toContain(
     'save the personal display name or default expression style',
   );
-  expect(text).toContain(
-    'personal Workflows use exact file preview and confirmation',
-  );
+  expect(text).toContain('Use exact preview/confirmation in employee details');
   expect(text).toContain('workspace_personal_skill_install');
   expect(text).toContain('workspace_personal_skill_version');
   expect(text).toContain('employee-customization Skill');
@@ -543,7 +532,10 @@ it('E3 projects the frozen basic Rice name/style and allows personal Skills and 
   const professional = {
     ...snapshot,
     content: undefined,
-    employee: { ...snapshot.employee, key: 'professional' },
+    instance: snapshot.instance && {
+      ...snapshot.instance,
+      kind: 'general' as const,
+    },
   };
   const other = employeeInstanceInstructions(professional).join('\n');
   expect(other).toContain('workspace_personal_skill_install');
@@ -551,6 +543,6 @@ it('E3 projects the frozen basic Rice name/style and allows personal Skills and 
   expect(other).toContain('do not send name or edit business methods');
   expect(other).not.toContain('"小米"');
   expect(other).not.toContain(
-    'personal Workflows use exact file preview and confirmation',
+    'Use exact preview/confirmation in employee details',
   );
 });

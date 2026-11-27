@@ -732,7 +732,7 @@ export async function executeEmployeeRun({
     ) {
       throw new HandlerError(
         'CONVERSATION_BUSY',
-        'Another Rice turn is still active for this conversation',
+        'Another employee turn is still active for this conversation',
         true,
       );
     }

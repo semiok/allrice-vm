@@ -64,10 +64,9 @@ export async function inspectPersonalSceneSkill(
   const contentRef = PersonalSceneContentRefSchema.parse(contentRefInput);
   return db.begin('isolation level repeatable read read only', async (tx) => {
     if (
-      !(await canUsePersonalEmployeeScenes(
+      !canUsePersonalEmployeeScenes(
         await getEmployeeInstance(context, instanceId, tx),
-        tx,
-      ))
+      )
     )
       throw new DataAccessError('not_found');
     const result = await readPersonalSceneSkillInTransaction(
@@ -96,10 +95,9 @@ export async function listPersonalSceneReads(
   human(scope);
   return db.begin('isolation level repeatable read read only', async (tx) => {
     if (
-      !(await canUsePersonalEmployeeScenes(
+      !canUsePersonalEmployeeScenes(
         await getEmployeeInstanceForHistory(scope, instanceId, tx),
-        tx,
-      ))
+      )
     )
       throw new DataAccessError('not_found');
     const rows = await tx<

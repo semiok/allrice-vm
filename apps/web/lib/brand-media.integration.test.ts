@@ -63,17 +63,10 @@ import {
   ensureGeneralEmployeeInstance,
   getEmployeeInstance,
 } from '../../../packages/database/src/employees/employee-instances.ts';
-import { isBaseRiceInstance } from '../../../packages/database/src/employees/employee-instance-policy.ts';
-import { createEmployeeAdministrationFixture } from '../../../packages/database/src/employee-administration.fixture.ts';
 import { approveSyntheticCurrentEmployeeExecution } from '../../../packages/database/src/current-execution.fixture.ts';
-import {
-  savePlatformEmployeeDraft,
-  assignPublishedPlatformEmployeeToWorkspace,
-} from '../../../packages/database/src/employees/platform-employees.ts';
 import {
   createChatSession,
   sendChatMessage,
-  getEmployeeWorkspace,
 } from '../../../packages/database/src/workspace/service.ts';
 import {
   EmployeeModuleError,
@@ -728,38 +721,12 @@ suite(
       expect(brandMediaModule.skills).toEqual(['brand-media']);
     });
 
-    it('allows the real published platform Rice to self-add without preinstallation or changed capabilities', async () => {
-      const a = await actor(),
-        source = await createEmployeeAdministrationFixture(f.db);
-      const [rice] = await f.db<
-        { id: string }[]
-      >`select id from allrice_platform_employees where employee_key='rice'`;
-      expect(rice).toBeDefined();
-      await savePlatformEmployeeDraft(rice!.id, {
-        definition: {
-          ...source.definition,
-          key: 'rice',
-          name: 'Platform Rice',
-        },
-      });
-      await source.preview(rice!.id);
-      expect((await source.publish(rice!.id)).valid).toBe(true);
-      await assignPublishedPlatformEmployeeToWorkspace(
-        'rice',
-        a.scope.workspaceId,
+    it('allows a privately owned employee to self-add without preinstallation or changed capabilities', async () => {
+      const target = await actor();
+      const instance = await getEmployeeInstance(
+        target.context,
+        target.scope.instanceId,
       );
-      const assigned = (
-        await getEmployeeWorkspace(a.context, a.scope.workspaceId)
-      ).employees.find((e) => e.employeeKey === 'default-assistant')!;
-      expect(assigned).toBeDefined();
-      await ensureGeneralEmployeeInstance(f.db, assigned.id);
-      const instance = await getEmployeeInstance(a.context, assigned.id);
-      expect(await isBaseRiceInstance(instance, f.db)).toBe(true);
-      const target = {
-        ...a,
-        assignmentId: assigned.id,
-        scope: { ...a.scope, instanceId: instance.id },
-      };
       const [before] =
         await f.db`select manifest,capabilities,config_checksum from allrice_employee_versions where id=${instance.source.employeeVersionId}`;
       const entries = await catalog.GET(

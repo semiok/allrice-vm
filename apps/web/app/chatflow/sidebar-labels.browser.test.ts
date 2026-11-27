@@ -434,7 +434,7 @@ suite('sidebar, create-employee dialog and workbench badge labels', () => {
 
       for (const [kind, name, eyebrow] of [
         ['reference', '引用会话', '会话资料'],
-        ['versions', '周报.docx 的版本历史', 'Rice 交付物'],
+        ['versions', '周报.docx 的版本历史', '交付物'],
         ['brand', '内容工作台', '内容员工'],
       ] as const)
         it(`reads the ${kind} dialog eyebrow at ${at}`, () =>

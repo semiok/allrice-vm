@@ -158,14 +158,14 @@ M1 只保留一套七线 wake/dog 调度；新源码默认状态根 `~/allrice40
 ## 6. 临时验收实例（`qa-instance`）
 
 - 用途：在合并之前，用自己的改动完整跑一遍页面和功能，不占共享 Dev。
-- `qa-instance up <任务名> --owner <线名> --card <MET卡号> [--ref <分支或提交>] [--ttl 6h] [--wait]`：从 `~/allrice40-repo` 取代码（默认 `origin/main`；`--ref` 可以是分支或提交，分支在本地和 origin 上都有时取较新的那个，两边分叉就报错，这时改传提交号；**只构建已提交的内容**，没提交的改动先 commit，不必 push），然后自动完成全部准备：构建、生成执行包、建库、生成配置、启动服务、初始化租户（公司 `QA-<任务名>`、账号 `qa-<任务名>`、发布 Rice 并配发）。Rice 模板使用该 ref 中的 `scripts/m1/rice-standard.json`，不使用安装工具时冻结的模板。
+- `qa-instance up <任务名> --owner <线名> --card <MET卡号> [--ref <分支或提交>] [--ttl 6h] [--wait]`：从 `~/allrice40-repo` 取代码（默认 `origin/main`；`--ref` 可以是分支或提交，分支在本地和 origin 上都有时取较新的那个，两边分叉就报错，这时改传提交号；**只构建已提交的内容**，没提交的改动先 commit，不必 push），然后自动完成构建、建库、生成配置和启动服务。用该 ref 的 `scripts/m1/qa-bootstrap.mjs` 建公司 `QA-<任务名>` 和账号 `qa-<任务名>`，按人开通 4.0，再由验收账号显式创建首个员工。
 - 本仓租期记录在 `repositoryExpiresAt`，默认 6 小时，`--ttl` 接受小时（`6` 或 `6h`）、分钟（`30m`）、秒（`60s`），最长 24 小时；`renew <任务名> [--ttl 6h]` 从当前时间续租，保留创建时间。需要保留的实例说明原因和预计释放时间。旧实例没有 owner/card/租期，显示 legacy，不猜测过期、不自动回收，使用完 down 后按新参数重建。
 - 并发：分配用内核锁，同任务的 `up/down/renew` 互斥。名额仍为 3；满额只回收“属于本仓、租期已过且确认全部进程已停”的实例，先归档日志和 instance.json 到 `~/allrice40-dev/qa/codex/qa-reclaimed/`，不带 creds/.env/plist/软链接，再 down。运行中、launchd 仍加载、状态未知、正在操作的实例不自动回收；不足时报告 owner/card/年龄/进程/租期。
 - `up --wait` 每 15 秒重查，最多等 24 小时，可 Ctrl-C；等待时不持有分配锁。超期但不能回收的实例，由等待进程在占用方 card 上提醒 owner，注明等待方与等待时间，同一实例跨等待者每 30 分钟最多一次（失败也限频，避免超时后重复发）。通知要求调用进程注入 `LINEAR_API_KEY`，不从 Dev 凭据文件取；没有认证时满额等待明确报错，不冒充已提醒。传输失败继续等，并把失败状态写入 `.reminders/<任务>.json` 供看护读取。详见 `docs/runbooks/qa-instance-leases.md`。
 - `up` 失败后实例仍占一个名额，脚本会提示；先 `qa-instance down <任务名>` 再重试。
 - `qa-instance list`：列出 owner、card、存在时间、进程/租期以及端口、版本和健康状态。`qa-instance down <任务名>`：停服务并等进程退出，然后删库、删目录、删 worktree；服务 90 秒内停不下来或数据库检查/删除失败就报错，不删文件。
 - 访问：在 M1 本机打开 `http://localhost:<Web 端口>`，或者用 SSH 端口转发；账号密码在 `~/allrice-qa/<任务名>/creds.json`。
-- **实例默认关闭云端执行**，发布的是去掉云端工具的 Rice：没有 Office 导出、数据分析和对账这类沙箱能力。这类改动在共享 Dev 上验。实例不共用沙箱虚拟机，因为 Worker 启动时会清理它不认识的容器，可能误伤共享 Dev 的任务。云端浏览器不依赖沙箱，实例上可以验。
+- **实例默认关闭云端执行**。Office 导出、数据分析和对账等依赖云端沙箱的能力在共享 Dev 验证。实例使用独立资源，避免 Worker 启动时清理共享 Dev 的容器。云端浏览器不依赖沙箱，实例上可以验。
 - 模型订阅：不复制凭证，`ALLRICE_DSH_PLATFORM_HOME` 指向共享 Dev 的凭证目录，订阅槽位与共享 Dev 保持一致。
 - `smoke-test --instance <任务名>`：使用该 QA 实例的账号与端口，验证同一条原生发布冒烟路径。
 - 实例也生成并核验独立构建身份，用于冒烟测试确认 Web/Worker 实际运行的版本；开发维护功能仍关闭，身份准备不授予发布准入。
