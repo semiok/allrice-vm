@@ -1391,7 +1391,7 @@ it('joins a fork from a registered ancestor but withholds registration after aut
 it.each(['login', 'vm binding'] as const)(
   'retains the native terminal through a page reconnect and joins owner cleanup after loss of %s',
   async (loss) => {
-    const f = await fixture();
+    const f = await fixture(undefined, false, false, 250);
     const revokedBinding = new AbortController();
     const watch = f.watchTerminal.getMockImplementation()!;
     f.watchTerminal.mockImplementationOnce(async (...args) => {

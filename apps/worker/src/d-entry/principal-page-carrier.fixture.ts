@@ -86,6 +86,7 @@ export async function fixture(
   release?: ProfileProof,
   newRoot = false,
   rootless = false,
+  cleanupTimeoutMs = 3000,
 ) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
@@ -123,7 +124,7 @@ export async function fixture(
   const carrier = new AbortController();
   const control = createDEntryPrincipalControl(host.node, {
     carrier: carrier.signal,
-    cleanupTimeoutMs: 3000,
+    cleanupTimeoutMs,
   });
   let controlCloseChecked = false;
   closes.push(async () => {

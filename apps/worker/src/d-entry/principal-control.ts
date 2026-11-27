@@ -136,6 +136,7 @@ class Relay<T extends ScopeFrame | StreamFrame> {
     parser: TypertSchema<T>,
     receive: (frame: T) => boolean,
     fence?: (reason: unknown) => void,
+    private readonly shutdown?: AbortSignal,
   ) {
     this.done = (async () => {
       try {
@@ -187,6 +188,7 @@ class Relay<T extends ScopeFrame | StreamFrame> {
     if (this.joined) return this.joined;
     this.joined = Promise.resolve().then(async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let startDeadline: (() => void) | undefined;
       const deliveryErrors: unknown[] = [];
       try {
         if (!this.ended && !this.closed && !this.withdrawn) {
@@ -203,7 +205,14 @@ class Relay<T extends ScopeFrame | StreamFrame> {
         await Promise.race([
           this.done,
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(unknown()), this.timeoutMs);
+            startDeadline = () => {
+              timer = setTimeout(() => reject(unknown()), this.timeoutMs);
+            };
+            if (this.shutdown && !this.shutdown.aborted)
+              this.shutdown.addEventListener('abort', startDeadline, {
+                once: true,
+              });
+            else startDeadline();
           }),
         ]);
         if (!this.closed) throw unknown();
@@ -227,6 +236,8 @@ class Relay<T extends ScopeFrame | StreamFrame> {
         );
       } finally {
         if (timer) clearTimeout(timer);
+        if (startDeadline)
+          this.shutdown?.removeEventListener('abort', startDeadline);
       }
     });
     this.closing = true;
@@ -262,6 +273,7 @@ export function createDEntryPrincipalControl(
       fence(reason?: unknown): void;
     }
   >();
+  const shutdown = new AbortController();
   let stopped = false,
     closing: Promise<void> | undefined;
   const control = {
@@ -340,6 +352,12 @@ export function createDEntryPrincipalControl(
                 if (published) revoked.abort(reason);
                 else opened.reject(reason);
               },
+              // The terminal login owner is already fenced on revocation.
+              // A healthy guest may take longer than a page close to prove
+              // process exit. Bound the join once the shared Host retires.
+              issue.access === 'page' && issue.terminalOwner
+                ? shutdown.signal
+                : undefined,
             );
             if (business.aborted || joined) void relay.close().catch(() => {});
             const first = await timing.run(
@@ -612,6 +630,7 @@ export function createDEntryPrincipalControl(
     },
     fence(reason?: unknown) {
       stopped = true;
+      shutdown.abort(reason);
       for (const activity of activities) activity.fence(reason);
     },
     close() {

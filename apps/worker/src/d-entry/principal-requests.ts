@@ -202,7 +202,12 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         authority.revoked.addEventListener('abort', lost, { once: true });
         activity = current.owner.acquirePrincipal(
           context,
-          { scopeId: randomUUID(), identity, access: 'page' },
+          {
+            scopeId: randomUUID(),
+            identity,
+            access: 'page',
+            terminalOwner: true,
+          },
           active,
         );
         scope = await activity.run(active);

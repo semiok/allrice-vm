@@ -132,7 +132,11 @@ it.skipIf(!cli)(
       },
     };
     const login = new AbortController();
-    const keeper = f.owner.acquirePrincipal(issue, login.signal, f.context);
+    const keeper = f.owner.acquirePrincipal(
+      { ...issue, terminalOwner: true },
+      login.signal,
+      f.context,
+    );
     const held = await keeper.run(login.signal);
     const id = randomUUID();
     await expect(

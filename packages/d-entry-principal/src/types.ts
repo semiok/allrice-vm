@@ -44,6 +44,7 @@ export type DEntryScopeIssue =
       identity: DEntryIdentity;
       access: 'page';
       root?: DEntryPrincipalIssue['root'];
+      terminalOwner?: true;
     }>;
 export type CloseCommand = 'close';
 export const D_ENTRY_PAGE_UPLINK_BYTES = 262_144;
@@ -206,5 +207,6 @@ export const DEntryScopeIssueSchema = z.union([
   scopeSchema.extend({
     access: z.literal('page'),
     root: scopeSchema.shape.root.optional(),
+    terminalOwner: z.literal(true).optional(),
   }),
 ]);

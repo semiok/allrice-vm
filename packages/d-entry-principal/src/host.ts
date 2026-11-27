@@ -1035,6 +1035,8 @@ class PrincipalService extends TypertRemoteService {
           this.terminalOwners.get(closingKey)?.terminals.get(closingKey);
         let terminal: TerminalReservation | undefined;
         if (endpoint === 'terminal/create') {
+          if (scope.issue.access !== 'page' || !scope.issue.terminalOwner)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
           const { agentId, request } = terminalCreate.parse(args);
           const ref = { agentId, id: request.id };
           const key = terminalKey(ref);
