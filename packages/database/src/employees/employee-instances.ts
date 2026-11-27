@@ -43,7 +43,6 @@ import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import { platformEmployeeModelPolicy } from '../providers/platform-model-settings.ts';
 import { runtimePolicyDigest } from '../runtime-policy-digest.ts';
 import { assertNativeWebEmployeeCapacity } from './native-web-capacity.ts';
-import { readFirstEmployeeLimit } from './d-entry-first-employee-limit.ts';
 import { frozenPackageSkills } from '../skill-bundles.ts';
 import {
   runtimePackageChecksum,
@@ -681,7 +680,6 @@ export class EmployeeInstanceError extends Error {
       | 'instance_conflict'
       | 'instance_archived'
       | 'default_protected'
-      | 'd_entry_first_employee_limit'
       | 'employee_port_slots_full',
     message: string = code,
   ) {
@@ -937,15 +935,6 @@ export async function listHistoricalEmployeeInstances(
   );
 }
 
-/** The caller must establish current workspace write authority first. The
- * limit belongs to the person, and retained employees and disks still count. */
-export async function hasExistingDEntryEmployeeOrVm(
-  context: RequestContext,
-  sql: Sql = getDatabase(),
-) {
-  return readFirstEmployeeLimit(sql, actorId(context));
-}
-
 export async function createEmployeeInstance(
   context: RequestContext,
   input: unknown,
@@ -1001,12 +990,7 @@ export async function createEmployeeInstance(
       return EmployeeInstanceSchema.parse(saved?.response);
     }
     if (released) {
-      // Only the unassigned path can admit a first 4.0 employee.
-      if (
-        existingAssignment ||
-        (await hasExistingDEntryEmployeeOrVm(scope, tx))
-      )
-        throw new EmployeeInstanceError('d_entry_first_employee_limit');
+      if (existingAssignment) throw new DataAccessError('authorization_denied');
       await assertNativeWebEmployeeCapacity(scope, tx);
     }
     const id = randomUUID();

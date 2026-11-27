@@ -45,7 +45,6 @@ type VmCapacityRow = {
   organization_id: string;
   phase: string;
   lease_owner: string | null;
-  instance_id: string | null;
   verified_web_slot_capacity: number | null;
 };
 
@@ -67,7 +66,7 @@ async function readVm(
   try {
     const [row] = await tx<
       VmCapacityRow[]
-    >`select organization_id,phase,lease_owner,instance_id,verified_web_slot_capacity
+    >`select organization_id,phase,lease_owner,verified_web_slot_capacity
       from person_virtual_machines where person_id=${personId} for share nowait`;
     return row;
   } catch (error) {
@@ -78,7 +77,6 @@ async function readVm(
 async function assertCapacity(
   tx: Tx,
   owner: Owner,
-  before: number,
   after: number,
   enrolling: boolean,
 ) {
@@ -98,7 +96,6 @@ async function assertCapacity(
   if (
     enrolling &&
     vm?.verified_web_slot_capacity === null &&
-    (before > 0 || vm.instance_id !== null) &&
     (vm.lease_owner !== null ||
       !['stopped', 'cold', 'deleted'].includes(vm.phase))
   )
@@ -129,8 +126,8 @@ export async function assertNativeWebEmployeeCapacity(
     personId: context.actor.id.toLowerCase(),
     organizationId: context.organizationId.toLowerCase(),
   };
-  const before = (await readNativeWebEmployeeIds(tx, owner, true)).size;
-  await assertCapacity(tx, owner, before, before + 1, true);
+  const roster = await readNativeWebEmployeeIds(tx, owner, true);
+  await assertCapacity(tx, owner, roster.size + 1, true);
 }
 
 type ChangeScope =
@@ -213,7 +210,7 @@ export async function captureNativeWebRosterChange(
           wasAdded(entry, id),
         )
       )
-        additions.push({ owner, ids, wasAdded, granted });
+        additions.push({ owner, wasAdded, granted });
     }
     if (!additions.length) return;
     await options.recheckWriter?.();
@@ -222,13 +219,12 @@ export async function captureNativeWebRosterChange(
         tx,
         additions.map(({ owner }) => owner),
       );
-    for (const { owner, ids, wasAdded, granted } of additions) {
+    for (const { owner, wasAdded, granted } of additions) {
       const current = await readRoster(owner);
       if (granted || [...current].some(([id, entry]) => wasAdded(entry, id)))
         await assertCapacity(
           tx,
           owner,
-          ids.size,
           current.size,
           options.enrolling !== false,
         );
@@ -254,6 +250,6 @@ export async function assertNativeWebRolloutCapacity(
   await lockPeople(tx, targets);
   for (const owner of targets) {
     const count = (await readNativeWebEmployeeIds(tx, owner, true)).size;
-    if (count) await assertCapacity(tx, owner, 0, count, false);
+    if (count) await assertCapacity(tx, owner, count, false);
   }
 }
