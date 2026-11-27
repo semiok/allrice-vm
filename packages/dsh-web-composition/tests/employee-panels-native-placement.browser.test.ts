@@ -790,24 +790,35 @@ suite(
           await settle(page);
         }
         const unreadDeliverablesName = '交付成果，5 项新增';
-        const unreadDeliveryBadge = native
-          .getByRole('button', { name: unreadDeliverablesName, exact: true })
-          .getByText('5', { exact: true });
+        const deliverables = native.getByRole('button', {
+          name: unreadDeliverablesName,
+          exact: true,
+        });
+        const unreadDeliveryBadge = deliverables.getByText('5', {
+          exact: true,
+        });
         await unreadDeliveryBadge.waitFor({ state: 'visible' });
-        const badgeRect = await unreadDeliveryBadge.boundingBox();
-        expect(badgeRect).not.toBeNull();
-        // Keep the rounded badge on its own paint layer before moving the app.
-        // Reparenting the app otherwise changes its subpixel edge rasterization.
+        const icon = deliverables.locator(':scope > svg');
+        const controlBounds = () =>
+          Promise.all([
+            deliverables.boundingBox(),
+            icon.boundingBox(),
+            unreadDeliveryBadge.boundingBox(),
+          ]);
+        const bounds = await controlBounds();
+        expect(bounds).not.toContain(null);
+        // Stabilize the whole control. A separate layer for only the badge
+        // leaves the adjacent SVG subject to rasterization during reparenting.
         await native.addStyleTag({
-          content: `button[aria-label=${JSON.stringify(unreadDeliverablesName)}] > span[aria-hidden="true"] { will-change: transform; }`,
+          content: `button[aria-label=${JSON.stringify(unreadDeliverablesName)}] { will-change: transform; }`,
         });
         await settle(native);
         expect(
-          await unreadDeliveryBadge.evaluate(
+          await deliverables.evaluate(
             (node) => getComputedStyle(node).willChange,
           ),
         ).toBe('transform');
-        expect(await unreadDeliveryBadge.boundingBox()).toEqual(badgeRect);
+        expect(await controlBounds()).toEqual(bounds);
         original = await capture(native, 'native-original');
         refStart = await capture(reference, 'reference-start');
         expect(refStart.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
@@ -818,7 +829,7 @@ suite(
           'native-original-repeat-control.json',
           original,
           repeated,
-          'native repeat with the same badge raster control',
+          'native repeat with the same deliverables raster control',
         );
         fiveUnreadDeliverables = await unreadDeliveryBadge.isVisible();
         expect(fiveUnreadDeliverables).toBe(true);
@@ -1044,7 +1055,7 @@ suite(
           actualPngs,
           cleanup,
           measuredScope:
-            'One native 1440/light/list/experience panel with the unread badge compositing hint held constant across native captures. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
+            'One native 1440/light/list/experience panel with the deliverables button compositing hint held constant across native captures. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
           failures: failures.map((error) => ({
             message: String(error),
             stack: error instanceof Error ? error.stack : null,
