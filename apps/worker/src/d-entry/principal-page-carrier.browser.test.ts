@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -30,9 +30,20 @@ it.skipIf(!browserExecutable)(
   { timeout: 60_000 },
   async () => {
     const release = await buildProfileFixture();
-    const manifest: { files: { path: string }[] } = JSON.parse(
+    const manifest: {
+      files: { path: string }[];
+      source: { contributionInputs: { path: string; sha256: string }[] };
+    } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
     );
+    const ownerPath =
+      'packages/dsh-web-composition/src/employee-product-owner.ts';
+    expect(manifest.source.contributionInputs).toContainEqual({
+      path: ownerPath,
+      sha256: createHash('sha256')
+        .update(await readFile(ownerPath))
+        .digest('hex'),
+    });
     const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
     const mime: Record<string, string> = {
       '.js': 'text/javascript',
@@ -149,7 +160,9 @@ it.skipIf(!browserExecutable)(
       executablePath: browserExecutable,
     });
     closes.push(() => browser.close());
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+    });
     await context.addCookies([
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
@@ -275,27 +288,43 @@ it.skipIf(!browserExecutable)(
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
-    const abilities = workbench.getByLabel('工作台入口').getByRole('button', {
-      name: '能力',
-      exact: true,
-    });
-    const panel = workbench.getByRole('region', {
+    const dock = workbench.locator(
+      '[data-sidebar-right-session="root"][data-sidebar-right-panel]',
+    );
+    // rc.2 keeps the corner on blank sessions while omitting title actions.
+    // Closing the guide's sole replacement collapses the original Dock again.
+    const openAbilities = async () => {
+      await workbench
+        .locator('[data-conversation-header-corner]')
+        .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
+        .click({ timeout: 5000 });
+      await dock
+        .getByRole('button', { name: /^能力\s*打开这位员工的业务工作台$/ })
+        .click({ timeout: 5000 });
+    };
+    const panel = dock.getByRole('region', {
       name: 'Fixture employee · 能力',
     });
     const closeAbilityTab = () =>
-      workbench
+      dock
         .getByRole('tab', { name: /能力/ })
-        .getByRole('button', { name: '关闭', exact: true })
+        .getByRole('button', { name: /^(关闭|Close)$/ })
         .click();
     try {
+      expect(
+        await workbench.locator('html').evaluate(() => innerWidth),
+      ).toBeGreaterThan(760);
+      expect(await workbench.locator('[aria-label="工作台入口"]').count()).toBe(
+        0,
+      );
       expect(reads).toHaveLength(0);
-      await abilities.click();
+      await openAbilities();
       await expect.poll(() => reads.length).toBe(1);
       await closeAbilityTab();
       await workbench.locator('html[data-skill-read-aborted]').waitFor();
       await panel.waitFor({ state: 'hidden' });
 
-      await abilities.click();
+      await openAbilities();
       await panel.getByText('技能读取失败，请重试。').waitFor();
       expect(
         await panel.getByRole('button', { name: '翻译校对' }).count(),
@@ -328,6 +357,7 @@ it.skipIf(!browserExecutable)(
       expect(await panel.getByText('品牌自媒体').count()).toBe(0);
       await closeAbilityTab();
       expect((await editor.innerText()).trim()).toBe('未发送的原生草稿');
+      expect(unary).not.toContain('session/prompt');
       expect(reads).toEqual(
         Array.from({ length: 3 }, () => ({
           method: 'GET',
@@ -337,6 +367,25 @@ it.skipIf(!browserExecutable)(
           workspaceHeader: f.identity.workspaceId,
         })),
       );
+    } catch (error) {
+      const state = await workbench.locator('html').evaluate(() => ({
+        viewportWidth: innerWidth,
+        toolbar: Boolean(document.querySelector('[aria-label="工作台入口"]')),
+        corner: document
+          .querySelector('[data-sidebar-right-expand]')
+          ?.getAttribute('aria-label'),
+        dock: document
+          .querySelector('[data-sidebar-right-panel]')
+          ?.getAttribute('data-sidebar-right-panel'),
+        tabs: [
+          ...document.querySelectorAll(
+            '[data-sidebar-right-panel] [role="tab"]',
+          ),
+        ].map((tab) => tab.textContent),
+      }));
+      throw Error(JSON.stringify({ state, reads: reads.length, errors }), {
+        cause: error,
+      });
     } finally {
       late.resolve();
     }
