@@ -26,7 +26,8 @@ import {
   readNativeEmployeeMemoryOrdinal,
   rememberNativeEmployeeMemory,
   reconcileNativeEmployeeMemory,
-  restoreNativeEmployeeMemoryContext,
+  type NativeMemoryRestoreTarget,
+  type NativeMemoryTarget,
 } from './employee-memory-runtime.ts';
 import {
   getAdminEmployeeMemory,
@@ -66,8 +67,16 @@ export interface EmployeeMemoryModuleQualification {
  * transaction. Their missing production current/B/call/source assembly is
  * closed; no host-supplied SQL or test assembly appears in these options. */
 export interface EmployeeMemoryPort {
-  issueContext: typeof issueNativeEmployeeMemoryContext;
-  restoreContext: typeof restoreNativeEmployeeMemoryContext;
+  issueContext(
+    context: RequestContext,
+    input: NativeMemoryTarget,
+    signal: AbortSignal,
+  ): Promise<string>;
+  restoreContext(
+    context: RequestContext,
+    input: NativeMemoryRestoreTarget,
+    signal: AbortSignal,
+  ): Promise<string>;
   readOrdinal: typeof readNativeEmployeeMemoryOrdinal;
   remember: typeof rememberNativeEmployeeMemory;
   reconcileRemember: typeof reconcileNativeEmployeeMemory;
@@ -210,8 +219,10 @@ export function createEmployeeMemoryPort(
   }
 
   return {
-    issueContext: issueNativeEmployeeMemoryContext,
-    restoreContext: restoreNativeEmployeeMemoryContext,
+    issueContext: (context, input, signal) =>
+      issueNativeEmployeeMemoryContext(context, input, signal, 'issue'),
+    restoreContext: (context, input, signal) =>
+      issueNativeEmployeeMemoryContext(context, input, signal, 'restore'),
     readOrdinal: readNativeEmployeeMemoryOrdinal,
     async remember(context, target, input, signal) {
       const receipt = await rememberNativeEmployeeMemory(

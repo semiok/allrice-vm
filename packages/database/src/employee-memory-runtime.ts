@@ -83,7 +83,7 @@ export const NativeMemoryTargetSchema =
 export type NativeMemoryTarget = z.input<typeof NativeMemoryTargetSchema>;
 const NativeMemoryRestoreTargetSchema =
   OriginalExecutionSelectorProjectionSchema.extend({ module: memoryModule });
-type NativeMemoryRestoreTarget = z.input<
+export type NativeMemoryRestoreTarget = z.input<
   typeof NativeMemoryRestoreTargetSchema
 >;
 export const NativeMemoryReconcileTargetSchema =
@@ -469,9 +469,13 @@ async function draft(
 
 export async function issueNativeEmployeeMemoryContext(
   context: RequestContext,
-  input: NativeMemoryTarget,
-  signal: AbortSignal,
+  ...[input, signal, mode]:
+    | [NativeMemoryTarget, AbortSignal, 'issue']
+    | [NativeMemoryRestoreTarget, AbortSignal, 'restore']
 ) {
+  if (mode === 'restore')
+    return restoreNativeEmployeeMemoryContext(context, input, signal);
+  if (mode !== 'issue') return denied();
   const target = NativeMemoryTargetSchema.parse(input);
   const document = await caller(
     context,
@@ -502,7 +506,7 @@ export async function issueNativeEmployeeMemoryContext(
 /** Reopen the original B without issuing or charging. The trusted Host also
  * calls this at final dispatch, before incorporating and hashing the document.
  * Never dispatch an earlier publication or a cached recovery result. */
-export async function restoreNativeEmployeeMemoryContext(
+async function restoreNativeEmployeeMemoryContext(
   context: RequestContext,
   input: NativeMemoryRestoreTarget,
   signal: AbortSignal,
