@@ -248,7 +248,7 @@ it.skipIf(!browserExecutable).each([false, true])(
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"
-            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ phase: _phase, ...bundle }) => bundle))}'`}></div>
+            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
