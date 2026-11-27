@@ -555,8 +555,6 @@ it
           (url) => url.searchParams.get('threadId') === otherThread,
         );
         expect(await editor.innerText()).toBe('另一条会话的原生草稿');
-        revokeOther!.abort();
-        await expect.poll(() => page.locator('iframe:visible').count()).toBe(0);
       }
       console.info(
         'NATIVE_THREAD_SWITCH_BENCHMARK ' +
@@ -569,14 +567,11 @@ it
           }),
       );
       if (cross) {
-        await page.goto(
-          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
-        );
-        await editor.waitFor();
         const before = { documentLoads, socketCount };
-        const original = await workbench
-          .locator('#app')
-          .getAttribute('data-scope-id');
+        const original = [...f.pageSignals].find(
+          ([, signal]) => !signal.aborted,
+        )?.[0];
+        expect(original).toBeDefined();
         const next = {
           workspaceId: cross.identity.workspaceId,
           employeeInstanceId: cross.identity.employeeInstanceId,
@@ -609,12 +604,22 @@ it
         expect(await editor.innerText()).not.toContain('未发送的原生草稿');
         expect(documentLoads).toBe(before.documentLoads + 1);
         expect(socketCount).toBe(before.socketCount + 1);
-        expect(
-          (await f.invokeThread(original!, f.selection.threadId)).status,
-        ).toBe(404);
+        expect((await f.invokeThread(original!, otherThread)).status).toBe(404);
         console.info(
           'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
         );
+        await page.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        await editor.waitFor();
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        revokeOther!.abort();
+        await expect.poll(() => page.locator('iframe:visible').count()).toBe(0);
       }
       await cdp.detach();
       await context.close();

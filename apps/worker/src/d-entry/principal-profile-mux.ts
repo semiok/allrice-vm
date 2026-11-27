@@ -182,13 +182,14 @@ async function runOwner(
       generation.operation,
     ]);
     if (streams.status === 'rejected') throw streams.reason;
-    if (
-      scope.status === 'rejected' &&
-      (generation.page ||
-        !generation.setup.signal.aborted ||
-        scope.reason !== generation.setup.signal.reason)
-    )
-      throw scope.reason;
+    if (scope.status === 'rejected') {
+      const intentional =
+        (generation.setup.signal.aborted &&
+          scope.reason === generation.setup.signal.reason) ||
+        (generation.stop.signal.aborted &&
+          scope.reason === generation.stop.signal.reason);
+      if (!intentional) throw scope.reason;
+    }
   }
 
   function mount(generation: OwnedPage, page: DEntryPageHandle) {
@@ -220,11 +221,14 @@ async function runOwner(
       async (generation, page) => {
         // New authority is watching before the old registration is fenced.
         // No stream or unary from the old document can use this new scope ID.
-        await previousPage.assertCurrent(connected);
+        await previousPage.assertCurrent(
+          AbortSignal.any([connected, generation.stop.signal]),
+        );
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
         endPage(previous);
         await join(previous);
+        generation.stop.signal.throwIfAborted();
         await page.assertCurrent(page.signal);
         page.signal.throwIfAborted();
         generation.stop.signal.throwIfAborted();

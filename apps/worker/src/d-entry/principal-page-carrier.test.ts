@@ -141,7 +141,41 @@ it('joins a cancelled target lookup and the old page on close during a handoff',
   expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
 });
 
-it.each(['employee', 'login', 'epoch'] as const)(
+it('joins a staged native scope and acknowledges the old page on close before publication', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const entered = deferred();
+  const allow = deferred();
+  f.authenticate.mockImplementation(async () => {
+    if (f.pageSignals.size === 2) {
+      entered.resolve();
+      await allow.promise;
+    }
+    return f.context;
+  });
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId: randomUUID(), threadId: target },
+  });
+  await entered.promise;
+  const fenced = once(revoked, 'abort');
+  closePage(peer);
+  await fenced;
+  allow.resolve();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(2);
+  expect([...f.pageSignals.values()].every((signal) => signal.aborted)).toBe(
+    true,
+  );
+});
+
+it.each(['employee', 'login', 'tenant', 'epoch'] as const)(
   'refuses native reuse when the %s changes and leaves the exact old scope joinable',
   async (change) => {
     const f = await fixture();
@@ -158,6 +192,12 @@ it.each(['employee', 'login', 'epoch'] as const)(
       f.authenticate.mockResolvedValueOnce({
         ...f.context,
         sessionId: randomUUID(),
+      });
+    if (change === 'tenant')
+      f.historyIdentity.mockResolvedValueOnce({
+        ...f.identity,
+        threadId: target,
+        organizationId: randomUUID(),
       });
     if (change === 'epoch')
       f.deps.owners.resolve.mockResolvedValueOnce({

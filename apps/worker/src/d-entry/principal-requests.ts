@@ -316,7 +316,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             return closing;
           }
           function stopPage() {
-            fence();
+            fence(stop.reason);
           }
           admitted.addEventListener('abort', lost, { once: true });
           stop.addEventListener('abort', stopPage, { once: true });
