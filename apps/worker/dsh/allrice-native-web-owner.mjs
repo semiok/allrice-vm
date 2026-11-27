@@ -1159,7 +1159,42 @@ export function applyNativeWebOwner(
               },
             },
           });
-          registeredModel = { dispose, llm: original(scope.llm), id };
+          const reasoningEffort = modelInfo.reasoning?.defaultEffort;
+          // Retained sessions can propose their last recorded model and
+          // effort. The managed Guest has exactly the route licensed by its
+          // Host. Apply it to new requests without editing the old journal.
+          const outer = { global: true, prepend: true };
+          const offPrompt = scope.on(
+            'system-prompt/assemble',
+            async (_assembly, _context, next) => {
+              const prompt = await next();
+              signal.throwIfAborted();
+              return {
+                ...prompt,
+                variables: { ...prompt.variables, provider, model },
+              };
+            },
+            outer,
+          );
+          const offRequest = scope.on(
+            'agent/request',
+            async (request, next) => {
+              const config = await next();
+              request.signal.throwIfAborted();
+              signal.throwIfAborted();
+              return { ...config, provider, model, reasoningEffort };
+            },
+            outer,
+          );
+          registeredModel = {
+            dispose() {
+              offRequest();
+              offPrompt();
+              dispose();
+            },
+            llm: original(scope.llm),
+            id,
+          };
           const models = await scope.llm.listModels(provider);
           if (models.length !== 1 || models[0].id !== model)
             throw Error('Native managed model was not registered');

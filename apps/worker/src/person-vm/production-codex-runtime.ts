@@ -20,10 +20,19 @@ import { codexSubscriptionHome } from '../codex-subscription-home.js';
 const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
 
-async function readSelectedSubscription() {
+async function readSelectedSubscription(connectionId: string) {
   const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
     select slot, extract(epoch from updated_at)::text as revision
-    from allrice_codex_subscriptions where enabled
+    from allrice_codex_subscriptions
+    where enabled and exists (
+      select 1
+      from allrice_model_connections c
+      join allrice_model_providers p on p.id=c.provider_id
+      where c.id=${connectionId} and c.scope='platform'
+        and c.credential_reference='deployment:codex-default' and c.base_url is null
+        and c.status='ready' and p.enabled
+        and p.provider_key in ('codex','openai-codex') and p.auth_mode='chatgpt_subscription'
+    )
   `;
   if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
   return selected;
@@ -79,6 +88,7 @@ function classify(
  * broker maintains. A change of slot never retargets this route generation. */
 async function openCodexGeneration(
   lifetime: AbortSignal,
+  connectionId: string,
   selection: Awaited<ReturnType<typeof readSelectedSubscription>>,
   model: string,
   reasoning: PlatformModelConfiguration['reasoningEffort'],
@@ -112,7 +122,7 @@ async function openCodexGeneration(
     const active = AbortSignal.any([signal, revoked]);
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
-    const current = await readSelectedSubscription();
+    const current = await readSelectedSubscription(connectionId);
     active.throwIfAborted();
     if (
       !record.configured ||
@@ -168,7 +178,7 @@ export async function createProductionCodexRuntime(
   // A Host and its existing guests share one pinned route. Activate the
   // audited platform selection when constructing the next Host generation.
   const {
-    configuration: { workModel: model, reasoningEffort },
+    configuration: { connectionId, workModel: model, reasoningEffort },
   } = await readPlatformModelSettings();
   lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -211,10 +221,11 @@ export async function createProductionCodexRuntime(
           await generation.assertCurrent(active);
           return generation;
         }
-        const selection = await readSelectedSubscription();
+        const selection = await readSelectedSubscription(connectionId);
         active.throwIfAborted();
         generation = await openCodexGeneration(
           revoked,
+          connectionId,
           selection,
           model,
           reasoningEffort,

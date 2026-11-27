@@ -22,7 +22,13 @@ import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
 const state = vi.hoisted(() => ({
   settings: vi.fn<typeof readPlatformModelSettings>(),
-  subscription: vi.fn<() => Promise<{ slot: 1 | 2; revision: string }[]>>(),
+  subscription:
+    vi.fn<
+      (
+        _query: TemplateStringsArray,
+        connectionId: string,
+      ) => Promise<{ slot: 1 | 2; revision: string }[]>
+    >(),
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
@@ -191,6 +197,16 @@ it('accepts only metered POST destinations and revokes an old owner after switch
     expect(current.aborted).toBe(true);
     const recovered = await host.assertCurrent();
     expect(recovered.aborted).toBe(false);
+    expect(state.subscription.mock.lastCall?.[1]).toBe(
+      '52000000-0000-4000-8000-000000000001',
+    );
+    // A revoked connection leaves no joined ready subscription even if a
+    // credential grant still exists on disk.
+    state.subscription.mockResolvedValueOnce([]);
+    await expect(host.assertCurrent()).rejects.toMatchObject({
+      code: 'AUTHORIZATION_DENIED',
+    });
+    expect(recovered.aborted).toBe(true);
   } finally {
     await host.close();
   }

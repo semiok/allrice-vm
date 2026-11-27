@@ -44,18 +44,22 @@ integration('platform-wide model inheritance', () => {
       const settings = await readPlatformModelSettings();
       const nextModel = 'gpt-6.2-sol';
       await withFixturePlatformAdministrator(f.ownerId, async () => {
-        await updatePlatformModelSettings(context, {
+        const selected = await updatePlatformModelSettings(context, {
           expectedRevision: settings.revision,
           configuration: {
             ...settings.configuration,
             workModel: nextModel,
-            reasoningEffort: 'high',
+            reasoningEffort: 'low',
           },
+        });
+        await updatePlatformModelSettings(context, {
+          expectedRevision: selected.revision,
+          configuration: { ...selected.configuration, reasoningEffort: 'high' },
         });
       });
       const updated = await readPlatformModelSettings();
       expect(updated).toMatchObject({
-        revision: settings.revision + 1,
+        revision: settings.revision + 2,
         configuration: { workModel: nextModel, reasoningEffort: 'high' },
       });
       const [entry] = await f.db`
@@ -69,11 +73,12 @@ integration('platform-wide model inheritance', () => {
       const [audit] = await f.db`
         select decision,metadata from allrice_audit_events
         where action='platform_models.update' and actor_id=${f.ownerId}
+          and metadata->>'revision'=${String(settings.revision + 2)}
       `;
       expect(audit).toMatchObject({
         decision: 'recorded',
         metadata: {
-          revision: settings.revision + 1,
+          revision: settings.revision + 2,
           configuration: { workModel: nextModel, reasoningEffort: 'high' },
         },
       });

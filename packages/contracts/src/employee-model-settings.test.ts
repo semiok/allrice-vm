@@ -32,6 +32,13 @@ describe('employee provider-specific configuration', () => {
       employeeModelPolicyProblem({ ...policy, model: 'gpt-6.1-sol' }),
     ).toBeNull();
     expect(
+      employeeModelPolicyProblem({
+        ...policy,
+        model: 'gpt-6.2-sol',
+        reasoningEffort: 'high',
+      }),
+    ).toBeNull();
+    expect(
       employeeReasoningSettings('openai-compatible', 'synthetic-model').efforts,
     ).toEqual([]);
     const old = {
