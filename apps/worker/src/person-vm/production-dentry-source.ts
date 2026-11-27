@@ -422,38 +422,51 @@ export function installProductionDEntrySource(input: {
         );
         // Route truth remains current even when the immutable profile and the
         // installed adapter's catalog have already been proved for this epoch.
-        const route = await timing.run('send-route', () =>
-          input.resolveSendRoute(
-            { context: scope, identity, binding, modelAdapterId },
-            active,
-          ),
-        );
+        const resolveRoute = () =>
+          timing.run('send-route', () =>
+            input.resolveSendRoute(
+              { context: scope, identity, binding, modelAdapterId },
+              active,
+            ),
+          );
         const owner = profile.verificationOwner;
         const old = owner && modelProofs.get(owner);
-        const canReuse =
+        const existing =
           old &&
           !old.revoked.aborted &&
           old.adapterId === modelAdapterId &&
-          old.seal === seal.manifestSha256 &&
-          old.provider === route.provider &&
-          old.model === route.model;
-        if (!canReuse) {
-          await timing.run('model-catalog', async () => {
-            const models = await readModels();
-            if (
-              models.value.default.provider !== route.provider ||
-              models.value.default.model !== route.model ||
-              !models.value.routableProviders.includes(route.provider) ||
-              !models.value.groups.some(
-                ({ id, models }) =>
-                  id === route.provider &&
-                  models.some(({ id }) => id === route.model),
-              ) ||
-              models.value.failures.some(({ id }) => id === route.provider)
-            )
-              throw new PersonVmError('RUNTIME_NOT_READY');
-          });
-        }
+          old.seal === seal.manifestSha256
+            ? await resolveRoute()
+            : undefined;
+        const route =
+          old &&
+          existing &&
+          !old.revoked.aborted &&
+          existing.provider === old.provider &&
+          existing.model === old.model
+            ? existing
+            : await (async () => {
+                const models = await timing.run('model-catalog', readModels);
+                // Route revocation may only be observed on a current read.
+                const currentRoute = await resolveRoute();
+                if (
+                  models.value.default.provider !== currentRoute.provider ||
+                  models.value.default.model !== currentRoute.model ||
+                  !models.value.routableProviders.includes(
+                    currentRoute.provider,
+                  ) ||
+                  !models.value.groups.some(
+                    ({ id, models }) =>
+                      id === currentRoute.provider &&
+                      models.some(({ id }) => id === currentRoute.model),
+                  ) ||
+                  models.value.failures.some(
+                    ({ id }) => id === currentRoute.provider,
+                  )
+                )
+                  throw new PersonVmError('RUNTIME_NOT_READY');
+                return currentRoute;
+              })();
         await timing.run('final-authority', async () => {
           await editor.assertCurrent(active);
           if (!sameDEntryIdentity(identity, await current())) denied();
