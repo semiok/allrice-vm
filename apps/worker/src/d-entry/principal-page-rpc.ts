@@ -10,7 +10,7 @@ import type {
   DEntryScopedUnaryCall,
 } from '@allrice/d-entry-principal/types';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
-import { DataAccessError } from '@allrice/database';
+import { DataAccessError, type DEntryPageForkSource } from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { rpcIdSchema } from '@deepseek-ai/dsh-client-connection';
 import {
@@ -146,7 +146,7 @@ export function createDEntryPageRpc(
                   ? await authorizeAttachment()
                   : undefined;
               let args = input.payload.args;
-              let forkSource: string | undefined;
+              let forkSource: DEntryPageForkSource | undefined;
               if (endpoint === 'session/create') {
                 const { request } = TYPERT_REMOTE.methods[endpoint]
                   .input({ strict: true })
@@ -167,7 +167,10 @@ export function createDEntryPageRpc(
                   .input({ strict: true })
                   .create()
                   .parse(args);
-                forkSource = request.sessionId;
+                forkSource = await page.authorizeForkSource(
+                  request.sessionId,
+                  active,
+                );
               }
               if (!isRemoteJsonValue(args))
                 throw new SyntaxError('Invalid entry request');
@@ -186,15 +189,17 @@ export function createDEntryPageRpc(
                   );
                   native = encodeScopedResult(rpcId, result);
                 } else {
-                  const result = await page.scope.invokePage(
-                    {
-                      kind: 'page',
-                      scopeId: input.scopeId,
-                      endpoint,
-                      args: args as Record<string, JsonValue>,
-                    },
-                    active,
-                  );
+                  const call = {
+                    kind: 'page' as const,
+                    scopeId: input.scopeId,
+                    endpoint,
+                    args: args as Record<string, JsonValue>,
+                  };
+                  const result =
+                    endpoint === 'terminal/create' ||
+                    endpoint === 'terminal/close'
+                      ? await page.invokeTerminal(call, active)
+                      : await page.scope.invokePage(call, active);
                   if (
                     endpoint === 'session/create' ||
                     endpoint === 'session/fork'

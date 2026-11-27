@@ -114,6 +114,73 @@ function observeSinglePrompt(signal: AbortSignal) {
 }
 
 it.skipIf(!cli)(
+  'kills the real rc.2 PTY on login-owner withdrawal and keeps the DSH Host available',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const f = await setup();
+    const signal = AbortSignal.timeout(15000);
+    const create = await f.owner.createRootFor(f.context, {}, signal);
+    const agentId = create.value.sessionId;
+    const issue = {
+      scopeId: randomUUID(),
+      access: 'page' as const,
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: null,
+      },
+    };
+    const login = new AbortController();
+    const keeper = f.owner.acquirePrincipal(
+      { ...issue, terminalOwner: true },
+      login.signal,
+      f.context,
+    );
+    const held = await keeper.run(login.signal);
+    const id = randomUUID();
+    await expect(
+      held.invokePage(
+        {
+          kind: 'page',
+          scopeId: issue.scopeId,
+          endpoint: 'terminal/create',
+          args: { agentId, request: { id, cols: 80, rows: 24 } },
+        },
+        signal,
+      ),
+    ).resolves.toMatchObject({ value: { id, state: 'running' } });
+    const readerId = randomUUID();
+    const reader = f.owner.acquirePrincipal(
+      { ...issue, scopeId: readerId },
+      signal,
+      f.context,
+    );
+    const page = await reader.run(signal);
+    const list = () =>
+      page.invokePage(
+        {
+          kind: 'page',
+          scopeId: readerId,
+          endpoint: 'terminal/list',
+          args: { sessionId: agentId },
+        },
+        signal,
+      );
+    try {
+      expect((await list()).value).toMatchObject([{ id, state: 'running' }]);
+      login.abort();
+      await keeper.close();
+      expect((await list()).value).toEqual([]);
+      expect(f.owner.controlReady()).toBe(true);
+    } finally {
+      login.abort();
+      await Promise.all([keeper.close(), reader.close()]);
+    }
+  },
+);
+
+it.skipIf(!cli)(
   '真实rc.2产物交换API Cookie→认证list/control baseline；scope结束不杀长期job，close实际join',
   { tags: [tag], timeout: 30000 },
   async () => {

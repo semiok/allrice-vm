@@ -111,13 +111,28 @@ function fixture() {
     });
   const wake = { assertDeliverable: vi.fn(), start: vi.fn() };
   io.wake.mockReturnValue(wake);
+  let selectionActive = false;
+  const physicalReady = vi.fn(async () => {
+    expect(selectionActive).toBe(true);
+  });
+  const withCurrentSelection = vi.fn(
+    async (_context, _identity, _active, work: () => Promise<void>) => {
+      selectionActive = true;
+      try {
+        return await work();
+      } finally {
+        selectionActive = false;
+      }
+    },
+  );
   const host = Object.freeze({
+    vm: Object.freeze({ assertRunningReadiness: physicalReady }),
+    current: Object.freeze({ withCurrentSelection }),
     startup: Object.freeze({}),
     admission: Object.freeze({}),
     providers: { configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } } },
-    vm: Object.freeze({}),
     lifetime: lifetime.signal,
-  }) as Parameters<ProductionPersonVmHostSources['bind']>[0];
+  }) as unknown as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {
     lifetime,
     guest,
@@ -132,6 +147,8 @@ function fixture() {
     authority,
     resolve,
     attach,
+    physicalReady,
+    withCurrentSelection,
     host,
     wake,
   };
@@ -146,7 +163,20 @@ it('shares the exact route and call association between A, B and the selected Co
   const bound = await sources.bind(f.host);
   expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm);
   expect(bound.scheduledWake).toBe(f.wake);
-  const { resolveSendRoute } = io.entry.mock.calls[0]![0];
+  const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
+  const { context, identity, binding } = f.candidate;
+  await confirmPhysical!(context, identity, binding, f.lifetime.signal);
+  expect(f.withCurrentSelection).toHaveBeenCalledWith(
+    context,
+    identity,
+    f.lifetime.signal,
+    expect.any(Function),
+  );
+  expect(f.physicalReady).toHaveBeenCalledWith(
+    context,
+    binding,
+    f.lifetime.signal,
+  );
   const issuance = f.attach.mock.calls[0]![1];
   expect(issuance.route).toBe(f.route);
   const ref = await issuance.issueCall(f.issued, f.lifetime.signal);

@@ -66,6 +66,10 @@ export type DEntryHistoryRootPin = Readonly<{
   vmId: string;
   forkedFromNativeSessionId?: string;
 }>;
+export type DEntryPageForkSource = Readonly<{
+  nativeSessionId: string;
+  root: DEntryHistoryRootPin;
+}>;
 const deny = (): never => {
   throw new DataAccessError('authorization_denied');
 };
@@ -207,11 +211,12 @@ export async function getDEntryPageNativeRoot(
 export async function registerDEntryPageNativeRoot(
   context: RequestContext,
   identity: DEntryIdentity,
-  receipt: DEntryNativeRootCreation & { forkedFromNativeSessionId?: string },
+  receipt: DEntryNativeRootCreation & { forkSource?: DEntryPageForkSource },
   signal: AbortSignal,
 ) {
   const host = hostSchema.parse(receipt.host);
   const { binding } = host;
+  const { forkSource } = receipt;
   const nativeSessionId = z
     .string()
     .min(1)
@@ -224,7 +229,7 @@ export async function registerDEntryPageNativeRoot(
     context.workspaceId !== identity.workspaceId ||
     binding.personId !== identity.personId ||
     binding.organizationId !== identity.organizationId ||
-    receipt.forkedFromNativeSessionId === nativeSessionId
+    forkSource?.nativeSessionId === nativeSessionId
   )
     return deny();
   signal.throwIfAborted();
@@ -266,6 +271,29 @@ export async function registerDEntryPageNativeRoot(
         and lease_epoch=${binding.leaseEpoch} and phase='running' for share`;
     if (!vm) return deny();
     signal.throwIfAborted();
+    if (forkSource) {
+      const expected = forkSource.root;
+      const [row] =
+        await tx`select d_entry_native_root from allrice_chat_sessions
+        where id=${expected.identity.threadId} and organization_id=${identity.organizationId}
+          and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
+          and coalesce(employee_instance_id,employee_assignment_id)=${instance.id}
+          and visibility='private' and execution_generation='4.0' and archived_at is null
+          and d_entry_native_root is not null for share`;
+      if (!row) return deny();
+      const current = projectPin(row.d_entry_native_root, {
+        ...identity,
+        threadId: expected.identity.threadId,
+      });
+      if (
+        current.vmId !== binding.vmId ||
+        current.rootNativeSessionId !== expected.rootNativeSessionId ||
+        current.rootOriginDigest !== expected.rootOriginDigest ||
+        current.rootBindingRef !== expected.rootBindingRef
+      )
+        return deny();
+    }
+    const forkedFromNativeSessionId = forkSource?.nativeSessionId;
     const existing = await findPageRoot(
       tx,
       identity,
@@ -274,8 +302,8 @@ export async function registerDEntryPageNativeRoot(
     );
     if (existing) {
       if (
-        receipt.forkedFromNativeSessionId !== undefined &&
-        receipt.forkedFromNativeSessionId !== existing.forkedFromNativeSessionId
+        forkSource &&
+        forkedFromNativeSessionId !== existing.forkedFromNativeSessionId
       )
         return deny();
       return existing;
@@ -297,9 +325,7 @@ export async function registerDEntryPageNativeRoot(
       host,
       operationId: randomUUID(),
       releaseRevision: policy.revision,
-      ...(receipt.forkedFromNativeSessionId && {
-        forkedFromNativeSessionId: receipt.forkedFromNativeSessionId,
-      }),
+      ...(forkedFromNativeSessionId && { forkedFromNativeSessionId }),
     });
     const pin = pinSchema.parse({ ...claim, nativeSessionId });
     await tx`update allrice_chat_sessions set d_entry_native_root_claim=${tx.json(claim)} where id=${thread.id}`;
@@ -307,7 +333,7 @@ export async function registerDEntryPageNativeRoot(
     await tx`insert into allrice_audit_events
       (organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
       values(${identity.organizationId},${identity.workspaceId},${identity.personId},'d_entry_root.bind',
-        'chat_session',${thread.id},'recorded',${receipt.forkedFromNativeSessionId ? 'host_native_fork' : 'host_native_create'},
+        'chat_session',${thread.id},'recorded',${forkSource ? 'host_native_fork' : 'host_native_create'},
         ${context.requestId},${tx.json({ operationId: claim.operationId, releaseRevision: policy.revision })})`;
     signal.throwIfAborted();
     return projectPin(pin, claim.identity);

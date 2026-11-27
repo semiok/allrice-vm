@@ -18,6 +18,10 @@ import {
   DEntryPageUnarySchema,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import {
+  D_ENTRY_PAGE_UPLINK_BYTES,
+  type DEntryPageInput,
+} from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import {
@@ -260,7 +264,14 @@ async function runStreams(
   signal: AbortSignal,
 ) {
   const send = sendTo(peer);
-  const streams = new Map<string, { cancel(): void; work: Promise<void> }>();
+  const streams = new Map<
+    string,
+    {
+      cancel(): void;
+      sendInput(input: DEntryPageInput): void;
+      work: Promise<void>;
+    }
+  >();
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
   const active = AbortSignal.any([signal, stop.signal]);
@@ -268,37 +279,53 @@ async function runStreams(
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = Promise.resolve()
-      .then(async () => {
-        await page.assertCurrent(child);
-        let source: AsyncIterable<{ scopeId: string; value: unknown }>;
-        if (frame.endpoint === '$events') {
-          emptyPayload.parse(frame.payload);
-          source = page.scope.stream(
-            {
-              kind: 'events',
-              scopeId,
-              payload: REMOTE_EVENT_STREAM_PAYLOAD,
-            },
-            child,
-          );
-        } else {
-          const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
-          const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
-            frame.payload,
-          );
-          if (!isRemoteJsonValue(args)) throw denied();
-          source = page.scope.streamPage(
-            {
-              kind: 'page',
-              scopeId,
-              endpoint,
-              args: args as Record<string, JsonValue>,
-            },
-            child,
-          );
-        }
-        for await (const item of source) {
+    let settled = false;
+    let buffered = 0;
+    let input = Promise.resolve();
+    let inputError = Promise.resolve();
+
+    function failInput(error: unknown) {
+      if (settled || child.aborted) return;
+      settled = true;
+      controller.abort();
+      inputError = page.assertCurrent(active).then(async () => {
+        active.throwIfAborted();
+        await send({
+          type: 'error',
+          streamId: id,
+          error: pageRemoteFailure(error),
+        });
+      });
+      void inputError.catch((error: unknown) => stop.abort(error));
+    }
+    const source = (async () => {
+      await page.assertCurrent(child);
+      child.throwIfAborted();
+      if (frame.endpoint === '$events') {
+        emptyPayload.parse(frame.payload);
+        return page.scope.stream(
+          { kind: 'events', scopeId, payload: REMOTE_EVENT_STREAM_PAYLOAD },
+          child,
+        );
+      }
+      const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
+      const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
+        frame.payload,
+      );
+      if (!isRemoteJsonValue(args)) throw denied();
+      return page.scope.streamPage(
+        {
+          kind: 'page',
+          scopeId,
+          endpoint,
+          args: args as Record<string, JsonValue>,
+        },
+        child,
+      );
+    })();
+    const work = source
+      .then(async (stream) => {
+        for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
           await page.assertCurrent(child);
@@ -307,21 +334,65 @@ async function runStreams(
         }
         await page.assertCurrent(child);
         child.throwIfAborted();
+        settled = true;
         await send({ type: 'end', streamId: id });
       })
       .catch(async (error) => {
-        if (!child.aborted) {
+        if (child.aborted) return;
+        if (settled) throw error;
+        try {
           await page.assertCurrent(child);
           child.throwIfAborted();
+          settled = true;
           await send({
             type: 'error',
             streamId: id,
             error: pageRemoteFailure(error),
           });
+        } catch (failure) {
+          if (!child.aborted) throw failure;
         }
       })
-      .finally(() => streams.delete(id));
-    streams.set(id, { cancel: () => controller.abort(), work });
+      .finally(async () => {
+        settled = true;
+        controller.abort();
+        await Promise.allSettled([input, inputError]);
+        streams.delete(id);
+      });
+    streams.set(id, {
+      work,
+      cancel: () => controller.abort(),
+      sendInput(command) {
+        if (settled || child.aborted) return;
+        const bytes = Buffer.byteLength(JSON.stringify(command));
+        if (buffered + bytes > D_ENTRY_PAGE_UPLINK_BYTES) {
+          failInput(
+            new RemoteError('gateway/uplink-overflow', 'Native input is full', {
+              endpoint: frame.endpoint,
+            }),
+          );
+          return;
+        }
+        buffered += bytes;
+        input = input
+          .then(async () => {
+            if (settled || child.aborted) return;
+            const stream = await source.catch(() => undefined);
+            if (!stream || settled || child.aborted) return;
+            if (!('send' in stream)) {
+              if (command.type === 'input') throw denied();
+              controller.abort();
+              return;
+            }
+            await page.assertCurrent(child);
+            if (!settled && !child.aborted) stream.send(command);
+          })
+          .catch(failInput)
+          .finally(() => {
+            buffered -= bytes;
+          });
+      },
+    });
     void work.catch((error) => stop.abort(error));
   }
   try {
@@ -334,9 +405,21 @@ async function runStreams(
       if (binary) throw denied();
       const frame = parseRemoteStreamClientMessage(String(message));
       const prior = streams.get(frame.streamId);
-      if (frame.type === 'open' && !prior) open(frame);
-      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
-      else throw denied();
+      if (frame.type === 'open') {
+        if (prior) throw denied();
+        open(frame);
+      } else if (frame.type === 'cancel') {
+        prior?.cancel();
+      } else if (frame.type === 'end') {
+        prior?.sendInput({ type: 'input-end' });
+      } else {
+        if (frame.value !== undefined && !isRemoteJsonValue(frame.value))
+          throw denied();
+        prior?.sendInput({
+          type: 'input',
+          value: frame.value as JsonValue | undefined,
+        });
+      }
     }
   } finally {
     stop.abort();

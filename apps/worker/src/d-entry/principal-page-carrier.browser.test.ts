@@ -28,10 +28,10 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable)(
-  'enables the rc.2 composer and reads native Cordis inventory while the relay denies plugin activation',
+it.skipIf(!browserExecutable).each([false, true])(
+  'boots the rc.2 composer or reports a stalled application body (stall=%s)',
   { timeout: 60_000 },
-  async () => {
+  async (stall) => {
     const release = await buildProfileFixture();
     const manifest: {
       files: { path: string }[];
@@ -108,6 +108,10 @@ it.skipIf(!browserExecutable)(
       'dynamicCordisRunner/syncInspectManifest',
     ]);
     const graph = DEntryProfileGraphSchema.parse(release.graph);
+    const application = graph.batches.find(
+      ({ phase }) => phase === 'application',
+    )!;
+    let applicationReads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -132,14 +136,24 @@ it.skipIf(!browserExecutable)(
           return await copy(result);
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
-          if (url.pathname === '/api/v1/d-entry/profile/' + kind)
-            return await copy(
-              await f.publish(
-                kind,
-                life.scopeId,
-                Object.fromEntries(url.searchParams),
-              ),
-            );
+          if (url.pathname !== '/api/v1/d-entry/profile/' + kind) continue;
+          if (
+            stall &&
+            kind === 'assets' &&
+            url.searchParams.get('reference') === application.url
+          ) {
+            applicationReads++;
+            response.writeHead(200, { 'content-type': 'text/javascript' });
+            response.write('/* deliberately incomplete application');
+            return;
+          }
+          return await copy(
+            await f.publish(
+              kind,
+              life.scopeId,
+              Object.fromEntries(url.searchParams),
+            ),
+          );
         }
         if (staticFiles.has(url.pathname)) {
           const asset = await readFile(
@@ -312,7 +326,31 @@ it.skipIf(!browserExecutable)(
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
       });
     });
+    if (stall) {
+      await page.clock.install();
+      await page.addInitScript(() => {
+        if (window.parent !== window) return;
+        window.addEventListener('message', (event) => {
+          if (
+            event.origin === location.origin &&
+            event.data?.reason === 'asset-timeout'
+          )
+            document.documentElement.dataset.assetTimeout = event.data.reason;
+        });
+      });
+    }
     await page.goto(f.origin);
+    if (stall) {
+      await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
+      await page.clock.fastForward(30_100);
+      await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(2);
+      await page.clock.fastForward(30_100);
+      await page.locator('html[data-asset-timeout="asset-timeout"]').waitFor();
+      expect(applicationReads).toBe(2);
+      expect(unary).not.toContain('session/list');
+      await context.close();
+      return;
+    }
     const workbench = page.frameLocator('iframe');
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
@@ -836,7 +874,11 @@ it.skipIf(!browserExecutable)(
       let found: string | undefined;
       await expect
         .poll(async () => {
-          const input = await page.locator('iframe').getAttribute('src');
+          const input = await page
+            .locator('iframe')
+            .evaluate(
+              (node) => (node as HTMLIFrameElement).contentDocument?.URL,
+            );
           if (!input) return false;
           const address = new URL(input, f.origin);
           const scope = address.searchParams.get('scopeId');

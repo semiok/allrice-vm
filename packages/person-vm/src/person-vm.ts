@@ -1357,6 +1357,71 @@ export class PersonVmService
       throw failure;
     }
   }
+  private async confirmRunning(
+    row: VmRecord,
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmFence,
+  ) {
+    await this.assertNoPendingDisk(row, signal);
+    if (target) await target.assertAuthority(signal);
+    const binding = bindingOf(row);
+    if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
+    const roster = await this.webRoster(context, signal);
+    if (roster) {
+      if (
+        roster.personId !== row.personId ||
+        roster.organizationId !== row.organizationId
+      )
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      if (!this.options.native.prepareWebEndpoints)
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      if (target && this.options.diskPool) await target.assertAuthority(signal);
+      const endpoints = await this.options.native.prepareWebEndpoints(
+        binding,
+        roster,
+        signal,
+        { runningOnly: true },
+      );
+      if (
+        !sameVmBinding(endpoints.binding, binding) ||
+        endpoints.rosterDigest !== roster.digest
+      )
+        throw new PersonVmError('LEASE_LOST');
+    }
+    await this.ready(row, signal, context);
+    if (
+      roster &&
+      (await this.webRoster(context, signal))?.digest !== roster.digest
+    )
+      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    const confirmed = await this.identity(context, 'start', signal);
+    if (
+      confirmed.personId !== row.personId ||
+      confirmed.organizationId !== row.organizationId
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    if (target && this.options.diskPool) await target.assertAuthority(signal);
+    await this.assertCurrentBinding(context, binding, signal);
+    signal.throwIfAborted();
+  }
+  /** Observe the same running proof without a cold create/start fallback. */
+  async assertRunningReadiness(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    const identity = await this.identity(context, 'start', signal);
+    const row = this.required(await this.options.store.read(identity.personId));
+    this.checkOrganization(row, identity.organizationId);
+    if (
+      row.phase !== 'running' ||
+      row.leaseOwner ||
+      !sameVmBinding(bindingOf(row), binding)
+    )
+      throw new PersonVmError('LEASE_CONFLICT');
+    await this.confirmRunning(row, context, signal);
+  }
   async prewarm(
     context: RequestContext,
     input: {
@@ -1418,48 +1483,7 @@ export class PersonVmService
       return opening;
     }
     if (row?.phase === 'running') {
-      await this.assertNoPendingDisk(row, signal);
-      if (target) await target.assertAuthority(signal);
-      const binding = bindingOf(row);
-      if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
-      const roster = await this.webRoster(context, signal);
-      if (roster) {
-        if (
-          roster.personId !== row.personId ||
-          roster.organizationId !== row.organizationId
-        )
-          throw new PersonVmError('AUTHORIZATION_DENIED');
-        if (!this.options.native.prepareWebEndpoints)
-          throw new PersonVmError('RUNTIME_NOT_READY');
-        if (target && this.options.diskPool)
-          await target.assertAuthority(signal);
-        const endpoints = await this.options.native.prepareWebEndpoints(
-          binding,
-          roster,
-          signal,
-          { runningOnly: true },
-        );
-        if (
-          !sameVmBinding(endpoints.binding, binding) ||
-          endpoints.rosterDigest !== roster.digest
-        )
-          throw new PersonVmError('LEASE_LOST');
-      }
-      await this.ready(row, signal, context);
-      if (
-        roster &&
-        (await this.webRoster(context, signal))?.digest !== roster.digest
-      )
-        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
-      const confirmed = await this.identity(context, 'start', signal);
-      if (
-        confirmed.personId !== row.personId ||
-        confirmed.organizationId !== row.organizationId
-      )
-        throw new PersonVmError('AUTHORIZATION_DENIED');
-      if (target && this.options.diskPool) await target.assertAuthority(signal);
-      await this.assertCurrentBinding(context, binding, signal);
-      signal.throwIfAborted();
+      await this.confirmRunning(row, context, signal, target);
       return view(row, true);
     }
 

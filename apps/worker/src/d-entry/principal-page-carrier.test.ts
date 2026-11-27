@@ -16,12 +16,12 @@ import {
 } from 'node:net';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import Llm from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
-import { z } from 'zod';
 import {
   deferred,
   summary,
@@ -46,6 +46,144 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+it('reads the sealed language default and persists a native language preference without opening platform settings', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const gateway = host.typertGateway;
+  const dispatch = gateway.invoke.bind(gateway);
+  let preference = 'zh';
+  const writes = vi.fn();
+  const languageView = () => ({
+    ns: 'locale',
+    value: { preference },
+    revision: 2,
+  });
+  const settings = '@deepseek-ai/dsh-api-settings-controller';
+  host.provide('llm', {
+    listConfigurableProviders: () => [{ settingsNs: 'llm-pi-ai' }],
+  } as never);
+  const dispose = host.typert.register({
+    package: settings,
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: ['describe', 'mutate', 'openSettingsDocument'].map(
+      (method) => ({
+        id: `${settings}#settings/${method}`,
+        namespace: 'settings',
+        method,
+        service: 'settingsController',
+        invocation: { kind: 'direct' },
+        parameters: [],
+        result: {
+          mode: 'strict',
+          typeSymbol: 'test#NativeLocaleJson',
+          create: () => z.json(),
+          jsonSchema: {},
+        },
+      }),
+    ),
+  });
+  const dispatchSpy = vi
+    .spyOn(gateway, 'invoke')
+    .mockImplementation(async (request) => {
+      if (request.namespace !== 'settings') return dispatch(request);
+      if (request.method === 'describe')
+        return {
+          writable: true,
+          hasDocument: true,
+          namespaces: [languageView(), { ns: 'llm-pi-ai' }],
+        };
+      writes(request.args);
+      preference = 'en';
+      return languageView();
+    });
+  try {
+    const life = await open(f);
+    const call = (endpoint: string, args: object, token = sessionToken) =>
+      f.invoke(life.scopeId, token, { endpoint, payload: { args } });
+    const describe = async () => {
+      const response = await call('settings/describe', {});
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.result.ok, JSON.stringify(body.result)).toBe(true);
+      return body;
+    };
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          hasDocument: false,
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'zh' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    expect((await call('settings/describe', {}, otherToken)).status).toBe(404);
+    const ops = [{ op: 'set', path: ['preference'], value: 'en' }];
+    const denied = await call('settings/mutate', {
+      ns: 'llm-pi-ai',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await denied.json()).toMatchObject({ result: { ok: false } });
+    const fullDocument = await call('settings/openSettingsDocument', {});
+    expect(await fullDocument.json()).toMatchObject({ result: { ok: false } });
+    expect(writes).not.toHaveBeenCalled();
+    const second = await open(f);
+    const eventPeer = f.connect(second.scopeId);
+    const events = messages(eventPeer);
+    await once(eventPeer, 'open');
+    send(eventPeer, {
+      type: 'open',
+      streamId: 'locale-events',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await events('locale-events')).toMatchObject({
+      value: { type: 'ready' },
+    });
+    const changed = await call('settings/mutate', {
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await changed.json()).toMatchObject({
+      result: { ok: true, value: { ns: 'locale' } },
+    });
+    expect(writes).toHaveBeenCalledExactlyOnceWith({
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'en' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    f.host.emit({ event: 'settings/document-updated', args: ['locale', 3] });
+    expect(await events('locale-events')).toMatchObject({
+      value: {
+        type: 'emit',
+        event: 'settings/document-updated',
+        args: ['locale', 3],
+      },
+    });
+    closePage(life.peer);
+    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    closePage(second.peer);
+  } finally {
+    dispatchSpy.mockRestore();
+    dispose();
+  }
+});
 
 it('qualifies a new 4.0 editor without writing on upgrade, then prepares its root once on explicit open', async () => {
   const f = await fixture(undefined, true);
@@ -1171,7 +1309,7 @@ it('uses actual DSH replies for create and fork registration on a page without a
     { ...f.identity, threadId: null },
     {
       nativeSessionId: 'native-created',
-      forkedFromNativeSessionId: undefined,
+      forkSource: undefined,
       host: {
         binding: f.binding,
         bindingRef: f.owner.bindingRef,
@@ -1180,20 +1318,200 @@ it('uses actual DSH replies for create and fork registration on a page without a
     },
     expect.any(AbortSignal),
   );
-  const fork = await f.invoke(life.scopeId, sessionToken, {
-    endpoint: 'session/fork',
-    payload: { args: { request: { sessionId: 'other' } } },
-  });
+  const forkOther = () =>
+    f.invoke(life.scopeId, sessionToken, {
+      endpoint: 'session/fork',
+      payload: { args: { request: { sessionId: 'other' } } },
+    });
+  expect((await forkOther()).status).toBe(404);
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).not.toContain(
+    'native-forked',
+  );
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
+  f.findRoot.mockResolvedValue(root);
+  const fork = await forkOther();
   expect(await fork.json()).toMatchObject({
     result: { ok: true, value: { sessionId: 'native-forked' } },
   });
   expect(f.registerRoot.mock.calls[1]?.[2]).toMatchObject({
     nativeSessionId: 'native-forked',
-    forkedFromNativeSessionId: 'other',
+    forkSource: { nativeSessionId: 'other', root },
   });
+  expect(f.findRoot).toHaveBeenCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  expect(
+    f.findRoot.mock.calls.filter((call) => call[3] === 'other'),
+  ).toHaveLength(3);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
+
+it('joins a fork from a registered ancestor but withholds registration after authority changes', async () => {
+  const f = await fixture(undefined, false, true);
+  const life = await open(f);
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
+  f.host.catalog.items.push(summary('other-child', 'other'));
+  f.findRoot.mockResolvedValueOnce(root).mockResolvedValueOnce(undefined);
+  const lost = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/fork',
+    payload: { args: { request: { sessionId: 'other-child' } } },
+  });
+  expect(lost.status).toBe(404);
+  expect(f.findRoot).toHaveBeenLastCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  expect(f.findRoot).toHaveBeenCalledTimes(2);
+  expect(f.registerRoot).not.toHaveBeenCalled();
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).toContain(
+    'native-forked',
+  );
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it.each(['login', 'vm binding'] as const)(
+  'retains the native terminal through a page reconnect and joins owner cleanup after loss of %s',
+  async (loss) => {
+    const f = await fixture(undefined, false, false, 250);
+    const revokedBinding = new AbortController();
+    const watch = f.watchTerminal.getMockImplementation()!;
+    f.watchTerminal.mockImplementationOnce(async (...args) => {
+      const subscription = await watch(...args);
+      return {
+        ...subscription,
+        revoked: AbortSignal.any([subscription.revoked, revokedBinding.signal]),
+      };
+    });
+    const { host } = f.host;
+    const web = createRequire(
+      new URL('../../../web/package.json', import.meta.url),
+    );
+    const { TYPERT } = await import(
+      pathToFileURL(
+        web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+      ).href
+    );
+    host.typert.register(TYPERT);
+    const terminal = {
+      id: 'retained-pty',
+      title: 'Shell',
+      cwd: '/work',
+      shell: { path: '/bin/sh', name: 'sh', args: [] },
+      cols: 80,
+      rows: 24,
+      state: 'running',
+      exitCode: null,
+    };
+    const closing = deferred();
+    const closed = deferred();
+    let closeAttempts = 0;
+    closes.push(async () => closed.resolve());
+    const invoke = host.typertGateway.invoke.bind(host.typertGateway);
+    const native = vi
+      .spyOn(host.typertGateway, 'invoke')
+      .mockImplementation(async (call) => {
+        if (call.namespace !== 'terminal') return invoke(call);
+        if (call.method === 'create') {
+          const request = z.object({ id: z.string() }).parse(call.args.request);
+          if (request.id !== terminal.id)
+            throw new RemoteError(
+              'gateway/arguments-invalid',
+              'Native validation rejected an unallocated terminal',
+              { endpoint: 'terminal/create' },
+            );
+          return terminal;
+        }
+        if (call.method === 'list') return [terminal];
+        if (call.method !== 'close') throw Error('Unexpected terminal RPC');
+        expect(call.peer.principal.kind).toBe('owner');
+        expect(call.peer.signal.aborted).toBe(false);
+        expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
+        if (++closeAttempts <= 3)
+          throw Error('Transient native termination failure');
+        closing.resolve();
+        await closed.promise;
+      });
+    const create = (page: Awaited<ReturnType<typeof open>>, id = terminal.id) =>
+      f.invoke(page.scopeId, sessionToken, {
+        endpoint: 'terminal/create',
+        payload: {
+          args: {
+            agentId: 'root',
+            request: { id, cols: 80, rows: 24 },
+          },
+        },
+      });
+    const first = await open(f);
+    expect(await (await create(first)).json()).toMatchObject({
+      result: { ok: true },
+    });
+    closePage(first.peer);
+    expect(await first.receive()).toMatchObject({ value: { type: 'closed' } });
+    const next = await open(f);
+    expect(await (await create(next)).json()).toMatchObject({
+      result: { ok: true },
+    });
+    expect(await (await create(next, 'unallocated-pty')).json()).toMatchObject({
+      result: { ok: false, error: { code: 'gateway/arguments-invalid' } },
+    });
+    expect(f.watchTerminal).toHaveBeenCalledTimes(1);
+    expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.
+    closePage(next.peer);
+    expect(await next.receive()).toMatchObject({ value: { type: 'closed' } });
+    expect(native.mock.calls.some(([call]) => call.method === 'close')).toBe(
+      false,
+    );
+
+    if (loss === 'login') {
+      f.identityRevoked.abort(new DataAccessError('authentication_required'));
+    } else {
+      const checks = f.watchTerminal.mock.calls[0]![4];
+      const stale = new DataAccessError('authorization_denied');
+      vi.mocked(f.owner.assertCurrent).mockRejectedValueOnce(stale);
+      await expect(checks.verifyBinding(revokedBinding.signal)).rejects.toBe(
+        stale,
+      );
+      revokedBinding.abort(stale);
+    }
+    await closing.promise;
+    const observed = f.closeControl();
+    let joined = false;
+    void observed.then(
+      () => {
+        joined = true;
+      },
+      () => {
+        joined = true;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(joined).toBe(false);
+    closed.resolve();
+    await observed;
+    expect(
+      native.mock.calls.filter(([call]) => call.method === 'close'),
+    ).toHaveLength(4);
+  },
+);
 
 it('withholds a successful native create reply after the page loses its VM authority', async () => {
   const f = await fixture(undefined, false, true);
@@ -1241,6 +1559,167 @@ it('keeps workspace file preview and private relay calls out of native dispatch'
         request.method !== 'openScope',
     ),
   ).toBe(true);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('carries native terminal input, resize and output across the owned VM stream', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const web = createRequire(
+    new URL('../../../web/package.json', import.meta.url),
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(
+      web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+    ).href
+  );
+  host.typert.register(TYPERT);
+  const life = await open(f);
+  expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
+  const descriptor = host.typert.local.get('terminal/attach');
+  const codec = descriptor?.uplink?.codec;
+  if (codec?.mode !== 'strict')
+    throw Error('Native terminal input schema missing');
+  const inputCodec = codec.create();
+  const wire = host.typertGateway.wireStream;
+  const dispatch = wire.open.bind(wire);
+  const inputs: unknown[] = [];
+  const fault = deferred();
+  const brokenId = 'native-error';
+  closes.push(async () => fault.resolve());
+  const attach = vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    if (args[0] !== 'terminal/attach') return dispatch(...args);
+    return (async function* () {
+      yield {
+        type: 'snapshot',
+        sequence: 0,
+        screen: '',
+        writable: true,
+        info: {
+          id: 'terminal-fixture',
+          title: 'Terminal',
+          shell: { path: '/bin/sh', args: [], name: 'sh' },
+          cwd: '/work',
+          cols: 80,
+          rows: 24,
+          state: 'running',
+          exitCode: null,
+        },
+      };
+      if ((args[1] as typeof payload).args.id === brokenId) {
+        await fault.promise;
+        throw new RemoteError('gateway/service-unavailable', 'Fixture error', {
+          endpoint: 'terminal/attach',
+        });
+      }
+      for await (const raw of args[2]) {
+        inputs.push(inputCodec.parse(raw));
+      }
+      yield { type: 'ack', sequence: 2 };
+      yield { type: 'output', sequence: 3, data: 'guest-file\r\n' };
+    })();
+  });
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const receive = messages(peer);
+  const streamId = 'terminal';
+  const payload = { args: { agentId: 'root', id: 'terminal-fixture' } };
+  send(peer, { type: 'open', streamId, endpoint: 'terminal/attach', payload });
+  const frameOverheadBytes =
+    Buffer.byteLength(
+      JSON.stringify({
+        type: 'item',
+        streamId: '199c8160-f4ab-4f45-8b01-51b581fdffee',
+        value: { type: 'input', value: null },
+      }),
+    ) - 4;
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: {
+      type: 'snapshot',
+      inputWindow: { maxBytes: 262_144, frameOverheadBytes },
+    },
+  });
+  const write = { type: 'write', sequence: 1, data: 'ls\r' };
+  const resize = { type: 'resize', sequence: 2, cols: 100, rows: 32 };
+  send(peer, { type: 'item', streamId, value: write });
+  send(peer, { type: 'item', streamId, value: resize });
+  send(peer, { type: 'end', streamId });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'ack', sequence: 2 },
+  });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'output', sequence: 3, data: 'guest-file\r\n' },
+  });
+  expect(await receive(streamId)).toMatchObject({ type: 'end' });
+  expect(inputs).toEqual([write, resize]);
+  expect(attach).toHaveBeenCalledWith(
+    'terminal/attach',
+    payload,
+    expect.any(Object),
+    expect.any(Object),
+    expect.any(AbortSignal),
+  );
+  // A late frame for an ended attachment cannot take down the page mux.
+  send(peer, { type: 'item', streamId, value: write });
+  const cancelled = 'cancelled-terminal';
+  send(peer, {
+    type: 'open',
+    streamId: cancelled,
+    endpoint: 'terminal/attach',
+    payload,
+  });
+  expect(await receive(cancelled)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  function holdCurrentCheck() {
+    const checking = deferred();
+    const interrupted = deferred();
+    vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+      async (_context, signal) => {
+        checking.resolve();
+        if (!signal.aborted) await once(signal, 'abort');
+        interrupted.resolve();
+        signal.throwIfAborted();
+      },
+    );
+    return { checking, interrupted };
+  }
+  const inputCheck = holdCurrentCheck();
+  send(peer, { type: 'item', streamId: cancelled, value: write });
+  await inputCheck.checking.promise;
+  send(peer, { type: 'cancel', streamId: cancelled });
+  await inputCheck.interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: brokenId,
+    endpoint: 'terminal/attach',
+    payload: { args: { ...payload.args, id: brokenId } },
+  });
+  expect(await receive(brokenId)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  const outputCheck = holdCurrentCheck();
+  fault.resolve();
+  await outputCheck.checking.promise;
+  send(peer, { type: 'cancel', streamId: brokenId });
+  await outputCheck.interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: 'still-open',
+    endpoint: 'session/control',
+    payload: { args: {} },
+  });
+  expect(await receive('still-open')).toMatchObject({
+    type: 'item',
+    value: { type: 'baseline' },
+  });
+  expect(inputs).toEqual([write, resize]);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
@@ -2078,6 +2557,34 @@ it(
     });
     expect(bad.status).toBe(404);
     await bad.body?.cancel();
+    const terminalModule = graph.entries.find(
+      ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
+    );
+    if (!terminalModule)
+      throw Error('Native terminal missing from sealed graph');
+    const chunk = `plugins/${terminalModule.id}/client.terminal.js?rev=${terminalModule.rev}`;
+    const loadChunk = (reference: string, revision = terminalModule.rev) =>
+      f.publish('assets', scopeId, {
+        bindingRef: f.owner.bindingRef,
+        reference,
+        revision,
+      });
+    const terminalScript = await loadChunk(chunk);
+    expect(terminalScript.status).toBe(200);
+    expect(terminalScript.headers.get('content-type')).toContain('javascript');
+    expect(Buffer.from(await terminalScript.arrayBuffer())).toEqual(
+      await read(chunk, source),
+    );
+    for (const response of [
+      await loadChunk(chunk, 'wrong'),
+      await loadChunk(
+        chunk.replace('client.terminal.js', 'client.unsealed.js'),
+      ),
+      await loadChunk(chunk.replace('client.terminal.js', 'client.node.js')),
+    ]) {
+      expect(response.status).toBe(404);
+      await response.body?.cancel();
+    }
 
     async function blockedAsset() {
       const serverResponse = deferred<ServerResponse>();

@@ -1,9 +1,12 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { pageDownlink, pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
   Remote,
   TypertRemoteService,
   isTypertRemoteMethod,
   isRemoteJsonValue,
+  RemoteError,
   remoteErrorOf,
   type PeerScope,
   type RemoteStream,
@@ -39,6 +42,7 @@ import {
 } from './policy.js';
 import type {
   CloseCommand,
+  DEntryPageInput,
   DEntryPrincipal,
   DEntryScopeIssue,
   DEntryPageNativeCall,
@@ -58,6 +62,21 @@ import {
 import { pageSettingsNamespaces } from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
+const terminalId = z.string().min(1).max(128);
+const terminalCreate = z.object({
+  agentId: z.string().min(1),
+  request: z.object({ id: terminalId }),
+});
+const terminalRef = z.object({ agentId: z.string().min(1), id: terminalId });
+const terminalList = z.array(z.object({ id: z.string() }));
+type TerminalRef = z.infer<typeof terminalRef>;
+type TerminalReservation = {
+  ref: TerminalRef;
+  pending: number;
+  possiblyAllocated: boolean;
+};
+const terminalKey = ({ agentId, id }: TerminalRef) =>
+  JSON.stringify([agentId, id]);
 const eventRoles = pageEventRoles(API_REMOTE_FORWARDED_EVENTS);
 const configSchema = z
   .object({
@@ -194,6 +213,7 @@ class Scope implements Projection {
   readonly abort = new AbortController();
   readonly jobs = new Set<Promise<unknown>>();
   readonly children = new Set<{ close(): Promise<void> }>();
+  readonly terminals = new Map<string, TerminalReservation>();
   readonly ready: Promise<void>;
   private closing?: Promise<void>;
   private detach = () => {};
@@ -391,28 +411,33 @@ class Scope implements Projection {
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closing = Promise.resolve().then(async () => {
+    const attempt = (this.closing = Promise.resolve().then(async () => {
       await Promise.allSettled([this.ready]);
       const children = await Promise.allSettled(
         [...this.children].map((child) => child.close()),
       );
       while (this.jobs.size) await Promise.allSettled([...this.jobs]);
-      const peer = await Promise.allSettled([this.peer?.dispose()]);
-      if ([...children, ...peer].some((result) => result.status === 'rejected'))
+      const owner = await Promise.allSettled([
+        this.host.closeTerminals(this),
+        this.peer?.dispose(),
+      ]);
+      if (
+        [...children, ...owner].some((result) => result.status === 'rejected')
+      )
         throw Error('PRINCIPAL_JOIN_UNKNOWN');
       this.detach();
       this.host.scopes.delete(this.issue.scopeId);
       // The registration waits this very close; withdrawing it must not await
       // itself. It owns no additional I/O beyond the resources joined above.
       void this.unregister?.().catch(() => {});
-    });
+    }));
     this.active = false;
     this.bindings = [];
     this.eventBindings = [];
     this.eventSessions.clear();
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
-    return this.closing;
+    return attempt;
   }
 }
 
@@ -427,6 +452,8 @@ class PrincipalService extends TypertRemoteService {
     'sessionController',
   ];
   readonly scopes = new Map<string, Scope>();
+  private readonly terminalOwners = new Map<string, Scope>();
+  private readonly terminalStop = new AbortController();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: {
@@ -448,6 +475,7 @@ class PrincipalService extends TypertRemoteService {
     );
     hostContext.effect(() => async () => {
       this.stopped = true;
+      this.terminalStop.abort(closed());
       if (this.graphObserver) await this.graphObserver.close();
       else await this.graphRetirement;
     });
@@ -466,6 +494,72 @@ class PrincipalService extends TypertRemoteService {
       if (failures.size)
         throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
     });
+  }
+  async closeTerminals(scope: Scope) {
+    if (!scope.terminals.size) return;
+    // This is the actual guest Host, not the disconnected browser or its
+    // Worker peer. The local peer is used only for owned terminal cleanup.
+    const peer = this.hostContext.connection.createPeer({
+      principal: { kind: 'owner' },
+      interactions: 'answer',
+    });
+    const active = AbortSignal.any([peer.signal, this.terminalStop.signal]);
+    try {
+      const results = await Promise.allSettled(
+        [...scope.terminals.values()].map(async (reservation) => {
+          let backoff = 100;
+          // Preserve the same cleanup and downlink across provider failures.
+          // Only an exact confirmation completes the remote scope's close.
+          while (!active.aborted) {
+            if (await this.confirmTerminalClosed(reservation.ref, peer)) {
+              this.forgetTerminal(reservation);
+              return;
+            }
+            await delay(backoff, undefined, { signal: active, ref: false });
+            backoff = Math.min(backoff * 2, 1000);
+          }
+          throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
+        }),
+      );
+      if (results.some((result) => result.status === 'rejected'))
+        throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
+    } finally {
+      await peer.dispose();
+    }
+  }
+  private async confirmTerminalClosed(ref: TerminalRef, peer: PeerScope) {
+    try {
+      await this.ctx.typertGateway.invoke({
+        namespace: 'terminal',
+        method: 'close',
+        args: ref,
+        peer,
+      });
+      return true;
+    } catch {
+      // The native Agent may already have exited. Confirm against the
+      // controller's inventory after all dispatched creation jobs have joined.
+      try {
+        const remaining = terminalList.parse(
+          await this.ctx.typertGateway.invoke({
+            namespace: 'terminal',
+            method: 'list',
+            args: { sessionId: ref.agentId },
+            peer,
+          }),
+        );
+        return remaining.every(({ id }) => id !== ref.id);
+      } catch {
+        return false;
+      }
+    }
+  }
+  private forgetTerminal(reservation: TerminalReservation) {
+    const key = terminalKey(reservation.ref);
+    const scope = this.terminalOwners.get(key);
+    if (scope?.terminals.get(key) !== reservation) return;
+    scope.terminals.delete(key);
+    this.terminalOwners.delete(key);
   }
   /** Internal Cordis consumer of the installed native graph revision. The
    * existing private stream reports withdrawal before any scope join. */
@@ -932,18 +1026,71 @@ class PrincipalService extends TypertRemoteService {
           endpoint === 'subagents/prompt';
         if (endpoint === 'session/attachment')
           throw Error('PRINCIPAL_RESOURCE_DENIED');
-        const value = await this.ctx.typertGateway.invoke({
-          namespace: descriptor.namespace,
-          method: descriptor.method,
-          args,
-          peer: modelInput ? scope.currentPeer() : scope.parent,
-          signal: active,
-        });
+        const closingKey =
+          endpoint === 'terminal/close'
+            ? terminalKey(terminalRef.parse(args))
+            : undefined;
+        const closingTerminal =
+          closingKey &&
+          this.terminalOwners.get(closingKey)?.terminals.get(closingKey);
+        let terminal: TerminalReservation | undefined;
+        if (endpoint === 'terminal/create') {
+          if (scope.issue.access !== 'page' || !scope.issue.terminalOwner)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
+          const { agentId, request } = terminalCreate.parse(args);
+          const ref = { agentId, id: request.id };
+          const key = terminalKey(ref);
+          const existing = this.terminalOwners.get(key);
+          if (existing && existing !== scope)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
+          // Reserve before native dispatch, even if its reply is later lost.
+          terminal = scope.terminals.get(key) ?? {
+            ref,
+            pending: 0,
+            possiblyAllocated: false,
+          };
+          terminal.pending++;
+          scope.terminals.set(key, terminal);
+          this.terminalOwners.set(key, scope);
+        }
+        let value: unknown;
+        try {
+          value = await this.ctx.typertGateway.invoke({
+            namespace: descriptor.namespace,
+            method: descriptor.method,
+            args,
+            peer: modelInput ? scope.currentPeer() : scope.parent,
+            signal: active,
+          });
+          if (terminal) terminal.possiblyAllocated = true;
+        } catch (error) {
+          // These rc.2 failures occur before any allocation. A success or
+          // ambiguous failure from a concurrent create still keeps ownership.
+          const code = String(remoteErrorOf(error)?.code);
+          if (
+            terminal &&
+            code !== 'terminal/limit-reached' &&
+            code !== 'gateway/arguments-invalid'
+          )
+            terminal.possiblyAllocated = true;
+          throw error;
+        } finally {
+          if (terminal) {
+            terminal.pending--;
+            if (!terminal.pending && !terminal.possiblyAllocated)
+              this.forgetTerminal(terminal);
+          }
+        }
+        if (closingTerminal) this.forgetTerminal(closingTerminal);
         active.throwIfAborted();
+        const visible =
+          endpoint === 'settings/describe'
+            ? { ...object.parse(value), hasDocument: false }
+            : value;
         return {
           kind: 'page',
           endpoint,
-          ...encodePageNativeResult(descriptor, value),
+          ...encodePageNativeResult(descriptor, visible),
         };
       }, active);
     });
@@ -954,33 +1101,63 @@ class PrincipalService extends TypertRemoteService {
     signal: AbortSignal,
   ): RemoteStream<
     DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError,
-    CloseCommand
+    CloseCommand | DEntryPageInput
   > {
     const { args, invocation } = this.raw('allricePrincipal/streamScoped');
     const raw = object.parse(args.call);
     const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
     const gate = signalGate(signal);
-    const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
-    const pump = commands(input, gate.stop);
-    void pump.catch(() => gate.stop());
+    const commands = invocation.uplink<CloseCommand | DEntryPageInput>();
+    const input = commands[Symbol.asyncIterator]();
     let iterator: AsyncIterator<unknown> | undefined,
       pending: Promise<IteratorResult<unknown>> | undefined;
     let closing: Promise<void> | undefined;
     let eventReady = false;
     const events = raw.kind === 'events';
     const page = raw.kind === 'page';
+    const endpoint = page ? z.string().parse(raw.endpoint) : undefined;
+    const inbox = endpoint === undefined ? undefined : pageUplink(endpoint);
     let pageMethod: ReturnType<PrincipalService['pageMethod']> | undefined;
+    let inputFailure: unknown;
+    const pump = pumpPageInput(input, (command) => {
+      if (
+        !inbox ||
+        (command.type === 'input' &&
+          pageMethod &&
+          !pageMethod.descriptor.uplink)
+      )
+        throw new RemoteError(
+          'gateway/protocol',
+          'Native stream does not accept input',
+          { endpoint: endpoint ?? '' },
+        );
+      inbox.add(command);
+    })
+      .catch((error: unknown) => {
+        inputFailure = error;
+      })
+      .finally(gate.stop);
     const active = AbortSignal.any([scope.abort.signal, gate.abort.signal]);
+    if (inbox) {
+      if (active.aborted) inbox.close();
+      else active.addEventListener('abort', inbox.close, { once: true });
+    }
     const setup = scope.own(async () => {
       active.throwIfAborted();
       if (page) {
         iterator = await scope.current(async () => {
           pageMethod = this.pageMethod(scope, raw, 'stream');
-          const { endpoint, args } = pageMethod;
+          const { endpoint, args, descriptor } = pageMethod;
+          if (!descriptor.uplink && inbox && inbox.hasItems())
+            throw new RemoteError(
+              'gateway/protocol',
+              'Native stream does not accept input',
+              { endpoint },
+            );
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
-            empty,
+            (descriptor.uplink && inbox) || empty,
             endpoint === 'remoteAccess/follow'
               ? scope.currentPeer()
               : scope.parent,
@@ -1067,6 +1244,7 @@ class PrincipalService extends TypertRemoteService {
             throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
           scope.children.delete(child);
         });
+        if (inbox) inbox.close();
         gate.stop();
         return closing;
       },
@@ -1117,7 +1295,11 @@ class PrincipalService extends TypertRemoteService {
           );
           if (value === undefined || attachments.length)
             throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
-          yield { type: 'page-item', scopeId: scope.issue.scopeId, value };
+          yield {
+            type: 'page-item',
+            scopeId: scope.issue.scopeId,
+            value: pageDownlink(pageMethod.endpoint, value),
+          };
           continue;
         }
         let value: Extract<DEntryScopedStreamFrame, { type: 'item' }>['value'];
@@ -1161,10 +1343,16 @@ class PrincipalService extends TypertRemoteService {
             .parse(next.value);
         yield { type: 'item', scopeId: scope.issue.scopeId, value };
       }
+      if (inputFailure !== undefined) throw inputFailure;
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
-      if (page && !active.aborted && !signal.aborted) {
+      if (
+        page &&
+        !scope.abort.signal.aborted &&
+        !signal.aborted &&
+        (!active.aborted || error === inputFailure)
+      ) {
         await child.close();
         const failure = this.ctx.typertGateway.wireStream.failure(error);
         yield {

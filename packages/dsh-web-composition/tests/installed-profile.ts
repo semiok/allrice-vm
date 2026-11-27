@@ -215,6 +215,7 @@ export async function startInstalledProfile(
   options: {
     fixtureGlobals?: Record<string, unknown>;
     referenceOnly?: boolean;
+    hostFixture?: Readonly<{ source: URL; patch: object[] }>;
   } = {},
 ) {
   const composition = installedFixtureComposition(options.referenceOnly);
@@ -330,7 +331,12 @@ export async function startInstalledProfile(
         },
       }),
     );
-    await writeFile(join(fixture, 'index.js'), 'export function apply() {}\n');
+    await writeFile(
+      join(fixture, 'index.js'),
+      options.hostFixture
+        ? await readFile(options.hostFixture.source, 'utf8')
+        : 'export function apply() {}\n',
+    );
     const globals = Object.entries(options.fixtureGlobals ?? {})
       .map(
         ([key, value]) =>
@@ -368,6 +374,7 @@ export async function startInstalledProfile(
         { id: 'session-title-llm', disabled: true },
         { id: 'agent-instructions', disabled: true },
         ...composition.patch,
+        ...(options.hostFixture?.patch ?? []),
       ]),
     );
     await mkdir(join(dshHome, 'storages'), { recursive: true });

@@ -59,6 +59,7 @@ import {
 import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
+  primeWorkerEmployeeWebRelease,
   readReleasedGuestProfile,
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
@@ -703,6 +704,7 @@ export function createProductionPersonVmHost(input: {
           };
         },
       );
+      await primeWorkerEmployeeWebRelease(lifetime);
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every

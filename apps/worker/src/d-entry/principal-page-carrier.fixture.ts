@@ -86,6 +86,7 @@ export async function fixture(
   release?: ProfileProof,
   newRoot = false,
   rootless = false,
+  cleanupTimeoutMs = 3000,
 ) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
@@ -123,7 +124,7 @@ export async function fixture(
   const carrier = new AbortController();
   const control = createDEntryPrincipalControl(host.node, {
     carrier: carrier.signal,
-    cleanupTimeoutMs: 3000,
+    cleanupTimeoutMs,
   });
   let controlCloseChecked = false;
   closes.push(async () => {
@@ -215,6 +216,12 @@ export async function fixture(
   });
   const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
+  const watchTerminal = vi.fn<
+    NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
+  >(async (...args) => {
+    await args[4].verifyRoster(args[3]);
+    return f.deps.watch();
+  });
   const pages = createDEntryPageRequests({
     ...f.deps,
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
@@ -226,6 +233,7 @@ export async function fixture(
     historyIdentity,
     registerRoot,
     findRoot,
+    watchTerminal,
     historyRoot: (...args) =>
       pinned ? selectedRoot(...args) : Promise.resolve(null),
   });
@@ -442,6 +450,7 @@ export async function fixture(
     prepareEditorRoot,
     registerRoot,
     findRoot,
+    watchTerminal,
     host,
     connect,
     invoke,
@@ -460,6 +469,7 @@ export async function fixture(
     pageSignals,
     profileCompletion,
     closeProfile: profile.close,
+    closeControl: control.close,
     async checkUnknownControlClose() {
       controlCloseChecked = true;
       await expect(control.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');

@@ -12,6 +12,7 @@ export class EmployeeEntryError extends Error {
   constructor(
     readonly status: number,
     readonly code?: 'UPGRADE_OPEN_REQUIRED',
+    readonly reason?: 'response-mismatch',
   ) {
     super('Employee entry is unavailable');
   }
@@ -194,6 +195,6 @@ export async function prepareEmployeeEntry(
     !next.threadId ||
     (operationId && operationId !== next.threadId)
   )
-    throw new EmployeeEntryError(403);
+    throw new EmployeeEntryError(403, undefined, 'response-mismatch');
   return next;
 }

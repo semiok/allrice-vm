@@ -30,8 +30,6 @@ export function requirePageNativeMethod(
   if (
     !method ||
     (method.mode ?? 'unary') !== mode ||
-    // The page mux carries downlink items and the existing close/cancel only.
-    method.uplink !== undefined ||
     isRetainedPageRestriction(method) ||
     !/^@deepseek-ai\/dsh(?:-[a-z0-9-]+)?#/u.test(method.id) ||
     !method.id.endsWith(`#${endpoint}`) ||

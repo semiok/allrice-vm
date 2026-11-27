@@ -23,6 +23,7 @@ import {
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
 import type * as ScheduledWake from './production-scheduled-wake.js';
+import type * as ReleasedProfile from '../d-entry/released-profile.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -75,6 +76,10 @@ const io = vi.hoisted(() => ({
         gateway: ReturnType<typeof Egress.createEgressGateway>,
       ) => void
     >(),
+}));
+vi.mock('../d-entry/released-profile.js', async (original) => ({
+  ...(await original<typeof ReleasedProfile>()),
+  primeWorkerEmployeeWebRelease: async () => {},
 }));
 vi.mock('./production-disk-preprovision.js', () => ({
   startProductionDiskPreprovision: io.diskPreprovision,
