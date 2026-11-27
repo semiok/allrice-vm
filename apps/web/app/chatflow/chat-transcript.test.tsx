@@ -260,7 +260,7 @@ describe('historical transcript capability gating', () => {
         {
           ...messages[0]!,
           status: 'pending',
-          content: { text: 'Rice 正在处理…' },
+          content: { text: '员工正在处理…' },
         },
       ],
       undefined,
@@ -271,7 +271,7 @@ describe('historical transcript capability gating', () => {
     expect(html.match(/>思考中…</g)).toHaveLength(1);
     expect(html).toContain('data-executing="true"');
     expect(html).not.toContain('data-shimmer-text');
-    expect(html).not.toContain('Rice');
+    expect(html).not.toContain('员工正在处理');
     expect(html).not.toContain('子智能体任务');
   });
   it('shows native compaction with the running process open and its detail collapsed, then clears the status after completion or failure', () => {
@@ -307,7 +307,7 @@ describe('historical transcript capability gating', () => {
           {
             ...messages[0]!,
             status: 'pending',
-            content: { text: 'Rice 正在处理…' },
+            content: { text: '员工正在处理…' },
           },
         ],
         undefined,
@@ -364,7 +364,7 @@ describe('historical transcript capability gating', () => {
         {
           ...messages[0]!,
           status: 'pending',
-          content: { text: 'Rice 正在处理…' },
+          content: { text: '员工正在处理…' },
         },
       ],
       undefined,
@@ -401,7 +401,7 @@ describe('historical transcript capability gating', () => {
     expect(html).toContain('data-streaming="true"');
     expect(html).not.toContain('思考中');
     expect(html).not.toContain('正在生成回复');
-    expect(html).not.toContain('Rice 正在处理');
+    expect(html).not.toContain('员工正在处理');
   });
   it('shows elapsed time once without allowing an empty work process to expand', () => {
     const html = render(

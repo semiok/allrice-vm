@@ -15,6 +15,7 @@ import {
   startClaimedJob,
 } from './execution/queue.ts';
 import { createCompletedRunFixture } from './completed-run.fixture.ts';
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { createChatSession, sendChatMessage } from './workspace/service.ts';
 import { getSessionRunTimings } from './conversation/interaction-status.ts';
 import { createTaskProgressRuntime } from './task-progress.ts';
@@ -1199,8 +1200,13 @@ suite('MET-210 PR4a chat boundaries and populated-schema upgrade', () => {
       workspaceId: f.workspace,
       title: '同属主的其他会话',
     });
+    const neighborAssignment = await createTestEmployeeAssignment(
+      f.neighbor,
+      f.workspace,
+    );
     const neighborSession = await createChatSession(f.neighbor, {
       workspaceId: f.workspace,
+      employeeAssignmentId: neighborAssignment.id,
       title: '同工作区的其他属主',
     });
     const sources = [

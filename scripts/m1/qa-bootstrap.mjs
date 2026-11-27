@@ -145,11 +145,9 @@ const orgDetail = await call(
   'GET',
   `/api/v1/admin/organizations/${org.id}`,
 );
-const workspaceId =
-  orgDetail.organization?.workspaceId ??
-  orgDetail.workspaceId ??
-  orgDetail.organization?.workspaces?.[0]?.id;
-if (!workspaceId) throw new Error('could not resolve QA workspace');
+const workspaceId = orgDetail.organization?.defaultWorkspaceId;
+if (orgDetail.organization?.id !== org.id || !workspaceId)
+  throw new Error('could not resolve QA default workspace');
 
 // 3. Member account: create (reusing the password in --creds when present), or reset
 // the password when our creds file is missing.

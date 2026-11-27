@@ -131,7 +131,8 @@ if [[ "${employee_catalog_empty}" != "t" ]]; then
   echo "Database preparation populated an employee catalog" >&2
   exit 1
 fi
-fixture_employee_id="$(docker compose --project-name "${compose_project}" exec -T worker \
+fixture_employee_id="$(docker compose --project-name "${compose_project}" exec -T \
+  -e ALLRICE_PLATFORM_ADMIN_EMAILS worker \
   node --input-type=module - "${bootstrap_organization_id}" "${bootstrap_workspace_id}" "$(printf '%s' "${bootstrap_json}" | jq -r '.userId')" <<'JS'
 import { DefaultPartnerProfile } from './packages/contracts/dist/index.js';
 import { authenticateSession, closeDatabase, createEmployee, createSession } from './packages/database/dist/index.js';
