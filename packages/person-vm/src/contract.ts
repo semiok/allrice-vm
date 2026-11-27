@@ -69,9 +69,8 @@ export interface PersonVmAuthority {
   }>;
 }
 
-/** Host-derived storage target only. A rollout revision is not a user session
- * or permission to start a VM. */
-export type PersonVmDiskPreparationTarget = Readonly<
+/** Exact employee profile checked by the current authenticated entry authorizer. */
+export type PersonVmEmployeeSelection = Readonly<
   Pick<
     DEntryIdentity,
     | 'personId'
@@ -80,8 +79,13 @@ export type PersonVmDiskPreparationTarget = Readonly<
     | 'employeeInstanceId'
     | 'employeeRevision'
     | 'employeeVersionId'
-  > & { platformRevisionId: string | null; policyRevision: string }
+  >
 >;
+
+/** Host-derived storage target only. A rollout revision is not a user session
+ * or permission to start a VM. */
+export type PersonVmDiskPreparationTarget = PersonVmEmployeeSelection &
+  Readonly<{ platformRevisionId: string | null; policyRevision: string }>;
 
 export interface PersonVmDiskPreparationPort {
   /** The provider owns the existing person lease and joins all disk I/O and
@@ -226,7 +230,11 @@ export interface PersonVmPort {
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
+    input: {
+      trigger: 'page' | 'input';
+      target?: PersonVmPrewarmFence;
+      selectedEmployee?: PersonVmEmployeeSelection;
+    },
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

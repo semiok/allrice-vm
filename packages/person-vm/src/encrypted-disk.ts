@@ -65,7 +65,11 @@ export interface PersonVmDiskPort {
     signal: AbortSignal,
     expected?: Readonly<{ image: PersonVmDiskIdentity; acrossTier?: true }>,
   ): Promise<PersonVmMountInspection>;
-  create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
+  /** Returns the creation identity only when this call formatted a new image. */
+  create(
+    disk: PersonDisk,
+    signal: AbortSignal,
+  ): Promise<PersonVmDiskIdentity | void>;
   attach(
     disk: PersonDisk,
     signal: AbortSignal,
@@ -623,19 +627,16 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
         constants.O_NOFOLLOW,
       0o600,
     );
+    const identity = { device: String(stat.dev), inode: String(stat.ino) };
     try {
       await receipt.writeFile(
-        JSON.stringify({
-          version: 1,
-          vmId: disk.vmId,
-          device: String(stat.dev),
-          inode: String(stat.ino),
-        }),
+        JSON.stringify({ version: 1, vmId: disk.vmId, ...identity }),
       );
       await receipt.sync();
     } finally {
       await receipt.close();
     }
+    return Object.freeze(identity);
   }
   async attach(
     disk: PersonDisk,

@@ -147,7 +147,7 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
       capacityGiB: 40,
       runner,
     });
-    await disk.create(ref, signal());
+    const freshImage = await disk.create(ref, signal());
     const image = join(volume, 'warm', ref.vmId + '.sparseimage');
     expect((await lstat(image)).mode & 0o777).toBe(0o600);
     expect((await lstat(join(keyRoot, ref.vmId + '.key'))).mode & 0o777).toBe(
@@ -159,6 +159,8 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
     if (initialMount.state === 'unknown')
       throw new Error('Missing disk identity');
     const originalImage = initialMount.image;
+    expect(freshImage).toEqual(originalImage);
+    await expect(disk.create(ref, signal())).resolves.toBeUndefined();
     expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
     const dispatched = vi.fn();
     const mount = await disk.attach(ref, signal(), dispatched);

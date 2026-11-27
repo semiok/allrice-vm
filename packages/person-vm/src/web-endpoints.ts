@@ -9,7 +9,11 @@ import {
   UuidSchema,
   type RequestContext,
 } from '@allrice/contracts';
-import { PersonVmError, type PersonVmBinding } from './contract.ts';
+import {
+  PersonVmError,
+  type PersonVmBinding,
+  type PersonVmEmployeeSelection,
+} from './contract.ts';
 
 export type PersonVmWebRoster = Readonly<{
   personId: string;
@@ -44,6 +48,9 @@ export type NativeWebSetupFailure = Readonly<{
 export type PersonVmWebStartup = Readonly<{
   context: RequestContext;
   receipt: PersonVmWebEndpointReceipt;
+  selectedEmployee?: PersonVmEmployeeSelection;
+  /** Proven on this start lease before guest profile staging. */
+  unusedEmployeeHomes?: true;
   recordNativeFailure?(
     failure: NativeWebSetupFailure,
     signal: AbortSignal,
