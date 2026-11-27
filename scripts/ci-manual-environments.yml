@@ -94,7 +94,7 @@ files:
     - apps/web/app/chatflow/brand-content-panel.test.tsx
     - scripts/test-proxy.browser.test.mjs
     - apps/web/server/project-preview.test.mjs
-    - scripts/m1/smoke-reply.browser.test.mjs
+    - scripts/m1/smoke-entry.browser.test.mjs
   browser+db:
     - apps/web/lib/d-entry/employee-panels-http.integration.test.ts
     - apps/web/app/chatflow/candidate-memory.browser.test.ts

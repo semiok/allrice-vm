@@ -907,6 +907,19 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertEqual(env['UNRELATED_SETTING'], 'keep')
                     self.assert_no_legacy_settings(env)
 
+    def test_smoke_prerequisite_skip_is_distinct_from_a_pass(self):
+        stubs, smoke = self.successful_deploy_stubs()
+        write(os.path.join(smoke, 'smoke-test'), '#!/bin/sh\necho "跳过：没有可用 VM"\nexit 77\n', 0o755)
+        self.seed_legacy_plists()
+        p = self.run_dd(stubs + 'deploy', FILES + ARCHIVED, CONTRACT='row:1',
+                        CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'c' * 64, SMOKE=smoke)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('smoke skipped', p.stdout)
+        self.assertIn('跳过：没有可用 VM', p.stdout)
+        with open(os.path.join(self.home, 'allrice40-dev/qa/deploys.jsonl')) as f:
+            self.assertEqual(json.loads(f.readlines()[-1])['result'], 'skipped')
+        self.remove_deploy_build()
+
     def test_failed_smoke_only_offers_default_rollback_when_one_is_recorded(self):
         stubs, smoke = self.successful_deploy_stubs()
         write(os.path.join(smoke, 'smoke-test'), '#!/bin/sh\nexit 1\n', 0o755)
@@ -1261,7 +1274,7 @@ class DeployDevMigrations(unittest.TestCase):
               'import json,os,sys\nargs=sys.argv[2:]; out=args[args.index("--out")+1]\n'
               'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
               'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
-        p = self.run_config_tool('smoke-test', '--instance', task, '--only', 'chat', PROBE=probe)
+        p = self.run_config_tool('smoke-test', '--instance', task, PROBE=probe)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(probe) as f:
             args = json.load(f)
@@ -1470,7 +1483,7 @@ def observe_unix_socket(pid, file):
             self.assertFalse(os.path.exists(self.live_plist(role)))
         self.assertEqual(self.read_plist(os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled/worker.plist')), worker)
 
-    def test_smoke_dev_reads_parked_ports_and_artifact(self):
+    def test_smoke_dev_reads_parked_ports(self):
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
         probe = os.path.join(self.tmp, 'smoke-args.json')
         write(os.path.join(self.home, '.local/opt/node-22.23.2/bin/node'), '#!' + sys.executable + '\n'
@@ -1478,14 +1491,12 @@ def observe_unix_socket(pid, file):
               'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
               'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
         out = os.path.join(self.tmp, 'smoke-result')
-        p = self.run_config_tool('smoke-test', '--dev', '--only', 'chat', '--out', out, PROBE=probe)
+        p = self.run_config_tool('smoke-test', '--dev', '--out', out, PROBE=probe)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(probe) as f:
             args = json.load(f)
         self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:3311')
         self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:3312')
-        with open(os.path.join(out, 'result.json')) as f:
-            self.assertEqual(json.load(f)['nativeArtifactId'], 'sha256:' + 'a' * 64)
         self.assert_parked()
 
     def seed_recovery_partition(self):

@@ -18,8 +18,6 @@
     "packages/client/ui-conversation/src/client/skeleton/InputBar.module.css",
     "packages/client/ui-conversation/src/client/queue/QueueDock.module.css",
     "packages/client/ui-primitives/src/icons/index.tsx (six QueueDock glyphs and Think glyph)",
-    "packages/client/ui-primitives/src/DisclosureRow.tsx",
-    "packages/client/ui-primitives/src/DisclosureRow.module.css",
     "packages/client/ui-conversation/src/client/chat/ReasoningRow.module.css"
   ],
   "adaptations": [
@@ -36,18 +34,6 @@
       "productChanges": "The existing host-added mobile section dropdown uses shared SelectField, like all ordinary host selects. Native rc.2 exposes no general Select; browser options, values and keyboard behavior remain native."
     },
     {
-      "source": "packages/client/ui-layout/src/client/AppFrame.tsx",
-      "target": "apps/web/app/chatflow/workbench-splitter.tsx",
-      "reuse": "DragHandle pointer capture, animation-frame throttling, frozen drag origin and frame ResizeObserver; native AppFrame handle/detailsCol CSS",
-      "productChanges": "Shared sidebar / deliverables splitter; sidebar 240–420px and deliverables 340px–80vw with protected conversation width; scoped width preferences, cancellation cleanup, keyboard resizing and double-click reset"
-    },
-    {
-      "source": "packages/client/ui-conversation/src/client/queue/QueueDock.tsx",
-      "target": "apps/web/app/chatflow/queued-messages-dock.tsx",
-      "reuse": "Native single-row / collapsed count list, awaited actions, unmodified QueueDock CSS and six native icons",
-      "productChanges": "PostgreSQL authoritative inbox instead of local runtime store; edit returns text and attachments to composer; tenant-scoped remove/steer; no browser scheduler"
-    },
-    {
       "source": "packages/client/ui-primitives/src/DisclosureRow.tsx; packages/client/ui-primitives/src/TextShimmer.tsx; packages/client/ui-tool/src/client/tool/components/ToolRow.tsx",
       "target": "apps/web/app/chatflow/work-process.tsx; apps/web/app/chatflow/work-process-step.tsx",
       "reuse": "Direct public DisclosureRow from 0.2.1-rc.2; existing pinned native process grouping, event pulse and presentation policy. No new private component copy: ToolRow cannot host authorized SaaS material/approval React nodes or shared reading-state aliases, so its public disclosure primitive remains the host seam.",
@@ -58,12 +44,6 @@
       "target": "apps/web/app/chatflow/workbench.module.css",
       "reuse": "Unmodified native SidebarRight visibility and host structure, native duration and easing, official DockLayout tabs and floating panes.",
       "productChanges": "Keep the inherited dock opening offset on the panel parent so tab visibility changes never replay the entrance. Only docked hosts inherit translation; floating panes stay independent. Reduced motion remains supported."
-    },
-    {
-      "source": "packages/client/ui-chat/src/client/chat/TurnNavigator.tsx",
-      "target": "apps/web/app/chatflow/dsh-upstream/turn-navigation/TurnNavigator.tsx",
-      "reuse": "Official virtual rail, hover/focus previews, active marks, independent rail scrolling, reduced motion, original stylesheet and bounded preview helper. Component behavior is unchanged; host type imports and a scoped official theme class are adapted.",
-      "productChanges": "Map existing Allrice user/assistant messages to loaded turns and Chinese labels; connect transcript anchors, reading position and composer/viewport measurements. Navigating back pauses automatic following. No new endpoint, model call or persisted content."
     },
     {
       "source": "packages/client/ui-chat/src/client/chat/TurnTriggerNodeView.tsx; turn-trigger.ts",
@@ -473,14 +453,14 @@
           "target": "apps/web/app/chatflow/dsh-upstream/document/image/ImageBody.tsx; native-image-preview.tsx; native-pdf-preview.tsx",
           "reuse": "Native image/PDF ZoomViewport fit-width, actual-size cap, zoom controls, anchoring and scroll ownership.",
           "productChanges": "User-approved deliverable canvas inset reduction: image host supplies optional horizontalInset 16 for native padding 8 per side, while other ImageBody callers retain the native default 24. Delivery PDF/converted Word/PPT supply horizontalInset 12 through the public ZoomViewport injection seat for padding 6 per side. Host CSS aligns PDF/Word/PPT top spacing, including Office image pages, with Markdown/Excel at desktop 12px and mobile 8px; side spacing, native zoom and centering remain unchanged. Markdown/Excel/image outer padding is halved without changing paper content padding or TXT/JSON.",
-          "upgradeChecks": "Replay the existing ImageBody source adapter patch; verify default horizontalInset 24 and forwarding to native ZoomViewport. workbench-layout.browser.test.ts checks six delivery types in light/dark desktop/phone, actual paper geometry within 0.5px and image zoom percentage against displayed width.",
+          "upgradeChecks": "Replay the existing ImageBody source adapter patch and verify default horizontalInset 24 and forwarding to native ZoomViewport. Recheck image and document surface sizing against the retained preview suite.",
           "removalCriteria": "Remove the ImageBody inset source adaptation when native ImageBody exposes an equivalent host sizing prop; keep user-approved host canvas spacing."
         },
         {
           "target": "apps/web/app/chatflow/native-excel-scroll.ts; native-excel-preview.tsx",
           "reuse": "Unmodified ExcelBody 0.2.1-rc.2, including Fortune Sheet 1.0.4 internal scrolling and existing zoom buttons; XLSX/XLS/CSV share this host.",
           "productChanges": "MET-225 user-approved private DOM exception: capture ordinary wheel only within [data-excel-preview] .fortune-sheet-container, read its unique .luckysheet-scrollbar-x/y boundaries, and stop propagation without preventing the default at an edge or without overflow. The browser scrolls the outer reader. Ctrl/Meta wheel stays native; no zoom, layout or package patch.",
-          "upgradeChecks": "The pinned client.excel.js asset hash is verified by dsh-ui:verify. workbench-layout.browser.test.ts mounts real XLSX and CSV, asserts the private grid and both scrollbar selectors, verifies inner scrolling, bidirectional edge chaining, fit-content forwarding, footer buttons and native button zoom. Review this contract on every DSH upgrade.",
+          "upgradeChecks": "The pinned client.excel.js asset hash is verified by dsh-ui:verify. Use the retained native-document-preview and native-scroll-chain browser suites to check that native Excel mounts and scrolling stays inside its intended reader.",
           "removalCriteria": "Remove the private DOM adapter when ExcelBody exposes native scroll chaining or a public boundary configuration."
         }
       ],
@@ -748,60 +728,6 @@
       ]
     },
     {
-      "id": "turn-navigation",
-      "version": "0.2.1-rc.2",
-      "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
-      "license": "MIT",
-      "integration": "native-source-with-recorded-adapter-patches",
-      "files": [
-        {
-          "source": "packages/client/ui-chat/src/client/chat/TurnNavigator.tsx",
-          "target": "apps/web/app/chatflow/dsh-upstream/turn-navigation/TurnNavigator.tsx",
-          "upstreamSha256": "be03cfad53e5b0211651ba17a3d5170872139c8f3d7c086e60625f5d38a0998f",
-          "sha256": "113152f7b3120014365eff814317928834a80e1d0c65547fc14a32d9b976fd96",
-          "patch": "scripts/dsh-ui-patches/TurnNavigator.tsx.patch",
-          "patchSha256": "c8b26439ccada35b23d2d255118bbf33dd278642663e30c0c25f3fd01105fd21"
-        },
-        {
-          "source": "packages/client/ui-chat/src/client/chat/TurnNavigator.module.css",
-          "target": "apps/web/app/chatflow/dsh-upstream/turn-navigation/TurnNavigator.module.css",
-          "upstreamSha256": "114ad82f41d9676dfd39ee6c8f9c239fcbbe343f9555dc9fbaea4814d9b8acdc",
-          "sha256": "114ad82f41d9676dfd39ee6c8f9c239fcbbe343f9555dc9fbaea4814d9b8acdc"
-        },
-        {
-          "source": "packages/client/ui-theme/src/styles/gradient-shadow-text.css",
-          "target": "apps/web/app/chatflow/dsh-upstream/turn-navigation/theme.module.css",
-          "upstreamSha256": "b6e1e8387edbfa60ec03bb29aad7c01245c0adbd22229d5a6f2916caa7e7b427",
-          "sha256": "5f834bf513397ecbee8ca2e6f955acb255381636ea9a284b0531e7b29de7a3e5",
-          "patch": "scripts/dsh-ui-patches/TurnNavigator-theme.css.patch",
-          "patchSha256": "618d14d511f84b936a1557c33952029460698b20cdb8d5b78c7a1dd19f94bce6"
-        }
-      ],
-      "excerpts": [
-        {
-          "source": "packages/client/ui-chat/src/client/conversation-nodes/turn-navigation.ts",
-          "symbol": "preview",
-          "target": "apps/web/app/chatflow/dsh-upstream/turn-navigation/preview.ts",
-          "sha256": "e9d2f8a9070c29bcefda575a8c9d7d0836ed6334d7ae979c99a6260db460baed",
-          "upstreamSymbolSha256": "e24f89830310740b4b13a7ce102538b79aa0446a8ecbf089c4d51f3523f7baa9",
-          "requiredDeclaration": "const PROMPT_PREVIEW_LIMIT = 50\nconst RESPONSE_PREVIEW_LIMIT = 120"
-        }
-      ],
-      "packages": [
-        {
-          "name": "@tanstack/react-virtual",
-          "version": "3.14.9",
-          "exports": [
-            "useVirtualizer",
-            "elementScroll",
-            "observeElementOffset",
-            "defaultRangeExtractor"
-          ],
-          "external": true
-        }
-      ]
-    },
-    {
       "id": "message-feedback",
       "version": "0.2.1-rc.2",
       "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
@@ -1025,135 +951,6 @@
       ]
     },
     {
-      "id": "native-task-plan",
-      "version": "0.2.1-rc.2",
-      "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
-      "license": "MIT",
-      "integration": "native-source-with-recorded-adapter-patches",
-      "files": [
-        {
-          "source": "packages/client/ui-conversation/src/client/skeleton/TodoPanel.tsx",
-          "target": "apps/web/app/chatflow/dsh-upstream/todo/TodoPanel.tsx",
-          "upstreamSha256": "8be70f4479c1984ca7e58ea089d0121b42855bb8dc5f16b05b2e643c4bbe3d55",
-          "sha256": "b10a6f484184ca3987829a662823bd5a9f495f82575aa795b2d3547ad49d3177",
-          "patch": "scripts/dsh-ui-patches/TodoPanel.tsx.patch",
-          "patchSha256": "47b042eafaf058c64d089b4664e5638f7a093fa78c77a5d69e787ea10a5fa8a4"
-        },
-        {
-          "source": "packages/client/ui-conversation/src/client/skeleton/TodoPanel.module.css",
-          "target": "apps/web/app/chatflow/dsh-upstream/todo/TodoPanel.module.css",
-          "upstreamSha256": "4177256462b4cde12c43eabc6433216bf2747cefcf911a93b4d1f1a2568011cc",
-          "sha256": "4177256462b4cde12c43eabc6433216bf2747cefcf911a93b4d1f1a2568011cc"
-        }
-      ],
-      "packages": [
-        {
-          "name": "@deepseek-ai/dsh-client-ui-primitives",
-          "version": "0.2.1-rc.2",
-          "exports": [
-            "StateDot",
-            "IconChecklistOutlineRegular",
-            "IconChevronDownOutlineRegular",
-            "IconChevronUpOutlineRegular"
-          ],
-          "resolvedDependencies": [
-            {
-              "name": "@deepseek-ai/dsh-client-store",
-              "version": "0.2.1-rc.2"
-            },
-            {
-              "name": "@deepseek-ai/dsh-util-code-language",
-              "version": "0.2.1-rc.2"
-            },
-            {
-              "name": "@deepseek-ai/dsh-util-workspace-path",
-              "version": "0.2.1-rc.2"
-            },
-            {
-              "name": "@shikijs/langs",
-              "version": "4.3.1"
-            },
-            {
-              "name": "anser",
-              "version": "2.3.5"
-            },
-            {
-              "name": "clsx",
-              "version": "2.1.1"
-            },
-            {
-              "name": "diff",
-              "version": "9.0.0"
-            },
-            {
-              "name": "katex",
-              "version": "0.16.47"
-            },
-            {
-              "name": "mdast-util-from-markdown",
-              "version": "2.0.3"
-            },
-            {
-              "name": "mdast-util-gfm",
-              "version": "3.1.0"
-            },
-            {
-              "name": "mdast-util-math",
-              "version": "3.0.0"
-            },
-            {
-              "name": "micromark-core-commonmark",
-              "version": "2.0.3"
-            },
-            {
-              "name": "micromark-extension-gfm",
-              "version": "3.0.0"
-            },
-            {
-              "name": "micromark-extension-math",
-              "version": "3.1.0"
-            },
-            {
-              "name": "micromark-factory-space",
-              "version": "2.0.1"
-            },
-            {
-              "name": "micromark-util-character",
-              "version": "2.1.1"
-            },
-            {
-              "name": "micromark-util-classify-character",
-              "version": "2.0.1"
-            },
-            {
-              "name": "micromark-util-sanitize-uri",
-              "version": "2.0.1"
-            },
-            {
-              "name": "micromark-util-symbol",
-              "version": "2.0.1"
-            },
-            {
-              "name": "react",
-              "version": "19.2.0"
-            },
-            {
-              "name": "react-dom",
-              "version": "19.2.0"
-            },
-            {
-              "name": "shiki",
-              "version": "4.3.1"
-            },
-            {
-              "name": "simple-icons",
-              "version": "16.31.0"
-            }
-          ]
-        }
-      ]
-    },
-    {
       "id": "session-archive",
       "version": "0.2.1-rc.2",
       "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
@@ -1238,16 +1035,6 @@
           "sha256": "9aad636abc275b823557383f265f92ac3909e9141152a26472c5ddb4b33c33ef",
           "patch": "scripts/dsh-ui-patches/message-image-historical-images.ts.patch",
           "patchSha256": "7d9cfb8198ed57b9de95b8876cbd18dc16aa5a652c0ca29af959bdbe06928b7c"
-        }
-      ],
-      "excerpts": [
-        {
-          "source": "packages/client/ui-conversation/src/client/service.ts",
-          "symbol": "nextPaint",
-          "target": "apps/web/app/chatflow/dsh-upstream/images/next-paint.ts",
-          "sha256": "9618e945bd79fc11f3a87ff02aceb64f4a8114d5ed2ceb5607ae839cfc432e93",
-          "upstreamSymbolSha256": "74446ea321c8ae5afbe3f2bb74cedd286eee00cb969e756223aec07a2e649682",
-          "requiredDeclaration": "function nextPaint(): Promise<void>"
         }
       ]
     },

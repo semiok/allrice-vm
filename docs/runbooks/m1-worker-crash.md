@@ -44,7 +44,7 @@ curl -s -m 5 http://127.0.0.1:3312/health/ready | head -c 600; echo
 curl -s -m 5 http://127.0.0.1:3312/health/ready | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("detail"), (d.get("nativeOnceControl") or {}).get("state"))'
 ```
 
-`ready` 且控制器变成 `active` 就好了，再跑 `~/allrice40-dev/bin/smoke-test --dev --only reminder`（每次重启 Worker 之后都跑）。重启后仍然 blocked，看 `lastFault`，派 `gpt-6.2-sol` `max` 只读诊断；一直 `cold`（Worker 被 `kill -9`、崩溃或数据库在它运行时停掉后常见），见[手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)。
+`ready` 且控制器变成 `active` 就好了，再按[确认恢复](m1-schedule-not-fired.md#确认恢复)核对定时控制器和告警。重启后仍然 blocked，看 `lastFault`，派 `gpt-6.2-sol` `max` 只读诊断；一直 `cold`（Worker 被 `kill -9`、崩溃或数据库在它运行时停掉后常见），见[手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)。
 
 ## 内存不足、DSH 进程越积越多
 

@@ -55,6 +55,8 @@ let references = structuredClone(sample.references);
 let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
+let pdfBase64: string | undefined;
+let favoriteGate: PromiseWithResolvers<void> | undefined;
 let publicationReplyLost = false;
 let publicationRejected = false;
 let receiptReady = false;
@@ -172,6 +174,8 @@ const bound = createEmployeePanelDataClient({
   },
   async favorite(input, signal) {
     await call('favorite', input, signal);
+    if (favoriteGate) await favoriteGate.promise;
+    signal.throwIfAborted();
     files = files.map((f) =>
       f.objectId === input.objectId
         ? { ...f, favorite: input.body.favorite }
@@ -198,6 +202,8 @@ const bound = createEmployeePanelDataClient({
   },
   async previewDeliverable(input, signal) {
     await call('previewDeliverable', input, signal);
+    if (pdfBase64)
+      return { kind: 'pdf', base64: pdfBase64, missingFonts: ['Fixture Sans'] };
     return textPage(input.offset);
   },
   async previewMaterial(input, signal) {
@@ -381,10 +387,21 @@ function Fixture() {
       mutateOriginal() {
         bytes.set(uid(300), '后续另存的内容');
       },
-      refusePreview(status, code) {
+      usePdf(base64) {
+        pdfBase64 = base64;
+      },
+      holdFavorite() {
+        favoriteGate = Promise.withResolvers<void>();
+      },
+      finishFavorite() {
+        favoriteGate?.resolve();
+        favoriteGate = undefined;
+      },
+      refusePreview(status, code, refresh = true) {
         metadataStatus = status;
         metadataCode = code;
-        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+        if (refresh)
+          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
       },
       losePublicationReply() {
         publicationReplyLost = true;

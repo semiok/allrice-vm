@@ -15,33 +15,51 @@ import {
 } from './employee-profile-form';
 import { readJson } from './chatflow-utils';
 
+type EmployeeCreateDialogProps = {
+  onClose: () => void;
+  onCreated: (instance: EmployeeInstance) => void;
+  headers: Record<string, string>;
+} & (
+  | { workspace: Workspace; personal?: false }
+  | {
+      workspace: {
+        workspaceId: string;
+        organizationId: string;
+        viewerId: string;
+      };
+      personal: true;
+    }
+);
+
 export function EmployeeCreateDialog({
   workspace,
   onClose,
   onCreated,
   headers,
-}: {
-  workspace: Workspace;
-  onClose: () => void;
-  onCreated: (instance: EmployeeInstance) => void;
-  headers: Record<string, string>;
-}) {
-  const sourceId =
-    (workspace.employees.find((e) => e.isDefault) ?? workspace.employees[0])
-      ?.id ?? '';
+  personal,
+}: EmployeeCreateDialogProps) {
+  const assignmentId = personal
+    ? undefined
+    : (
+        workspace.employees.find((employee) => employee.isDefault) ??
+        workspace.employees[0]
+      )?.id;
+  const canCreate = personal === true || Boolean(assignmentId);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const request = useRef<{ payload: string; id: string } | null>(null);
   const active = useRef<AbortController | null>(null);
   useEffect(() => () => active.current?.abort(), []);
   async function createEmployee(values: EmployeeProfileFormValues) {
-    if (active.current || !sourceId || !values.name.trim()) return;
-    const profile = createEmployeeProfile(values);
-    const payload = JSON.stringify({
+    if (active.current || !canCreate || !values.name.trim()) return;
+    const input = {
       workspaceId: workspace.workspaceId,
-      assignmentId: sourceId,
-      profile,
-    });
+      ...(personal
+        ? { expectedOwnerId: workspace.viewerId }
+        : { assignmentId }),
+      profile: createEmployeeProfile(values),
+    };
+    const payload = JSON.stringify(input);
     if (request.current?.payload !== payload)
       request.current = { payload, id: crypto.randomUUID() };
     const controller = new AbortController();
@@ -54,15 +72,22 @@ export function EmployeeCreateDialog({
         headers: { ...headers, 'content-type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          workspaceId: workspace.workspaceId,
-          assignmentId: sourceId,
+          ...input,
           requestId: request.current.id,
-          profile,
         }),
       });
       const result = await readJson<{ instance: EmployeeInstance }>(response);
-      if (!controller.signal.aborted)
-        onCreated(EmployeeInstanceSchema.parse(result.instance));
+      if (controller.signal.aborted) return;
+      const instance = EmployeeInstanceSchema.parse(result.instance);
+      if (
+        personal &&
+        (instance.organizationId !== workspace.organizationId ||
+          instance.workspaceId !== workspace.workspaceId ||
+          instance.ownerId !== workspace.viewerId ||
+          instance.kind !== 'custom')
+      )
+        throw new Error('创建未完成，请重试。');
+      onCreated(instance);
     } catch (cause) {
       if (!controller.signal.aborted)
         setError(
@@ -113,7 +138,8 @@ export function EmployeeCreateDialog({
         mode="create"
         initialValue={defaultEmployeeProfileFormValues}
         busy={busy}
-        disabled={!sourceId}
+        disabled={!canCreate}
+        namePlaceholder={personal ? '例如：文案专家、财务专员' : undefined}
         error={error}
         onSubmit={createEmployee}
         onCancel={onClose}

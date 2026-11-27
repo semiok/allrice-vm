@@ -38,13 +38,12 @@ async function request(path: string, expected: number, authenticated = false) {
 }
 
 try {
-  await request('/chatflow', 200);
-  for (const path of ['/chatflow/employees', '/chatflow/governance']) {
-    const response = await request(path, 307);
-    if (response.headers.get('location') !== '/chatflow') {
-      throw new Error(`${path} did not redirect to ChatFlow`);
-    }
+  const workbench = await request('/chatflow', 307);
+  if (workbench.headers.get('location') !== '/chatflow/4.0') {
+    throw new Error('The workbench did not redirect to 4.0');
   }
+  await request('/chatflow/employees', 404);
+  await request('/chatflow/governance', 404);
   await request('/chatflow/admin', 404);
   const legacy = await request('/workspace', 307);
   if (legacy.headers.get('location') !== '/chatflow') {

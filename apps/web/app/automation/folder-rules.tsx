@@ -376,11 +376,6 @@ export function FolderRules({ workspaceId }: { workspaceId?: string }) {
                                   ? '等待导入'
                                   : '正在校验原件'}
                           </span>
-                          {e.runId && e.sessionId ? (
-                            <Link href={`/chatflow?session=${e.sessionId}`}>
-                              查看工作与成果
-                            </Link>
-                          ) : null}
                           {e.errorMessage ? <p>{e.errorMessage}</p> : null}
                         </div>
                       ))

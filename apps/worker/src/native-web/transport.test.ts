@@ -6,6 +6,7 @@ import type { Socket } from 'node:net';
 import WebSocket from 'ws';
 import { afterEach, expect, it, vi } from 'vitest';
 import { nativeIndexByteLimit, nativeWebTransport } from './transport.js';
+import { nativeSetupError } from './startup-diagnostic.js';
 
 const cleanup: (() => Promise<void>)[] = [];
 function latch<T = void>() {
@@ -500,6 +501,74 @@ for (const accepted of [false, true])
       transport.fetch(new URL('/', origin), { method: 'GET' }),
     ).rejects.toBeDefined();
   });
+
+it.each(['http', 'invalid-upgrade', 'reset'] as const)(
+  'captures the original WebSocket %s failure before reporting loss',
+  async (kind) => {
+    const server = createServer((_request, response) => {
+      response.writeHead(302, {
+        location: './api/remote.mux',
+        'set-cookie': 'private=synthetic-api-cookie',
+      });
+      response.end();
+    });
+    server.on('upgrade', (_request, socket) => {
+      if (kind === 'reset') socket.destroy();
+      else if (kind === 'invalid-upgrade')
+        socket.end(
+          'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid\r\n\r\n',
+        );
+      else
+        socket.end(
+          'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+        );
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const lost = latch(),
+      observations: ReturnType<typeof nativeSetupError>[] = [];
+    const sources: string[] = [];
+    const headers: number[] = [];
+    const transport = nativeWebTransport(
+      origin,
+      new AbortController().signal,
+      () => lost.resolve(),
+      (error, status, failed, source) => {
+        if (!failed && source === 'websocket' && status !== undefined)
+          headers.push(status);
+        // The owner keeps the first observation; the subsequent close is loss.
+        if (failed && !observations.length) {
+          observations.push(nativeSetupError(error, status));
+          sources.push(source);
+        }
+      },
+    );
+    cleanup.push(async () => {
+      await transport.close();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    });
+    await transport.authenticate(origin + '/?token=synthetic-startup-token');
+    transport.createWebSocket(
+      origin.replace('http:', 'ws:') + '/api/remote.mux',
+    );
+    await lost.promise;
+    expect(sources).toEqual(['websocket']);
+    expect(headers).toEqual(
+      kind === 'reset' ? [] : [kind === 'invalid-upgrade' ? 101 : 404],
+    );
+    expect(observations).toEqual([
+      kind === 'reset'
+        ? { errorType: 'SystemError', errorCode: 'ECONNRESET' }
+        : {
+            errorType: 'HttpError',
+            errorCode: 'UNEXPECTED_HTTP_RESPONSE',
+            httpStatus: kind === 'invalid-upgrade' ? 101 : 404,
+          },
+    ]);
+  },
+);
 
 for (const accepted of [false, true])
   it(`WS handshake close joins physical request/socket ${accepted ? 'after TCP/Upgrade request' : 'before socket assignment'}`, async () => {

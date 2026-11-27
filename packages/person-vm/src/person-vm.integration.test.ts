@@ -124,6 +124,57 @@ suite(
         await admin`select pg_terminate_backend(${rows[0]!.pid}) as killed`;
       expect(killed!.killed).toBe(true);
     }
+    it('bounds a blocked diagnostic insert on its own connection and leaves the VM lease usable', async () => {
+      const h = harness(store);
+      const rc = context();
+      await h.service.create(rc, signal());
+      await store.withLease(
+        rc.actor.id,
+        { now: () => new Date(), ttlMs: 5000 },
+        async (lease) => {
+          const leaseWorker = workerNames.at(-1);
+          await db.begin(async (tx) => {
+            await tx`lock table person_vm_audit in access exclusive mode`;
+            const cancel = new AbortController();
+            const writing = store.auditStartupFailure(
+              lease.row!,
+              {
+                requestId: rc.requestId,
+                action: 'start.native-web.authenticate',
+                result: 'failed',
+                errorCode: '{"httpStatus":401}',
+              },
+              cancel.signal,
+            );
+            const rejected = expect(writing).rejects.toBeDefined();
+            const diagnosticWorker = workerNames.at(-1);
+            const diagnosticClosed = workerClosures.at(-1);
+            try {
+              expect(diagnosticWorker).not.toBe(leaseWorker);
+              await expect
+                .poll(async () => {
+                  const [activity] =
+                    await admin`select wait_event_type from pg_stat_activity
+                where application_name=${diagnosticWorker!}`;
+                  return activity?.wait_event_type;
+                })
+                .toBe('Lock');
+              await lease.guard();
+              expect(lease.signal.aborted).toBe(false);
+            } finally {
+              cancel.abort();
+              await rejected;
+              await diagnosticClosed;
+            }
+          });
+          await lease.guard();
+        },
+      );
+      expect(
+        await db`select action from person_vm_audit where action like 'start.native-web.%'`,
+      ).toEqual([]);
+    });
+
     it('真实PG物理owner持有至confirmed-stop runtime退役实际join，再释放并允许新代重试', async () => {
       const h = harness(store),
         rc = context();

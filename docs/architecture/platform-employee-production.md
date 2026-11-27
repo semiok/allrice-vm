@@ -24,8 +24,8 @@ AllRice Runtime Console (platform administrator)
 
 The management surface is the **AI 员工** module on `allrice-dsh.*`. Tenant
 surfaces only list employees assigned to that tenant and can start a Session;
-the old `/employees` and `/chatflow/employees` configuration pages redirect to
-the conversation surface.
+`/employees` redirects to the workbench. The old `/chatflow/employees`
+configuration page was removed with the 3.x workbench.
 
 ## Initial catalog
 

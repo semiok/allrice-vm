@@ -122,6 +122,9 @@ suite(
           ],
         ),
       );
+      const pdfChunk = await readFile(
+        'apps/web/node_modules/@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.pdf.js',
+      );
       server = createServer((request, response) => {
         const path = new URL(request.url!, origin).pathname;
         const asset = assets.get(path);
@@ -132,6 +135,9 @@ suite(
               : 'application/javascript',
           });
           response.end(asset);
+        } else if (path === '/api/dsh-ui/pdf') {
+          response.writeHead(200, { 'Content-Type': 'application/javascript' });
+          response.end(pdfChunk);
         } else if (path === '/') {
           response.writeHead(200, { 'Content-Type': 'text/html' });
           response.end(
@@ -217,6 +223,155 @@ suite(
           await page.close();
         }
       },
+    );
+
+    it.each(environments)(
+      'keeps the PDF reader during metadata failure and recovery at $width/$theme',
+      async ({ width, theme }) => {
+        const page = await browser.newPage({
+          viewport: { width, height: 900 },
+          reducedMotion: 'reduce',
+        });
+        const errors: string[] = [];
+        page.on('pageerror', (error) => errors.push(error.message));
+        try {
+          const base64 = (
+            await readFile(
+              'tests/fixtures/pdf/01-chinese-multipage-digital.pdf',
+            )
+          ).toString('base64');
+          await page.goto(origin + '?theme=' + theme);
+          await root(page).getByText(firstFile, { exact: true }).waitFor();
+          await page.evaluate(
+            (pdf) => window.__panelDataFixture.usePdf(pdf),
+            base64,
+          );
+          await root(page).getByText(firstFile, { exact: true }).click();
+          const preview = root(page);
+          const toolbar = preview.locator('header[aria-label="文件操作"]');
+          const fontNotice = preview.getByRole('button', {
+            name: '缺失 1 种字体，点击查看',
+          });
+          await fontNotice.waitFor();
+          const viewport = preview.locator('[data-document-zoom-scrollport]');
+          await viewport.waitFor();
+          const frame = await preview
+            .locator('[data-document-zoom-frame]')
+            .boundingBox();
+          expect(frame).not.toBeNull();
+          await page.mouse.move(
+            frame!.x + frame!.width / 2,
+            frame!.y + frame!.height - 20,
+          );
+          await preview.locator('[data-document-zoom-visible]').waitFor();
+          const zoom = preview.getByRole('button', { name: '选择缩放比例' });
+          await zoom.click();
+          await page
+            .getByRole('menuitem', { name: '150%', exact: true })
+            .click();
+          await expect.poll(() => zoom.innerText()).toContain('150%');
+          await expect
+            .poll(() =>
+              viewport.evaluate(
+                (node) => node.scrollHeight - node.clientHeight,
+              ),
+            )
+            .toBeGreaterThan(100);
+          const reader = await viewport.elementHandle();
+          expect(reader).not.toBeNull();
+          const top = await reader!.evaluate((node) => {
+            node.scrollTop = 100;
+            return node.scrollTop;
+          });
+          expect(top).toBeGreaterThan(0);
+          const reads = async () =>
+            (await evidence(page)).calls.filter(
+              (call) => call.method === 'previewDeliverable',
+            ).length;
+          const before = await reads();
+          const metadataReads = async () =>
+            (await evidence(page)).calls.filter(
+              (call) =>
+                call.method === 'listDeliverables' &&
+                (call.input as { objectId?: string }).objectId === uid(300),
+            ).length;
+          const initialMetadataReads = await metadataReads();
+
+          await page.evaluate(() => window.__panelDataFixture.holdFavorite());
+          await toolbar
+            .getByRole('button', { name: '收藏', exact: true })
+            .click();
+          await expect
+            .poll(
+              async () =>
+                (await evidence(page)).calls.filter(
+                  (call) => call.method === 'favorite',
+                ).length,
+            )
+            .toBe(1);
+          await fontNotice.click();
+          const fonts = page.getByRole('dialog', { name: '缺失的字体' });
+          const missing = fonts.getByText('Fixture Sans', { exact: true });
+          await missing.waitFor();
+
+          await page.evaluate(() => {
+            window.__panelDataFixture.refusePreview(503, undefined, false);
+            window.__panelDataFixture.finishFavorite();
+          });
+          const warning = preview
+            .getByRole('alert')
+            .filter({ hasText: '预览加载失败' });
+          await warning.waitFor();
+          expect(await metadataReads()).toBe(initialMetadataReads + 1);
+          const assertRetained = async (priorTop: number) => {
+            const reading = await reader!.evaluate((node) => ({
+              connected: node.isConnected,
+              top: node.scrollTop,
+              max: node.scrollHeight - node.clientHeight,
+            }));
+            expect(reading.connected).toBe(true);
+            expect(
+              Math.abs(reading.top - Math.min(priorTop, reading.max)),
+            ).toBeLessThanOrEqual(0.5);
+            expect(await zoom.innerText()).toContain('150%');
+            expect(await reads()).toBe(before);
+          };
+          await assertRetained(top);
+          expect(await missing.isVisible()).toBe(true);
+
+          await fonts.press('Escape');
+          await page.evaluate(() =>
+            window.__panelDataFixture.refusePreview(
+              undefined,
+              undefined,
+              false,
+            ),
+          );
+          const retry = warning.getByRole('button', {
+            name: '重新加载',
+            exact: true,
+          });
+          // Keyboard activation of the retry button should not move the
+          // reader to the PDF footer before the recovery assertion.
+          await retry.evaluate((button) =>
+            (button as HTMLButtonElement).focus({ preventScroll: true }),
+          );
+          const retryTop = await reader!.evaluate((node) => node.scrollTop);
+          await page.keyboard.press('Enter');
+          await warning.waitFor({ state: 'hidden' });
+          await toolbar
+            .getByRole('button', { name: '取消收藏', exact: true })
+            .waitFor();
+          expect(await metadataReads()).toBe(initialMetadataReads + 2);
+          await assertRetained(retryTop);
+          await fontNotice.click();
+          await missing.waitFor();
+          expect(errors).toEqual([]);
+        } finally {
+          await page.close();
+        }
+      },
+      30_000,
     );
 
     it('reopens an ambiguous publication on its original receipt and never submits a second upload', async () => {

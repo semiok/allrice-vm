@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   CheckFailed,
   DSH_EDITOR,
@@ -10,6 +11,7 @@ import {
   requireFact,
   sameSelection,
 } from './contracts.mjs';
+import { createHelloProbe, nativeReadMethods } from './live-native.mjs';
 
 const webRequire = createRequire(
   new URL('../../../apps/web/package.json', import.meta.url),
@@ -39,7 +41,14 @@ function responseStatus(status, expected, code) {
 }
 
 /** Observe the browser's own requests, including the single polling loop. */
-function browserFlow({ identity, account, employeeName, receipt }) {
+function browserFlow({
+  identity,
+  account,
+  employeeName,
+  receipt,
+  onColdTicket,
+  hello,
+}) {
   let selection;
   let employeeVersion;
   let carrier;
@@ -107,21 +116,30 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     );
   }
 
-  function openCarrier(url, frame, exchange) {
+  function muxRole(url) {
     const query = Object.fromEntries(url.searchParams);
-    const { payload } = frame ?? {};
     requireFact(
       current().identityVerified &&
-        !carrier &&
         url.protocol === 'wss:' &&
         url.host === new URL(publicOrigin).host &&
         !url.username &&
         !url.password &&
         url.pathname === paths.mux &&
-        [...url.searchParams].length === 5 &&
+        url.searchParams.size === (query.scopeId ? 6 : 5) &&
+        new Set(url.searchParams.keys()).size === url.searchParams.size &&
         query.carrier === 'page' &&
         query.organizationId === identity.organizationId &&
         sameSelection(query, selection) &&
+        (query.scopeId ? query.scopeId === carrier?.scopeId : !carrier),
+      'carrier-address-unverified',
+    );
+    return query.scopeId ? 'streams' : 'owner';
+  }
+
+  function beginCarrier(url, frame) {
+    const { payload } = frame ?? {};
+    requireFact(
+      muxRole(url) === 'owner' &&
         frame?.type === 'open' &&
         frame.endpoint === '$d-entry/page' &&
         isId(frame.streamId) &&
@@ -132,23 +150,24 @@ function browserFlow({ identity, account, employeeName, receipt }) {
         !Array.isArray(payload.args),
       'carrier-request-unverified',
     );
-    const reply = exchange(frame);
-    const { scopeReference, bindingRef } = reply?.value ?? {};
-    requireFact(
-      reply?.type === 'item' &&
-        reply.streamId === frame.streamId &&
-        reply.value?.type === 'opened' &&
-        isId(scopeReference?.scopeId) &&
-        Object.keys(scopeReference).length === 1 &&
-        Object.keys(reply.value).length === 3 &&
-        scopeReference.scopeId !== previousScope &&
-        typeof bindingRef === 'string' &&
-        profileToken.test(bindingRef),
-      'carrier-open-unverified',
-    );
-    carrier = { scopeId: scopeReference.scopeId, bindingRef };
-    current().carrierVerified = true;
-    return reply;
+    return (reply) => {
+      const { scopeReference, bindingRef } = reply?.value ?? {};
+      requireFact(
+        reply?.type === 'item' &&
+          reply.streamId === frame.streamId &&
+          reply.value?.type === 'opened' &&
+          isId(scopeReference?.scopeId) &&
+          Object.keys(scopeReference).length === 1 &&
+          Object.keys(reply.value).length === 3 &&
+          scopeReference.scopeId !== previousScope &&
+          typeof bindingRef === 'string' &&
+          profileToken.test(bindingRef),
+        'carrier-open-unverified',
+      );
+      carrier = { scopeId: scopeReference.scopeId, bindingRef };
+      current().carrierVerified = true;
+      return reply;
+    };
   }
 
   function allowWrite(path, url, body) {
@@ -166,6 +185,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
           !employeeStarted &&
           !url.search &&
           body?.workspaceId === identity.workspaceId &&
+          (!onColdTicket || body.expectedOwnerId === identity.personId) &&
           !Object.hasOwn(body, 'assignmentId') &&
           isId(body.requestId) &&
           body.profile?.name === employeeName
@@ -204,8 +224,24 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     );
     const query = Object.fromEntries(url.searchParams);
     let poll;
+    let prompt;
     if (method === 'POST') {
-      requireFact(allowWrite(path, url, body), 'write-blocked');
+      if (path === paths.rpc && onColdTicket) {
+        requireFact(
+          url.search === '?carrier=page' &&
+            carrier &&
+            body?.scopeId === carrier.scopeId &&
+            sameSelection(body.selection, selection),
+          'native-rpc-scope',
+        );
+        if (body.endpoint === 'session/prompt' && hello) {
+          prompt = hello.dispatch(body);
+        } else {
+          requireFact(nativeReadMethods.has(body.endpoint), 'write-blocked');
+        }
+      } else {
+        requireFact(allowWrite(path, url, body), 'write-blocked');
+      }
       if (path === paths.login) loginStarted = performance.now();
       if (path === paths.employee) {
         requireFact(
@@ -224,6 +260,12 @@ function browserFlow({ identity, account, employeeName, receipt }) {
       requireFact(method === 'GET', 'write-blocked');
       requireFact(
         readPaths.has(path) ||
+          (onColdTicket &&
+            [
+              '/favicon.ico',
+              '/brand/allrice-icon-v1.svg',
+              '/brand/apple-touch-icon-v1.png',
+            ].includes(path)) ||
           path === documentPath ||
           path.startsWith(documentPath + '/') ||
           path.startsWith('/_next/static/') ||
@@ -262,6 +304,17 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     }
     const reply = await exchange();
     const data = reply.json;
+    if (
+      onColdTicket &&
+      [401, 403, 410].includes(reply.status) &&
+      (path === documentPath ||
+        path.startsWith(documentPath + '/') ||
+        path.startsWith('/api/v1/d-entry/profile/') ||
+        path === paths.rpc)
+    ) {
+      throw new CheckFailed('native-page-access-denied', reply.status);
+    }
+    if (prompt) hello.accept(prompt, reply);
     switch (`${method} ${path}`) {
       case `POST ${paths.login}`:
         responseStatus(reply.status, 200, 'login-http');
@@ -316,6 +369,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
             'invalid-prewarm-ticket',
           );
           ticket = data;
+          onColdTicket?.(data.operationId);
           pollAfterMs = data.pollAfterMs;
           lastPollResponseAt = performance.now();
           pollDeadline =
@@ -359,6 +413,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
         }
         if (state === 'ready') {
           current().prewarmReady = true;
+          if (onColdTicket) current().readyObservedAt = performance.now();
           receipt.timings.coldPrewarmToReadyObservedMs =
             duration(prewarmStarted);
         }
@@ -398,7 +453,10 @@ function browserFlow({ identity, account, employeeName, receipt }) {
 
   return {
     request,
-    openCarrier,
+    muxRole,
+    beginCarrier,
+    openCarrier: (url, frame, exchange) =>
+      beginCarrier(url, frame)(exchange(frame)),
     hasDocumentScope,
     selection: () => selection,
     warm: () => {
@@ -418,11 +476,19 @@ export async function runBrowser({
   receipt,
   browserExecutable,
   fail,
+  onColdTicket,
+  sendHello = false,
+  beforeHello,
+  reopenWarm = true,
+  signal,
+  launch = (options) => webRequire('playwright-core').chromium.launch(options),
 }) {
-  const { chromium } = webRequire('playwright-core');
-  const browser = await chromium.launch({
+  requireFact(!signal?.aborted, 'acceptance-interrupted');
+  const browser = await launch({
     executablePath: browserExecutable,
-    timeout,
+    timeout: onColdTicket ? 30_000 : timeout,
+    handleSIGINT: !onColdTicket,
+    handleSIGTERM: !onColdTicket,
     headless: true,
     args: driver.chromiumArgs,
     env: Object.fromEntries(
@@ -447,16 +513,30 @@ export async function runBrowser({
   void networkFailure.catch(() => {});
   let stage = 'browser';
   let routeFailed = false;
-  const flow = browserFlow({ identity, account, employeeName, receipt });
+  const hello = sendHello ? createHelloProbe(receipt) : null;
+  const flow = browserFlow({
+    identity,
+    account,
+    employeeName,
+    receipt,
+    onColdTicket,
+    hello,
+  });
   function failure(error) {
     if (routeFailed) return;
     routeFailed = true;
     fail(stage, error);
     rejectNetwork(error);
   }
+  const cancel = () => failure(new CheckFailed('acceptance-interrupted'));
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const guarded = (action) => Promise.race([action, networkFailure]);
   let context;
+  let publicEditor;
+  let pendingPrewarm;
   try {
+    requireFact(!signal?.aborted, 'acceptance-interrupted');
     context = await browser.newContext({
       acceptDownloads: false,
       serviceWorkers: 'block',
@@ -465,12 +545,30 @@ export async function runBrowser({
     await driver.install(context, {
       inspect: (request, exchange) => {
         requireFact(!routeFailed, 'request-after-failure');
-        return flow.request(request, exchange);
+        const result = flow.request(request, exchange);
+        if (
+          onColdTicket &&
+          !pendingPrewarm &&
+          request.method === 'POST' &&
+          request.url.pathname === paths.prewarm
+        )
+          pendingPrewarm = result;
+        return result;
       },
       openCarrier: (url, frame, exchange) => {
         requireFact(!routeFailed, 'request-after-failure');
         return flow.openCarrier(url, frame, exchange);
       },
+      muxRole: (url) => {
+        requireFact(!routeFailed, 'carrier-after-failure');
+        return flow.muxRole(url);
+      },
+      beginCarrier: (url, frame) => {
+        requireFact(!routeFailed, 'carrier-after-failure');
+        return flow.beginCarrier(url, frame);
+      },
+      observeFollow: (sessionId, item) => hello?.follow(sessionId, item),
+      followClosed: (sessionId) => hello?.closed(sessionId),
       fail: failure,
     });
     const page = await context.newPage();
@@ -508,6 +606,8 @@ export async function runBrowser({
       'zero-employee-frame-present',
     );
     receipt.stages.zeroEmployee = 'passed';
+    if (onColdTicket)
+      receipt.timings.loginToZeroEmployeeMs = duration(loginStart);
     stage = 'employeeCreation';
     await guarded(
       page.getByRole('button', { name: '创建员工', exact: true }).click(),
@@ -548,6 +648,9 @@ export async function runBrowser({
               source: view.frameElement?.src,
               loaded: node.ownerDocument.URL,
               scopeId: view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId,
+              nativeSessionId: node.ownerDocument
+                .querySelector('[data-native-session-id]')
+                ?.getAttribute('data-native-session-id'),
               editable: node.isContentEditable,
               focused: node.ownerDocument.activeElement === node,
             };
@@ -575,23 +678,167 @@ export async function runBrowser({
       );
       receipt.browser[phase].documentVerified = true;
       receipt.timings[`${phase}ToEditableMs`] = duration(start);
+      if (onColdTicket && phase === 'cold') {
+        receipt.timings.readyToEditableMs = duration(
+          receipt.browser.cold.readyObservedAt,
+        );
+        delete receipt.browser.cold.readyObservedAt;
+      }
       receipt.stages[`${phase}Editor`] = 'passed';
+      return {
+        child,
+        editor,
+        nativeSessionId: after.nativeSessionId,
+        readEditor,
+      };
     }
-    await focusedEditor('cold', coldStart);
-    flow.warm();
-    stage = 'warmReopen';
-    const warmStart = performance.now();
-    await guarded(page.reload({ waitUntil: 'domcontentloaded' }));
-    await focusedEditor('warm', warmStart);
+    const { child, editor, nativeSessionId, readEditor } = await focusedEditor(
+      'cold',
+      coldStart,
+    );
+    if (onColdTicket) publicEditor = editor;
+    if (hello) {
+      stage = 'hello';
+      await guarded(beforeHello());
+      const current = await readEditor();
+      requireFact(
+        flow.hasDocumentScope(current) &&
+          current.nativeSessionId === nativeSessionId &&
+          current.editable &&
+          current.focused,
+        'hello-native-session-unverified',
+      );
+      requireFact(
+        !(await guarded(editor.innerText())).trim(),
+        'hello-draft-not-empty',
+      );
+      await guarded(page.keyboard.insertText('你好'));
+      requireFact(
+        (await guarded(editor.innerText())).trim() === '你好',
+        'hello-draft-mismatch',
+      );
+      const send = child.getByRole('button', {
+        name: /^(发送消息|Send message)$/u,
+      });
+      await guarded(send.waitFor({ state: 'visible' }));
+      requireFact(await guarded(send.isEnabled()), 'hello-send-disabled');
+      hello.arm(nativeSessionId);
+      await guarded(send.click());
+      await guarded(
+        Promise.race([
+          (async () => {
+            const turn = await hello.boundTurn;
+            // Observe the pinned DSH ChatView's assistant turn and Markdown
+            // wrapper. Reasoning disclosures have data-variant="think".
+            const responses = child
+              .locator(
+                `[data-chat-flow-kind="assistant-step"][data-chat-turn="${turn}"]:not([data-chat-group-part="reasoning"]) [class~="MarkdownText_markdown"]:not([data-variant="think"] *):visible`,
+              )
+              .filter({ hasText: /\S/u });
+            await responses.first().waitFor({ timeout: 120_000 });
+            receipt.timings.helloToFirstReplyMs = hello.elapsed();
+            await hello.complete;
+            await child
+              .locator(
+                `[data-turn-tail="${turn}"][data-actions-reveal="always"]`,
+              )
+              .waitFor({ timeout: 120_000 });
+            const final = await readEditor();
+            requireFact(
+              flow.hasDocumentScope(final) &&
+                final.nativeSessionId === nativeSessionId &&
+                (await responses.last().isVisible()),
+              'hello-reply-not-visible',
+            );
+            receipt.timings.helloToCompleteReplyMs = hello.elapsed();
+          })(),
+          delay(120_000, undefined, { ref: false }).then(() => {
+            throw new CheckFailed('hello-reply-timeout');
+          }),
+        ]),
+      );
+      receipt.stages.hello = 'passed';
+    }
+    if (reopenWarm) {
+      flow.warm();
+      stage = 'warmReopen';
+      const warmStart = performance.now();
+      await guarded(page.reload({ waitUntil: 'domcontentloaded' }));
+      await focusedEditor('warm', warmStart);
+    }
   } catch (error) {
     fail(stage, error);
     throw error;
   } finally {
     try {
+      if (pendingPrewarm) {
+        // Let the one already-dispatched request yield its actual ticket. A
+        // lost reply is unknown ownership; no second POST is permitted.
+        await Promise.race([
+          pendingPrewarm.catch(() => {}),
+          delay(POLL_REQUEST_MS, undefined, { ref: false }),
+        ]);
+      }
+      if (publicEditor) {
+        try {
+          // Use the existing authenticated document carrier's completion
+          // handshake before killing the Playwright context.
+          const joined = await publicEditor.evaluate(
+            (node) => {
+              const view = node.ownerDocument.defaultView;
+              const scopeId = view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId;
+              return new Promise((resolve) => {
+                let remoteClosed = false;
+                let frameClosed = false;
+                const finish = (closed) => {
+                  view.clearTimeout(timer);
+                  view.removeEventListener('message', receiveRemote);
+                  view.parent.removeEventListener('message', receiveFrame);
+                  resolve(closed);
+                };
+                const completion = (event, source) =>
+                  scopeId &&
+                  event.source === source &&
+                  event.origin === view.location.origin &&
+                  event.data?.scopeId === scopeId &&
+                  event.data.type === 'allrice:d-entry:completion';
+                const receiveRemote = (event) => {
+                  if (!completion(event, view.parent)) return;
+                  if (event.data.state !== 'closed') return finish(false);
+                  remoteClosed = true;
+                  if (frameClosed) finish(true);
+                };
+                const receiveFrame = (event) => {
+                  if (!completion(event, view)) return;
+                  if (event.data.state !== 'closed') return finish(false);
+                  frameClosed = true;
+                  if (remoteClosed) finish(true);
+                };
+                const timer = view.setTimeout(() => finish(false), 15_000);
+                view.addEventListener('message', receiveRemote);
+                view.parent.addEventListener('message', receiveFrame);
+                // The actual native local entry closes on pagehide and asks
+                // the parent carrier to join before it acknowledges disposal.
+                view.dispatchEvent(new view.PageTransitionEvent('pagehide'));
+              });
+            },
+            undefined,
+            { timeout: 15_000 },
+          );
+          requireFact(joined, 'public-carrier-close-unconfirmed');
+          receipt.browser.carrierJoined = true;
+        } catch (error) {
+          fail('carrierClose', error);
+        }
+      }
       await context?.close();
     } finally {
-      await browser.close();
-      receipt.browser.closed = true;
+      try {
+        await browser.close();
+        receipt.browser.closed = true;
+      } finally {
+        signal?.removeEventListener('abort', cancel);
+      }
     }
   }
 }

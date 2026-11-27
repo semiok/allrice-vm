@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { build, type Loader } from 'esbuild';
+import { build, type Loader, type PluginBuild } from 'esbuild';
 import { createLegacySidebarSnapshot } from './legacy-sidebar-baseline';
 
 export const panelsRev2Head = '4c2e1069e087e645365100850756afe742c35e3d';
@@ -29,6 +29,10 @@ export const panelsRev2Sources = {
     '38ea9dca82fc93d8536e7aa0cf45a27465c019f199bdbad788430d5602a90314',
 };
 const components = Object.keys(panelsRev2Sources);
+export const panelsRev2Manifest = {
+  path: 'apps/web/app/dsh-upstream/upstream.json',
+  sha256: '364bf6701201ec7fded9903131371d482a1affb31b6997f501f58c7bf5e70fd0',
+};
 
 /** Replay fixed rev2 app/UI/contracts source. In source-archive environments,
  * require this generator's prebuilt artifact with verified bytes and identities. */
@@ -73,17 +77,15 @@ export async function writeEmployeePanelsBaseline(
     await writeFile(join(artifacts, 'panels-rev2-sources.json'), metadata);
     return pathToFileURL(join(artifacts, 'panels-rev2.html'));
   }
+  const readPinned = (path: string) =>
+    execFileSync('git', ['show', `${panelsRev2Head}:${path}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+    });
   const sources = new Map<string, string>();
   const readBase = (path: string) => {
-    if (!sources.has(path))
-      sources.set(
-        path,
-        execFileSync('git', ['show', `${panelsRev2Head}:${path}`], {
-          cwd: repoRoot,
-          encoding: 'utf8',
-          maxBuffer: 4 * 1024 * 1024,
-        }),
-      );
+    if (!sources.has(path)) sources.set(path, readPinned(path));
     return sources.get(path)!;
   };
   // Seed the complete public real-component identities even when tree-shaken.
@@ -99,7 +101,22 @@ export async function writeEmployeePanelsBaseline(
     write: false,
     minify: true,
     outdir: join(artifacts, 'rev2-assets'),
-    plugins: [{ ...snapshot, name: 'pinned-rev2-panels' }],
+    plugins: [
+      {
+        name: 'pinned-rev2-provenance',
+        setup(plugin: PluginBuild) {
+          plugin.onLoad({ filter: /upstream\.json$/ }, ({ path }) => {
+            if (path !== resolve(repoRoot, panelsRev2Manifest.path)) return;
+            // Keep the original source inventory schema and replay bytes.
+            const contents = readPinned(panelsRev2Manifest.path);
+            if (sha256(contents) !== panelsRev2Manifest.sha256)
+              throw Error('Approved rev2 manifest bytes changed');
+            return { contents, loader: 'json' as const };
+          });
+        },
+      },
+      { ...snapshot, name: 'pinned-rev2-panels' },
+    ],
     loader: {
       '.woff': 'dataurl',
       '.woff2': 'dataurl',

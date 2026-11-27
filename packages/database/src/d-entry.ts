@@ -1,6 +1,7 @@
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
+  hasDEntryPersonRelease,
   sameDEntryIdentity,
   selectDEntryGeneration,
   type DEntryIdentity,
@@ -17,6 +18,7 @@ import {
   EmployeeInstanceError,
   getEmployeeInstance,
   getEmployeeInstanceForHistory,
+  listEmployeeInstances,
 } from './employees/employee-instances.ts';
 import { requireCurrentWorkspaceWriteAuthority } from './identity.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
@@ -125,21 +127,17 @@ export async function readDEntryEmployeeDirectory(
     'isolation level repeatable read read only',
     async (sql) => {
       const policy = await readDEntryReleasePolicy(sql);
+      if (!hasDEntryPersonRelease(policy, identity))
+        throw new DataAccessError('authorization_denied');
       const employees = [];
-      for (const item of policy.selections) {
-        if (
-          item.organizationId !== identity.organizationId ||
-          item.personId !== identity.personId ||
-          item.generation !== '4.0'
-        )
-          continue;
+      for (const { id: employeeId } of await listEmployeeInstances(
+        scope,
+        identity.workspaceId,
+        sql,
+      )) {
         signal.throwIfAborted();
         try {
-          const instance = await getEmployeeInstance(
-            scope,
-            item.employeeInstanceId,
-            sql,
-          );
+          const instance = await getEmployeeInstance(scope, employeeId, sql);
           const [version] = await sql<
             { employee_id: string; name: string; is_default: boolean }[]
           >`

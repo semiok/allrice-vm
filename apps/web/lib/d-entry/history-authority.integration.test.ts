@@ -204,14 +204,7 @@ suite(
       await updateDEntryReleasePolicy(context, {
         revision: 'fixture-enable',
         defaultGeneration: '3.x',
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0',
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       });
       const identity = await requireDEntryNativeIdentity(context, selection);
       const nativeSessionId = `fixture-root-${randomUUID()}`;

@@ -13,7 +13,7 @@ import type {
 import { PersonVmError, PersonVmService } from '@allrice/person-vm';
 import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
-import type { NativeWebOwner } from './owner.js';
+import type { NativeWebOwner, openNativeWebOwner } from './owner.js';
 import {
   harness,
   MemoryStore,
@@ -165,8 +165,14 @@ it('实际DB producer直接绑定service roster，取消仍等待已发SQL结束
   await f.service.close();
 });
 it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐个接收绑定，control不冒充editor ready', async () => {
-  const f = fixture(),
-    owners = f.web.receipt.endpoints.map(() => catalogOwner());
+  const f = fixture();
+  const ownerLifetimes = f.web.receipt.endpoints.map(
+    () => new AbortController(),
+  );
+  const owners = ownerLifetimes.map(({ signal }) => ({
+    ...catalogOwner(),
+    revoked: signal,
+  }));
   owners.forEach((owner) => open.mockResolvedValueOnce(owner));
   const plan = await f.service.memoryGuestPlan(
     f.binding,
@@ -230,9 +236,8 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       owners[index],
     );
   }
-  expect(() =>
-    f.service.assertAuthenticatedGroup(f.binding, signal()),
-  ).not.toThrow();
+  const wholeGroup = f.service.assertAuthenticatedGroup(f.binding, signal());
+  expect(wholeGroup.aborted).toBe(false);
   expect(() =>
     f.service.assertAuthenticatedGroup(
       { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
@@ -243,6 +248,11 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   expect(() => f.service.assertAuthenticatedGroup(f.binding, signal())).toThrow(
     'RUNTIME_NOT_READY',
   );
+  const siblingLost = new PersonVmError('LEASE_LOST');
+  ownerLifetimes[1]!.abort(siblingLost);
+  expect(owners[0]!.revoked.aborted).toBe(false);
+  expect(wholeGroup.aborted).toBe(true);
+  expect(wholeGroup.reason).toBe(siblingLost);
   expect(f.service).not.toHaveProperty('readiness');
   f.startup.abort();
   expect(owners[0]!.close).not.toHaveBeenCalled();
@@ -603,6 +613,91 @@ it.each([false, true])(
     else await f.service.close();
   },
 );
+
+it('writes the owner diagnostic through the startup lease before the normal failure audit and VM rollback', async () => {
+  const f = fixture();
+  const store = new MemoryStore();
+  const h = harness(store);
+  const entries = f.web.receipt.endpoints
+    .map(
+      ({
+        workspaceId,
+        employeeInstanceId,
+        employeeRevision,
+        employeeVersionId,
+      }) => ({
+        workspaceId,
+        employeeInstanceId,
+        employeeRevision,
+        employeeVersionId,
+      }),
+    )
+    .sort((a, b) => a.employeeInstanceId.localeCompare(b.employeeInstanceId));
+  const facts = {
+    personId: f.binding.personId,
+    organizationId: f.binding.organizationId,
+    entries,
+  };
+  const roster = {
+    ...facts,
+    digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+  };
+  h.native.prepareWebEndpoints = async (binding) => ({
+    binding,
+    rosterDigest: roster.digest,
+    endpoints: f.web.receipt.endpoints,
+  });
+  h.native.assertWebEndpoints = async () => {};
+  const bootstrap = h.native.bootstrap;
+  h.native.bootstrap = async (scope, plan) => ({
+    ...(await bootstrap(scope, plan)),
+    readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+  });
+  const diagnostic = {
+    step: 'session-list',
+    errorType: 'SystemError',
+    errorCode: 'ECONNRESET',
+    target: '127.0.0.1:32171',
+  };
+  open.mockImplementationOnce(
+    async (input: Parameters<typeof openNativeWebOwner>[0]) => {
+      expect(input.recordStartupFailure).toBeTypeOf('function');
+      expect(input.startupPending?.()).toBe(true);
+      await input.recordStartupFailure!(diagnostic, signal());
+      throw new PersonVmError('PROVIDER_FAILED');
+    },
+  );
+  const service = new PersonVmService({
+    ...h.options,
+    nativeWeb: { prepare: async () => roster },
+    runtime: {
+      ...h.runtime,
+      memoryGuestPlan: f.service.memoryGuestPlan,
+      start: f.service.start,
+      retireAfterNativeStop: f.service.retireAfterNativeStop,
+    },
+  });
+  try {
+    await service.create(f.web.context, signal());
+    await expect(service.start(f.web.context, signal())).rejects.toMatchObject({
+      code: 'PROVIDER_FAILED',
+    });
+    expect(
+      store.audits.filter(({ result }) => result === 'failed'),
+    ).toMatchObject([
+      {
+        requestId: f.web.context.requestId,
+        action: 'start.native-web.session-list',
+        errorCode: JSON.stringify(diagnostic),
+      },
+      { action: 'start', errorCode: 'PROVIDER_FAILED' },
+    ]);
+    expect(h.log).toContain('native:stop');
+    expect(h.mounts.size).toBe(0);
+  } finally {
+    await f.service.close();
+  }
+});
 
 it.each(['readiness', 'save'] as const)(
   'service start已返回后%s失败：confirmed stop→exact host join→同组件新代重试（synthetic provider）',

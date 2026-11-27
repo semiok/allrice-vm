@@ -277,6 +277,7 @@ export function createAssignedNativeWebStartup(input: {
         };
         running.set(binding.vmId, group);
         let attemptedOwnerOpen = false;
+        let awaitingGroupSetup = true;
         try {
           const prove = editorProof;
           signal.throwIfAborted();
@@ -304,6 +305,8 @@ export function createAssignedNativeWebStartup(input: {
               vm: input.vm,
               lifetime,
               cleanupTimeoutMs: input.cleanupTimeoutMs,
+              recordStartupFailure: web.recordNativeFailure,
+              startupPending: () => awaitingGroupSetup,
               ...(modelAdapter
                 ? {
                     async beforePrompt(
@@ -358,7 +361,9 @@ export function createAssignedNativeWebStartup(input: {
             throw new PersonVmError('RUNTIME_NOT_READY');
           group.verifiedBy = prove;
           group.ready = true;
+          awaitingGroupSetup = false;
         } catch (error) {
+          awaitingGroupSetup = false;
           group.ready = false;
           group.revoked.abort(error);
           // The startup scope and native stop own address-probe cleanup.
@@ -431,6 +436,11 @@ export function createAssignedNativeWebStartup(input: {
         )
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
+      return AbortSignal.any([
+        lifetime,
+        group.revoked.signal,
+        ...[...group.owners.values()].map((owner) => owner.revoked),
+      ]);
     },
     assertVerifiedEditor(
       binding: PersonVmBinding,
@@ -613,7 +623,7 @@ export function createAssignedNativeWebStartup(input: {
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,
-    ): void;
+    ): AbortSignal;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,

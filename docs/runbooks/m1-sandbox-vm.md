@@ -49,11 +49,7 @@ curl --fail --silent --show-error "${RENDERER_URL%/}/health"
 
 ## 确认恢复
 
-下一轮告警自动恢复后，跑相关冒烟：
-
-```bash
-~/allrice40-dev/bin/smoke-test --dev --only office,csv,browser
-```
+下一轮告警恢复后，核对已有镜像和运行时健康回执；Office、CSV、云浏览器的真机复核按各自验收范围执行。4.0 发布冒烟只验证原生工作台入口。
 
 ## 谁来做
 

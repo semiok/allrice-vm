@@ -61,6 +61,7 @@ export async function POST(request: Request) {
     if (!context) throw new DataAccessError('authentication_required');
     const session = await createChatSession(context, await request.json(), {
       freezeAccountCapabilities: true,
+      requireLegacyBrowserWriter: true,
     });
     return Response.json({ session }, { status: 201 });
   } catch (error) {

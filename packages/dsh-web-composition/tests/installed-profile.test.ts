@@ -84,6 +84,31 @@ it('offline-installs the actual tarball with native Host exports in an empty HOM
     'node_modules/@allrice/dsh-web-composition',
   );
   expect(await realpath(installedRoot)).not.toBe(await realpath(packageRoot));
+  const installedMetadata = JSON.parse(
+    await readFile(join(installedRoot, 'package.json'), 'utf8'),
+  );
+  expect(installedMetadata.dsh.bundle.patch).toBe('./cordis.patch.yml');
+  const upstreamPatch = parse(
+    await readFile(
+      join(installedRoot, installedMetadata.dsh.bundle.patch),
+      'utf8',
+    ),
+  );
+  expect(upstreamPatch).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: 'directory-picker', disabled: true }),
+      expect.objectContaining({
+        insert: expect.arrayContaining([
+          expect.objectContaining({
+            name: '@deepseek-ai/dsh-host-directory-picker-browse',
+          }),
+          expect.objectContaining({
+            name: '@deepseek-ai/dsh-client-ui-directory-picker-browse',
+          }),
+        ]),
+      }),
+    ]),
+  );
   const installedRequire = createRequire(join(installedRoot, 'package.json'));
   for (const entry of [
     'plugin-manager',

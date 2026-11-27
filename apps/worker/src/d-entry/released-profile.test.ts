@@ -1080,7 +1080,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
         },
         lifetime,
       ),
-    ).rejects.toThrow('D entry native owner is not bound');
+    ).rejects.toHaveProperty('graphRule', 'entries[0].url/rev/topology');
 
     const local = await hostFixture(issue('execute'), true, null);
     const neighbor = await hostFixture(issue('execute'));

@@ -20,9 +20,9 @@ async function assertHttp(baseUrl) {
   const checks = [
     ['/api/health/live', 200],
     ['/api/health/ready', 200],
-    ['/chatflow', 200],
-    ['/chatflow/employees', 307],
-    ['/chatflow/governance', 307],
+    ['/chatflow', 307],
+    ['/chatflow/employees', 404],
+    ['/chatflow/governance', 404],
     ['/chatflow/admin', 404],
   ];
   for (const [path, status] of checks) {
@@ -33,6 +33,12 @@ async function assertHttp(baseUrl) {
       throw new Error(
         `${path} returned ${response.status}, expected ${status}`,
       );
+    }
+    if (
+      path === '/chatflow' &&
+      response.headers.get('location') !== '/chatflow/4.0'
+    ) {
+      throw new Error('The workbench did not redirect to 4.0');
     }
     process.stdout.write(`[MET-62] HTTP ${path} ${response.status}\n`);
   }

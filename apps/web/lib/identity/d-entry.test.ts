@@ -111,14 +111,7 @@ const selection = { workspaceId, employeeInstanceId, threadId };
 const policy = {
   revision: 'approved-test-release',
   defaultGeneration: '3.x' as const,
-  selections: [
-    {
-      organizationId,
-      personId,
-      employeeInstanceId,
-      generation: '4.0' as const,
-    },
-  ],
+  selections: [{ organizationId, personId }],
 };
 function request(body?: unknown) {
   return new Request(
@@ -220,7 +213,7 @@ describe('trusted cookie D entry and explicit release selection', () => {
     });
     expect((await GET(request())).status).toBe(403);
   });
-  it('requires explicit policy defaults and unique complete person/employee tuples', () => {
+  it('releases the current person only within the listed organization', () => {
     expect(
       DEntryRolloutPolicySchema.safeParse({ selections: [] }).success,
     ).toBe(false);
@@ -239,7 +232,39 @@ describe('trusted cookie D entry and explicit release selection', () => {
         ...identity,
         employeeInstanceId: randomUUID(),
       }),
+    ).toBe('4.0');
+    expect(
+      selectDEntryGeneration(policy, {
+        ...identity,
+        organizationId: randomUUID(),
+      }),
     ).toBe('3.x');
+    expect(
+      DEntryRolloutPolicySchema.safeParse({
+        ...policy,
+        selections: [
+          { organizationId, personId, employeeInstanceId, generation: '4.0' },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+  it('normalizes person selections before comparing or rejecting duplicates', () => {
+    const upper = {
+      organizationId: organizationId.toUpperCase(),
+      personId: personId.toUpperCase(),
+    };
+    const parsed = DEntryRolloutPolicySchema.parse({
+      ...policy,
+      selections: [upper],
+    });
+    expect(parsed.selections).toEqual([{ organizationId, personId }]);
+    expect(selectDEntryGeneration(parsed, identity)).toBe('4.0');
+    expect(
+      DEntryRolloutPolicySchema.safeParse({
+        ...policy,
+        selections: [upper, { organizationId, personId }],
+      }).success,
+    ).toBe(false);
   });
   it('never changes an old thread writer and rejects unsupported 4.0 fallback', async () => {
     ports.generation.mockResolvedValue('3.x');

@@ -42,6 +42,7 @@ type Startup = Pick<
   | 'installStartingEditorProof'
   | 'assertVerifiedEditor'
   | 'ensureVerifiedEditor'
+  | 'assertAuthenticatedGroup'
 >;
 
 /** The managed model owner checks the configured route and its same-generation
@@ -144,13 +145,18 @@ export function installProductionDEntrySource(input: {
           identity,
           active,
         );
+        const binding = current.view.receipt.binding;
         const proof = await input.startup.ensureVerifiedEditor(
           context,
-          current.view.receipt.binding,
+          binding,
           identity.employeeInstanceId,
           current.signal,
         );
-        return AbortSignal.any([current.signal, proof]);
+        const group = input.startup.assertAuthenticatedGroup(
+          binding,
+          current.signal,
+        );
+        return AbortSignal.any([current.signal, proof, group]);
       });
     },
     resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {

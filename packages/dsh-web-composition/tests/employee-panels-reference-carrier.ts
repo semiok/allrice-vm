@@ -4,7 +4,11 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build, type Loader, type PluginBuild } from 'esbuild';
-import { panelsRev2Head, panelsRev2Sources } from './employee-panels-baseline';
+import {
+  panelsRev2Head,
+  panelsRev2Manifest,
+  panelsRev2Sources,
+} from './employee-panels-baseline';
 import { createLegacySidebarSnapshot } from './legacy-sidebar-baseline';
 import {
   derivePinnedReferenceStyle,
@@ -46,8 +50,7 @@ const externals = [
 // The historical TS/CSS resolver did not record JSON. The new executable pins
 // this additional actual input explicitly, without rewriting old metadata.
 const additionalSources: Record<string, string> = {
-  'apps/web/app/dsh-upstream/upstream.json':
-    '364bf6701201ec7fded9903131371d482a1affb31b6997f501f58c7bf5e70fd0',
+  [panelsRev2Manifest.path]: panelsRev2Manifest.sha256,
 };
 const sourceMap = (values: { path: string; sha256: string }[]) => {
   if (
