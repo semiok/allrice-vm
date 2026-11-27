@@ -124,7 +124,7 @@ function fixture() {
     startup: Object.freeze({}),
     admission: Object.freeze({}),
     lifetime: lifetime.signal,
-  }) as Parameters<ProductionPersonVmHostSources['bind']>[0];
+  }) as unknown as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {
     lifetime,
     guest,
