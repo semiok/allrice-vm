@@ -137,7 +137,7 @@ import { dEntryHttpDefaults } from '../../../worker/src/d-entry/http';
 import { installProductionDEntrySource } from '../../../worker/src/person-vm/production-dentry-source.js';
 import { currentDEntryNativeDataPort } from '../../../worker/src/d-entry/native-data.js';
 import { installAssignedDEntryNativeRuntime } from '../../../worker/src/business-runtime/native-prewarm.js';
-import type { PublishedNativeCatalog } from '../../../worker/src/business-runtime/native-catalog.js';
+import type { AssignedNativeWebCatalog } from '../../../worker/src/native-web/composition.js';
 import { createProductionPersonVmAuthority } from '../../../worker/src/person-vm/production-authority.js';
 import {
   createProductionCurrentPrewarm,
@@ -3747,10 +3747,51 @@ suite(
           let newEmployeeJobExited = false;
           const dispatches: PersonVmBinding[] = [];
           const dispatchPermits: string[] = [];
+          const endpoint = {
+            ...scope,
+            employeeRevision: next.employeeRevision,
+            employeeVersionId: next.employeeVersionId,
+            hostPort: 30080,
+            guestPort: 30081,
+          };
+          let published: AssignedNativeWebCatalog | undefined;
+          const catalog = (target: PersonVmBinding, id: string) => {
+            if (
+              !published ||
+              !sameVmBinding(target, published.receipt.binding) ||
+              id !== endpoint.employeeInstanceId
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            return published;
+          };
+          const assertVerifiedEditor = (
+            target: PersonVmBinding,
+            active: AbortSignal,
+            id: string = endpoint.employeeInstanceId,
+          ) => {
+            active.throwIfAborted();
+            const { owner, revoked } = catalog(target, id);
+            if (!owner.controlReady())
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            revoked.throwIfAborted();
+            return revoked;
+          };
+          const confirmPhysical = vi.fn<
+            NonNullable<
+              Parameters<
+                typeof installProductionDEntrySource
+              >[0]['confirmPhysical']
+            >
+          >((context, identity, target, active) =>
+            current.withCurrentSelection(context, identity, active, () =>
+              vm.assertRunningReadiness(context, target, active),
+            ),
+          );
           const startup = installProductionDEntrySource({
             vm,
             admission,
             lifetime,
+            confirmPhysical,
             resolveSendRoute: vi.fn(),
             startup: {
               needsEmployee: (_context, target) =>
@@ -3787,28 +3828,25 @@ suite(
                 );
               },
               installStartingEditorProof: () => () => {},
-              ensureVerifiedEditor: async (_context, current, id) => {
+              ensureVerifiedEditor: async (_context, current, id, active) => {
                 expect(current).toMatchObject({
                   vmId: binding.vmId,
                   leaseEpoch: binding.leaseEpoch + 1,
                 });
                 expect(id).toBe(next.employeeInstanceId);
-                return lifetime;
+                return assertVerifiedEditor(current, active, id);
               },
-              assertVerifiedEditor: vi.fn(),
-              assertAuthenticatedGroup: () => lifetime,
-              catalog: vi.fn(),
+              assertVerifiedEditor,
+              assertAuthenticatedGroup: assertVerifiedEditor,
+              catalog,
             },
           });
           probes.add(startup.close);
-          const endpoint = {
-            ...scope,
-            employeeRevision: next.employeeRevision,
-            employeeVersionId: next.employeeVersionId,
-            hostPort: 30080,
-            guestPort: 30081,
+          const unexpectedOwnerOperation = () => {
+            throw Error(
+              'This fixture does not dispatch native owner operations',
+            );
           };
-          let published: PublishedNativeCatalog | undefined;
           const startNative = h.runtime.start;
           h.runtime.start = async (...args) => {
             await startNative(...args);
@@ -3829,10 +3867,30 @@ suite(
                 bindingRef: target.instanceId,
                 revoked: lifetime,
                 owner: {
+                  binding: target,
                   revoked: lifetime,
-                  controlReady: () => true,
-                  acquirePrincipal: vi.fn(),
-                  readSessionsFor: vi.fn(),
+                  jobExited: signal(),
+                  modelAdapterId: undefined,
+                  profileVerificationOwner: {},
+                  nativeInstanceId: target.instanceId,
+                  controlReady: () => !newEmployeeJobExited,
+                  verifyStartingEditor: unexpectedOwnerOperation,
+                  verifyRunningEditor: unexpectedOwnerOperation,
+                  createRootFor: unexpectedOwnerOperation,
+                  acquirePrincipal: unexpectedOwnerOperation,
+                  readSessions: unexpectedOwnerOperation,
+                  readSessionsFor: unexpectedOwnerOperation,
+                  readImmutableGraphFor: unexpectedOwnerOperation,
+                  readImmutableBundleFor: unexpectedOwnerOperation,
+                  readNativeRootWakeFor: unexpectedOwnerOperation,
+                  readNativeAttemptFor: unexpectedOwnerOperation,
+                  waitNativeTurnEnd: unexpectedOwnerOperation,
+                  readPersistedRunTerminalFor: unexpectedOwnerOperation,
+                  readManagedModelImageFor: unexpectedOwnerOperation,
+                  readModelCatalogFor: unexpectedOwnerOperation,
+                  retireAfterJobExit: unexpectedOwnerOperation,
+                  retireAfterNativeStop: unexpectedOwnerOperation,
+                  close: unexpectedOwnerOperation,
                 },
               });
           };
@@ -3842,17 +3900,10 @@ suite(
             prewarmCurrent,
             reconcileStoppedEntry: reconcile,
             isLiveSlottedBinding: (target) =>
-              target.leaseEpoch === binding.leaseEpoch + 1,
-            startup: {
-              catalog(target, id) {
-                if (
-                  published &&
-                  sameVmBinding(target, published.receipt.binding) &&
-                  id === endpoint.employeeInstanceId
-                )
-                  return published;
-              },
-            },
+              Boolean(
+                published && sameVmBinding(target, published.receipt.binding),
+              ),
+            startup: { catalog },
           });
           probes.add(installed.close);
           const other = await admission.admit(
@@ -4122,6 +4173,8 @@ suite(
               expect(dispatchPermits).toEqual([]);
               expect(await owners()).toEqual([]);
 
+              expect(confirmPhysical).not.toHaveBeenCalled();
+              const ping = vi.spyOn(h.native, 'ping');
               const hot = await open();
               if (hot.status === 202) {
                 const hotId: string = (await hot.json()).ticket.operationId;
@@ -4131,6 +4184,16 @@ suite(
                   });
                 });
               } else expect(hot.status).toBe(200);
+              expect(confirmPhysical).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ sessionId: f.context.sessionId }),
+                next,
+                reopened,
+                expect.any(AbortSignal),
+              );
+              expect(ping).toHaveBeenCalledExactlyOnceWith(
+                reopened,
+                expect.any(AbortSignal),
+              );
               expect(dispatches).toEqual([binding, reopened]);
               expect(dispatchPermits).toHaveLength(1);
               expect(await owners()).toEqual([]);
