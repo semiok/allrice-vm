@@ -45,11 +45,8 @@ import {
 it('reads the sealed language default and persists only a native language preference', async () => {
   const f = await fixture();
   const { host } = f.host;
-  const registry = host.typert.local;
-  const lookup = registry.get.bind(registry);
   const gateway = host.typertGateway;
   const dispatch = gateway.invoke.bind(gateway);
-  const template = lookup('session/list')!;
   let preference = 'zh';
   const writes = vi.fn();
   const languageView = () => ({
@@ -57,19 +54,26 @@ it('reads the sealed language default and persists only a native language prefer
     value: { preference },
     revision: 2,
   });
-  const lookupSpy = vi.spyOn(registry, 'get').mockImplementation((endpoint) => {
-    if (endpoint !== 'settings/describe' && endpoint !== 'settings/mutate')
-      return lookup(endpoint);
-    return {
-      ...template,
-      id: `@deepseek-ai/dsh-api-settings-controller#${endpoint}`,
+  const settings = '@deepseek-ai/dsh-api-settings-controller';
+  const dispose = host.typert.register({
+    package: settings,
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: ['describe', 'mutate'].map((method) => ({
+      id: `${settings}#settings/${method}`,
+      namespace: 'settings',
+      method,
+      service: 'settingsController',
+      invocation: { kind: 'direct' },
+      parameters: [],
       result: {
         mode: 'strict',
         typeSymbol: 'test#NativeLocaleJson',
         create: () => z.json(),
         jsonSchema: {},
       },
-    };
+    })),
   });
   const dispatchSpy = vi
     .spyOn(gateway, 'invoke')
@@ -92,7 +96,9 @@ it('reads the sealed language default and persists only a native language prefer
     const describe = async () => {
       const response = await call('settings/describe', {});
       expect(response.status).toBe(200);
-      return response.json();
+      const body = await response.json();
+      expect(body.result.ok, JSON.stringify(body.result)).toBe(true);
+      return body;
     };
     expect(await describe()).toMatchObject({
       result: {
@@ -141,7 +147,7 @@ it('reads the sealed language default and persists only a native language prefer
     expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
   } finally {
     dispatchSpy.mockRestore();
-    lookupSpy.mockRestore();
+    dispose();
   }
 });
 
