@@ -241,9 +241,17 @@ function affectsRoster(change: Change, identity: DEntryIdentity) {
   }
 }
 
+export type DEntryAuthorityObservation = Readonly<{
+  // A hint fences delivery synchronously. Only the caller's full check can
+  // qualify the same subscription again.
+  subscribe(invalidate: () => void): () => void;
+  observeThroughCommit(signal: AbortSignal): Promise<void>;
+}>;
+
 export type DEntryAuthoritySubscription = Readonly<{
   revoked: AbortSignal;
   readonly expiresAt: string;
+  readonly observation?: DEntryAuthorityObservation;
   close(): Promise<void>;
 }>;
 
@@ -288,6 +296,7 @@ async function watchDEntryAuthority(
   let stopped = false;
   let expiresAt = '';
   let checks = Promise.resolve();
+  const observers = new Set<() => void>();
   const ticketThread = verifyRevision && expected.threadId;
   const invalidate = (error: unknown) => abort.abort(error);
   const recheck = async (roster: boolean) => {
@@ -379,6 +388,7 @@ async function watchDEntryAuthority(
     stopped = true;
     detach?.();
     detach = undefined;
+    observers.clear();
     if (timer) clearTimeout(timer);
     await joinChecks();
     if (timer) clearTimeout(timer); // A read already in flight may have armed it.
@@ -388,7 +398,10 @@ async function watchDEntryAuthority(
       {
         changed(change) {
           if (change.table === 'person_virtual_machines') {
-            if (change.personId === expected.personId) enqueueBinding();
+            if (change.personId === expected.personId) {
+              for (const observer of observers) observer();
+              enqueueBinding();
+            }
             return;
           }
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
@@ -406,7 +419,10 @@ async function watchDEntryAuthority(
             return;
           }
           const roster = !!nativeChecks && affectsRoster(change, expected);
-          if (roster || affects(change, context, expected)) enqueue(roster);
+          if (roster || affects(change, context, expected)) {
+            for (const observer of observers) observer();
+            enqueue(roster);
+          }
         },
         lost: invalidate,
       },
@@ -417,6 +433,19 @@ async function watchDEntryAuthority(
     revoked.throwIfAborted();
     return {
       revoked,
+      observation: {
+        subscribe(invalidate) {
+          revoked.throwIfAborted();
+          if (stopped) throw new DataAccessError('authorization_denied');
+          observers.add(invalidate);
+          return () => observers.delete(invalidate);
+        },
+        observeThroughCommit(active) {
+          return source.observeThroughCommit(
+            AbortSignal.any([active, revoked]),
+          );
+        },
+      },
       ...(ticketThread && {
         async assertTicketThread(active: AbortSignal) {
           if (stopped) throw new DataAccessError('authorization_denied');
