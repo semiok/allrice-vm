@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
@@ -328,6 +329,64 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await expect(f.store().readClaimRoster(claim!)).resolves.toEqual(roster);
     } finally {
       await host.close();
+    }
+  });
+
+  it('cancels the dedicated wake scan while another connection still holds its table lock', async () => {
+    let locked!: () => void;
+    let release!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = db.begin(async (tx) => {
+      await tx`lock table person_vm_scheduled_wakes in access exclusive mode`;
+      locked();
+      await held;
+    });
+    const caller = new AbortController();
+    let read: Promise<unknown> | undefined;
+    async function blocked() {
+      const [row] = await db<{ count: number }[]>`select count(*)::int as count
+        from pg_locks where relation='person_vm_scheduled_wakes'::regclass
+          and mode='AccessShareLock' and not granted`;
+      return row?.count;
+    }
+    try {
+      await Promise.race([acquired, holder]);
+      read = createPostgresPersonVmScheduledWakeStore(db).nextCommittedWakeAt(
+        caller.signal,
+      );
+      void read.catch(() => {});
+      await vi.waitFor(async () => expect(await blocked()).toBe(1), {
+        interval: 20,
+        timeout: 1_500,
+      });
+      const reason = new Error(
+        'synthetic drain disconnected while read was active',
+      );
+      caller.abort(reason);
+      const deadline = new AbortController();
+      try {
+        expect(
+          await Promise.race([
+            read.catch((error: unknown) => error),
+            sleep(750, 'client did not close', { signal: deadline.signal }),
+          ]),
+        ).toBe(reason);
+      } finally {
+        deadline.abort();
+      }
+      await vi.waitFor(async () => expect(await blocked()).toBe(0), {
+        interval: 20,
+        timeout: 2_500,
+      });
+    } finally {
+      caller.abort();
+      release();
+      await Promise.allSettled([holder, read]);
     }
   });
 

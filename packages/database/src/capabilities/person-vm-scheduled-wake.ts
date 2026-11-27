@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import { selectDEntryGeneration } from '@allrice/contracts';
 import type { PersonVmBinding, PersonVmWebRoster } from '@allrice/person-vm';
 import type { ISql, Sql, TransactionSql } from 'postgres';
@@ -263,12 +264,20 @@ async function withWakeAuthority<T>(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
-    nextCommittedWakeAt(signal: AbortSignal): Promise<Date | null> {
-      return withWakeAuthority(
-        sql,
-        'isolation level read committed',
-        signal,
-        async (tx, active) => {
+    async nextCommittedWakeAt(signal: AbortSignal): Promise<Date | null> {
+      const active = AbortSignal.any([signal, AbortSignal.timeout(3_000)]);
+      active.throwIfAborted();
+      const dedicated = createDedicatedDatabase(sql);
+      let closing: Promise<void> | undefined;
+      const close = () => (closing ??= dedicated.end({ timeout: 0 }));
+      // This transaction is strictly read-only. It can safely be terminated
+      // without waiting for an unresponsive database or a network read.
+      const abort = addAbortListener(
+        active,
+        () => void close().catch(() => {}),
+      );
+      try {
+        return await dedicated.begin('read only', async (tx) => {
           await tx`set local statement_timeout = '2s'`;
           active.throwIfAborted();
           const [row] = await tx<{ earliest: Date | null }[]>`
@@ -286,8 +295,14 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             order by a.id desc limit 1)`;
           active.throwIfAborted();
           return row?.earliest ?? null;
-        },
-      );
+        });
+      } catch (error) {
+        active.throwIfAborted();
+        throw error;
+      } finally {
+        abort[Symbol.dispose]();
+        await close();
+      }
     },
     stage(plan: WakePlan): Promise<boolean> {
       return sql.begin(async (tx) => {

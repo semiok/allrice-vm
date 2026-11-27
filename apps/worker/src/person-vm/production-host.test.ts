@@ -555,7 +555,7 @@ it('resumes startup and wake if final drain recovery made a near-term wake eligi
   expect(row?.phase).toBe('running');
   const value = fixture();
   value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
-  io.upgradeOperator.mockResolvedValue(context.actor.id);
+  io.upgradeOperator.mockResolvedValueOnce(context.actor.id);
   const nextWake = vi.fn().mockResolvedValueOnce(null);
   const wake = {
     nextCommittedWakeAt: nextWake,
@@ -569,7 +569,7 @@ it('resumes startup and wake if final drain recovery made a near-term wake eligi
     prepareStopWithWake: vi.fn(),
     prepareUpgradeStop: vi.fn(),
   };
-  io.upgradeWake.mockReturnValue(wake);
+  io.upgradeWake.mockReturnValueOnce(wake);
   const list = vi
     .spyOn(PostgresPersonVmStore.prototype, 'listUpgradeCandidates')
     .mockResolvedValueOnce([row!])
