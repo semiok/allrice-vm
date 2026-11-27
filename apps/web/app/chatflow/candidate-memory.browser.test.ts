@@ -912,17 +912,26 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
   );
 
   it('keeps management scoped to an explicitly selected workspace the person belongs to', async () => {
+    const separate = await createEmployeeInstance(
+      { ...owner, workspaceId: otherWorkspace },
+      {
+        workspaceId: otherWorkspace,
+        assignmentId: otherInstance,
+        requestId: randomUUID(),
+        profile: { name: 'Other scope' },
+      },
+    );
     const created = await api(
       '',
       write({
         workspaceId: otherWorkspace,
-        instanceId: otherInstance,
+        instanceId: separate.id,
         summary: '第二工作区的本人记忆',
         idempotencyKey: randomUUID(),
       }),
       ownerToken,
       otherWorkspace,
-      otherInstance,
+      separate.id,
     );
     expect(created.status).toBe(201);
     const { memory } = EmployeeMemoryWriteResponseSchema.parse(
@@ -937,7 +946,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
         request,
         ownerToken,
         otherWorkspace,
-        otherInstance,
+        separate.id,
       );
       expect(response.status).toBe(200);
       expect(await response.text()).toContain(memory.id);
@@ -947,7 +956,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
       request,
       ownerToken,
       otherWorkspace,
-      otherInstance,
+      separate.id,
     );
     expect(source.status).toBe(403);
   });
