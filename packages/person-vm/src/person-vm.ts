@@ -19,6 +19,8 @@ import {
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
   type PersonVmPrewarmFence,
+  type PersonVmPrewarmInput,
+  type PersonVmPrewarmObserver,
   type PersonVmRuntimePort,
   type PersonVmView,
 } from './contract.ts';
@@ -422,13 +424,15 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
   ) {
-    return this.createForStartup(context, signal, target);
+    return this.createForStartup(context, signal, target, observer);
   }
   private createForStartup(
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
     observeFirstDisk?: (proof: FirstPrewarmDisk) => void,
   ) {
     return this.leased(
@@ -453,7 +457,7 @@ export class PersonVmService
             await target.assertAuthority(signal);
             signal.throwIfAborted();
           }
-          target?.observeVmReservation?.(lease.row.vmId);
+          observer?.observeVmReservation?.(lease.row.vmId);
           return view(lease.row);
         }
         if (lease.row?.diskRetained && !retry) {
@@ -493,7 +497,7 @@ export class PersonVmService
               throw new PersonVmError('AUTHORIZATION_DENIED');
           },
           assertPrewarmAuthority: assertTicket,
-          observeVmReservation: target?.observeVmReservation,
+          observeVmReservation: observer?.observeVmReservation,
           observeFirstDisk:
             !lease.row && !lease.joinedOfflinePreparation
               ? observeFirstDisk
@@ -615,7 +619,7 @@ export class PersonVmService
       lane: 'foreground' | 'admin';
       assertCurrent(): Promise<void>;
       assertPrewarmAuthority?: PersonVmPrewarmFence['assertAuthority'];
-      observeVmReservation?: PersonVmPrewarmFence['observeVmReservation'];
+      observeVmReservation?: PersonVmPrewarmObserver['observeVmReservation'];
       observeFirstDisk?: (proof: FirstPrewarmDisk) => void;
     },
   ) {
@@ -888,13 +892,15 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
   ) {
-    return this.startForSelection(context, signal, target);
+    return this.startForSelection(context, signal, target, observer);
   }
   private startForSelection(
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
     selectedStartup?: SelectedStartup,
   ) {
     const startup = target?.orphanedStart;
@@ -911,6 +917,7 @@ export class PersonVmService
             lease,
             current,
             target,
+            observer,
             selectedStartup,
           );
         } catch (error) {
@@ -989,6 +996,7 @@ export class PersonVmService
     lease: VmLease,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer?: PersonVmPrewarmObserver,
     selectedStartup?: SelectedStartup,
   ) {
     const assertAuthority =
@@ -1103,7 +1111,7 @@ export class PersonVmService
     row.lastActivityAt = this.now().toISOString();
     target?.orphanedStart?.observeInstance(bindingOf(row));
     await lease.save(row);
-    target?.observeVmStart?.(bindingOf(row));
+    observer?.observeVmStart?.(bindingOf(row));
     if (previousBinding)
       this.admissionHost?.forgetStoppedEntryRecovery(previousBinding);
     await lease.audit(row, {
@@ -1348,7 +1356,7 @@ export class PersonVmService
   }
   async prewarm(
     context: RequestContext,
-    input: Parameters<PersonVmHostPort['prewarm']>[1],
+    input: PersonVmPrewarmInput,
     signal: AbortSignal,
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
@@ -1358,6 +1366,7 @@ export class PersonVmService
         context,
         signal,
         input.target,
+        input.observer,
         input.selectedEmployee,
       );
     return this.options.diskPool
@@ -1368,6 +1377,7 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer?: PersonVmPrewarmObserver,
     selectedEmployee?: PersonVmEmployeeSelection,
   ) {
     const identity = await this.identity(context, 'start', signal);
@@ -1384,11 +1394,11 @@ export class PersonVmService
       firstDisk?: FirstPrewarmDisk,
     ) =>
       selectedEmployee
-        ? this.startForSelection(context, signal, nextTarget, {
+        ? this.startForSelection(context, signal, nextTarget, observer, {
             employee: selectedEmployee,
             firstDisk,
           })
-        : this.start(context, signal, nextTarget);
+        : this.start(context, signal, nextTarget, observer);
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
     this.assertPrewarmTarget(row, target, true);
@@ -1451,10 +1461,16 @@ export class PersonVmService
       !target.replacesVmId &&
       !target.restoreRetained;
     const created = canProveFirstDisk
-      ? await this.createForStartup(context, signal, target, (proof) => {
-          firstDisk = proof;
-        })
-      : await this.create(context, signal, target);
+      ? await this.createForStartup(
+          context,
+          signal,
+          target,
+          observer,
+          (proof) => {
+            firstDisk = proof;
+          },
+        )
+      : await this.create(context, signal, target, observer);
     return start(
       target && { ...target, vmId: target.vmId ?? created.vmId },
       firstDisk,

@@ -205,28 +205,39 @@ export type PersonVmPrewarmTarget = Readonly<{
 /** Host-only stages. A written candidate proves nothing until independently visible. */
 export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
 
-export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
-  assertAuthority(signal: AbortSignal): Promise<void>;
-  /** Opaque deletion fact from the Worker snapshot, checked under the VM lease. */
-  readonly deletionFence?: string | null;
-  /** Host-only observations from this request's create and start leases. */
+/** Host-only observations from this request's create and start leases. */
+export type PersonVmPrewarmObserver = {
   observeVmReservation?(vmId: string): void;
   observeVmStart?(binding: PersonVmBinding): void;
-  /** Host-only observations for this ticket's exact orphaned start. */
-  orphanedStart?: Readonly<{
-    predecessor: PersonVmBinding;
-    observeLease(ownerToken: string, signal: AbortSignal): void;
-    observeInstance(binding: PersonVmBinding): void;
-    observeFailure?(
-      ownerToken: string,
-      phase: 'starting' | 'stopped' | 'failed',
-    ): void;
-    observeRelease?(
-      ownerToken: string,
-      rowVersion: string,
-      stage: PersonVmLeaseReleaseStage,
-    ): void;
-  }>;
+};
+
+export type PersonVmPrewarmFence = PersonVmPrewarmTarget &
+  PersonVmPrewarmObserver & {
+    assertAuthority(signal: AbortSignal): Promise<void>;
+    /** Opaque deletion fact from the Worker snapshot, checked under the VM lease. */
+    readonly deletionFence?: string | null;
+    /** Host-only observations for this ticket's exact orphaned start. */
+    orphanedStart?: Readonly<{
+      predecessor: PersonVmBinding;
+      observeLease(ownerToken: string, signal: AbortSignal): void;
+      observeInstance(binding: PersonVmBinding): void;
+      observeFailure?(
+        ownerToken: string,
+        phase: 'starting' | 'stopped' | 'failed',
+      ): void;
+      observeRelease?(
+        ownerToken: string,
+        rowVersion: string,
+        stage: PersonVmLeaseReleaseStage,
+      ): void;
+    }>;
+  };
+
+export type PersonVmPrewarmInput = {
+  trigger: 'page' | 'input';
+  target?: PersonVmPrewarmFence;
+  observer?: PersonVmPrewarmObserver;
+  selectedEmployee?: PersonVmEmployeeSelection;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
@@ -235,11 +246,7 @@ export interface PersonVmPort {
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: {
-      trigger: 'page' | 'input';
-      target?: PersonVmPrewarmFence;
-      selectedEmployee?: PersonVmEmployeeSelection;
-    },
+    input: PersonVmPrewarmInput,
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

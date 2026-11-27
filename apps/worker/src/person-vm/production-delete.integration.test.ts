@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { lstat, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   DEntryNativePrewarmAcceptedSchema,
@@ -12,6 +12,7 @@ import {
   authenticatePlatformSession,
   authenticateSession,
   closeDEntryAuthorityFeeds,
+  createDEntryAuthorityFeed,
   createDedicatedDatabase,
   createEmployeeInstance,
   createSession,
@@ -28,6 +29,7 @@ import {
   PersonVmService,
   PostgresPersonVmStore,
   type PersonVmAuthority,
+  type PersonVmBinding,
 } from '@allrice/person-vm';
 import * as client from '../../../../packages/database/src/core/client.ts';
 import { DiskPoolLedger } from '../../../../packages/person-vm/src/disk-pool-ledger.ts';
@@ -346,6 +348,7 @@ suite(
       const prewarm = createProductionCurrentPrewarm({ vm, current });
       const dispatch = vi.fn(prewarm);
       const watch = vi.fn(dEntryHttpDefaults.watch);
+      const isCurrent = vi.fn(dEntryHttpDefaults.prewarm.isCurrent!);
       const releaseGates: (() => void)[] = [];
       function gate() {
         const entered = deferred<void>();
@@ -383,12 +386,41 @@ suite(
       }
       function pauseBeforeIssue() {
         const { entered, resume } = gate();
+        const watchCurrent = watch.getMockImplementation()!;
         watch.mockImplementationOnce(async (...args) => {
-          const subscription = await dEntryHttpDefaults.watch(...args);
+          const subscription = await watchCurrent(...args);
           entered.resolve();
           await resume.promise;
           return subscription;
         });
+        return { entered, resume };
+      }
+      function pauseAfterSuccessfulIssueRead() {
+        const { entered, resume } = gate();
+        const check = isCurrent.getMockImplementation()!;
+        isCurrent.mockImplementation(async (...args) => {
+          if (args[4] !== 'issue') return check(...args);
+          isCurrent.mockImplementation(check);
+          // Hold delivery of the real repeatable-read result to the handler.
+          const current = await check(...args);
+          expect(current).toBe(true);
+          entered.resolve();
+          await resume.promise;
+          return current;
+        });
+        return { entered, resume };
+      }
+      function pauseAfterLeaseClaim() {
+        const { entered, resume } = gate();
+        const withLease = store.withLease.bind(store);
+        vi.spyOn(store, 'withLease').mockImplementationOnce(
+          (person, options, work) =>
+            withLease(person, options, async (lease) => {
+              entered.resolve();
+              await resume.promise;
+              return work(lease);
+            }),
+        );
         return { entered, resume };
       }
       const proof = vi.fn<
@@ -411,6 +443,7 @@ suite(
       const entry = await nativeEntryServer(undefined, {
         ...dEntryHttpDefaults,
         watch,
+        prewarm: { ...dEntryHttpDefaults.prewarm, isCurrent },
       });
       const headers = (loginToken: string) => ({
         authorization: `Bearer ${loginToken}`,
@@ -482,7 +515,7 @@ suite(
           vmId,
           confirmationId: review.json.confirmationId,
         });
-        expect(erased.status).toBe(status);
+        expect(erased.status, JSON.stringify(erased.json)).toBe(status);
         if (status === 200)
           expect(erased.json.vm).toMatchObject({
             vmId,
@@ -490,19 +523,38 @@ suite(
             diskRetained: false,
           });
       }
-      async function close() {
+      async function close(predecessor?: PersonVmBinding) {
         failImageCreation = false;
         failRuntimeStart = false;
         for (const release of releaseGates) release();
         try {
           await entry.close();
           await runtime.close();
-          const current = await store.read(personId);
-          if (current?.diskRetained) {
-            if (current.nativeCreated)
-              nativeStates.set(current.vmId, 'stopped');
-            await purge(current.vmId);
-            nativeStates.delete(current.vmId);
+          const persisted = await store.read(personId);
+          if (persisted?.diskRetained) {
+            if (predecessor && persisted.phase === 'starting') {
+              // The fixture seeded this stopped predecessor. Its cancelled
+              // takeover has joined and released the original lease.
+              expect(persisted).toMatchObject({
+                ...predecessor,
+                leaseOwner: null,
+              });
+              expect(nativeStates.get(predecessor.vmId)).toBe('stopped');
+              await vm.shutdownOwned(predecessor, false);
+              expect(await row()).toMatchObject({
+                ...predecessor,
+                phase: 'stopped',
+                leaseOwner: null,
+                egressReceipt: null,
+              });
+              expect(
+                [...attachments.values()].map((mount) => basename(mount)),
+              ).not.toContain(predecessor.vmId);
+            }
+            if (persisted.nativeCreated)
+              nativeStates.set(persisted.vmId, 'stopped');
+            await purge(persisted.vmId);
+            nativeStates.delete(persisted.vmId);
           }
         } finally {
           uninstallData();
@@ -517,9 +569,13 @@ suite(
         personId,
         proof,
         dispatch,
+        watch,
+        isCurrent,
         pauseDispatch,
         pauseCreate,
         pauseBeforeIssue,
+        pauseAfterSuccessfulIssueRead,
+        pauseAfterLeaseClaim,
         open,
         openTicket,
         status,
@@ -787,33 +843,271 @@ suite(
       },
     );
 
-    it('reuses the cold ticket after its own start saves the exact running instance', async () => {
-      const f = await prewarmDeletionTarget();
-      const entered = deferred<void>();
-      const resume = deferred<void>();
-      const prove = f.proof.getMockImplementation()!;
-      f.proof.mockImplementationOnce(async (...args) => {
-        entered.resolve();
-        await resume.promise;
-        return prove(...args);
-      });
-      try {
-        const original = await f.openTicket();
-        await entered.promise;
-        expect(await f.row()).toMatchObject({
-          phase: 'running',
-          instanceId: expect.any(String),
-          leaseOwner: null,
+    it.each([
+      ['same login', 'before issue'],
+      ['same login', 'after a successful issue read'],
+      ['different login', 'before issue'],
+    ] as const)(
+      'checks a cold POST prepared before the exact instance was saved by the %s (%s)',
+      async (login, timing) => {
+        const f = await prewarmDeletionTarget();
+        const entered = deferred<void>();
+        const resume = deferred<void>();
+        const prove = f.proof.getMockImplementation()!;
+        f.proof.mockImplementationOnce(async (...args) => {
+          entered.resolve();
+          await resume.promise;
+          return prove(...args);
         });
-        expect(await f.openTicket()).toBe(original);
-        expect(f.dispatch).toHaveBeenCalledOnce();
-        resume.resolve();
-        expect(await f.ready(original)).toMatchObject({ leaseEpoch: 1 });
-      } finally {
-        resume.resolve();
-        await f.close();
-      }
-    });
+        try {
+          const owner =
+            login === 'different login'
+              ? (await createSession(f.personId)).token
+              : undefined;
+          const paused =
+            timing === 'before issue'
+              ? f.pauseBeforeIssue()
+              : f.pauseAfterSuccessfulIssueRead();
+          const opening = f.open();
+          await Promise.race([
+            paused.entered.promise,
+            opening.then((response) => {
+              throw Error(
+                'POST ended before its watch barrier: ' + response.status,
+              );
+            }),
+          ]);
+          const original = await f.openTicket(owner);
+          await entered.promise;
+          expect(await f.row()).toMatchObject({
+            phase: 'running',
+            instanceId: expect.any(String),
+            leaseOwner: null,
+          });
+          paused.resume.resolve();
+          const delayed = await opening;
+          const body = await delayed.json();
+          if (login === 'same login')
+            expect({ status: delayed.status, json: body }).toMatchObject({
+              status: 202,
+              json: {
+                ticket: { operationId: original },
+                identity: f.identity,
+              },
+            });
+          else
+            expect({ status: delayed.status, json: body }).toEqual(
+              expiredTicket,
+            );
+          // A new prepare after publication still joins its own exact ticket.
+          expect(await f.openTicket(owner)).toBe(original);
+          expect(f.dispatch).toHaveBeenCalledOnce();
+          resume.resolve();
+          expect(await f.ready(original, owner)).toMatchObject({
+            leaseEpoch: 1,
+          });
+        } finally {
+          resume.resolve();
+          await f.close();
+        }
+      },
+    );
+
+    it.each(['before issue', 'after a successful issue read'] as const)(
+      'rejects a cold POST delayed %s when its login only has a hot ticket for the instance started by another login',
+      async (timing) => {
+        const f = await prewarmDeletionTarget();
+        const proving = deferred<void>();
+        const resume = deferred<void>();
+        try {
+          const independent = (await createSession(f.personId)).token;
+          const paused =
+            timing === 'before issue'
+              ? f.pauseBeforeIssue()
+              : f.pauseAfterSuccessfulIssueRead();
+          const opening = f.open();
+          await Promise.race([
+            paused.entered.promise,
+            opening.then((response) => {
+              throw Error(
+                'POST ended before its issue barrier: ' + response.status,
+              );
+            }),
+          ]);
+          expect(await store.read(f.personId)).toBeNull();
+          const starter = await f.openTicket(independent);
+          const binding = await f.ready(starter, independent);
+          const healthy = await f.leaseRowVersion();
+          expect(healthy.lease_owner).toBeNull();
+
+          const prove = f.proof.getMockImplementation()!;
+          f.proof.mockImplementationOnce(async (...args) => {
+            proving.resolve();
+            await resume.promise;
+            return prove(...args);
+          });
+          const hot = await f.openTicket();
+          await proving.promise;
+          expect(hot).not.toBe(starter);
+          expect(await f.status(hot)).toEqual({
+            status: 200,
+            json: { state: 'starting' },
+          });
+
+          paused.resume.resolve();
+          const delayed = await opening;
+          expect({
+            status: delayed.status,
+            json: await delayed.json(),
+          }).toEqual(expiredTicket);
+          // Hot proof precedes a call to the existing VM lifecycle in this fixture.
+          expect(f.dispatch).toHaveBeenCalledOnce();
+          expect(f.proof.mock.calls.map(([, , , current]) => current)).toEqual([
+            binding,
+            binding,
+          ]);
+          expect(await f.leaseRowVersion()).toEqual(healthy);
+          resume.resolve();
+          expect(await f.ready(hot)).toEqual(binding);
+          expect(await f.ready(starter, independent)).toEqual(binding);
+          expect(f.dispatch).toHaveBeenCalledTimes(2);
+          const [, employee, input] = f.dispatch.mock.calls[1]!;
+          expect(employee).toEqual(f.identity);
+          expect(input.target).toMatchObject({
+            vmId: binding.vmId,
+            instanceId: binding.instanceId,
+            leaseEpoch: binding.leaseEpoch,
+          });
+          expect(await f.leaseRowVersion()).toEqual(healthy);
+        } finally {
+          resume.resolve();
+          await f.close();
+        }
+      },
+    );
+
+    it.each(['issue', 'reuse', 'operation'] as const)(
+      'uses the correct HTTP result when %s SQL sees revocation before its notification is handled',
+      async (mode) => {
+        const f = await prewarmDeletionTarget();
+        const feed = createDEntryAuthorityFeed(process.env.DATABASE_URL!);
+        const subscribe = feed.subscribe.bind(feed);
+        const blocked: (() => void)[] = [];
+        vi.spyOn(feed, 'subscribe').mockImplementation((listener, active) =>
+          subscribe(
+            {
+              ...listener,
+              changed(change) {
+                if (
+                  change.table === 'allrice_memberships' &&
+                  change.personId === f.personId
+                )
+                  blocked.push(() => listener.changed(change));
+                else listener.changed(change);
+              },
+            },
+            active,
+          ),
+        );
+        f.watch.mockImplementation(
+          (context, selection, identity, signal, _feed, verify) =>
+            dEntryHttpDefaults.watch(
+              context,
+              selection,
+              identity,
+              signal,
+              feed,
+              verify,
+            ),
+        );
+        const productionCheck = dEntryHttpDefaults.prewarm.isCurrent!;
+        let withdraw = false;
+        let predecessor: PersonVmBinding | undefined;
+        f.isCurrent.mockImplementation(async (...args) => {
+          const active = args[3];
+          if (withdraw && args[4] === mode) {
+            withdraw = false;
+            const withdrawn =
+              await fixture.db`update allrice_memberships set active=false
+                where user_id=${f.personId} and organization_id=${f.owner.organizationId} and active
+                returning id`;
+            expect(withdrawn.length).toBeGreaterThan(0);
+            await feed.observeThroughCommit(active);
+            expect(blocked).toHaveLength(
+              withdrawn.length * (mode === 'reuse' ? 2 : 1),
+            );
+            expect(active.aborted).toBe(false);
+          }
+          return productionCheck(...args);
+        });
+        async function expectDenied(response: Response) {
+          expect(response.status).toBe(404);
+          expect(await response.json()).toMatchObject({
+            error: { code: 'RESOURCE_NOT_FOUND' },
+          });
+        }
+        try {
+          if (mode === 'issue') {
+            withdraw = true;
+            await expectDenied(await f.open());
+            expect(withdraw).toBe(false);
+            expect(f.dispatch).not.toHaveBeenCalled();
+            expect(await store.read(f.personId)).toBeNull();
+            return;
+          }
+
+          const prior = await f.ready(await f.openTicket());
+          nativeStates.set(prior.vmId, 'stopped');
+          // Emulate a prior worker loss before it published running. Its exact
+          // stopped instance, retained disk and port receipt are from real startup.
+          const orphaned =
+            await fixture.db`update person_virtual_machines set phase='starting'
+            where vm_id=${prior.vmId} and instance_id=${prior.instanceId} and phase='running'
+              and lease_epoch=${prior.leaseEpoch} and lease_owner is null
+            returning instance_id`;
+          expect(orphaned).toHaveLength(1);
+          predecessor = prior;
+          const delayed = mode === 'reuse' ? f.pauseBeforeIssue() : undefined;
+          const opening = delayed && f.open();
+          if (delayed && opening)
+            await Promise.race([
+              delayed.entered.promise,
+              opening.then((response) => {
+                throw Error(
+                  'POST ended before its watch barrier: ' + response.status,
+                );
+              }),
+            ]);
+
+          const physical = f.pauseAfterLeaseClaim();
+          const original = await f.openTicket();
+          await physical.entered.promise;
+          expect(await f.row()).toMatchObject({
+            ...prior,
+            phase: 'starting',
+            leaseOwner: expect.any(String),
+          });
+          const claimed = await f.leaseRowVersion();
+          withdraw = true;
+          if (delayed && opening) {
+            delayed.resume.resolve();
+            await expectDenied(await opening);
+          } else {
+            expect(await f.status(original)).toEqual(expiredTicket);
+          }
+          expect(withdraw).toBe(false);
+          expect(await f.leaseRowVersion()).toEqual(claimed);
+          expect(f.dispatch).toHaveBeenCalledTimes(2);
+        } finally {
+          for (const notify of blocked) notify();
+          try {
+            await f.close(predecessor);
+          } finally {
+            await feed.close();
+          }
+        }
+      },
+    );
 
     it('does not issue a retained-disk ticket when an actual purge finishes during the prepared POST', async () => {
       const f = await prewarmDeletionTarget();

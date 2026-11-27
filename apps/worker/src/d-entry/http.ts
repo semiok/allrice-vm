@@ -159,6 +159,18 @@ function sendPrewarmAccepted(
     .end(JSON.stringify(DEntryNativePrewarmAcceptedSchema.parse(value)));
 }
 
+function sendPrewarmReady(
+  response: ServerResponse,
+  value: z.infer<typeof DEntryNativePrewarmResultSchema>,
+) {
+  response
+    .writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    })
+    .end(JSON.stringify(DEntryNativePrewarmResultSchema.parse(value)));
+}
+
 function sendPrewarmStatus(
   response: ServerResponse,
   value: DEntryNativePrewarmStatus,
@@ -326,14 +338,30 @@ export function createDEntryHttpHandler(
       const check = deps.prewarm.isCurrent?.bind(deps.prewarm);
       if (prewarmRequest && (!plan || !check))
         throw new DEntryNativeUnavailable();
-      const prior = plan && plan.reuse;
-      if (prewarmRequest && prior && check) {
-        const existing = prewarm.reuse(auth.context, auth.identity, prior);
+      async function publishExistingPrewarm(
+        existing: ReturnType<typeof prewarm.reuse>['existing'],
+        trigger: 'page' | 'input',
+        verify: NonNullable<DEntryNativePrewarmPort['isCurrent']>,
+        preferReady = false,
+      ) {
         if (!existing) {
           sendPrewarmStatus(response, { state: 'expired' });
-          return true;
+          return;
         }
         finishPrewarmReply = existing.finishReply;
+        if (preferReady) {
+          const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
+          try {
+            await Promise.race([
+              existing.settled,
+              delay(1000, false, { signal: probe, ref: false }),
+            ]);
+          } finally {
+            budget.abort();
+            signal.throwIfAborted();
+          }
+        }
         const threadOpen = await existing.observeThread(signal);
         const { context, identity } = await currentDEntryRequest(
           deps,
@@ -344,18 +372,29 @@ export function createDEntryHttpHandler(
         const mayPublish =
           threadOpen &&
           (await existing.recheck(context, identity, (mode) =>
-            check(context, identity, prior, signal, mode),
+            verify(context, identity, existing.plan, signal, mode, 'publish'),
           ));
         signal.throwIfAborted();
         if (!threadOpen) existing.assertNotRevoked();
         if (mayPublish && mayPublish()) {
+          if (preferReady && existing.ready()) {
+            sendPrewarmReady(response, { identity, trigger });
+            return;
+          }
           existing.publish();
           sendPrewarmAccepted(response, {
             identity,
-            trigger: prewarmRequest.trigger,
+            trigger,
             ticket: existing.ticket,
           });
         } else sendPrewarmStatus(response, { state: 'expired' });
+      }
+      if (prewarmRequest && plan && plan.reuse && check) {
+        await publishExistingPrewarm(
+          prewarm.reuse(auth.context, auth.identity, plan).existing,
+          prewarmRequest.trigger,
+          check,
+        );
         return true;
       }
       // The job takes ownership of its subscription on acceptance. LISTEN
@@ -400,10 +439,23 @@ export function createDEntryHttpHandler(
         const { context, identity } = next;
         plan.assertTicketThread = authority.assertTicketThread;
         await plan.assertTicketThread?.(signal);
-        const canIssue = await check(context, identity, plan, signal, 'issue');
+        let canIssue = await check(context, identity, plan, signal, 'issue');
         signal.throwIfAborted();
-        if (!canIssue) {
-          sendPrewarmStatus(response, { state: 'expired' });
+        let match = prewarm.reuse(context, identity, plan, canIssue);
+        if (canIssue && !match.existing && match.publishedInstance) {
+          // A compatible-looking instance can have appeared after this MVCC
+          // read. Recheck before creating a ticket from the earlier cold plan.
+          canIssue = await check(context, identity, plan, signal, 'issue');
+          signal.throwIfAborted();
+          match = prewarm.reuse(context, identity, plan, canIssue);
+        }
+        if (match.existing || !canIssue) {
+          await publishExistingPrewarm(
+            match.existing,
+            prewarmRequest.trigger,
+            check,
+            canIssue && plan.running === true,
+          );
           return true;
         }
         const { trigger } = prewarmRequest;
@@ -423,7 +475,7 @@ export function createDEntryHttpHandler(
               plan,
             ),
         );
-        transferred = accepted.owned;
+        transferred = true;
         finishPrewarmReply = accepted.finishReply;
         let hot = false;
         // An already running VM only gets a short window for immediate proof.
@@ -470,13 +522,7 @@ export function createDEntryHttpHandler(
           });
           return true;
         }
-        response.writeHead(200, {
-          'content-type': 'application/json',
-          'cache-control': 'no-store',
-        });
-        response.end(
-          JSON.stringify(DEntryNativePrewarmResultSchema.parse(receipt)),
-        );
+        sendPrewarmReady(response, receipt);
         return true;
       }
       const current = await currentDEntryNativeOwner(

@@ -17,7 +17,10 @@ import {
   dEntryNativePrewarmPort,
   installDEntryNativePrewarmPort,
 } from '../d-entry/native-prewarm.js';
-import { installDEntryNativeDataPort } from '../d-entry/native-data.js';
+import {
+  installDEntryNativeDataPort,
+  type DEntryNativeDataPort,
+} from '../d-entry/native-data.js';
 import {
   dEntryNativeOwnerPort,
   DEntryNativeUnavailable,
@@ -284,10 +287,12 @@ it.each(['completes', 'disconnects', 'loses authority'])(
       revoked = new AbortController();
     const cancelled = leaderOutcome === 'disconnects' ? caller : revoked;
     const follower = { ...f.base.context, requestId: randomUUID() };
-    const prove = vi.fn(async (context: typeof f.base.context) => {
-      expect(context.sessionId).toBe(f.base.context.sessionId);
-      return signal();
-    });
+    const prove = vi.fn<NonNullable<DEntryNativeDataPort['assertEditorReady']>>(
+      async (context) => {
+        expect(context.sessionId).toBe(f.base.context.sessionId);
+        return signal();
+      },
+    );
     cleanups.push(async () => release.resolve());
     const uninstall = installDEntryNativeDataPort({
       ...f.base.data,
@@ -349,9 +354,60 @@ it.each(['completes', 'disconnects', 'loses authority'])(
         ? [f.base.context.requestId, follower.requestId]
         : [follower.requestId];
     expect(provedRequests).toEqual(expectedRequests.sort());
+    const current = await f.h.service.resolve(f.base.context, signal());
+    expect(prove.mock.calls.map(([, , , binding]) => binding)).toEqual(
+      expectedRequests.map(() => current),
+    );
     expect(f.stop).not.toHaveBeenCalled();
   },
 );
+
+it('does not join a published instance observed for a different physical start', async () => {
+  const f = fixture(true);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const { context, identity } = f.base;
+  f.start.mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return f.runStart(...args);
+  });
+  const first = f.assembly.port.prewarm(
+    context,
+    identity,
+    'page',
+    signal(),
+    signal(),
+  );
+  void first.catch(() => {});
+  try {
+    await entered.promise;
+    const owned = await f.h.store.read(identity.personId);
+    expect(owned).toMatchObject({
+      phase: 'starting',
+      instanceId: expect.any(String),
+    });
+    f.readCoordination.mockResolvedValueOnce({
+      authorityRevision: 'release-1',
+      vm: { ...owned!, instanceId: randomUUID() },
+    });
+    await expect(
+      f.assembly.port.prewarm(
+        { ...context, requestId: randomUUID() },
+        identity,
+        'input',
+        signal(),
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+    expect(f.vm).toHaveBeenCalledTimes(2);
+    expect(f.start).toHaveBeenCalledOnce();
+    expect(await f.h.store.read(identity.personId)).toEqual(owned);
+  } finally {
+    release.resolve();
+    await first;
+  }
+});
 
 it.each(['login', 'employee'])(
   'does not reuse completed prewarm work or share in-flight work across a different %s',
@@ -770,7 +826,28 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
     let operationId: string;
     const post = () =>
       server.request('native-prewarm', { ...body, trigger: 'page' });
+    const watchEntered = deferred<void>();
+    const allowIssue = deferred<void>();
+    let delayed: Promise<Response> | undefined;
     try {
+      if (mode === 'exact start') {
+        const watch = f.base.deps.watch.getMockImplementation()!;
+        f.base.deps.watch.mockImplementationOnce(async () => {
+          const subscription = await watch();
+          watchEntered.resolve();
+          await allowIssue.promise;
+          return subscription;
+        });
+        delayed = post();
+        await Promise.race([
+          watchEntered.promise,
+          delayed.then((response) => {
+            throw Error(
+              'POST ended before its watch barrier: ' + response.status,
+            );
+          }),
+        ]);
+      }
       const response = await post();
       expect(response.status).toBe(202);
       operationId = (await response.json()).ticket.operationId;
@@ -783,6 +860,13 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
         leaseEpoch: original.leaseEpoch,
         leaseOwner: expect.any(String),
       });
+      if (delayed) {
+        allowIssue.resolve();
+        const resumed = await delayed;
+        expect(resumed.status).toBe(202);
+        expect((await resumed.json()).ticket.operationId).toBe(operationId);
+        expect(f.vm).toHaveBeenCalledOnce();
+      }
       const beforePoll = f.h.log.slice();
       const poll = () => prewarmStatus(server, operationId);
       const starting = await poll();
@@ -815,7 +899,7 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
           const response = await post();
           expect(response.status).toBe(202);
           expect((await response.json()).ticket.operationId).toBe(operationId);
-          expect(f.base.deps.watch).toHaveBeenCalledOnce();
+          expect(f.base.deps.watch).toHaveBeenCalledTimes(2);
           expect(f.vm).toHaveBeenCalledOnce();
           expect(reconcile).not.toHaveBeenCalled();
         };
@@ -870,8 +954,10 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
         expect(f.vm).toHaveBeenCalledOnce();
       }
     } finally {
+      allowIssue.resolve();
       allowTakeover.resolve();
       allowNewInstance.resolve();
+      await delayed?.catch(() => {});
     }
     const observed: number[] = [];
     await vi.waitFor(async () => {

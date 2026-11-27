@@ -20,7 +20,7 @@ type PrewarmReadMode = Exclude<
   PrewarmVerificationMode,
   'authority' | 'issue' | 'reuse'
 >;
-type PrewarmReuseMode = PrewarmReadMode | 'reuse';
+type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
 export type PrewarmPlan = {
   key: string;
@@ -71,10 +71,19 @@ export function observedPrewarmTarget({
   reservation,
 }: Pick<PrewarmPlan, 'target' | 'reservation'>): PrewarmGeneration {
   if (!reservation) return target;
+  const instance = reservation.instance;
+  if (instance) {
+    if (!compatiblePrewarmGeneration(target, instance)) return target;
+    return {
+      ...target,
+      vmId: instance.vmId,
+      instanceId: instance.instanceId,
+      leaseEpoch: instance.leaseEpoch,
+    };
+  }
   return {
     ...target,
     vmId: target.vmId ?? reservation.vmId ?? null,
-    instanceId: target.instanceId ?? reservation.instance?.instanceId ?? null,
   };
 }
 
@@ -97,6 +106,8 @@ export interface DEntryNativePrewarmPort {
     plan: PrewarmPlan,
     signal: AbortSignal,
     mode: PrewarmVerificationMode,
+    /** A POST is about to publish its response, even if the original ticket is ready. */
+    purpose?: 'publish',
   ): Promise<boolean>;
   prewarm(
     context: RequestContext,
@@ -122,9 +133,9 @@ export const dEntryNativePrewarmPort: DEntryNativePrewarmPort = {
     if (!installed?.prepare) throw new DEntryNativeUnavailable();
     return installed.prepare(context, identity, signal);
   },
-  isCurrent(context, identity, plan, signal, mode) {
+  isCurrent(context, identity, plan, signal, mode, purpose) {
     if (!installed?.isCurrent) throw new DEntryNativeUnavailable();
-    return installed.isCurrent(context, identity, plan, signal, mode);
+    return installed.isCurrent(context, identity, plan, signal, mode, purpose);
   },
   prewarm(context, identity, trigger, signal, revoked, plan) {
     signal.throwIfAborted();
@@ -141,6 +152,7 @@ export function createPrewarmOperations(
     identity: DEntryIdentity;
     sessionId: string;
     plan: PrewarmPlan;
+    preparedTarget: PrewarmGeneration;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
     deadline: AbortSignal;
@@ -168,16 +180,49 @@ export function createPrewarmOperations(
   ) =>
     entry.sessionId === context.sessionId &&
     sameDEntryIdentity(entry.identity, identity);
+  function matchesPendingTarget(
+    entry: Operation,
+    plan: PrewarmPlan,
+    canIssue: boolean,
+  ) {
+    const requested = plan.target;
+    if (requested.instanceId !== null)
+      return canIssue && canSharePrewarmTarget(entry.plan, requested);
+
+    if (entry.plan.orphanedInstanceId !== plan.orphanedInstanceId) return false;
+    const origin = entry.preparedTarget;
+    if (plan.running || entry.plan.running || origin.instanceId !== null)
+      return false;
+    const sameOrigin =
+      origin.vmId === requested.vmId &&
+      origin.leaseEpoch === requested.leaseEpoch &&
+      origin.replacesVmId === requested.replacesVmId &&
+      origin.restoreRetained === requested.restoreRetained;
+    // Orphan reuse separately verifies the exact predecessor and actual lease.
+    if (plan.orphanedInstanceId !== undefined) return sameOrigin;
+
+    const reservation = entry.plan.reservation;
+    const started = reservation?.instance;
+    if (!started) return canIssue && sameOrigin;
+    // A delayed cold request needs a start that consumed its original target.
+    // A ticket issued against an already assigned instance only proves that instance.
+    return (
+      started.personId === entry.identity.personId &&
+      started.organizationId === entry.identity.organizationId &&
+      compatiblePrewarmGeneration(origin, started) &&
+      (requested.vmId !== null || origin.vmId === null) &&
+      canSharePrewarmTarget({ target: origin, reservation }, requested)
+    );
+  }
   function discardUnpublished(entry: Operation) {
     if (entry.published || entry.replies || active(entry)) return;
     tickets.delete(entry.ticket.operationId);
     void entry.release();
   }
-  function accepted(entry: Operation, owned: boolean) {
+  function accepted(entry: Operation) {
     entry.replies += 1;
     return {
       ticket: entry.ticket,
-      owned,
       settled: entry.settled,
       ready: () => entry.state.state === 'ready' && !entry.proof?.aborted,
       assertTicketThread: entry.plan.assertTicketThread,
@@ -195,28 +240,53 @@ export function createPrewarmOperations(
     reuse(
       context: RequestContext,
       identity: DEntryIdentity,
-      prior: PrewarmPlan,
+      plan: PrewarmPlan,
+      canIssue = false,
     ) {
-      const entry = [...tickets.values()].find((entry) => entry.plan === prior);
-      if (
-        !entry ||
-        expired(entry) ||
-        entry.revoked.aborted ||
-        !belongs(entry, context, identity)
-      )
-        return;
+      const prior = plan.reuse;
+      let publishedInstance = false;
+      const entry = [...tickets.values()].find((entry) => {
+        if (expired(entry) || entry.revoked.aborted) return false;
+        if (prior)
+          return entry.plan === prior && belongs(entry, context, identity);
+        if (
+          active(entry) &&
+          belongs(entry, context, identity) &&
+          entry.plan.key === plan.key &&
+          matchesPendingTarget(entry, plan, canIssue)
+        )
+          return true;
+        if (
+          canIssue &&
+          plan.target.instanceId === null &&
+          entry.identity.personId === identity.personId &&
+          entry.identity.organizationId === identity.organizationId
+        ) {
+          const known = observedPrewarmTarget(entry.plan);
+          publishedInstance ||=
+            known.instanceId !== null &&
+            known.leaseEpoch >= plan.target.leaseEpoch;
+        }
+        return false;
+      });
+      if (!entry) return { existing: undefined, publishedInstance };
       const mode = (): PrewarmReuseMode | undefined => {
-        if (active(entry)) return 'reuse';
+        if (active(entry)) {
+          if (entry.plan.orphanedInstanceId === undefined) return 'issue';
+          return canIssue && !prior ? 'operation' : 'reuse';
+        }
         if (entry.state.state === 'ready' && !entry.proof?.aborted)
           return 'ready';
         if (
+          (prior || canIssue) &&
           entry.state.state === 'failed' &&
           entry.state.code === 'START_UNAVAILABLE'
         )
           return 'failed';
       };
-      return {
-        ...accepted(entry, false),
+      const existing = {
+        ...accepted(entry),
+        plan: entry.plan,
         async observeThread(signal: AbortSignal) {
           try {
             await entry.plan.assertTicketThread?.(signal);
@@ -245,7 +315,8 @@ export function createPrewarmOperations(
             tickets.get(entry.ticket.operationId) === entry &&
             !expired(entry) &&
             !entry.revoked.aborted &&
-            belongs(entry, context, identity);
+            belongs(entry, context, identity) &&
+            (!!prior || matchesPendingTarget(entry, plan, canIssue));
           const initial = mode();
           if (!initial || !live()) return;
           const verified = await verify(initial);
@@ -259,6 +330,7 @@ export function createPrewarmOperations(
           if (valid) return () => live() && mode() === current;
         },
       };
+      return { existing, publishedInstance };
     },
     accept(
       context: RequestContext,
@@ -276,16 +348,6 @@ export function createPrewarmOperations(
             tickets.delete(id);
             void entry.release('expired');
           }
-        } else if (
-          active(entry) &&
-          !entry.revoked.aborted &&
-          belongs(entry, context, identity) &&
-          entry.plan.key === plan.key &&
-          (!plan.orphanedInstanceId ||
-            entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
-          canSharePrewarmTarget(entry.plan, plan.target)
-        ) {
-          return accepted(entry, false);
         }
       }
       if (pending.size >= 256) throw new DEntryNativeUnavailable();
@@ -310,6 +372,7 @@ export function createPrewarmOperations(
         identity,
         sessionId: context.sessionId,
         plan,
+        preparedTarget: plan.target,
         ticket,
         expires,
         deadline,
@@ -383,7 +446,7 @@ export function createPrewarmOperations(
       pending.add(task);
       operation.settled = task;
       void task.then(() => pending.delete(task));
-      return accepted(operation, true);
+      return accepted(operation);
     },
     async read(
       operationId: string,
