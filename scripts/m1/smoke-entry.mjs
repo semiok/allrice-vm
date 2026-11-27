@@ -3,6 +3,7 @@ const ENTRY = '/chatflow/4.0';
 const DOCUMENT = ENTRY + '/document';
 const PROFILE = '/api/v1/d-entry/profile';
 const PREWARM = '/api/v1/d-entry/native-prewarm';
+const RPC = '/api/v1/d-entry/native-rpc';
 const LOGIN = '/api/v1/auth/login';
 const FRAME = 'iframe[title="员工工作区"]';
 const EDITOR = '[role="textbox"][data-composer-input]';
@@ -27,7 +28,7 @@ export async function smokeNativeEntry(
   base,
   credentials,
   receipt,
-  { hello = false, timeout = 360_000 } = {},
+  { hello = false, timeout = 360_000, missingVmHost = false } = {},
 ) {
   const origin = new URL(base).origin;
   const fact = receipt.stages;
@@ -36,6 +37,9 @@ export async function smokeNativeEntry(
   let selection;
   let ticket;
   let ready = false;
+  let warm = false;
+  let allowedPrompt;
+  let sentPrompt;
   let observation = Promise.resolve();
   let outcome;
   const stopped = new Promise((_, reject) => {
@@ -57,18 +61,22 @@ export async function smokeNativeEntry(
       if (request?.trigger !== 'page') return;
       fact.employee = 'existing';
       fact.prewarm = status;
-      if (status === 204)
-        throw new SmokeSkip('当前 VM 已预热，缺少冷启动 202 证据');
-      requireFact(status === 202, '预热未返回 202');
-      requireFact(!ticket, '观察到重复的页面预热');
+      requireFact(!selection, '观察到重复的页面预热');
       selection = request.selection;
-      ticket = (await response.json()).operationId;
       requireFact(
-        UUID.test(ticket ?? '') &&
-          UUID.test(selection?.workspaceId ?? '') &&
+        UUID.test(selection?.workspaceId ?? '') &&
           UUID.test(selection?.employeeInstanceId ?? ''),
-        '预热票据或员工选择无效',
+        '员工选择无效',
       );
+      if (status === 204) {
+        warm = true;
+        return;
+      }
+      if (status === 503 && missingVmHost)
+        throw new SmokeSkip('当前 Worker 发布未配置真实 VM 宿主');
+      requireFact(status === 202, '预热未返回 202');
+      ticket = (await response.json()).operationId;
+      requireFact(UUID.test(ticket ?? ''), '预热票据无效');
     } else if (url.pathname === PREWARM + '/status' && method === 'GET') {
       requireFact(
         ticket &&
@@ -105,6 +113,52 @@ export async function smokeNativeEntry(
     observation = observation.then(() => consume(response));
     void observation.catch(outcome);
   };
+  const rpcAddress = (url) => url.origin === origin && url.pathname === RPC;
+  async function guardPrompt(route) {
+    const request = route.request();
+    let body;
+    if (request.method() === 'POST') {
+      try {
+        body = request.postDataJSON();
+      } catch {
+        outcome(new SmokeFailure('原生 RPC 请求无法校验'));
+        await route.abort();
+        return;
+      }
+    }
+    if (body?.endpoint !== 'session/prompt') {
+      await route.continue();
+      return;
+    }
+    const prompt = body.payload?.args?.request;
+    const content = prompt?.content;
+    if (
+      !allowedPrompt ||
+      sentPrompt ||
+      body.scopeId !== allowedPrompt.scope ||
+      !body.selection ||
+      !sameEmployee(new URLSearchParams(body.selection), selection) ||
+      body.selection.threadId !== allowedPrompt.thread ||
+      new URL(request.url()).search !== '?carrier=page' ||
+      typeof body.rpcId !== 'string' ||
+      !body.rpcId ||
+      prompt?.sessionId !== allowedPrompt.nativeSessionId ||
+      !UUID.test(prompt?.requestId ?? '') ||
+      prompt.mode !== 'queue' ||
+      content?.length !== 1 ||
+      content[0]?.type !== 'text' ||
+      content[0]?.text !== '你好' ||
+      Object.keys(content[0]).length !== 2
+    ) {
+      outcome(new SmokeFailure('拦截了未经授权或重复的模型消息'));
+      await route.abort();
+      return;
+    }
+    sentPrompt = request;
+    await route.continue();
+  }
+  // Keep the guard until the caller closes this dedicated browser page.
+  await page.route(rpcAddress, guardPrompt);
   page.on('response', observe);
 
   try {
@@ -163,39 +217,57 @@ export async function smokeNativeEntry(
     const child = page.frameLocator(FRAME);
     const editor = child.locator(EDITOR);
     await guarded(editor.waitFor({ state: 'visible', timeout }));
-    await guarded(editor.focus());
+    await guarded(editor.focus({ timeout }));
     const document = await guarded(
-      editor.evaluate((node) => ({
-        source: node.ownerDocument.defaultView?.frameElement?.src,
-        loaded: node.ownerDocument.URL,
-        assets: [
-          ...node.ownerDocument.querySelectorAll(
-            '[data-allrice-document-asset]',
-          ),
-        ].map((asset) => ({
-          url: asset.src ?? asset.href,
-          kind: asset.getAttribute('data-allrice-document-asset'),
-        })),
-        editable:
-          node.isContentEditable &&
-          node.getAttribute('aria-disabled') !== 'true',
-        focused: node.ownerDocument.activeElement === node,
-      })),
+      editor.evaluate(
+        (node) => ({
+          source: node.ownerDocument.defaultView?.frameElement?.src,
+          loaded: node.ownerDocument.URL,
+          nativeSessionId:
+            node.ownerDocument.querySelector('#app')?.dataset.nativeSessionId,
+          assets: [
+            ...node.ownerDocument.querySelectorAll(
+              '[data-allrice-document-asset]',
+            ),
+          ].map((asset) => ({
+            url: asset.src ?? asset.href,
+            kind: asset.getAttribute('data-allrice-document-asset'),
+          })),
+          editable:
+            node.isContentEditable &&
+            node.getAttribute('aria-disabled') !== 'true',
+          focused: node.ownerDocument.activeElement === node,
+        }),
+        undefined,
+        { timeout },
+      ),
     );
     await guarded(observation);
-    requireFact(ready, '未观察到原票据轮询至 ready');
+    requireFact(ready || warm, '未观察到原票据轮询至 ready');
     const source = new URL(document.source);
     const loaded = new URL(document.loaded);
     const scope = source.searchParams.get('scopeId');
     const thread = source.searchParams.get('threadId');
+    const path = loaded.pathname.slice(DOCUMENT.length + 1).split('/');
+    const [, workspace, employee, publishedThread, binding, graph, manifest] =
+      path;
     requireFact(
       source.origin === origin &&
         source.pathname === DOCUMENT &&
         sameEmployee(source.searchParams, selection) &&
+        (!selection.threadId || selection.threadId === thread) &&
         UUID.test(scope ?? '') &&
         UUID.test(thread ?? '') &&
         loaded.origin === origin &&
-        loaded.pathname.startsWith(DOCUMENT + '/' + scope + '/') &&
+        loaded.pathname.startsWith(DOCUMENT + '/') &&
+        path[0] === scope &&
+        workspace === selection.workspaceId &&
+        employee === selection.employeeInstanceId &&
+        publishedThread === thread &&
+        /^[a-zA-Z0-9_-]{1,160}$/.test(binding ?? '') &&
+        /^[a-zA-Z0-9_-]{1,160}$/.test(graph ?? '') &&
+        /^[a-f0-9]{64}$/.test(manifest ?? '') &&
+        path.slice(7).join('/') === 'native/index.html' &&
         resources.get(loaded.href)?.status === 200,
       '编辑器不属于本次原生工作台',
     );
@@ -212,69 +284,96 @@ export async function smokeNativeEntry(
       '原生 bootstrap 未返回 200',
     );
     fact.bootstrap = 200;
-    for (const [kind, media, key] of [
-      ['entry', /^(?:text|application)\/javascript$/, 'javascript'],
-      ['style', /^text\/css$/, 'css'],
+    const managed =
+      origin +
+      PROFILE +
+      '/assets/static/' +
+      path.slice(0, 7).join('/') +
+      '/managed/';
+    const vendor = new URL('assets/', loaded).href;
+    const assetUrl = (kind, matcher) =>
+      document.assets.filter(
+        (asset) => asset.kind === kind && matcher(asset.url),
+      );
+    const exact = (address) => (url) => url === address;
+    const nativeStyle = (prefix) => (url) =>
+      url.startsWith(vendor + prefix + '-') &&
+      /^[a-zA-Z0-9_-]+\.css$/.test(
+        url.slice(vendor.length + prefix.length + 1),
+      );
+    for (const [key, mime, expected, kind] of [
+      [
+        'javascript',
+        /^(?:text|application)\/javascript$/,
+        [exact(managed + 'employee-web-entry.js')],
+        'entry',
+      ],
+      [
+        'css',
+        /^text\/css$/,
+        [
+          nativeStyle('index'),
+          nativeStyle('vendor'),
+          exact(managed + 'employee-web-entry.css'),
+        ],
+        'style',
+      ],
     ]) {
-      const assets = document.assets.filter((asset) => asset.kind === kind);
       requireFact(
-        assets.length > 0 &&
-          assets.every(({ url }) => {
-            const result = resources.get(url);
-            return result?.status === 200 && media.test(result.media);
-          }),
+        expected.every((matcher) => {
+          const [asset, duplicate] = assetUrl(kind, matcher);
+          const result = asset && resources.get(asset.url);
+          return (
+            !duplicate && result?.status === 200 && mime.test(result.media)
+          );
+        }),
         '原生 ' + key + ' 未返回 200',
       );
-      fact[key] = assets.map(() => 200);
+      fact[key] = expected.map(() => 200);
     }
     requireFact(document.editable && document.focused, '原生编辑器不可输入');
     fact.editor = true;
+    if (warm) throw new SmokeSkip('当前 VM 已预热，缺少冷启动 202 证据');
     if (hello) {
+      requireFact(document.nativeSessionId, '原生会话未确认');
       receipt.step = 'optional-hello';
       requireFact(
-        !(await guarded(editor.innerText())).trim(),
+        !(await guarded(editor.innerText({ timeout }))).trim(),
         '编辑器已有草稿',
       );
       await guarded(page.keyboard.insertText('你好'));
       requireFact(
-        (await guarded(editor.innerText())).trim() === '你好',
+        (await guarded(editor.innerText({ timeout }))).trim() === '你好',
         '原生编辑器输入未回显',
       );
+      allowedPrompt = {
+        scope,
+        thread,
+        nativeSessionId: document.nativeSessionId,
+      };
       const [sent] = await guarded(
         Promise.all([
           page.waitForResponse(
-            (response) => {
-              const url = new URL(response.url());
-              if (
-                url.origin !== origin ||
-                url.pathname !== '/api/v1/d-entry/native-rpc' ||
-                response.request().method() !== 'POST'
-              )
-                return false;
-              const body = response.request().postDataJSON();
-              const content = body?.payload?.args?.request?.content;
-              return (
-                body?.endpoint === 'session/prompt' &&
-                body.scopeId === scope &&
-                content?.length === 1 &&
-                content[0]?.type === 'text' &&
-                content[0].text === '你好'
-              );
+            (response) => response.request() === sentPrompt,
+            {
+              timeout,
             },
-            { timeout },
           ),
           child
             .getByRole('button', { name: /^(发送消息|Send message)$/u })
-            .click(),
+            .click({ timeout }),
         ]),
       );
-      const result = (await guarded(sent.json())).result;
+      const reply = await guarded(sent.json());
       requireFact(
         sent.status() === 200 &&
-          result?.ok === true &&
-          result.value?.accepted === true,
+          reply?.type === 'server-response' &&
+          reply.rpcId === sentPrompt.postDataJSON().rpcId &&
+          reply.result?.ok === true &&
+          reply.result.value?.accepted === true,
         '原生问候未获接收回执',
       );
+      allowedPrompt = undefined;
       fact.hello = 'accepted';
     }
   } finally {

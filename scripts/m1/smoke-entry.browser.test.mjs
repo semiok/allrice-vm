@@ -17,8 +17,17 @@ const selection = { workspaceId: id(1), employeeInstanceId: id(2) };
 const scopeId = id(3);
 const operationId = id(4);
 const query = new URLSearchParams({ ...selection, scopeId, threadId: id(5) });
-const directory = documentPath + '/' + scopeId + '/publication';
-const staticPath = profile + '/assets/static/' + scopeId + '/publication';
+const publication = [
+  scopeId,
+  selection.workspaceId,
+  selection.employeeInstanceId,
+  id(5),
+  'binding',
+  'graph',
+  'a'.repeat(64),
+].join('/');
+const directory = documentPath + '/' + publication;
+const staticPath = profile + '/assets/static/' + publication;
 const json = (value) => JSON.stringify(value);
 
 async function fixture(mode) {
@@ -61,23 +70,26 @@ async function fixture(mode) {
           method:'POST', body: JSON.stringify({trigger:'page', selection:${json(selection)}}),
           headers:{'Content-Type':'application/json'}
         });
+        let ready = initial.status === 204;
         if (initial.status === 202) {
           const {operationId} = await initial.json();
           const url = ${json(prewarm + '/status?')} + new URLSearchParams({...${json(selection)}, operationId});
           await (await fetch(url)).json();
           const result = await (await fetch(url)).json();
-          if (result.state === 'ready') {
+          ready = result.state === 'ready';
+        }
+        if (ready) {
             const frame = document.createElement('iframe');
             frame.title = '员工工作区'; frame.src = ${json(documentPath + '?' + query)};
             document.querySelector('main').append(frame);
-          }
         }
       </script>`,
       );
     }
     if (path === prewarm) {
-      if (mode === 'warm') return write(204, '');
-      if (mode === 'failure') return write(503, '{}', 'application/json');
+      if (mode.startsWith('warm')) return write(204, '');
+      if (mode === 'failure' || mode === 'no-vm-host')
+        return write(503, '{}', 'application/json');
       return write(202, json({ operationId }), 'application/json');
     }
     if (path === prewarm + '/status') {
@@ -93,23 +105,26 @@ async function fixture(mode) {
       return write(
         200,
         `
-      <link data-allrice-document-asset="style" rel="stylesheet" href="assets/theme.css">
-      <link data-allrice-document-asset="style" rel="stylesheet" href="${staticPath}/managed/entry.css">
-      <script data-allrice-document-asset="entry" src="${staticPath}/managed/entry.js"></script>
-      <div role="textbox" data-composer-input contenteditable="false" style="min-height:24px"></div><button>发送消息</button>
+      <link data-allrice-document-asset="style" rel="stylesheet" href="assets/index-aa.css">
+      ${mode === 'missing-vendor' ? '' : '<link data-allrice-document-asset="style" rel="stylesheet" href="assets/vendor-bb.css">'}
+      <link data-allrice-document-asset="style" rel="stylesheet" href="${mode === 'foreign-css' ? staticPath.replace('/graph/', '/future/') : staticPath}/managed/employee-web-entry.css">
+      <script data-allrice-document-asset="entry" src="${staticPath}/managed/employee-web-entry.js"></script>
+      <div id="app" data-native-session-id="native-session" hidden><div role="textbox" data-composer-input contenteditable="false" style="min-height:24px" tabindex="0"></div></div><button>发送消息</button>
       <script type="module">
         await fetch(${json(profile + '/bootstrap?' + query)});
         const editor = document.querySelector('[data-composer-input]');
-        editor.setAttribute('contenteditable', ${json(mode === 'disabled' ? 'false' : 'true')});
-        document.querySelector('button').onclick = () => {
-          fetch('/api/v1/d-entry/native-rpc', {method:'POST', body: JSON.stringify({
-            endpoint: 'session/prompt', scopeId: ${json(scopeId)},
-            payload:{args:{request:{content:[{type:'text', text:editor.innerText}]}}}
-          })});
-        };
+        editor.setAttribute('contenteditable', ${json(mode.endsWith('disabled') ? 'false' : 'true')});
+        const send = () => fetch('/api/v1/d-entry/native-rpc?carrier=page', {method:'POST', body: JSON.stringify({
+          endpoint: 'session/prompt', scopeId: ${json(scopeId)}, rpcId:'rpc',
+          selection: ${json({ ...selection, threadId: id(5) })},
+          payload:{args:{request:{sessionId: 'native-session', requestId: ${json(id(6))}, mode:'queue', content:[{type:'text', text:editor.innerText}]}}}
+        })});
+        document.querySelector('button').onclick = send;
+        if (${json(mode === 'unexpected-prompt')}) await send();
+        document.querySelector('#app').hidden = false;
       </script>`,
       );
-    if (path === staticPath + '/managed/entry.js')
+    if (path === staticPath + '/managed/employee-web-entry.js')
       return write(200, '// native JS', 'text/javascript');
     if (path.endsWith('.css'))
       return write(
@@ -122,7 +137,11 @@ async function fixture(mode) {
     if (path === '/api/v1/d-entry/native-rpc')
       return write(
         200,
-        json({ result: { ok: true, value: { accepted: true } } }),
+        json({
+          type: 'server-response',
+          rpcId: 'rpc',
+          result: { ok: true, value: { accepted: true } },
+        }),
         'application/json',
       );
     write(404, '');
@@ -163,7 +182,7 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
         local.origin,
         { username: 'smoke', password: 'fake' },
         receipt,
-        { hello, timeout: 5000 },
+        { hello, timeout: 5000, missingVmHost: mode === 'no-vm-host' },
       );
       await assertion(
         smoke.catch((error) => {
@@ -199,7 +218,7 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
             polls: ['starting', 'ready'],
             bootstrap: 200,
             javascript: [200],
-            css: [200, 200],
+            css: [200, 200, 200],
             editor: true,
           });
           expect(
@@ -220,11 +239,13 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
 
   it.each([
     ['zero', '冒烟账号没有可预热的员工'],
+    ['no-vm-host', '当前 Worker 发布未配置真实 VM 宿主'],
     ['warm', '当前 VM 已预热，缺少冷启动 202 证据'],
   ])('identifies the %s prerequisite skip', async (mode, reason) => {
-    await run(mode, async (smoke) => {
+    await run(mode, async (smoke, receipt) => {
       const error = await smoke.catch((error) => error);
       expect(error).toBeInstanceOf(SmokeSkip);
+      if (mode === 'warm') expect(receipt.stages.editor).toBe(true);
       expect(error.message).toContain(reason);
     });
   });
@@ -232,7 +253,11 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
   it.each([
     ['failure', '预热未返回 202'],
     ['bad-css', '原生 css 未返回 200'],
+    ['missing-vendor', '原生 css 未返回 200'],
+    ['foreign-css', '原生 css 未返回 200'],
     ['disabled', '原生编辑器不可输入'],
+    ['warm-disabled', '原生编辑器不可输入'],
+    ['unexpected-prompt', '拦截了未经授权或重复的模型消息'],
   ])('fails %s', async (mode, reason) => {
     await run(mode, async (smoke) => {
       const error = await smoke.catch((error) => error);

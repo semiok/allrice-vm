@@ -1,6 +1,6 @@
 #!/bin/bash
 # 4.0 release smoke. Exit 77 means a documented prerequisite skip.
-# smoke-test --dev [--hello] [--expect-sha SHA] [--out DIR] [--vm-unavailable capacity|host]
+# smoke-test --dev [--hello] [--expect-sha SHA] [--out DIR]
 # smoke-test --instance TASK [same options]
 set -euo pipefail
 unset PGHOSTADDR PGSERVICE PGSERVICEFILE
@@ -9,12 +9,14 @@ NODE="$HOME/.local/opt/node-22.23.2/bin/node"; BIN=$(cd "$(dirname "$0")" && pwd
 ts=$(date +%Y%m%d-%H%M%S)
 json() { /usr/bin/python3 -c 'import json,sys;v=json.load(open(sys.argv[1]))[sys.argv[2]];print("" if v is None else v)' "$1" "$2"; }
 penv() { /usr/bin/python3 -c 'import plistlib,os,sys;print(plistlib.load(open(os.path.expanduser(sys.argv[1]),"rb"))["EnvironmentVariables"][sys.argv[2]])' "$1" "$2"; }
+pwork() { /usr/bin/python3 -c 'import plistlib,sys;print(plistlib.load(open(sys.argv[1],"rb"))["WorkingDirectory"])' "$1"; }
 case "${1:-}" in
   --dev)
     shift
     dev_plist_pair || exit 2
     web=$(penv "$(dev_plist web)" ALLRICE_WEB_PORT)
-    worker=$(penv "$(dev_plist worker)" ALLRICE_WORKER_PORT)
+    worker_plist=$(dev_plist worker)
+    worker=$(penv "$worker_plist" ALLRICE_WORKER_PORT)
     creds="$HOME/allrice40-dev/qa/smoke-cred.json"; out="$HOME/allrice40-dev/qa/smoke/$ts" ;;
   --instance)
     task=${2:?task}; shift 2
@@ -34,12 +36,17 @@ case "${1:-}" in
     qa_worker="$HOME/Library/LaunchAgents/$worker_label.plist"
     service_plist_config "$qa_web" "$web_label" ALLRICE_WEB_PORT "$web" "$qa_db" "worker-port=$worker" || exit 2
     service_plist_config "$qa_worker" "$worker_label" ALLRICE_WORKER_PORT "$worker" "$qa_db" || exit 2
+    worker_plist=$qa_worker
     ;;
   *) sed -n '2,4p' "$0"; exit 2 ;;
 esac
 
-# Retain the QA instance lock in the shell until the browser runner exits.
+worker_release=$(pwork "$worker_plist")
+
+# The child inherits the lock. An interrupted shell must not unlink it.
+trap - EXIT
 rc=0
 "$NODE" "$BIN/smoke-test.mjs" --url "http://127.0.0.1:$web" \
-  --worker-url "http://127.0.0.1:$worker" --creds "$creds" --out "$out" "$@" || rc=$?
+  --worker-url "http://127.0.0.1:$worker" --creds "$creds" --out "$out" --worker-release "$worker_release" "$@" || rc=$?
+[ -z "${task_lock:-}" ] || qa_task_unlock "$task_lock"
 exit "$rc"

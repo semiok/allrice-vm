@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import {
   access,
@@ -9,7 +10,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { SmokeFailure, SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
 
@@ -21,23 +22,17 @@ const { values: args } = parseArgs({
     out: { type: 'string' },
     'expect-sha': { type: 'string' },
     hello: { type: 'boolean' },
-    'vm-unavailable': { type: 'string' },
+    'worker-release': { type: 'string' },
   },
 });
 if (!args.url || !args['worker-url'] || !args.creds || !args.out) {
   console.error(
-    'usage: smoke-test.mjs --url URL --worker-url URL --creds FILE --out DIR [--expect-sha SHA] [--hello] [--vm-unavailable capacity|host]',
+    'usage: smoke-test.mjs --url URL --worker-url URL --creds FILE --out DIR [--expect-sha SHA] [--hello] [--worker-release DIR]',
   );
   process.exit(2);
 }
 
 const sha = /^[a-f0-9]{40}$/;
-const declaredLimit =
-  args['vm-unavailable'] ?? process.env.ALLRICE_SMOKE_VM_UNAVAILABLE;
-const prerequisites = new Map([
-  ['capacity', '没有可用的真实 VM 名额'],
-  ['host', '真实 VM 宿主未就绪'],
-]);
 const receipt = {
   at: new Date().toISOString(),
   status: 'failed',
@@ -46,25 +41,64 @@ const receipt = {
 };
 await mkdir(args.out, { recursive: true, mode: 0o700 });
 
-async function readySha(base, path) {
+async function readyIdentity(base, path, service) {
   const response = await fetch(new URL(path, base), {
     signal: AbortSignal.timeout(10_000),
   });
   const result = await response.json();
-  const version = result.identity?.sourceSha;
-  if (!response.ok || result.status !== 'ready' || !sha.test(version ?? ''))
+  const identity = result.identity;
+  if (
+    !response.ok ||
+    result.status !== 'ready' ||
+    identity?.repository !== 'semiok/allrice-vm' ||
+    String(identity.repositoryId) !== '1469490636' ||
+    identity.service !== service ||
+    identity.mode !== 'production' ||
+    !sha.test(identity.sourceSha ?? '') ||
+    !sha.test(identity.sourceTree ?? '') ||
+    !/^sha256:[a-f0-9]{64}$/.test(identity.manifestDigest ?? '')
+  )
     throw new SmokeFailure('服务未就绪或缺少发布提交');
-  return version;
+  return identity;
 }
 
 async function versions() {
   const [web, worker] = await Promise.all([
-    readySha(args.url, '/api/health/ready'),
-    readySha(args['worker-url'], '/health/ready'),
+    readyIdentity(args.url, '/api/health/ready', 'web'),
+    readyIdentity(args['worker-url'], '/health/ready', 'worker'),
   ]);
-  if (web !== worker || (args['expect-sha'] && web !== args['expect-sha']))
+  if (
+    web.sourceSha !== worker.sourceSha ||
+    web.sourceTree !== worker.sourceTree ||
+    web.manifestDigest !== worker.manifestDigest ||
+    (args['expect-sha'] && web.sourceSha !== args['expect-sha'])
+  )
     throw new SmokeFailure('Web、Worker 与预期发布提交不一致');
-  return { web, worker };
+  return {
+    web: web.sourceSha,
+    worker: worker.sourceSha,
+    manifest: worker.manifestDigest,
+  };
+}
+
+async function missingVmHost() {
+  const root = args['worker-release'];
+  if (!root || !isAbsolute(root)) return false;
+  const { manifestDigest, ...manifest } = JSON.parse(
+    await readFile(join(root, '.local/dev-build-identity.json'), 'utf8'),
+  );
+  const digest =
+    'sha256:' +
+    createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
+  if (
+    digest !== manifestDigest ||
+    digest !== receipt.versionStart.manifest ||
+    manifest.sourceSha !== receipt.versionStart.worker
+  )
+    throw new SmokeFailure('无法核对 Worker 真实 VM 宿主的发布来源');
+  return !manifest.files.some(
+    (file) => file.path === '.local/person-vm-host.json',
+  );
 }
 
 async function playwright() {
@@ -91,11 +125,7 @@ async function playwright() {
 let browser;
 try {
   receipt.versionStart = await versions();
-  if (declaredLimit !== undefined) {
-    if (!prerequisites.has(declaredLimit))
-      throw new SmokeFailure('未知的 VM 前提缺口');
-    throw new SmokeSkip(prerequisites.get(declaredLimit));
-  }
+
   receipt.step = 'browser';
   const executablePath =
     process.env.ALLRICE_TEST_CHROME_EXECUTABLE ??
@@ -116,6 +146,7 @@ try {
   const credentials = JSON.parse(await readFile(args.creds, 'utf8'));
   await smokeNativeEntry(page, args.url, credentials, receipt, {
     hello: args.hello,
+    missingVmHost: await missingVmHost(),
   });
   receipt.status = 'passed';
 } catch (error) {
@@ -129,7 +160,10 @@ try {
   if (receipt.versionStart) {
     try {
       receipt.versionEnd = await versions();
-      if (receipt.versionStart.web !== receipt.versionEnd.web)
+      if (
+        receipt.versionStart.web !== receipt.versionEnd.web ||
+        receipt.versionStart.manifest !== receipt.versionEnd.manifest
+      )
         throw new SmokeFailure('冒烟期间发布提交变化');
     } catch {
       receipt.status = 'failed';
