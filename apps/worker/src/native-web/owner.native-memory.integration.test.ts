@@ -73,7 +73,11 @@ const build = {
   webBuildId: 'isolated-memory-build',
 };
 
-it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
+it.skipIf(
+  !cli ||
+    process.env.NATIVE_MEMORY_POSTGRES !== '1' ||
+    process.env.ALLRICE_RUN_DB_INTEGRATION !== '1',
+)(
   'commits both sealed rc.2 tool occurrences before native memory execution and denies revoked or mismatched evidence',
   { tags: ['manual:NATIVE_MEMORY_POSTGRES'], timeout: 45_000 },
   async () => {
@@ -365,6 +369,49 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         );
       }
 
+      async function commitWithoutDelivery(ref: string, input: unknown) {
+        const abort = new AbortController();
+        const canceled = Error('Canceled after the real candidate commit');
+        const createDedicated = client.createDedicatedDatabase;
+        vi.spyOn(client, 'createDedicatedDatabase').mockImplementationOnce(
+          (db) => {
+            const dedicated = createDedicated(db);
+            return new Proxy(dedicated, {
+              get(handle, key, receiver) {
+                if (key !== 'reserve')
+                  return Reflect.get(handle, key, receiver);
+                return async () => {
+                  const session = await dedicated.reserve();
+                  return new Proxy(session, {
+                    apply(handle, receiver, args) {
+                      const query: unknown = Reflect.apply(
+                        handle,
+                        receiver,
+                        args,
+                      );
+                      if (!(
+                        Array.isArray(args[0]) &&
+                        args[0].join('').trim() === 'commit'
+                      ))
+                        return query;
+                      return Promise.resolve(query).then(() =>
+                        abort.abort(canceled),
+                      );
+                    },
+                  });
+                };
+              },
+            });
+          },
+        );
+        await expect(
+          host.remember(context, target(ref), input, abort.signal),
+        ).rejects.toMatchObject({
+          name: 'EmployeeMemoryWriteOutcomeUnknown',
+          cause: canceled,
+        });
+      }
+
       const server = createServer((request, response) => {
         void (async () => {
           if (request.headers.authorization !== 'Bearer ' + capability)
@@ -380,6 +427,13 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               })
               .strict()
               .parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            if (body.id === 'memory_remember' && attempts.size === 2) {
+              await commitWithoutDelivery(body.ref, body.args);
+              delivered.set(body.ref, { id: body.id, value: null });
+              response.writeHead(409).end();
+              results.resolve();
+              return;
+            }
             const value =
               body.id === 'memory_read'
                 ? await host.readOrdinal(
@@ -398,7 +452,6 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             response
               .writeHead(200, { 'content-type': 'application/json' })
               .end(JSON.stringify(value));
-            if (delivered.size === 3) results.resolve();
             return;
           }
           if (
@@ -446,6 +499,15 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             .end(
               [
                 ...deltas,
+                {
+                  type: 'usage',
+                  usage: {
+                    inputTokens: 15,
+                    outputTokens: 5,
+                    cacheReadTokens: 0,
+                    totalTokens: 20,
+                  },
+                },
                 {
                   type: 'finish',
                   reason: { kind: called.length ? 'tool-calls' : 'stop' },
@@ -575,28 +637,31 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       const created = await owner.createRootFor(context, {}, signal);
       if (!created.ok) throw Error('Root was not created');
       const nativeSessionId = created.value.sessionId;
-      const nativePin = await db.begin(async (tx) => {
-        const creation = {
-          schemaVersion: 1,
-          identity,
-          host: {
-            binding: owner.binding,
-            bindingRef: randomUUID(),
-            rosterDigest: 'fixture',
-          },
-          operationId: randomUUID(),
-          releaseRevision: 'fixture',
-        };
-        await tx`update allrice_chat_sessions set d_entry_native_root_claim=${tx.json(creation)} where id=${f.session}`;
-        await tx`update allrice_chat_sessions set d_entry_native_root=${tx.json({ ...creation, nativeSessionId })} where id=${f.session}`;
-        const { vmId, instanceId, leaseEpoch } = owner.binding;
-        await tx`insert into person_virtual_machines
+      const { vmId, instanceId, leaseEpoch } = owner.binding;
+      await db`insert into person_virtual_machines
         (person_id,vm_id,organization_id,phase,disk_tier,native_created,instance_id,lease_epoch,egress_receipt)
         values (${f.user},${vmId},${f.org},'running','warm',true,${instanceId},${leaseEpoch},'{}')`;
-        const pin = await readLockedDEntryNativeRootPin(tx, identity);
-        if (!pin) throw Error('No original root pin');
-        return pin;
-      });
+      const pinRoot = (threadId: string, root: string) =>
+        db.begin(async (tx) => {
+          const selected = { ...identity, threadId };
+          const creation = {
+            schemaVersion: 1,
+            identity: selected,
+            host: {
+              binding: owner.binding,
+              bindingRef: randomUUID(),
+              rosterDigest: 'fixture',
+            },
+            operationId: randomUUID(),
+            releaseRevision: 'fixture',
+          };
+          await tx`update allrice_chat_sessions set d_entry_native_root_claim=${tx.json(creation)} where id=${threadId}`;
+          await tx`update allrice_chat_sessions set d_entry_native_root=${tx.json({ ...creation, nativeSessionId: root })} where id=${threadId}`;
+          const pin = await readLockedDEntryNativeRootPin(tx, selected);
+          if (!pin) throw Error('No original root pin');
+          return pin;
+        });
+      const nativePin = await pinRoot(f.session, nativeSessionId);
       const scopeId = randomUUID();
       const owned = owner.acquirePrincipal(
         {
@@ -662,50 +727,10 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         requiresConfirmation: true,
       };
       expect(remembered.value).toMatchObject(receiptShape);
-      expect(otherRemembered.value).toMatchObject(receiptShape);
-      expect(otherRemembered.value).not.toEqual(remembered.value);
+      expect(otherRemembered.value).toBeNull();
       expect(
         await host.remember(context, target(ref), candidate, signal),
       ).toEqual(remembered.value);
-      const abort = new AbortController();
-      const canceled = Error('Canceled after the real candidate commit');
-      const createDedicated = client.createDedicatedDatabase;
-      vi.spyOn(client, 'createDedicatedDatabase').mockImplementationOnce(
-        (db) => {
-          const dedicated = createDedicated(db);
-          return new Proxy(dedicated, {
-            get(handle, key, receiver) {
-              if (key !== 'reserve') return Reflect.get(handle, key, receiver);
-              return async () => {
-                const session = await dedicated.reserve();
-                return new Proxy(session, {
-                  apply(handle, receiver, args) {
-                    const query: unknown = Reflect.apply(
-                      handle,
-                      receiver,
-                      args,
-                    );
-                    if (!(
-                      Array.isArray(args[0]) &&
-                      args[0].join('').trim() === 'commit'
-                    ))
-                      return query;
-                    return Promise.resolve(query).then(() =>
-                      abort.abort(canceled),
-                    );
-                  },
-                });
-              };
-            },
-          });
-        },
-      );
-      await expect(
-        host.remember(context, target(ref), candidate, abort.signal),
-      ).rejects.toMatchObject({
-        name: 'EmployeeMemoryWriteOutcomeUnknown',
-        cause: canceled,
-      });
       await expect(
         host.readOrdinal(context, target(ref), { number: 1 }, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
@@ -735,6 +760,10 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         },
         { executionGeneration: '4.0' },
       );
+      const alternateRoot = await owner.createRootFor(context, {}, signal);
+      if (!alternateRoot.ok)
+        throw Error('Alternate native root was not created');
+      await pinRoot(other.id, alternateRoot.value.sessionId);
       await expect(
         host.remember(
           context,
@@ -797,6 +826,18 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         );
       await expect(reconcile()).resolves.toMatchObject({
         id: pending?.id,
+        status: 'recorded',
+        state: 'pending',
+        originalReceiptCurrent: true,
+      });
+      await expect(
+        host.reconcileRemember(
+          context,
+          { ...target(otherRef), b: run.runId },
+          signal,
+        ),
+      ).resolves.toMatchObject({
+        id: candidates.find(({ call_ref }) => call_ref === otherRef)?.id,
         status: 'recorded',
         state: 'pending',
         originalReceiptCurrent: true,

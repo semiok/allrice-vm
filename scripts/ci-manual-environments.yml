@@ -72,7 +72,6 @@ files:
     - scripts/rice-bridge-pdf-guardian.test.mjs
     - scripts/rice-bridge-terminal-runtime.test.mjs
   manual:
-    - apps/worker/src/native-web/owner.native-memory.integration.test.ts
     - apps/worker/src/native-web/owner.native-schedule.integration.test.ts
     - apps/worker/src/native-web/owner.native.integration.test.ts
     - scripts/acceptance/workday/native-entry.fixture.test.ts
@@ -134,6 +133,7 @@ files:
     - packages/database/src/freeze-helpers.transaction.test.ts
     - scripts/acceptance/runtime/p27-codex-worker-fixture.test.ts
   manual-db:
+    - apps/worker/src/native-web/owner.native-memory.integration.test.ts
     - apps/worker/test/native-schedule-monthly.integration.test.ts
     - apps/worker/test/p25/dsh-control-journal-capture.test.ts
     - packages/database/src/desktop-bridge.integration.test.ts
@@ -169,7 +169,7 @@ tags:
       && pnpm build:test-sources
       && pnpm -r --workspace-concurrency=1 --filter @allrice/worker... --if-present run build
       && node apps/worker/scripts/prepare-native-artifact.mjs --root=.
-      && ALLRICE_RUN_DB_INTEGRATION=1 ALLRICE_NATIVE_WEB_TEST_CLI="$NATIVE_WEB_TEST_CLI" pnpm exec vitest run {file} --maxWorkers=1
+      && NATIVE_MEMORY_POSTGRES=1 ALLRICE_RUN_DB_INTEGRATION=1 ALLRICE_NATIVE_WEB_TEST_CLI="$NATIVE_WEB_TEST_CLI" pnpm exec vitest run {file} --maxWorkers=1
   manual:WORKDAY_FIXTURE_SOURCE:
     reason: Exact allrice-vm checkout with nativeEntryServer/nativeEntryFixture, pinned by full Git SHA in FIXTURE_CONFIG and validated by workday/run.py. FIXTURE_OUTPUT must be a new output directory. Synthetic consumer HTTP only, no real Host, VM, database, model or Dev acceptance.
     command: test "{file}" = scripts/acceptance/workday/native-entry.fixture.test.ts && (fixture_rc=0; python3 scripts/acceptance/workday/run.py --mode fixture --config "$FIXTURE_CONFIG" --output "$FIXTURE_OUTPUT" || fixture_rc=$?; test "$fixture_rc" -eq 2 && test -f "$FIXTURE_OUTPUT/native-source.json")
