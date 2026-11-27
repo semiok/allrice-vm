@@ -993,6 +993,7 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
         identity,
         expect.any(AbortSignal),
         await f.h.service.resolve(context, signal()),
+        expect.any(Function),
       );
     else expect(assertEditorReady).not.toHaveBeenCalled();
   },
