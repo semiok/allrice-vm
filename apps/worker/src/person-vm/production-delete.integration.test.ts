@@ -8,6 +8,7 @@ import { DEntryNativePrewarmAcceptedSchema } from '@allrice/contracts';
 import {
   authenticatePlatformSession,
   authenticateSession,
+  closeDEntryAuthorityFeeds,
   createDedicatedDatabase,
   createEmployeeInstance,
   createSession,
@@ -107,6 +108,8 @@ suite(
     }
     beforeAll(async () => {
       fixture = await createRuntimeFixtureDatabase();
+      // The authority feed owns a separate pg listener from the fixture pool.
+      vi.stubEnv('DATABASE_URL', process.env.ALLRICE_TEST_DATABASE_URL);
       vi.spyOn(client, 'getDatabase').mockReturnValue(fixture.db);
       await fixture.db.unsafe(`
         create function assert_retained_owner_released() returns trigger language plpgsql as $$
@@ -266,9 +269,13 @@ suite(
         worker.close();
         await once(worker, 'close');
       }
-      vi.restoreAllMocks();
-      vi.unstubAllEnvs();
-      await fixture?.close();
+      try {
+        await closeDEntryAuthorityFeeds();
+      } finally {
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+        await fixture?.close();
+      }
       expect(attachments.size).toBe(0);
     });
     it('audits and clears an initial failed reservation that never produced an image', async () => {
