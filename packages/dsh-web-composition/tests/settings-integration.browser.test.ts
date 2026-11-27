@@ -574,6 +574,12 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         .getByRole('button', { name: 'AllRice 账号', exact: true })
         .click();
       await pane.getByText('修改登录密码', { exact: true }).click();
+      await page.setViewportSize({ width: 390, height: 395 });
+      await expect
+        .poll(() =>
+          pane.evaluate((node) => node.scrollHeight > node.clientHeight),
+        )
+        .toBe(true);
       await pane
         .getByLabel('当前密码', { exact: true })
         .fill('old-test-password');

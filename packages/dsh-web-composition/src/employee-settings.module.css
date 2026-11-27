@@ -38,6 +38,9 @@
 }
 
 .pane {
+  box-sizing: border-box;
+  height: 100%;
+  overflow: auto;
   padding: var(--ar-space-5);
   display: grid;
   align-content: start;
