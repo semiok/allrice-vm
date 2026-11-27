@@ -70,7 +70,7 @@ export function apply(ctx: Context) {
       const active = AbortSignal.any([lifetime, owner.signal]);
       let actions: Header['inputActions'] | undefined;
       let mounted: SessionIdOf | undefined;
-      function capture({ sessionId, inputActions }: Header) {
+      function Capture({ sessionId, inputActions }: Header) {
         useEffect(() => {
           if (sessionId !== nativeSessionId) return;
           mounted = sessionId;
@@ -168,7 +168,7 @@ export function apply(ctx: Context) {
             name: 'conversation.session.header.actions',
             id: 'allrice-employee-panels.reference-input',
           },
-          capture,
+          Capture,
         ),
       );
       const bridge: DocumentReferences = {
