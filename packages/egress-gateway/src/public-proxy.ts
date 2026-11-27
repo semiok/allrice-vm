@@ -298,12 +298,13 @@ async function firstBytes(
 /** CONNECT never forwards bytes outside a complete TLS record. This checks
  * wire framing only; the client still validates certificates and ciphertext. */
 async function* tlsRecords(
-  source: AsyncIterable<Buffer>,
+  source: Duplex,
   inspect: (record: Buffer, first: boolean) => Promise<void> | void,
 ) {
   let pending = Buffer.alloc(0);
   let first = true;
-  for await (const chunk of source) {
+  // The default iterator destroys a socket at EOF if its write side is open.
+  for await (const chunk of source.iterator({ destroyOnReturn: false })) {
     pending = Buffer.concat([pending, chunk]);
     while (pending.length >= 5) {
       const type = pending[0]!;
@@ -357,8 +358,8 @@ async function relayTls(
   // finish notification that was already consumed by a half-closing socket.
   const ingress = pipeline(
     peer,
-    (source) =>
-      tlsRecords(source, (record, first) => {
+    () =>
+      tlsRecords(peer, (record, first) => {
         if (!first) return;
         const hello = record[0] === 22 && record[5] === 2;
         if (!hello && record[0] !== 21) throw denied();
@@ -370,8 +371,8 @@ async function relayTls(
   ).then(() => finishTlsWrite(client, active));
   const egress = pipeline(
     client,
-    (source) =>
-      tlsRecords(source, (record) => {
+    () =>
+      tlsRecords(client, (record) => {
         if (serverHello === true) return;
         // A TLS 1.3 client can send framed early data before ServerHello.
         if (

@@ -445,39 +445,43 @@ async function nativeClientHello() {
   return initial;
 }
 
-it('joins the epoch after an upstream TLS alert and FIN precede the guest FIN', async () => {
-  const initial = await nativeClientHello();
-  const upstream = deferred<Net.Socket>();
-  const peerClosed = deferred<void>();
-  const port = await listen(
-    createTcpServer({ allowHalfOpen: true }, (socket) => {
-      socket.once('close', () => peerClosed.resolve());
-      socket.once('data', () => {
-        socket.end(Buffer.from([21, 3, 3, 0, 2, 2, 40]));
-        upstream.resolve(socket);
-      });
-    }),
-  );
-  const vm = await setup();
-  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
-  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
-  expect(response.statusCode).toBe(200);
-  tunnel.allowHalfOpen = true;
-  const ended = once(tunnel, 'end');
-  const clientClosed = once(tunnel, 'close');
-  tunnel.resume();
-  tunnel.write(initial);
-  try {
-    await ended;
-    expect((await upstream.promise).readableEnded).toBe(false);
-    tunnel.end();
-    await Promise.all([clientClosed, peerClosed.promise]);
-    vm.stop.abort();
-    await vm.drain();
-  } finally {
-    tunnel.destroy();
-  }
-});
+it.each(['guest FIN', 'epoch revoke'] as const)(
+  'joins the TLS relay after an upstream alert and FIN followed by %s',
+  async (completion) => {
+    const initial = await nativeClientHello();
+    const upstream = deferred<Net.Socket>();
+    const peerClosed = deferred<void>();
+    const port = await listen(
+      createTcpServer({ allowHalfOpen: true }, (socket) => {
+        socket.once('close', () => peerClosed.resolve());
+        socket.once('data', () => {
+          socket.end(Buffer.from([21, 3, 3, 0, 2, 2, 40]));
+          upstream.resolve(socket);
+        });
+      }),
+    );
+    const vm = await setup();
+    network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+    const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+    expect(response.statusCode).toBe(200);
+    tunnel.allowHalfOpen = true;
+    const ended = once(tunnel, 'end');
+    const clientClosed = once(tunnel, 'close');
+    tunnel.resume();
+    tunnel.write(initial);
+    try {
+      await ended;
+      expect((await upstream.promise).readableEnded).toBe(false);
+      if (completion === 'guest FIN') tunnel.end();
+      else vm.stop.abort();
+      await Promise.all([peerClosed.promise, vm.drain()]);
+      if (completion === 'epoch revoke') tunnel.destroy();
+      await clientClosed;
+    } finally {
+      tunnel.destroy();
+    }
+  },
+);
 
 it.each(['coalesced', 'split'] as const)(
   'relays %s early TLS records before the first server flight',
