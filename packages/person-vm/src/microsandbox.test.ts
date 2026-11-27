@@ -27,8 +27,8 @@ import {
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import {
-  PERSON_VM_MEMORY_MIB,
   PersonVmError,
+  PERSON_VM_MEMORY_MIB,
   type PersonVmBinding,
 } from './contract.ts';
 import { runCommand } from './process.ts';
@@ -1553,6 +1553,52 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toBe(false);
     },
   );
+  it('rechecks the admitted ticket after staging the host file and before the first guest copy', async () => {
+    const f = await bootstrapFixture();
+    const home = join(f.mount, 'host-home');
+    const readPlan = f.h.runtime.memoryGuestPlan;
+    let planning = false;
+    let staged = false;
+    f.h.runtime.memoryGuestPlan = async (...args) => {
+      planning = true;
+      return readPlan(...args);
+    };
+    await expect(
+      f.service.prewarm(
+        f.rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!planning) return;
+              const directory = (await readdir(home)).find((name) =>
+                name.startsWith('bootstrap-'),
+              );
+              if (
+                directory &&
+                (await readdir(join(home, directory))).includes('0')
+              ) {
+                staged = true;
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              }
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(staged).toBe(true);
+    const calls = await f.calls();
+    expect(calls.some(([verb]) => verb === 'cp')).toBe(false);
+    expect(calls.some(([verb]) => verb === 'stop')).toBe(true);
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      (await readdir(home)).some((name) => name.startsWith('bootstrap-')),
+    ).toBe(false);
+  });
   it('a partial native cp failure never sends the remaining files or initializes', async () => {
     const f = await bootstrapFixture('partial-copy');
     await expect(

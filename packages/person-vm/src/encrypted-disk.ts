@@ -1,17 +1,42 @@
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, rename, rm } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rm,
+  stat,
+} from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { PersonVmError } from './contract.ts';
+import {
+  missing,
+  privatePersonVmDirectory,
+  syncDiskPoolDirectory,
+  systemPathNormalizer,
+} from './disk-pool-ledger.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 
 export type PersonDisk = Readonly<{ vmId: string; tier: 'warm' | 'cold' }>;
 export type PersonVmDiskInspection =
   | Readonly<{ state: 'absent' | 'unknown' }>
   | Readonly<{ state: 'ready'; disk: PersonDisk }>;
+type DiskImageInfo = {
+  images?: {
+    'image-path': string;
+    'system-entities'?: { 'mount-point'?: string }[];
+  }[];
+};
 export interface PersonVmDiskPort {
   /** Host-only non-destructive reconciliation of this vmId's two storage locations. */
   inspect(vmId: string, signal: AbortSignal): Promise<PersonVmDiskInspection>;
+  /** Independently confirm a previously retired VM's disk, key and mount are absent. */
+  confirmAbsence?(vmId: string, signal: AbortSignal): Promise<boolean>;
+  /** Formal Host references that need an owner before allocating new storage. */
+  listFormalDiskIds?(signal: AbortSignal): Promise<string[]>;
   create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
   attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
   detach(disk: PersonDisk, signal: AbortSignal): Promise<void>;
@@ -23,9 +48,14 @@ export interface PersonVmDiskPort {
   delete(disk: PersonDisk, signal: AbortSignal): Promise<void>;
 }
 export interface PersonVmKeyStore {
-  readOrCreate(vmId: string): Promise<Buffer>;
+  readOrCreate(
+    vmId: string,
+    beforeWrite?: () => Promise<void>,
+  ): Promise<Buffer>;
   read(vmId: string): Promise<Buffer>;
   delete(vmId: string): Promise<void>;
+  confirmAbsence?(vmId: string): Promise<boolean>;
+  listDiskIds?(signal: AbortSignal): Promise<string[]>;
 }
 
 function checkedId(vmId: string) {
@@ -47,18 +77,37 @@ export async function privateDirectory(path: string) {
   await chmod(path, 0o700);
 }
 
+async function privateFileIds(
+  path: string,
+  suffix: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const directory = await privatePersonVmDirectory(path);
+  if (!directory) return [];
+  const ids: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (!entry.name.endsWith(suffix)) continue;
+    if (!entry.isFile()) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    ids.push(checkedId(entry.name.slice(0, -suffix.length)));
+  }
+  signal.throwIfAborted();
+  return ids;
+}
+
 /** Dedicated host directory only. Never use a DSH plugin storageDir or guest path. */
 export class FilePersonVmKeyStore implements PersonVmKeyStore {
   constructor(private readonly root: string) {}
-  private path(id: string) {
+  filePath(id: string) {
     return join(this.root, `${checkedId(id)}.key`);
   }
-  async readOrCreate(id: string) {
+  async readOrCreate(id: string, beforeWrite?: () => Promise<void>) {
     await privateDirectory(this.root);
     const value = randomBytes(48).toString('hex');
+    if (beforeWrite) await beforeWrite();
     try {
       const file = await open(
-        this.path(id),
+        this.filePath(id),
         constants.O_WRONLY |
           constants.O_CREAT |
           constants.O_EXCL |
@@ -78,7 +127,7 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
   }
   async read(id: string) {
     const file = await open(
-      this.path(id),
+      this.filePath(id),
       constants.O_RDONLY | constants.O_NOFOLLOW,
     );
     try {
@@ -91,7 +140,22 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
     }
   }
   async delete(id: string) {
-    await rm(this.path(id), { force: true });
+    await rm(this.filePath(id), { force: true });
+  }
+  async confirmAbsence(id: string) {
+    const root = await privatePersonVmDirectory(this.root);
+    if (!root) return false;
+    try {
+      await lstat(join(root, basename(this.filePath(id))));
+      return false;
+    } catch (error) {
+      if (!missing(error)) throw error;
+    }
+    await syncDiskPoolDirectory(root);
+    return true;
+  }
+  listDiskIds(signal: AbortSignal) {
+    return privateFileIds(this.root, '.key', signal);
   }
 }
 
@@ -123,6 +187,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
   private manifest(vmId: string) {
     return join(this.options.root, 'manifests', `${checkedId(vmId)}.json`);
   }
+  /** Trusted adapter only. Transferring ownership requires these exact paths. */
+  poolFiles(disk: PersonDisk) {
+    return { image: this.image(disk), manifest: this.manifest(disk.vmId) };
+  }
   private async command(
     args: string[],
     signal: AbortSignal,
@@ -136,12 +204,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       ...(input ? { input } : {}),
     });
   }
-  private async info(signal: AbortSignal): Promise<{
-    images?: {
-      'image-path': string;
-      'system-entities'?: { 'mount-point'?: string }[];
-    }[];
-  }> {
+  private async info(
+    signal: AbortSignal,
+    canonical: ReturnType<typeof systemPathNormalizer>,
+  ): Promise<DiskImageInfo> {
     const plist = await this.command(['info', '-plist'], signal);
     const json = await this.run({
       executable: '/usr/bin/plutil',
@@ -150,17 +216,33 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       signal,
       input: Buffer.from(plist),
     });
-    return JSON.parse(json);
+    const state = JSON.parse(json) as DiskImageInfo;
+    if (Array.isArray(state.images)) {
+      for (const image of state.images) {
+        signal.throwIfAborted();
+        if (typeof image?.['image-path'] === 'string')
+          image['image-path'] = await canonical(image['image-path']);
+        if (Array.isArray(image?.['system-entities'])) {
+          for (const entity of image['system-entities']) {
+            const point = entity?.['mount-point'];
+            if (typeof point === 'string')
+              entity['mount-point'] = await canonical(point);
+          }
+        }
+      }
+    }
+    return state;
   }
   private async isAttached(disk: PersonDisk, signal: AbortSignal) {
-    const image = (await this.info(signal)).images?.find(
-      (item) => item['image-path'] === this.image(disk),
+    const canonical = systemPathNormalizer();
+    const path = await canonical(this.image(disk));
+    const mount = await canonical(this.mount(disk));
+    const image = (await this.info(signal, canonical)).images?.find(
+      (item) => item['image-path'] === path,
     );
     if (
       image &&
-      !image['system-entities']?.some(
-        (item) => item['mount-point'] === this.mount(disk),
-      )
+      !image['system-entities']?.some((item) => item['mount-point'] === mount)
     )
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     return Boolean(image);
@@ -169,9 +251,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     disk: PersonDisk,
     create: boolean,
     fn: (key: Buffer) => Promise<T>,
+    beforeKeyWrite?: () => Promise<void>,
   ) {
     const key = await (create
-      ? this.options.keys.readOrCreate(disk.vmId)
+      ? this.options.keys.readOrCreate(disk.vmId, beforeKeyWrite)
       : this.options.keys.read(disk.vmId));
     const input = Buffer.concat([key, Buffer.from([0])]);
     try {
@@ -181,6 +264,74 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       input.fill(0);
     }
   }
+  async verifyImageKey(disk: PersonDisk, signal: AbortSignal) {
+    await this.withKey(disk, false, (key) =>
+      this.command(
+        ['imageinfo', this.image(disk), '-stdinpass', '-plist'],
+        signal,
+        key,
+      ),
+    );
+  }
+
+  /** Pool entries may not have a live device or an occupied mount point. */
+  async verifyOffline(disk: PersonDisk, signal: AbortSignal) {
+    const canonical = systemPathNormalizer();
+    const image = await canonical(this.image(disk));
+    const mount = await canonical(this.mount(disk));
+    const actual = await stat(image, { bigint: true }).catch(
+      (error: unknown) => {
+        if (missing(error)) return null;
+        throw error;
+      },
+    );
+    const observe = async (disappeared?: string) => {
+      const state = await this.info(signal, canonical);
+      if (
+        !Array.isArray(state.images) ||
+        state.images.some(
+          (entry) =>
+            !entry ||
+            typeof entry['image-path'] !== 'string' ||
+            entry['image-path'] === image ||
+            entry['image-path'] === disappeared ||
+            !Array.isArray(entry['system-entities']) ||
+            entry['system-entities'].some(
+              (entity) => !entity || entity['mount-point'] === mount,
+            ),
+        )
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      if (!actual) return;
+      for (const item of state.images) {
+        signal.throwIfAborted();
+        const path = item['image-path'];
+        if (!isAbsolute(path)) throw new PersonVmError('CLEANUP_INCOMPLETE');
+        let candidate;
+        try {
+          candidate = await stat(path, { bigint: true });
+        } catch (error) {
+          if (missing(error)) return path;
+          throw error;
+        }
+        if (candidate.dev === actual.dev && candidate.ino === actual.ino)
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }
+    };
+    const disappeared = await observe();
+    // A vanished path is harmless only when a fresh device inventory no
+    // longer reports that attachment and still proves the target offline.
+    if (disappeared && (await observe(disappeared)))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const root = await lstat(this.options.root);
+    const mounted = await lstat(mount).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (mounted && (!mounted.isDirectory() || mounted.dev !== root.dev))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    signal.throwIfAborted();
+  }
   async inspect(
     vmId: string,
     signal: AbortSignal,
@@ -189,6 +340,35 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     for (const directory of ['', 'warm', 'cold', 'manifests'])
       await privateDirectory(join(this.options.root, directory));
     return this.inspectExisting(vmId, signal);
+  }
+  async listFormalDiskIds(signal: AbortSignal) {
+    const root = await privatePersonVmDirectory(this.options.root);
+    const ids = new Set(await this.options.keys.listDiskIds?.(signal));
+    if (!root) return [...ids];
+    for (const [dir, suffix] of [
+      ['warm', '.sparseimage'],
+      ['cold', '.sparseimage'],
+      ['manifests', '.json'],
+    ] as const) {
+      for (const id of await privateFileIds(join(root, dir), suffix, signal))
+        ids.add(id);
+    }
+    return [...ids];
+  }
+  async confirmAbsence(vmId: string, signal: AbortSignal) {
+    // An absent image/manifest pair alone can still leave an attached device
+    // or an old key. Validate the original root before accepting absence.
+    const root = await privatePersonVmDirectory(this.options.root);
+    if (!root) return false;
+    if ((await this.inspectExisting(vmId, signal)).state !== 'absent')
+      return false;
+    for (const tier of ['warm', 'cold'] as const)
+      await this.verifyOffline({ vmId, tier }, signal);
+    if (!(await this.options.keys.confirmAbsence?.(vmId))) return false;
+    for (const dir of ['warm', 'cold', 'manifests'])
+      await syncDiskPoolDirectory(join(root, dir));
+    signal.throwIfAborted();
+    return true;
   }
   private async inspectExisting(
     vmId: string,
@@ -245,13 +425,7 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     try {
       // Recognize/decrypt the completed container through the public command.
       // This does not mount, repair, reformat, or claim filesystem health.
-      await this.withKey(actual.disk, false, (key) =>
-        this.command(
-          ['imageinfo', this.image(actual.disk), '-stdinpass', '-plist'],
-          signal,
-          key,
-        ),
-      );
+      await this.verifyImageKey(actual.disk, signal);
     } catch (error) {
       if (signal.aborted) throw error;
       return { state: 'unknown' };
@@ -264,9 +438,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     const observed = await this.inspectExisting(disk.vmId, signal);
     if (observed.state !== 'ready' || observed.disk.tier !== disk.tier)
       return null;
-    const mount = this.mount(disk);
-    const image = this.image(disk);
-    const matches = (await this.info(signal)).images?.filter(
+    const canonical = systemPathNormalizer();
+    const mount = await canonical(this.mount(disk));
+    const image = await canonical(this.image(disk));
+    const matches = (await this.info(signal, canonical)).images?.filter(
       (entry) =>
         entry['image-path'] === image ||
         entry['system-entities']?.some(
@@ -279,35 +454,43 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       matches[0]['system-entities']?.filter(
         (entity) => entity['mount-point'] === mount,
       ).length === 1
-      ? mount
+      ? this.mount(disk)
       : null;
   }
-  async create(disk: PersonDisk, signal: AbortSignal) {
+  async create(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    beforeKeyWrite?: () => Promise<void>,
+  ) {
     await privateDirectory(this.options.root);
     await privateDirectory(join(this.options.root, disk.tier));
     const existing = await this.inspect(disk.vmId, signal);
     if (existing.state === 'ready') return;
     if (existing.state !== 'absent') throw new PersonVmError('PROVIDER_FAILED');
-    await this.withKey(disk, true, (key) =>
-      this.command(
-        [
-          'create',
-          '-size',
-          `${this.options.capacityGiB}g`,
-          '-fs',
-          'APFS',
-          '-volname',
-          `AllRice-${disk.vmId}`,
-          '-type',
-          'SPARSE',
-          '-encryption',
-          'AES-256',
-          '-stdinpass',
-          this.image(disk),
-        ],
-        signal,
-        key,
-      ),
+    await this.withKey(
+      disk,
+      true,
+      (key) =>
+        this.command(
+          [
+            'create',
+            '-size',
+            `${this.options.capacityGiB}g`,
+            '-fs',
+            'APFS',
+            '-volname',
+            `AllRice-${disk.vmId}`,
+            '-type',
+            'SPARSE',
+            '-encryption',
+            'AES-256',
+            '-stdinpass',
+            this.image(disk),
+          ],
+          signal,
+          key,
+        ),
+      beforeKeyWrite,
     );
     await chmod(this.image(disk), 0o600);
     const stat = await lstat(this.image(disk), { bigint: true });

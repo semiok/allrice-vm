@@ -1,5 +1,5 @@
-import type { PersonVmManagedProbeJob } from './native-command-observer.ts';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { isIPv4 } from 'node:net';
 import { dirname, isAbsolute, join, posix } from 'node:path';
 import { PersonVmError } from './contract.ts';
 import {
@@ -14,8 +14,10 @@ import type {
   PersonVmJobExit,
   PersonVmManagedJob,
   PersonVmMemoryGuestPlan,
+  PersonVmNativeWebGuestAddress,
   PersonVmStartingScope,
 } from './guest-bootstrap.ts';
+import type { PersonVmManagedProbeJob } from './native-command-observer.ts';
 import {
   nativeWebAuthArtifact,
   NATIVE_WEB_AUTH_READER,
@@ -27,6 +29,52 @@ import { COMMAND_MEMORY_STATE_ROOT } from './readonly-artifact.ts';
 const BASE_IMAGE_PATH =
   '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
+
+const readEthernetAddresses = String.raw`
+const interfaces = require('node:os').networkInterfaces();
+const ipv4 = (interfaces.eth0 ?? []).filter(({ family }) => family === 'IPv4');
+process.stdout.write(JSON.stringify(ipv4.map(({ address, cidr, internal }) => ({ address, cidr, internal }))));
+`;
+
+export function isMicrosandboxGuestIpv4(address: unknown): address is string {
+  if (typeof address !== 'string' || !isIPv4(address)) return false;
+  const parts = address.split('.');
+  const first = Number(parts[0]);
+  const second = Number(parts[1]);
+  const privateAddress =
+    first === 10 ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168);
+  // MSB v0.7.16 assigns offset 2 in the sandbox's /30 to eth0 and
+  // offset 1 to its gateway (network.rs: guest_bootstrap_network, derive_guest_ipv4).
+  return privateAddress && Number(parts[3]) % 4 === 2;
+}
+
+function parseNativeWebGuestAddress(
+  text: string,
+): PersonVmNativeWebGuestAddress {
+  let result: unknown;
+  try {
+    result = JSON.parse(text);
+  } catch (cause) {
+    throw new PersonVmError('PROVIDER_FAILED', { cause });
+  }
+  if (!Array.isArray(result) || result.length !== 1)
+    throw new PersonVmError('PROVIDER_FAILED');
+  const [entry]: unknown[] = result;
+  if (
+    !entry ||
+    typeof entry !== 'object' ||
+    !('address' in entry) ||
+    !isMicrosandboxGuestIpv4(entry.address) ||
+    !('internal' in entry) ||
+    entry.internal !== false ||
+    !('cidr' in entry) ||
+    entry.cidr !== `${entry.address}/30`
+  )
+    throw new PersonVmError('PROVIDER_FAILED');
+  return entry.address as PersonVmNativeWebGuestAddress;
+}
 
 const prepareCommandMemoryState = String.raw`
 const fs = require('node:fs');
@@ -269,7 +317,12 @@ export async function bootstrapMicrosandbox(input: {
     cliSha256?: string;
   }>;
   command: NativeCommand;
-}): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>> {
+}): Promise<
+  Pick<
+    PersonVmBootstrapScope,
+    'launch' | 'readNativeWebGuestAddress' | 'readNativeWebAuth'
+  >
+> {
   const { scope, name, command } = input;
   const plan = structuredClone(input.plan); // Trusted configuration snapshot, not guest authority.
   const paths = new Set<string>();
@@ -417,6 +470,42 @@ export async function bootstrapMicrosandbox(input: {
     await rm(stage, { recursive: true, force: true });
   }
   return Object.freeze({
+    readNativeWebGuestAddress: async (signal = scope.signal) => {
+      const active = AbortSignal.any([scope.signal, signal]);
+      const job = await spawnMicrosandboxManagedProbe(
+        {
+          scope: { ...scope, signal: active },
+          name,
+          command,
+          cleanupTimeoutMs: input.cleanupTimeoutMs,
+        },
+        {
+          executable: '/usr/local/bin/node',
+          args: ['-e', readEthernetAddresses],
+        },
+      );
+      let joined = false;
+      try {
+        const result = await job.wait(active);
+        joined = true;
+        if (result.exitCode !== 0 || result.timedOut)
+          throw new PersonVmError('PROVIDER_FAILED');
+        return parseNativeWebGuestAddress(await job.stdout(active));
+      } catch (cause) {
+        if (!joined) {
+          try {
+            await job.cancelAndWait(
+              AbortSignal.timeout(input.cleanupTimeoutMs),
+            );
+          } catch (cleanup) {
+            throw new PersonVmError('CLEANUP_INCOMPLETE', {
+              cause: new AggregateError([cause, cleanup]),
+            });
+          }
+        }
+        throw cause;
+      }
+    },
     readNativeWebAuth: async (
       request: PersonVmNativeWebAuthRequest,
       signal = scope.signal,
@@ -447,7 +536,17 @@ export async function bootstrapMicrosandbox(input: {
           String(maxBytes),
         ],
         active,
-      );
+      ).catch((error: unknown) => {
+        if (
+          !active.aborted &&
+          error instanceof PersonVmError &&
+          error.code === 'PROVIDER_FAILED'
+        )
+          throw new PersonVmError('PROVIDER_FAILED', {
+            cause: 'AUTH_ARTIFACT_READ_FAILED',
+          });
+        throw error;
+      });
       await scope.assertCurrent();
       active.throwIfAborted();
       return parseNativeWebAuth(text, request);

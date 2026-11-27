@@ -14,6 +14,7 @@ import {
 } from '@deepseek-ai/dsh-typert-protocol';
 import { DEntryPageMuxQuerySchema } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
+import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import { authorizeDEntryNativeInvocation } from './native-invocation.js';
 import {
@@ -278,6 +279,9 @@ async function runStreams(
         } else if (frame.endpoint === 'remoteAccess/follow') {
           const { args } = emptyPayload.parse(frame.payload);
           call = { scopeId, endpoint: 'remoteAccess/follow' as const, args };
+        } else if (frame.endpoint === 'session/control') {
+          const { args } = emptyPayload.parse(frame.payload);
+          call = { scopeId, endpoint: 'session/control' as const, args };
         } else if (frame.endpoint === 'session/follow') {
           const authorize = () =>
             authorizeDEntryNativeInvocation(
@@ -328,6 +332,31 @@ async function runStreams(
             // A remove must still reach the client after the child has left
             // the catalogue. Only frames granting access require child proof.
             await page.assertCurrent(child, sessionIds);
+          } else if (frame.endpoint === 'session/control') {
+            const control = Native.methods['session/control'].result
+              .create()
+              .parse(item.value);
+            if (control.type === 'baseline') {
+              await page.assertCurrent(
+                child,
+                Object.keys(control.value.projections),
+              );
+            } else {
+              try {
+                await page.assertCurrent(child, [String(control.sessionId)]);
+              } catch (error) {
+                // A child can leave the catalog between guest filtering and
+                // delivery. A failed page/root check also revokes the page.
+                if (
+                  error instanceof DataAccessError &&
+                  error.code === 'not_found' &&
+                  !page.signal.aborted &&
+                  !child.aborted
+                )
+                  continue;
+                throw error;
+              }
+            }
           } else await check();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });

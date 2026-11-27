@@ -357,24 +357,30 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       });
     },
 
-    /** Once the exact stopped generation is gone, a prior boot may have
-     * executed. Record the unresolved attempt without dispatching it again. */
-    recordExpiredClaimWithoutStoppedSource(): Promise<boolean> {
+    /** Retire expired claims that cannot be retried. A missing stopped
+     * generation leaves the prior start unconfirmed. */
+    recordExpiredUnrecoverableClaim(): Promise<boolean> {
       return sql.begin(async (tx) => {
-        const [row] = await tx<(PlanRow & { expired_claim: string })[]>`
+        const [row] = await tx<
+          (PlanRow & { expired_claim: string; reason: string })[]
+        >`
           update person_vm_scheduled_wakes as w
-          set state='unknown',claim_id=null,claim_until=null,
-            reason='START_UNCONFIRMED',updated_at=now()
+          set state=case when expired.denied then 'blocked' else 'unknown' end,
+            claim_id=null,claim_until=null,
+            reason=case when expired.denied then 'STALE_PLAN' else 'START_UNCONFIRMED' end,
+            updated_at=now()
           from (
-            select p.plan_id,p.claim_id from person_vm_scheduled_wakes p
+            select p.plan_id,p.claim_id,p.revoked_at is not null and source.stopped as denied
+            from person_vm_scheduled_wakes p
+            left join person_virtual_machines vm on vm.person_id=p.person_id
+            cross join lateral (
+              select coalesce(vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
+                and vm.instance_id=p.instance_id and vm.lease_epoch=p.lease_epoch
+                and vm.phase in ('stopped','cold') and vm.disk_retained
+                and vm.egress_receipt is null, false) as stopped
+            ) as source
             where p.state='claimed' and p.claim_until<=now()
-              and not exists (
-                select 1 from person_virtual_machines vm where vm.person_id=p.person_id
-                  and (vm.lease_owner is not null or (
-                    vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
-                    and vm.instance_id=p.instance_id and vm.lease_epoch=p.lease_epoch
-                    and vm.phase in ('stopped','cold') and vm.disk_retained
-                    and vm.egress_receipt is null)))
+              and vm.lease_owner is null and (p.revoked_at is not null or not source.stopped)
             order by p.claim_until,p.plan_id
             limit 1 for update of p skip locked
           ) as expired where w.plan_id=expired.plan_id
@@ -385,8 +391,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           row,
           row.expired_claim,
           'settle',
-          'failed',
-          'START_UNCONFIRMED',
+          row.state === 'blocked' ? 'denied' : 'failed',
+          row.reason,
         );
         return true;
       });

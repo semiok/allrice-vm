@@ -102,13 +102,14 @@ begin
               when 'allrice_employees' then a.employee_id=(fact->>'id')::uuid
               else a.employee_id=(fact->>'tenant_employee_id')::uuid and fact->>'active'='false'
             end))
-        and (tg_table_name<>'allrice_settings' or exists(
-          select 1 from allrice_native_schedule_observation_receipts receipt
-          cross join lateral (select jsonb_build_array(jsonb_build_object(
-            'organizationId',w.organization_id,'personId',w.person_id,
-            'employeeInstanceId',receipt.employee_instance_id,'generation','4.0')) as selection) allowed
-          where receipt.receipt_id=any(w.receipt_ids)
-            and previous_policy @> allowed.selection and not current_policy @> allowed.selection))
+        -- The published rollout opts in a person within one organization.
+        and (tg_table_name<>'allrice_settings' or (
+          exists(select 1 from jsonb_array_elements(previous_policy) selection
+            where lower(selection->>'organizationId')=w.organization_id::text
+              and lower(selection->>'personId')=w.person_id::text)
+          and not exists(select 1 from jsonb_array_elements(current_policy) selection
+            where lower(selection->>'organizationId')=w.organization_id::text
+              and lower(selection->>'personId')=w.person_id::text)))
         and (tg_table_name<>'allrice_native_schedule_observation_receipts' or exists(
           select 1 from allrice_native_schedule_observation_receipts receipt
           where receipt.receipt_id=any(w.receipt_ids)

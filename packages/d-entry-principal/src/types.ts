@@ -58,6 +58,7 @@ export type OutputOf<M> = M extends { result: TypertRemoteValue<infer O> }
 type NativeMethods = typeof Native.methods;
 type AccessMethods = typeof Access.methods;
 export type NativeUnary =
+  | 'session/list'
   | 'session/attachment'
   | 'session/page'
   | 'session/projections'
@@ -82,7 +83,7 @@ export type DEntryScopedUnaryResult = {
   }>;
 }[NativeUnary];
 export type DEntryScopedStreamCall =
-  | Calls<'session/follow'>
+  | Calls<'session/control' | 'session/follow'>
   | Readonly<{
       scopeId: string;
       endpoint: 'remoteAccess/follow';
@@ -104,6 +105,7 @@ export type DEntryScopedStreamFrame =
       type: 'item';
       scopeId: string;
       value:
+        | OutputOf<NativeMethods['session/control']>
         | OutputOf<NativeMethods['session/follow']>
         | OutputOf<AccessMethods['remoteAccess/follow']>
         | ScopedEventFrame;

@@ -90,7 +90,7 @@ export interface DEntryNativeOwnerPort {
   ): Promise<ResolvedDEntryNativeOwner>;
 }
 export class DEntryNativeUnavailable extends Error {
-  constructor() {
+  constructor(readonly graphRule?: string) {
     super('D entry native owner is not bound');
   }
 }

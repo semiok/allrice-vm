@@ -179,14 +179,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         values('system','d_entry_rollout_policy',${tx.json({
           revision: randomUUID(),
           defaultGeneration: '3.x',
-          selections: [
-            {
-              personId,
-              organizationId,
-              employeeInstanceId,
-              generation: '4.0',
-            },
-          ],
+          selections: [{ personId, organizationId }],
         })})
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
       return employee!.id;
@@ -372,7 +365,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(stop).not.toHaveBeenCalled();
   });
 
-  it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
+  it('durably invalidates a person’s old plan only when their 4.0 qualification is removed', async () => {
     const f = await fixture();
     await publishFixtureAuthority(f);
     const planId = randomUUID();
@@ -384,8 +377,6 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     const other = {
       personId: randomUUID(),
       organizationId: f.binding.organizationId,
-      employeeInstanceId: randomUUID(),
-      generation: '4.0',
     };
     await db`update allrice_settings
       set value=jsonb_set(value,'{revision}',to_jsonb(${randomUUID()}::text))
@@ -409,9 +400,34 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     await db`update allrice_settings
       set value=jsonb_set(value,'{selections}','[]'::jsonb)
       where key='d_entry_rollout_policy'`;
+    const [revoked] =
+      await db`select revoked_at,reason from person_vm_scheduled_wakes
+      where plan_id=${planId}`;
+    expect(revoked).toMatchObject({
+      revoked_at: expect.any(Date),
+      reason: 'STALE_PLAN',
+    });
     await db`update allrice_settings set value=${db.json(original!.value)}
       where key='d_entry_rollout_policy'`;
     await expect(f.store().readClaimRoster(claim!)).resolves.toBeNull();
+    await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
+      where plan_id=${planId}`;
+    expect(await f.store().claim(300_000)).toBeNull();
+    expect(await f.module().runDueOnce(signal)).toBe(true);
+    expect(await f.module().runDueOnce(signal)).toBe(false);
+    expect(f.start).not.toHaveBeenCalled();
+    const [settled] =
+      await db`select w.state,w.claim_id,w.claim_until,a.result,a.error_code
+      from person_vm_scheduled_wakes w join person_vm_audit a using (person_id,vm_id)
+      where w.plan_id=${planId} and a.request_id=${claim!.claimId}
+        and a.action='scheduled-wake.settle'`;
+    expect(settled).toEqual({
+      state: 'blocked',
+      claim_id: null,
+      claim_until: null,
+      result: 'denied',
+      error_code: 'STALE_PLAN',
+    });
   });
 
   it('orders a real employee archive against the admitted native dispatch', async () => {
@@ -525,6 +541,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
       where plan_id=${planId}`;
     expect(await f.store().claim(300_000)).toBeNull();
+    expect(await f.module().runDueOnce(signal)).toBe(true);
     const rows = await db`select action,error_code from person_vm_audit
       where request_id=${planId} and action='scheduled-wake.invalidate'`;
     expect(rows).toEqual([
@@ -727,33 +744,37 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(staged).toEqual([]);
   });
 
-  it('audits an expired claim whose VM advanced during boot without retrying on the new binding', async () => {
-    const f = await fixture(),
-      planId = randomUUID();
-    await expect(
-      f.module().prepareStopWithWake(f.binding, planId, signal),
-    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
-    await f.stop(planId);
-    const claim = await f.store().claim(300_000);
-    expect(claim).not.toBeNull();
-    await db`update person_virtual_machines
+  it.each([false, true])(
+    'audits an unconfirmed start after the VM advanced (revoked: %s)',
+    async (revoked) => {
+      const f = await fixture(),
+        planId = randomUUID();
+      await expect(
+        f.module().prepareStopWithWake(f.binding, planId, signal),
+      ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+      await f.stop(planId);
+      const claim = await f.store().claim(300_000);
+      expect(claim).not.toBeNull();
+      await db`update person_virtual_machines
       set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting'
       where person_id=${f.binding.personId}`;
-    await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
+      if (revoked) await f.invalidate(planId);
+      await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
       where plan_id=${planId}`;
-    expect(await f.module().runDueOnce(signal)).toBe(true);
-    expect(await f.module().runDueOnce(signal)).toBe(false);
-    expect(f.start).not.toHaveBeenCalled();
-    expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
-    const [row] = await db`select w.state,a.error_code
+      expect(await f.module().runDueOnce(signal)).toBe(true);
+      expect(await f.module().runDueOnce(signal)).toBe(false);
+      expect(f.start).not.toHaveBeenCalled();
+      expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
+      const [row] = await db`select w.state,a.error_code
       from person_vm_scheduled_wakes w join person_vm_audit a using (person_id,vm_id)
       where w.plan_id=${planId} and a.request_id=${claim!.claimId}
         and a.action='scheduled-wake.settle'`;
-    expect(row).toMatchObject({
-      state: 'unknown',
-      error_code: 'START_UNCONFIRMED',
-    });
-  });
+      expect(row).toMatchObject({
+        state: 'unknown',
+        error_code: 'START_UNCONFIRMED',
+      });
+    },
+  );
 
   it('recovers an expired claim, retries a confirmed non-start, and fences late settlements', async () => {
     const f = await fixture(),

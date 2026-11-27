@@ -10,6 +10,8 @@ issue that first introduced them:
 - `runtime/`: DSH process inventory and runtime-console behavior.
 - `workday/`: 4.0 workday evidence runner; fixture passes and missing production
   sources remain distinct from authorized Dev acceptance.
+- `public-greenfield/`: 4.0 first-employee, cold and warm browser acceptance. The
+  offline fixture runs independently of the public deployment.
 
 The historical `scripts/met*.{mjs,ts}` files remain as small compatibility
 entry points. New checks belong in the relevant capability folder and should

@@ -2,10 +2,22 @@ import { randomUUID } from 'node:crypto';
 import type postgres from 'postgres';
 import {
   DEntryRolloutPolicySchema,
+  UuidSchema,
   type RequestContext,
 } from '@allrice/contracts';
-import { getDatabase } from './core/client.ts';
+import {
+  PersonVmError,
+  type PersonVmDiskPreparationTarget,
+} from '@allrice/person-vm';
+import { readContentPrincipal } from './content-maintenance.ts';
+import { joinCallerSave } from './business-runtime/caller-transaction.ts';
+import { createDedicatedDatabase, getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
+import {
+  EmployeeInstanceError,
+  getEmployeeInstance,
+  readEmployeeVersionPublication,
+} from './employees/employee-instances.ts';
 import { requireCurrentPlatformAdmin } from './platform-authority.ts';
 
 // The existing platform release store is shared by Web and Worker. No process
@@ -24,6 +36,9 @@ export async function readDEntryReleasePolicy(
   sql: ReturnType<typeof getDatabase> | postgres.TransactionSql = getDatabase(),
   lock = false,
 ) {
+  // A missing settings row cannot serialize with the first publication.
+  if (lock)
+    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
   const [row] = await sql`select value from allrice_settings
     where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
     ${lock ? sql`for share` : sql``}`;
@@ -41,7 +56,7 @@ export async function getDEntryReleasePolicy(context: RequestContext) {
 }
 
 /** Published by the same platform-admin authority as native_question_mode.
- * Only exact person/employee tuples opt in; global enable is not supported. */
+ * Each selection opts one person into 4.0 within their organization. */
 export async function updateDEntryReleasePolicy(
   context: RequestContext,
   input: unknown,
@@ -52,6 +67,7 @@ export async function updateDEntryReleasePolicy(
   const policy = { ...parsed, revision: randomUUID() };
   await getDatabase().begin(async (tx) => {
     const actor = await requireCurrentPlatformAdmin(context, tx);
+    await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
     const [setting] =
       await tx`insert into allrice_settings(scope_type,key,value,updated_by)
       values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})
@@ -65,4 +81,265 @@ export async function updateDEntryReleasePolicy(
         ${tx.json({ revision: policy.revision })})`;
   });
   return policy;
+}
+
+/** Preparation reads stay off the request pool. Cancellation closes only
+ * this owned connection and joins even a callback interrupted by disconnect. */
+async function readDiskPreparation<T>(
+  mode: string,
+  signal: AbortSignal,
+  read: (sql: postgres.TransactionSql, active: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const active = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
+  active.throwIfAborted();
+  const client = createDedicatedDatabase(getDatabase());
+  let closing: Promise<void> | undefined;
+  let callback: Promise<{ value: T }> | undefined;
+  const close = () => (closing ??= client.end({ timeout: 0 }));
+  const abort = () => void close().catch(() => {});
+  active.addEventListener('abort', abort, { once: true });
+  try {
+    const result = await joinCallerSave(
+      client.begin(mode, (sql) => {
+        callback = (async () => {
+          active.throwIfAborted();
+          await sql`set local transaction_timeout = '5s'`;
+          active.throwIfAborted();
+          return { value: await read(sql, active) };
+        })();
+        return callback;
+      }),
+      () => callback,
+    );
+    active.throwIfAborted();
+    return result.value;
+  } finally {
+    active.removeEventListener('abort', abort);
+    await close();
+  }
+}
+
+/** One committed roster per sweep. Pages are scheduling hints only. */
+export async function readPersonVmDiskPreparationRoster(signal: AbortSignal) {
+  const policy = await readDiskPreparation('read only', signal, (sql) =>
+    readDEntryReleasePolicy(sql),
+  );
+  const people = [
+    ...new Set(policy.selections.map(({ personId }) => personId)),
+  ].sort();
+  return Object.freeze({
+    page(offset: number, limit: number) {
+      if (
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        !Number.isInteger(limit) ||
+        limit < 1 ||
+        limit > 100
+      )
+        throw new RangeError('Invalid disk preparation page');
+      const personIds = people.slice(offset, offset + limit);
+      const next = offset + personIds.length;
+      return { personIds, nextOffset: next < people.length ? next : null };
+    },
+  });
+}
+
+/** Advisory preflight only. The provider owns physical lease arbitration. */
+export async function readPersonVmDiskPreparationForegroundBusy(
+  personId: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  return readDiskPreparation('read only', signal, async (sql) => {
+    const [row] = await sql<{ busy: boolean }[]>`
+      select lease_owner is not null or instance_id is not null
+        or holds <> '[]'::jsonb as busy
+      from person_virtual_machines where person_id=${UuidSchema.parse(personId)}`;
+    return row?.busy ?? false;
+  });
+}
+
+/** Tenant and personal provenance must come from the exact version's creation
+ * transaction. A missing platform mapping also describes old materializations. */
+async function hasDiskPreparationVersionProvenance(
+  sql: postgres.TransactionSql,
+  identity: Pick<
+    PersonVmDiskPreparationTarget,
+    | 'organizationId'
+    | 'workspaceId'
+    | 'employeeVersionId'
+    | 'employeeInstanceId'
+    | 'personId'
+  >,
+  employeeId: string,
+) {
+  const [proof] = await sql<{ verified: boolean }[]>`
+    select exists (
+      select 1 from allrice_employee_versions v
+      join allrice_audit_events audit
+        on audit.organization_id=v.organization_id and audit.workspace_id=v.workspace_id
+      where v.organization_id=${identity.organizationId} and v.workspace_id=${identity.workspaceId}
+        and v.employee_id=${employeeId} and v.id=${identity.employeeVersionId}
+        and audit.decision='allowed' and audit.occurred_at=v.published_at
+        and (
+          (v.version=1 and audit.action='employee.create' and audit.resource_type='employee'
+            and audit.resource_id=v.employee_id and audit.reason='admin_created_employee_definition')
+          or
+          (audit.action='employee.version.publish' and audit.resource_type='employee_version'
+            and audit.resource_id=v.id
+            and audit.reason in ('admin_published_immutable_candidate', 'admin_published_immutable_manifest')
+            and audit.metadata->>'checksum'=v.config_checksum)
+          or
+          (v.version=1 and audit.action='employee.instance.create' and audit.resource_type='employee_instance'
+            and audit.resource_id=${identity.employeeInstanceId} and audit.actor_id=${identity.personId}
+            and audit.reason='d_entry_personal_employee_create'
+            and exists (select 1 from allrice_employee_instances i
+              where i.id=audit.resource_id and i.assignment_id=i.id and i.kind='custom'
+                and i.organization_id=v.organization_id and i.workspace_id=v.workspace_id
+                and i.owner_id=audit.actor_id and i.creation_version_id=v.id))
+        )
+    ) as verified`;
+  return proof?.verified === true;
+}
+
+/** Rebuild current storage eligibility from committed data in one short read.
+ * The returned facts authorize neither a logged-in principal nor VM startup. */
+export async function readPersonVmDiskPreparationTarget(
+  personId: string,
+  signal: AbortSignal,
+): Promise<PersonVmDiskPreparationTarget | null | 'version-source-unverified'> {
+  const ownerId = UuidSchema.parse(personId).toLowerCase();
+  signal.throwIfAborted();
+  return readDiskPreparation(
+    'isolation level repeatable read read only',
+    signal,
+    async (sql, active) => {
+      const policy = await readDEntryReleasePolicy(sql);
+      const [vm] = await sql<
+        {
+          organization_id: string;
+          phase: string;
+          disk_retained: boolean;
+          native_created: boolean;
+          instance_id: string | null;
+        }[]
+      >`
+        select organization_id,phase,disk_retained,native_created,instance_id
+        from person_virtual_machines where person_id=${ownerId}`;
+      if (
+        vm &&
+        (!vm.disk_retained ||
+          vm.native_created ||
+          vm.instance_id !== null ||
+          vm.phase === 'deleted' ||
+          vm.phase === 'running')
+      )
+        return null;
+
+      const organizations = policy.selections
+        .filter(
+          (entry) =>
+            entry.personId === ownerId &&
+            (!vm || entry.organizationId === vm.organization_id),
+        )
+        .map(({ organizationId }) => organizationId);
+      if (!organizations.length) return null;
+
+      // The rollout grants a person in an organization. Resolve their current
+      // employee instances inside this snapshot to retain publication checks.
+      const employees = await sql<
+        {
+          id: string;
+          organization_id: string;
+          workspace_id: string;
+          employee_id: string;
+          platform_version: boolean;
+        }[]
+      >`
+          select i.id,i.organization_id,i.workspace_id,a.employee_id,
+            exists (select 1 from allrice_platform_employee_tenant_assignments d
+              where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
+                and d.tenant_employee_id=a.employee_id
+                and d.tenant_employee_version_id=a.employee_version_id) as platform_version
+          from allrice_employee_instances i
+          join allrice_employee_assignments a on a.id=i.assignment_id
+            and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
+            and a.user_id=i.owner_id and a.active
+          where i.organization_id=any(${organizations}::uuid[]) and i.owner_id=${ownerId}
+            and i.archived_at is null
+          order by i.organization_id,i.id`;
+      let eligible: PersonVmDiskPreparationTarget | null = null;
+      let organizationConflict = false;
+      for (const instance of employees) {
+        active.throwIfAborted();
+        // A read-only subject projection, deliberately without a session.
+        const subject = {
+          actor: { type: 'user' as const, id: ownerId },
+          organizationId: instance.organization_id,
+          workspaceId: instance.workspace_id,
+        };
+        if (!(await readContentPrincipal(subject, sql))?.writable) continue;
+        try {
+          const employee = await getEmployeeInstance(subject, instance.id, sql);
+          active.throwIfAborted();
+          const identity = {
+            personId: ownerId,
+            organizationId: instance.organization_id,
+            workspaceId: employee.workspaceId,
+            employeeInstanceId: employee.id,
+            employeeRevision: employee.revision,
+            employeeVersionId: employee.source.employeeVersionId,
+          };
+          const source = employee.source;
+          if (
+            source.kind === 'tenant_version' &&
+            (instance.platform_version ||
+              !(await hasDiskPreparationVersionProvenance(
+                sql,
+                identity,
+                instance.employee_id,
+              )))
+          )
+            return 'version-source-unverified';
+          const platformRevisionId =
+            source.kind === 'platform' ? source.templateRevisionId : null;
+          if (platformRevisionId) {
+            const publication = await readEmployeeVersionPublication(
+              {
+                organizationId: identity.organizationId,
+                workspaceId: identity.workspaceId,
+                employeeId: instance.employee_id,
+                versionId: identity.employeeVersionId,
+              },
+              sql,
+            );
+            if (publication?.revision_id !== platformRevisionId) continue;
+          }
+          active.throwIfAborted();
+          if (eligible) {
+            organizationConflict ||=
+              eligible.organizationId !== identity.organizationId;
+            continue;
+          }
+          eligible = Object.freeze({
+            ...identity,
+            platformRevisionId,
+            policyRevision: policy.revision,
+          });
+        } catch (error) {
+          if (
+            (error instanceof DataAccessError &&
+              ['not_found', 'authorization_denied'].includes(error.code)) ||
+            (error instanceof EmployeeInstanceError &&
+              error.code === 'instance_archived')
+          )
+            continue;
+          throw error;
+        }
+      }
+      active.throwIfAborted();
+      if (organizationConflict)
+        throw new PersonVmError('ORGANIZATION_CONFLICT');
+      return eligible;
+    },
+  );
 }

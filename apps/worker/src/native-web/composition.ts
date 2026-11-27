@@ -14,10 +14,11 @@ import { preparePersonNativeWebRoster } from '@allrice/database';
 import type { RequestContext } from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
+  nativeWebLaunchOnGuest,
   prepareNativeWebLaunch,
   type NativeWebConfiguration,
   type NativeWebGuestProfile,
-  type NativeWebLaunch,
+  type NativeWebLaunchPlan,
   type NativeWebModelAdapter,
 } from './launch.js';
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
@@ -67,7 +68,7 @@ export function createAssignedNativeWebStartup(input: {
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
-    'cliPath' | 'guestAddress' | 'startupTimeoutMs'
+    'cliPath' | 'startupTimeoutMs'
   > & {
     publicUrl(endpoint: Endpoint, binding: PersonVmBinding): string;
   };
@@ -76,7 +77,7 @@ export function createAssignedNativeWebStartup(input: {
 }) {
   const prepared = new WeakMap<
     PersonVmWebStartup,
-    readonly NativeWebLaunch[]
+    readonly NativeWebLaunchPlan[]
   >();
   const running = new Map<
     string,
@@ -278,21 +279,37 @@ export function createAssignedNativeWebStartup(input: {
           unjoinedOpen: false,
         };
         running.set(binding.vmId, group);
+        let attemptedOwnerOpen = false;
+        let awaitingGroupSetup = true;
         try {
           const prove = editorProof;
+          signal.throwIfAborted();
+          await scope.assertCurrent();
+          if (!scope.readNativeWebGuestAddress)
+            throw new PersonVmError('PROVIDER_FAILED');
+          const guestAddress = await scope.readNativeWebGuestAddress(
+            AbortSignal.any([
+              signal,
+              AbortSignal.timeout(input.configuration.startupTimeoutMs),
+            ]),
+          );
           for (const [index, launch] of launches.entries()) {
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
             current(binding, web);
             signal.throwIfAborted();
             await scope.assertCurrent();
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
+            const boundLaunch = nativeWebLaunchOnGuest(launch, guestAddress);
+            attemptedOwnerOpen = true;
             const owner = await openNativeWebOwner({
               scope,
-              launch,
+              launch: boundLaunch,
               context: web.context,
               vm: input.vm,
               lifetime,
               cleanupTimeoutMs: input.cleanupTimeoutMs,
+              recordStartupFailure: web.recordNativeFailure,
+              startupPending: () => awaitingGroupSetup,
               ...(modelAdapter
                 ? {
                     async beforePrompt(
@@ -353,10 +370,15 @@ export function createAssignedNativeWebStartup(input: {
             throw new PersonVmError('RUNTIME_NOT_READY');
           group.verifiedBy = prove;
           group.ready = true;
+          awaitingGroupSetup = false;
         } catch (error) {
+          awaitingGroupSetup = false;
           group.ready = false;
           group.revoked.abort(error);
+          // The startup scope and native stop own address-probe cleanup.
+          // Only an attempted DSH owner open can retain a Host resource here.
           group.unjoinedOpen =
+            attemptedOwnerOpen &&
             error instanceof PersonVmError &&
             error.code === 'CLEANUP_INCOMPLETE';
           const joined = await Promise.allSettled(
@@ -423,6 +445,11 @@ export function createAssignedNativeWebStartup(input: {
         )
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
+      return AbortSignal.any([
+        lifetime,
+        group.revoked.signal,
+        ...[...group.owners.values()].map((owner) => owner.revoked),
+      ]);
     },
     assertVerifiedEditor(
       binding: PersonVmBinding,
@@ -644,7 +671,7 @@ export function createAssignedNativeWebStartup(input: {
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,
-    ): void;
+    ): AbortSignal;
     prepareForegroundEditor(
       binding: PersonVmBinding,
       context: RequestContext,

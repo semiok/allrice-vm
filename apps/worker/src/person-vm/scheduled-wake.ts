@@ -200,7 +200,7 @@ export function createPersonVmScheduledWake(input: Options) {
       if (!claim)
         return signal.aborted
           ? false
-          : input.store.recordExpiredClaimWithoutStoppedSource();
+          : input.store.recordExpiredUnrecoverableClaim();
       const current = () => input.store.isCurrent(claim);
       let eligible: boolean;
       try {

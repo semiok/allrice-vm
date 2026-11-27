@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as database from './core/client.ts';
 import { DataAccessError } from './data.ts';
+import { createDEntryAuthorityFeed } from './d-entry-authority.ts';
 import * as rootPin from './d-entry-native-root.ts';
 import {
   isDEntryNativeRunJournalCurrent,
@@ -29,6 +30,55 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
   afterAll(async () => {
     vi.restoreAllMocks();
     await fixture?.close();
+  });
+
+  it('observes committed thread authority changes before the fence despite restoration, without invalidating a title edit', async () => {
+    const { db } = fixture;
+    const f = await createRunAuthorityFixture(db, {
+      configure: false,
+      executionGeneration: '4.0',
+    });
+    const [namespace] = await db<
+      { schema: string }[]
+    >`select current_schema() as schema`;
+    const feed = createDEntryAuthorityFeed(
+      process.env.ALLRICE_TEST_DATABASE_URL!,
+    );
+    const abort = new AbortController();
+    const changed = vi.fn();
+    try {
+      const unsubscribe = await feed.subscribe(
+        {
+          changed(change) {
+            if (
+              change.schema === namespace!.schema &&
+              change.table === 'allrice_chat_sessions' &&
+              change.id === f.session
+            )
+              changed();
+          },
+          lost: (error) => abort.abort(error),
+        },
+        abort.signal,
+      );
+      try {
+        await db`update allrice_chat_sessions set title='Ordinary title edit' where id=${f.session}`;
+        await feed.observeThroughCommit(
+          AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]),
+        );
+        expect(changed).not.toHaveBeenCalled();
+        await db`update allrice_chat_sessions set archived_at=clock_timestamp() where id=${f.session}`;
+        await db`update allrice_chat_sessions set archived_at=null where id=${f.session}`;
+        await feed.observeThroughCommit(
+          AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]),
+        );
+        expect(changed).toHaveBeenCalledTimes(2);
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      await feed.close();
+    }
   });
 
   it('recovers an atomic failure through a new owner of the original retained VM and root', async () => {

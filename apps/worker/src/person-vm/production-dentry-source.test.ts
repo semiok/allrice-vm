@@ -5,6 +5,7 @@ import type * as Database from '@allrice/database';
 import { afterEach, expect, it, vi } from 'vitest';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
+  installDEntryNativeOwnerPort,
   resolveDEntryNativeResource,
   type ResolvedDEntryNativeOwner,
 } from '../d-entry/native-owner.js';
@@ -82,8 +83,10 @@ function fixture() {
   current.mockResolvedValue(identity);
   policy.mockResolvedValue({
     revision: 'fixture',
-    defaultGeneration: '4.0',
-    selections: [],
+    defaultGeneration: '3.x',
+    selections: [
+      { organizationId: binding.organizationId, personId: binding.personId },
+    ],
   });
   const readModels = vi.fn<Parameters<Proof>[0]['readModels']>(async () => ({
     ok: true,
@@ -123,7 +126,9 @@ function fixture() {
   const uninstallProof = vi.fn(() => {
     verified = null;
   });
+  const group = new AbortController();
   const startup = {
+    assertAuthenticatedGroup: vi.fn(() => group.signal),
     catalog: vi.fn(() => ({ ...roster, owner: host })),
     installStartingEditorProof(value: Proof) {
       proof = value;
@@ -168,6 +173,8 @@ function fixture() {
   }
   return {
     source,
+    group,
+    assertAuthenticatedGroup: startup.assertAuthenticatedGroup,
     port: currentDEntryNativeDataPort()!,
     binding,
     endpoint,
@@ -210,6 +217,34 @@ it('publishes exact-generation readiness only after same Host artifact, native m
   await f.source.close();
   expect(f.uninstallProof).toHaveBeenCalledOnce();
   expect(currentDEntryNativeDataPort()).toBeUndefined();
+});
+
+it('ties the selected prewarm proof to the revocation of the authenticated Host group', async () => {
+  const f = fixture();
+  const uninstall = installDEntryNativeOwnerPort({
+    resolve: async () => f.owner,
+  });
+  try {
+    await f.prove();
+    const proof = await f.port.assertEditorReady!(
+      f.context,
+      f.identity,
+      f.signal,
+    );
+    expect(f.assertAuthenticatedGroup).toHaveBeenCalledWith(
+      f.binding,
+      expect.any(AbortSignal),
+    );
+    expect(proof.aborted).toBe(false);
+    const siblingLost = Error('fixture sibling lost');
+    f.group.abort(siblingLost);
+    expect(f.owner.revoked.aborted).toBe(false);
+    expect(f.route.revoked.aborted).toBe(false);
+    expect(proof.aborted).toBe(true);
+    expect(proof.reason).toBe(siblingLost);
+  } finally {
+    uninstall();
+  }
 });
 
 it('requires rollout authority, a routable exact model and a current employee after all async evidence', async () => {

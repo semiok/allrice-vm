@@ -23,9 +23,22 @@ export type PersonVmWebEndpointReceipt = Readonly<{
   endpoints: readonly (PersonVmWebRoster['entries'][number] &
     Readonly<{ hostPort: number; guestPort: number }>)[];
 }>;
-/** System wake brings up the original DSH host without a browser principal. */
+export type NativeWebSetupFailure = Readonly<{
+  step: string;
+  errorType: string;
+  errorCode?: string;
+  httpStatus?: number;
+  target?: string;
+}>;
+/** Host-owned startup metadata, from the authenticated caller or system wake. */
 export type PersonVmWebStartup = Readonly<
-  { receipt: PersonVmWebEndpointReceipt } & (
+  {
+    receipt: PersonVmWebEndpointReceipt;
+    recordNativeFailure?(
+      failure: NativeWebSetupFailure,
+      signal: AbortSignal,
+    ): Promise<void>;
+  } & (
     | { context: RequestContext; purpose?: never }
     | { context?: never; purpose: 'scheduled-wake' }
   )

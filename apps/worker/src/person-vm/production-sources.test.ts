@@ -7,6 +7,7 @@ import type {
   ResolveProductionDEntrySendRoute,
 } from './production-dentry-source.js';
 import type { createProductionEgressAuthority } from './production-egress-authority.js';
+import type { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
 import type { createProductionCodexRuntime as loadCodexRuntime } from './production-codex-runtime.js';
 import {
   createProductionPersonVmSources,
@@ -17,6 +18,7 @@ const io = vi.hoisted(() => ({
   codex: vi.fn<typeof loadCodexRuntime>(),
   entry: vi.fn<typeof installProductionDEntrySource>(),
   egress: vi.fn<typeof createProductionEgressAuthority>(),
+  wake: vi.fn<typeof createProductionScheduledWakeSource>(),
 }));
 vi.mock('./production-codex-runtime.js', () => ({
   createProductionCodexRuntime: io.codex,
@@ -26,6 +28,9 @@ vi.mock('./production-dentry-source.js', () => ({
 }));
 vi.mock('./production-egress-authority.js', () => ({
   createProductionEgressAuthority: io.egress,
+}));
+vi.mock('./production-scheduled-wake.js', () => ({
+  createProductionScheduledWakeSource: io.wake,
 }));
 afterEach(() => vi.resetAllMocks());
 
@@ -104,9 +109,13 @@ function fixture() {
       close: nativeClose,
       resolveSendRoute: resolve,
     });
+  const wake = { assertDeliverable: vi.fn(), start: vi.fn() };
+  io.wake.mockReturnValue(wake);
   const host = Object.freeze({
     startup: Object.freeze({}),
     admission: Object.freeze({}),
+    providers: { configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } } },
+    vm: Object.freeze({}),
     lifetime: lifetime.signal,
   }) as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {
@@ -124,6 +133,7 @@ function fixture() {
     resolve,
     attach,
     host,
+    wake,
   };
 }
 
@@ -134,6 +144,8 @@ it('shares the exact route and call association between A, B and the selected Co
     attach: f.attach,
   });
   const bound = await sources.bind(f.host);
+  expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm);
+  expect(bound.scheduledWake).toBe(f.wake);
   const { resolveSendRoute } = io.entry.mock.calls[0]![0];
   const issuance = f.attach.mock.calls[0]![1];
   expect(issuance.route).toBe(f.route);

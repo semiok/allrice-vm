@@ -19,7 +19,9 @@ import {
 import TypertRegistry, {
   type TypertContribution,
 } from '@deepseek-ai/dsh-typert-registry';
-import RemoteAccess from '@deepseek-ai/dsh-api-remote-access';
+import RemoteAccess, {
+  type RemoteAccessService,
+} from '@deepseek-ai/dsh-api-remote-access';
 import { TYPERT as AccessMetadata } from '@deepseek-ai/dsh-api-remote-access/typert';
 import Gateway, {
   type TypertRemoteEventDispatch,
@@ -34,6 +36,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type {
   SessionFollowFrame,
   SessionFollowRequest,
+  SessionControlFrame,
   SessionPage,
   SessionPageRequest,
   SessionSummary,
@@ -144,8 +147,9 @@ class Credentials extends CredentialProvider {
 /** Native catalog content is an explicit fixture. Peers, invocation scopes,
  * RemoteAccess snapshots/follow, event ready, codecs and carriers are real rc.2. */
 class Catalog extends TypertRemoteService {
+  static inject = ['remoteAccess'];
   items = [summary('root'), summary('child', 'root'), summary('other')];
-  beforeList?: (signal: AbortSignal) => Promise<void>;
+  beforeList?: (signal: AbortSignal, scoped: boolean) => Promise<void>;
   beforeFollow?: () => Promise<void>;
   afterFollowSnapshot?: () => Promise<void>;
   afterFollow?: () => Promise<void>;
@@ -155,11 +159,38 @@ class Catalog extends TypertRemoteService {
   constructor(ctx: Context) {
     super(ctx, 'sessionController', { namespace: 'session' });
   }
+  private allows({ sessionId }: SessionSummary) {
+    // This fixture runs the Host service even when typechecked in the Web
+    // workspace, whose Cordis augmentation names the Client service instead.
+    const access = this.ctx.remoteAccess as unknown as RemoteAccessService;
+    return access.allows({ kind: 'session', id: sessionId });
+  }
   @Remote('list')
   async list(_request: object, signal: AbortSignal) {
-    await this.beforeList?.(signal);
+    await this.beforeList?.(
+      signal,
+      this.ctx.invocation?.peer.principal.kind === 'allrice-d-entry',
+    );
     signal.throwIfAborted();
-    return { items: this.items };
+    return { items: this.items.filter((row) => this.allows(row)) };
+  }
+  @Remote({ mode: 'stream' })
+  async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
+    signal.throwIfAborted();
+    const projections = Object.fromEntries(
+      this.items
+        .filter((row) => this.allows(row))
+        .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
+    );
+    yield { type: 'baseline', value: { projections } };
+    await new Promise<void>((resolve) => {
+      const stop = () => {
+        signal.removeEventListener('abort', stop);
+        resolve();
+      };
+      signal.addEventListener('abort', stop, { once: true });
+      if (signal.aborted) stop();
+    });
   }
   @Remote({
     name: 'page',
@@ -209,6 +240,7 @@ class Catalog extends TypertRemoteService {
         records: [],
         hasMore: false,
         projections: { asOfSeq: 0, values: {} },
+        ...(request.assistantStream && { assistantStream: { revision: 0 } }),
       };
       await this.afterFollowSnapshot?.();
       await new Promise<void>((resolve) => {
@@ -246,7 +278,8 @@ export async function hostFixture(
   host.typert.resources.register('session', { field: 'sessionId' });
   await host.plugin(RemoteAccess);
   await host.plugin(Gateway);
-  const catalog = new Catalog(host);
+  await host.plugin(Catalog);
+  const catalog = host.get('sessionController') as unknown as Catalog;
   const dispatched: TypertRemoteEventDispatch[] = [];
   let wake = () => {};
   const source = (

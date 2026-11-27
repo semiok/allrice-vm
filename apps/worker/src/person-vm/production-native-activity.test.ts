@@ -52,7 +52,7 @@ function harness() {
   });
   const startup = {
     activityCatalogs: catalogs,
-    assertAuthenticatedGroup: () => {},
+    assertAuthenticatedGroup: () => signal,
   };
   const create = (lifetime = signal) =>
     createProductionNativeActivity(startup, lifetime, {

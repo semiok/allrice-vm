@@ -7,6 +7,13 @@
       name: '@allrice/dsh-web-composition/host/settings-account'
     - id: allrice-plugin-manager-host
       name: '@allrice/dsh-web-composition/host/plugin-manager'
+    - id: employee-directory-picker-host
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: employee-directory-picker-ui
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
+# The sealed employee profile and the VM must select the same native pair.
+- id: directory-picker
+  disabled: true
 # Its Host entry is a no-op. The AllRice column is the cold-profile child owner;
 # native settings-general continues to own the actual settings shell.
 - id: ui-sidebar

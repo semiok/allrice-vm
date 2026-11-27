@@ -6,7 +6,7 @@ import type { createProductionPersonVmAuthority } from './production-authority.j
 export type CurrentSelectionPrewarm = (
   context: RequestContext,
   identity: DEntryIdentity,
-  input: { trigger: 'page' | 'input' },
+  input: Parameters<PersonVmPort['prewarm']>[1],
   physicalSignal: AbortSignal,
 ) => ReturnType<PersonVmPort['prewarm']>;
 

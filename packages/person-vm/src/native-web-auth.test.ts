@@ -112,7 +112,11 @@ it('实际reader拒绝symlink/超长，不输出其内容；解析错不携带�
     } catch (error) {
       failure = error;
     }
-    expect(failure).toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(failure).toMatchObject({
+      code: 'PROVIDER_FAILED',
+      message: 'PROVIDER_FAILED',
+      cause: 'AUTH_ARTIFACT_INVALID',
+    });
     expect(String(failure)).not.toContain('invalid-secret');
   }
 });

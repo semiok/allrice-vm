@@ -3,6 +3,7 @@ import { PHASE_PRODUCTION_BUILD } from 'next/constants.js';
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  compress: true,
   serverExternalPackages: [
     '@deepseek-ai/dsh-office-to-pdf',
     '@deepseek-ai/libreoffice-kit',

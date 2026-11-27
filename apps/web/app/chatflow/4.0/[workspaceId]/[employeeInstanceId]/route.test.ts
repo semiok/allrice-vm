@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { NextRequest } from 'next/server';
 import {
   selectDEntryGeneration,
+  type DEntryRolloutPolicy,
   type RequestContext,
 } from '@allrice/contracts';
 import {
@@ -62,11 +63,9 @@ const policy = {
     {
       organizationId: context.organizationId,
       personId: context.actor.id,
-      employeeInstanceId: selection.employeeInstanceId,
-      generation: '4.0',
     },
   ],
-};
+} satisfies DEntryRolloutPolicy;
 const route = (
   params: Awaited<Parameters<typeof GET>[1]['params']> = selection,
   request = new Request(origin + path),

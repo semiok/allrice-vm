@@ -39,9 +39,23 @@ import {
   dEntryNativePublicUrl,
   prepareNativeWebLaunch,
   type NativeWebLaunch,
+  type NativeWebLaunchPlan,
   type NativeWebModelAdapter,
 } from './launch.js';
 import { openNativeWebOwner } from './owner.js';
+
+function launchOnTestHost({
+  commandWithoutHost,
+  ...staged
+}: NativeWebLaunchPlan): NativeWebLaunch {
+  return {
+    ...staged,
+    command: {
+      ...commandWithoutHost,
+      args: [...commandWithoutHost.args, '--host', '127.0.0.1'],
+    },
+  };
+}
 
 async function releaseNativeStartup(
   eventsPath: string,
@@ -217,7 +231,6 @@ export async function setupNativeWebFixture(
       `http://127.0.0.1:${port}`,
       principalProfile,
     ),
-    guestAddress: '127.0.0.1',
     guestPort: port,
     dshHome,
     agentsHome: join(root, 'agents'),
@@ -226,12 +239,14 @@ export async function setupNativeWebFixture(
     startupTimeoutMs: 10000,
     principalProfile,
   };
-  const launch = await prepareNativeWebLaunch(
-    configuration,
-    binding,
-    profile,
-    undefined,
-    managedModel,
+  const launch = launchOnTestHost(
+    await prepareNativeWebLaunch(
+      configuration,
+      binding,
+      profile,
+      undefined,
+      managedModel,
+    ),
   );
   const bootGate = join(root, 'native-startup-gate.mjs');
   const eventPrefix = join(root, 'native-startup');
@@ -634,10 +649,8 @@ export async function setupNativeWebFixture(
         (child.exitCode === null && child.signalCode === null)
       )
         throw Error('The original isolated Host must stop before restart');
-      const next = await prepareNativeWebLaunch(
-        configuration,
-        binding,
-        profile,
+      const next = launchOnTestHost(
+        await prepareNativeWebLaunch(configuration, binding, profile),
       );
       await stage(next);
       const restarted = await openNativeWebOwner({
