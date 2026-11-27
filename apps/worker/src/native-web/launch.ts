@@ -21,6 +21,7 @@ import {
   type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
+import { nativeSearchToolPatches } from './search-tools.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -295,19 +296,9 @@ export function apply(ctx, config) {
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                ...(!modelAdapter.webSearchEnabled
-                  ? [
-                      {
-                        id: 'tool-web',
-                        // rc.2 replaces the entire config. Keep the base preset values.
-                        config: {
-                          fetch: true,
-                          search: false,
-                          searchTimeoutMs: 60_000,
-                        },
-                      },
-                    ]
-                  : []),
+                ...nativeSearchToolPatches(
+                  modelAdapter.webSearchEnabled === true,
+                ),
                 {
                   id: 'agent-default-model',
                   config: {

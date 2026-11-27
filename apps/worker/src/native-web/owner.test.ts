@@ -20,6 +20,10 @@ import type {
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
+import {
+  nativeSearchToolPatches,
+  nativeWebBundlePatches,
+} from './search-tools.js';
 import { nativeSetupError } from './startup-diagnostic.js';
 
 const binding = {
@@ -55,8 +59,8 @@ it('生产compiler收集全部native Web产品而不emit测试；typecheck仍收
   expect(build.options.rootDir).toBe(join(worker, 'src'));
   expect(build.options.paths).toEqual({});
 });
-function launchConfiguration() {
-  return {
+it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI；不写token或端口池', async () => {
+  const config = {
     origin: 'http://127.0.0.1:32179/',
     publicUrl: 'https://e1.example.test/',
     guestPort: 8080,
@@ -72,13 +76,9 @@ function launchConfiguration() {
       employeeVersionId: randomUUID(),
     },
   };
-}
-const profile = [
-  { path: 'package.json', contents: '{"name":"fixture-profile"}' },
-] as const;
-
-it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI；不写token或端口池', async () => {
-  const config = launchConfiguration();
+  const profile = [
+    { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+  ] as const;
   const staged = await prepareNativeWebLaunch(config, binding, profile);
   expect(staged.commandWithoutHost.args).not.toContain('--host');
   const a = nativeWebLaunchOnGuest(
@@ -230,41 +230,38 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
 it.each([false, true])(
   'advertises native Search only with a host provider (%s) and still executes WebFetch',
   async (webSearchEnabled) => {
-    const provider = 'fixture-codex';
-    const model = 'fixture';
-    const staged = await prepareNativeWebLaunch(
-      launchConfiguration(),
-      binding,
-      profile,
-      undefined,
-      {
-        capability: 'synthetic-epoch-capability',
-        origin: 'http://172.16.0.5:52400/',
-        provider,
-        model,
-        modelInfo: { provider, id: model, name: model },
-        webSearchEnabled,
-      },
-    );
-    const patch = staged.files.find(({ path }) =>
-      path.endsWith('/owner.patch.json'),
-    );
-    if (!patch) throw Error('native owner patch missing');
+    const layers = nativeWebBundlePatches();
+    const patches = nativeSearchToolPatches(webSearchEnabled);
+    const before = composeEntries(layers);
+    // prepareNativeWebLaunch writes this overlay as JSON in the guest.
     const composed = composeEntries([
-      [
-        {
-          insert: [
-            {
-              id: 'tool-web',
-              name: '@deepseek-ai/dsh-tool-web',
-              config: { fetch: true, searchTimeoutMs: 60_000 },
-            },
-          ],
-        },
-      ],
-      JSON.parse(patch.contents),
+      ...layers,
+      JSON.parse(JSON.stringify(patches)),
     ]);
-    const config = composed.find(({ id }) => id === 'tool-web')?.config;
+    const presetIds = ['preset-standard', 'preset-ptc', 'preset-cordis'];
+    expect(patches.map(({ id }) => id)).toEqual(
+      webSearchEnabled ? [] : presetIds,
+    );
+    expect(composed.find(({ id }) => id === 'tool-web')?.disabled).toBe(true);
+    for (const id of presetIds) {
+      const original = before.find((entry) => entry.id === id)?.config;
+      const actual = composed.find((entry) => entry.id === id)?.config;
+      expect(actual).toEqual({
+        ...original,
+        plugins: original.plugins.map(
+          (plugin: { name: string; config?: Record<string, unknown> }) =>
+            !webSearchEnabled && plugin.name === '@deepseek-ai/dsh-tool-web'
+              ? { ...plugin, config: { ...plugin.config, search: false } }
+              : plugin,
+        ),
+      });
+    }
+    const standard = composed.find(
+      ({ id }) => id === 'preset-standard',
+    )?.config;
+    const config = standard.plugins.find(
+      (plugin: { id: string }) => plugin.id === 'tool-web',
+    )?.config;
     expect(config).toEqual({
       fetch: true,
       searchTimeoutMs: 60_000,
