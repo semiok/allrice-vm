@@ -453,6 +453,7 @@ export * from './capabilities/native-schedule-observation-ledger.ts';
 export {
   createPostgresPersonVmScheduledWakeStore,
   readPersonVmWakeRoster,
+  withOwnedPersonVmAuthorityTransaction,
   type ScheduledWakeClaim,
 } from './capabilities/person-vm-scheduled-wake.ts';
 export {

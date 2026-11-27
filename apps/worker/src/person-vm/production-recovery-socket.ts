@@ -108,9 +108,18 @@ export async function openProductionRecoverySocket(input: {
               expected,
               disconnected.signal,
             );
-            if (!response.destroyed)
-              response.once('finish', () => setImmediate(shutdown));
-            else setImmediate(shutdown);
+            // Once the Host consumes the handoff, this connection no longer
+            // owns completion. A disconnect still retires the same Worker.
+            const depart = () => {
+              response.off('finish', depart);
+              response.off('close', depart);
+              setImmediate(shutdown);
+            };
+            if (response.destroyed) depart();
+            else {
+              response.once('finish', depart);
+              response.once('close', depart);
+            }
             writeStatus(202);
             return;
           }

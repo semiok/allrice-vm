@@ -119,7 +119,7 @@ worker_drain_cli() {
   shift 2
   local args=()
   if [ -n "$DRAIN_SOCKET" ]; then args+=(--socket "$DRAIN_SOCKET"); fi
-  "$M1_PY" "$BIN/person-vm-drain" --pid "$pid" --boot-id "$boot" "${args[@]}" "$@" <<<"$DRAIN_TOKEN"
+  "$M1_PY" "$BIN/person-vm-drain" --pid "$pid" --boot-id "$boot" ${args[@]+"${args[@]}"} "$@" <<<"$DRAIN_TOKEN"
 }
 read_drain_receipt() { worker_drain_cli "$1" "$2"; }
 claim_drained_worker() { worker_drain_cli "$1" "$2" --claim-expiry "$3"; }

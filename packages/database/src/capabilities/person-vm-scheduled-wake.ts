@@ -220,7 +220,7 @@ async function audit(
       ${'scheduled-wake.' + action},${result},${reason},${row.lease_epoch})`;
 }
 
-async function withWakeAuthority<T>(
+export async function withOwnedPersonVmAuthorityTransaction<T>(
   sql: Sql,
   isolation:
     'isolation level read committed' | 'isolation level repeatable read',
@@ -465,7 +465,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       signal: AbortSignal,
       work: (roster: PersonVmWebRoster, active: AbortSignal) => Promise<T>,
     ): Promise<T | null> {
-      return withWakeAuthority(
+      return withOwnedPersonVmAuthorityTransaction(
         sql,
         'isolation level repeatable read',
         signal,
@@ -492,7 +492,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     ): Promise<boolean> {
       // Read deployments after taking the employee key lock so the next
       // statement also sees any deployments inserted before that lock.
-      return withWakeAuthority(
+      return withOwnedPersonVmAuthorityTransaction(
         sql,
         'isolation level read committed',
         signal,

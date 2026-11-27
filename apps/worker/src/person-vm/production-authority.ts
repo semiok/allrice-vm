@@ -11,6 +11,7 @@ import {
   requireCurrentPlatformAdmin,
   readContentPrincipal,
   readPersonVmWakeRoster,
+  withOwnedPersonVmAuthorityTransaction,
   getDatabase,
   requireDEntryNativeIdentity,
 } from '@allrice/database';
@@ -201,6 +202,7 @@ export function createProductionPersonVmAuthority(lifetime?: AbortSignal) {
       expected: DEntryIdentity,
       binding: PersonVmBinding,
       signal: AbortSignal,
+      assertTicket: (signal: AbortSignal) => Promise<void>,
       dispatch: () => Promise<void>,
     ) {
       const operation = operations.getStore();
@@ -217,35 +219,45 @@ export function createProductionPersonVmAuthority(lifetime?: AbortSignal) {
         )
           denied();
         guard(operation, checking);
-        await getDatabase().begin(async (tx) => {
-          await tx`set local lock_timeout = '1500ms'`;
-          await tx`set local statement_timeout = '3000ms'`;
-          const roster = await readPersonVmWakeRoster(
-            tx,
-            binding,
-            [expected],
-            true,
-          );
-          if (!roster) denied();
-          const [session] = await tx`select s.id from allrice_sessions s
-            where s.id=${context.sessionId} and s.user_id=${binding.personId}
-              and s.revoked_at is null and s.expires_at > clock_timestamp()
-            for share of s nowait`;
-          if (!session) denied();
-          if (expected.threadId) {
-            const [thread] = await tx`select t.id from allrice_chat_sessions t
-              where t.id=${expected.threadId} and t.workspace_id=${expected.workspaceId}
-                and t.organization_id=${binding.organizationId} and t.owner_id=${binding.personId}
-                and t.execution_generation='4.0' and t.archived_at is null
-                and coalesce(t.employee_instance_id,t.employee_assignment_id)=${expected.employeeInstanceId}
-              for share of t nowait`;
-            if (!thread) denied();
-          }
-          guard(operation, checking);
-          // The authorization transaction orders revocation against dispatch.
-          // Work after dispatch is owned by the physical lease, not the login.
-          await dispatch();
-        });
+        await withOwnedPersonVmAuthorityTransaction(
+          getDatabase(),
+          'isolation level read committed',
+          checking,
+          async (tx, locked) => {
+            await tx`set local statement_timeout = '3000ms'`;
+            const roster = await readPersonVmWakeRoster(
+              tx,
+              binding,
+              [expected],
+              true,
+            );
+            if (!roster) denied();
+            const [session] = await tx`select s.id from allrice_sessions s
+              where s.id=${context.sessionId} and s.user_id=${binding.personId}
+                and s.revoked_at is null and s.expires_at > clock_timestamp()
+              for share of s nowait`;
+            if (!session) denied();
+            if (expected.threadId) {
+              const [thread] = await tx`select t.id from allrice_chat_sessions t
+                where t.id=${expected.threadId} and t.workspace_id=${expected.workspaceId}
+                  and t.organization_id=${binding.organizationId} and t.owner_id=${binding.personId}
+                  and t.execution_generation='4.0' and t.archived_at is null
+                  and coalesce(t.employee_instance_id,t.employee_assignment_id)=${expected.employeeInstanceId}
+                for share of t nowait`;
+              if (!thread) denied();
+            }
+            await tx`select m.id from allrice_memberships m
+              where m.user_id=${binding.personId} and m.organization_id=${binding.organizationId}
+                and m.active and m.role in ('admin','member')
+                and (m.workspace_id is null or m.workspace_id=${expected.workspaceId})
+              order by m.id for share of m nowait`;
+            await assertTicket(locked);
+            guard(operation, locked);
+            // The authorization connection orders revocation against dispatch.
+            // The native command has its own physical lease and bounded join.
+            await dispatch();
+          },
+        );
       }, operation);
     },
     close() {

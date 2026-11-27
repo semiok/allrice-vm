@@ -43,7 +43,14 @@ export function createProductionCurrentPrewarm(input: {
                   target: {
                     ...target,
                     dispatchUpgradeStop: (binding, signal, stop) =>
-                      dispatch(context, identity, binding, signal, stop),
+                      dispatch(
+                        context,
+                        identity,
+                        binding,
+                        signal,
+                        target.assertAuthority,
+                        stop,
+                      ),
                   },
                 }
               : request,

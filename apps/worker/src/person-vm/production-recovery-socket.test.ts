@@ -282,3 +282,54 @@ it('only drains through the private socket for the authenticated and exact Worke
     await socket.close();
   }
 });
+
+it('keeps the consumed release handoff when the private client disconnects', async () => {
+  const context = modelBinding().context;
+  const entered = deferred<AbortSignal>();
+  const release = deferred();
+  const completed = deferred();
+  const retire = vi.fn(completed.resolve);
+  const socket = await openProductionRecoverySocket({
+    authenticate: async () => null,
+    recover: async () => 0,
+    pending: () => true,
+    upgrade: {
+      bootId: 'worker-boot',
+      authenticate: async () => context,
+      drain: async () => ({ stopped: 0, expiresAt: 'same-receipt' }),
+      async claimShutdown(_context, _expiresAt, active) {
+        entered.resolve(active);
+        await release.promise;
+        return retire;
+      },
+    },
+  });
+  const client = request({
+    socketPath: socket.path,
+    method: 'POST',
+    path: '/shutdown-after-drain',
+    headers: {
+      authorization: 'Bearer synthetic',
+      'x-allrice-worker-boot': 'worker-boot',
+      'x-allrice-drain-expires': 'same-receipt',
+    },
+  });
+  client.on('error', () => {});
+  client.end();
+  try {
+    const active = await entered.promise;
+    const disconnected = deferred();
+    active.addEventListener('abort', () => disconnected.resolve(), {
+      once: true,
+    });
+    client.destroy();
+    await disconnected.promise;
+    release.resolve();
+    await completed.promise;
+    expect(retire).toHaveBeenCalledTimes(1);
+  } finally {
+    client.destroy();
+    release.resolve();
+    await socket.close();
+  }
+});

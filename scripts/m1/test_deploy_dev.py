@@ -173,6 +173,18 @@ class DeployDevMigrations(unittest.TestCase):
         verdict, _, printed = p.stdout.strip().partition(' ')
         return verdict == 'OK', printed
 
+    def test_drain_cli_accepts_no_socket_hint_under_bash_nounset(self):
+        p = self.run_dd(r"""
+          fake_python() { printf '%s\n' "$@"; cat >/dev/null; }
+          M1_PY=fake_python
+          DRAIN_TOKEN=synthetic
+          worker_drain_cli 661e00de-c0fc-45e6-a1db-bfd158aedad8 73001
+        """, FILES)
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(p.stdout.splitlines()[1:], [
+            '--pid', '73001', '--boot-id', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
+        ])
+
     def test_release_refuses_running_vms_without_a_drain(self):
         p = self.run_dd("""
           job_state() { echo 'running 73001'; }
