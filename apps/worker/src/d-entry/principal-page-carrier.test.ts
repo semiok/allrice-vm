@@ -1429,7 +1429,9 @@ it('carries native terminal input, resize and output across the owned VM stream'
       };
       if ((args[1] as typeof payload).args.id === brokenId) {
         await fault.promise;
-        throw new RemoteError('terminal/unavailable', 'Fixture error', {});
+        throw new RemoteError('gateway/service-unavailable', 'Fixture error', {
+          endpoint: 'terminal/attach',
+        });
       }
       for await (const raw of args[2]) {
         inputs.push(inputCodec.parse(raw));
