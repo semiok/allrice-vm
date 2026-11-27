@@ -21,8 +21,11 @@ const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
     ? describe.sequential
     : describe.skip;
+const lockObservation = { timeout: 5_000 };
 suite(
   'actual observation receipt migration/SQL; no producer, native, model or VM authority',
+  // Budget for PostgreSQL setup and assertions around the real five-second teardown.
+  { timeout: 15_000 },
   () => {
     let admin: ReturnType<typeof postgres>, db: ReturnType<typeof postgres>;
     const schema = 'met285_ledger_' + randomUUID().replaceAll('-', '');
@@ -64,6 +67,16 @@ suite(
       ...extra,
     });
     const ledger = () => createPostgresNativeScheduleObservationLedger(db);
+    const blockedBy = (
+      holder: number,
+      statement: string,
+      applicationName = schema,
+    ) =>
+      admin<{ pid: number }[]>`select pid from pg_stat_activity
+        where datname=current_database() and application_name=${applicationName}
+          and state='active' and wait_event_type='Lock'
+          and query like ${statement + '%'}
+          and ${holder}=any(pg_blocking_pids(pid))`;
 
     beforeAll(async () => {
       // Apply the allocated product migration, never replacement fixture DDL.
@@ -315,14 +328,12 @@ suite(
           .commitBatch(request)
           .finally(settled)
           .catch((error: unknown) => error);
-        async function blockedWrite() {
-          return admin<{ pid: number }[]>`select pid from pg_stat_activity
-            where datname=current_database() and application_name=${schema}
-            and state='active' and wait_event_type='Lock'
-            and query like 'insert into allrice_native_schedule_observation_receipts%'
-            and ${holder!.pid}=any(pg_blocking_pids(pid))`;
-        }
-        await expect.poll(blockedWrite).toHaveLength(1);
+        const blockedWrite = () =>
+          blockedBy(
+            holder!.pid,
+            'insert into allrice_native_schedule_observation_receipts',
+          );
+        await expect.poll(blockedWrite, lockObservation).toHaveLength(1);
         const [victim] = await blockedWrite();
         expect(inserts).toHaveLength(1);
         const nativeFailure = Promise.resolve(inserts[0]!).catch(
@@ -331,10 +342,15 @@ suite(
         const [terminated] = await admin<
           { stopped: boolean }[]
         >`select pg_terminate_backend(pid, 5000) stopped from pg_stat_activity
-          where datname=current_database() and application_name=${schema}
-          and pid=${victim!.pid} and ${holder!.pid}=any(pg_blocking_pids(pid))`;
+      where datname=current_database() and application_name=${schema}
+      and pid=${victim!.pid} and ${holder!.pid}=any(pg_blocking_pids(pid))`;
         expect(terminated?.stopped).toBe(true);
-        await clientClosed;
+        await Promise.race([
+          clientClosed,
+          outcome.then(() => {
+            throw Error('Caller settled before the owned client closed');
+          }),
+        ]);
         expect(settled).not.toHaveBeenCalled();
         releaseEnd();
         const originalError = await nativeFailure;
@@ -346,53 +362,70 @@ suite(
         ).toEqual([]);
       } finally {
         releaseEnd();
-        await blocker`rollback`;
-        blocker.release();
-        await outcome;
+        try {
+          await blocker`rollback`;
+        } finally {
+          blocker.release();
+          await outcome;
+        }
       }
       expect(await ledger().readExactReceipt(request)).toBeNull();
       expect(await ledger().readExactReceipt(old)).toEqual(original);
     });
 
     it('cancels real lock-wait SQL and joins rollback before returning both observed failures', async () => {
-      let release!: () => void, ready!: () => void;
-      const locked = new Promise<void>((done) => {
-        ready = done;
-      });
-      const gate = new Promise<void>((done) => {
-        release = done;
-      });
-      const holder = db.begin(async (tx) => {
-        await tx`lock table allrice_native_schedule_observation_receipts in access exclusive mode`;
-        ready();
-        await gate;
-      });
-      await locked;
+      const blocker = await db.reserve();
+      const applicationName = schema + '_cancel';
       const request = input(),
         abort = new AbortController();
-      const result = ledger().commitBatch(request, abort.signal);
-      const caught = result.catch((error: unknown) => error);
+      let caught: Promise<unknown> | undefined;
+      let writer: ReturnType<typeof client.createDedicatedDatabase> | undefined;
       try {
+        await blocker`begin`;
+        await blocker`lock table allrice_native_schedule_observation_receipts in access exclusive mode`;
+        const [holder] = await blocker<
+          { pid: number }[]
+        >`select pg_backend_pid() pid`;
+        // The caller clones this application name for its own connection.
+        // An earlier receipt lookup can have the same SQL and blocker.
+        writer = client.createDedicatedDatabase({
+          options: {
+            ...db.options,
+            connection: {
+              ...db.options.connection,
+              application_name: applicationName,
+            },
+          },
+        });
+        caught = createPostgresNativeScheduleObservationLedger(writer)
+          .commitBatch(request, abort.signal)
+          .catch((error: unknown) => error);
         await expect
-          .poll(async () => {
-            const [row] = await admin<
-              { n: number }[]
-            >`select count(*)::int n from pg_stat_activity where application_name=${schema} and wait_event_type='Lock'`;
-            return row!.n;
-          })
-          .toBeGreaterThan(0);
+          .poll(
+            () =>
+              blockedBy(
+                holder!.pid,
+                'select receipt_id,input_digest,input_payload,received_at',
+                applicationName,
+              ),
+            lockObservation,
+          )
+          .toHaveLength(1);
         abort.abort();
         const error = await caught;
         expect(error).toBeInstanceOf(AggregateError);
         expect((error as AggregateError).errors.at(-1)).toBe(
           abort.signal.reason,
         );
-        expect((error as Error).cause).not.toBe(abort.signal.reason);
+        expect((error as Error).cause).toMatchObject({ code: '57014' });
       } finally {
         abort.abort();
-        release();
-        await holder;
-        await caught;
+        try {
+          await blocker`rollback`;
+        } finally {
+          blocker.release();
+          await Promise.all([caught, writer?.end({ timeout: 5 })]);
+        }
       }
       expect(await ledger().readExactReceipt(request)).toBeNull();
     });
