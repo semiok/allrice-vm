@@ -26,14 +26,13 @@ import type { PanelRoute } from './employee-panels-http';
 
 type Scope = Awaited<ReturnType<typeof requireEmployeePanelsContext>>;
 
-function guardedRead(
+// Pass named readers and rechecks so the row-lock audit can follow both.
+function guardedRead<Data, Evidence>(
   read: (
     scope: Scope,
     request: Request,
-  ) => Promise<{
-    data: unknown;
-    recheck(current: Scope): Promise<void>;
-  }>,
+  ) => Promise<{ data: Data; evidence: Evidence }>,
+  recheck: (current: Scope, evidence: Evidence, data: Data) => Promise<void>,
   businessError = workbenchFileError,
 ) {
   return async (request: Request, { params }: PanelRoute) => {
@@ -49,10 +48,10 @@ function guardedRead(
         !request.headers.get('x-allrice-expected-viewer-id')
       )
         throw new DataAccessError('authorization_denied');
-      const { data, recheck } = await read(scope, request);
+      const { data, evidence } = await read(scope, request);
       const { context } = await scope.current();
       // A current page identity does not establish current business access.
-      await recheck({ ...scope, context });
+      await recheck({ ...scope, context }, evidence, data);
       request.signal.throwIfAborted();
       return Response.json(data, { headers: workbenchFileHeaders });
     } catch (error) {
@@ -117,17 +116,21 @@ function projectSceneCatalog({
   };
 }
 
-export const readCapabilityScenes = guardedRead(async (scope) => {
-  const observed = await sceneCatalog(scope);
-  return {
-    data: projectSceneCatalog(observed),
-    async recheck(current) {
-      // The source readers still own package and reference access.
-      if (!isDeepStrictEqual(observed, await sceneCatalog(current)))
-        throw new DataAccessError('authorization_denied');
-    },
-  };
-});
+async function readScenes(scope: Scope) {
+  const evidence = await sceneCatalog(scope);
+  return { data: projectSceneCatalog(evidence), evidence };
+}
+
+async function recheckScenes(
+  current: Scope,
+  observed: Awaited<ReturnType<typeof sceneCatalog>>,
+) {
+  // The source readers still own package and reference access.
+  if (!isDeepStrictEqual(observed, await sceneCatalog(current)))
+    throw new DataAccessError('authorization_denied');
+}
+
+export const readCapabilityScenes = guardedRead(readScenes, recheckScenes);
 
 const moduleTarget = ({ selection }: Scope) => ({
   workspaceId: selection.workspaceId,
@@ -169,7 +172,7 @@ async function requireSameBrandBinding(
     throw new EmployeeModuleError('module_version_conflict');
 }
 
-export const readCapabilityModules = guardedRead(async (scope) => {
+async function readModuleDirectory(scope: Scope) {
   const binding = await currentBrandBinding(scope);
   return {
     data: {
@@ -184,9 +187,15 @@ export const readCapabilityModules = guardedRead(async (scope) => {
           ]
         : [],
     },
-    recheck: (current) => requireSameBrandBinding(current, binding),
+    evidence: binding,
   };
-}, brandMediaErrorResponse);
+}
+
+export const readCapabilityModules = guardedRead(
+  readModuleDirectory,
+  requireSameBrandBinding,
+  brandMediaErrorResponse,
+);
 
 function savedArticle({
   id,
@@ -237,7 +246,7 @@ function projectBrandRecords(result: BrandMediaReadResult) {
   };
 }
 
-export const readCapabilityBrandMedia = guardedRead(async (scope, request) => {
+async function readSavedBrandRecords(scope: Scope, request: Request) {
   const query = new URL(request.url).searchParams;
   query.delete('workspaceId');
   query.delete('threadId');
@@ -253,15 +262,26 @@ export const readCapabilityBrandMedia = guardedRead(async (scope, request) => {
   const binding = await currentBrandBinding(scope);
   if (!binding) throw new EmployeeModuleError('module_unavailable');
   const data = projectBrandRecords(await readBrandMedia(scope.context, input));
-  return {
-    data,
-    async recheck(current) {
-      const records = projectBrandRecords(
-        await readBrandMedia(current.context, input),
-      );
-      if (!isDeepStrictEqual(data, records))
-        throw new BrandMediaError('version_conflict');
-      await requireSameBrandBinding(current, binding);
-    },
-  };
-}, brandMediaErrorResponse);
+  return { data, evidence: { input, binding } };
+}
+
+type SavedBrandRead = Awaited<ReturnType<typeof readSavedBrandRecords>>;
+
+async function recheckBrandRecords(
+  current: Scope,
+  { input, binding }: SavedBrandRead['evidence'],
+  data: SavedBrandRead['data'],
+) {
+  const records = projectBrandRecords(
+    await readBrandMedia(current.context, input),
+  );
+  if (!isDeepStrictEqual(data, records))
+    throw new BrandMediaError('version_conflict');
+  await requireSameBrandBinding(current, binding);
+}
+
+export const readCapabilityBrandMedia = guardedRead(
+  readSavedBrandRecords,
+  recheckBrandRecords,
+  brandMediaErrorResponse,
+);
