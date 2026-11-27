@@ -41,6 +41,24 @@ import type { PersonVmWebRoster, PersonVmWebStartup } from './web-endpoints.ts';
 import { PERSON_VM_GUEST_CONTROL_READER } from './native-resource.ts';
 import { PERSON_VM_COMMAND_MEMORY_PROGRAM } from './native-command-observer.ts';
 
+vi.mock('node:os', async (source) => ({
+  ...(await source<typeof import('node:os')>()),
+  networkInterfaces: () => ({
+    lo: [{ address: '127.0.0.1' }, { address: '::1' }],
+    en0: [{ address: '192.168.0.10' }, { address: 'fe80::8%en0' }],
+  }),
+}));
+
+const outboundRules = [
+  'deny:egress@127.0.0.1',
+  'deny:egress@[::1]',
+  'deny:egress@192.168.0.10',
+  'deny:egress@[fe80::8]',
+  'allow:egress@dns',
+  'allow:egress@public',
+  'allow:egress@host:tcp:38990',
+];
+
 const temporary: string[] = [];
 const readonlyRoots: string[] = [];
 async function unsealFixture(path: string) {
@@ -915,7 +933,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         arg === '--net-rule' ? [creation[index + 1]] : [],
       ),
     ).toEqual([
-      'allow:egress@host:tcp:38990',
+      ...outboundRules,
       ...startup!.receipt.endpoints.map(
         (entry) => `allow:ingress@127.0.0.1/32:tcp:${entry.guestPort}`,
       ),
@@ -987,10 +1005,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     const create = (await f.calls()).find((args) => args[0] === 'create')!;
     expect(
       create.flatMap((arg, i) => (arg === '--net-rule' ? [create[i + 1]] : [])),
-    ).toEqual([
-      'allow:egress@host:tcp:38990',
-      `allow:ingress@127.0.0.1/32:tcp:${g}`,
-    ]);
+    ).toEqual([...outboundRules, `allow:ingress@127.0.0.1/32:tcp:${g}`]);
     expect(create).toContain(`127.0.0.1:${h}:${g}`);
     expect(create).not.toContain(`allow:ingress@127.0.0.1/32:tcp:${h}`);
     expect(create[create.indexOf('--net-default') + 1]).toBe('deny');
@@ -1741,7 +1756,7 @@ fs.writeFileSync(f,JSON.stringify(v));
         'never',
         '--net-default',
         'deny',
-        'allow:egress@host:tcp:38990',
+        ...outboundRules,
       ]),
     );
     expect(create.args).not.toContain('--idle-timeout');
