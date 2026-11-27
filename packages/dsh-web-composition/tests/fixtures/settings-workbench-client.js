@@ -24,8 +24,8 @@ window.__ModuleLoader__.load({
               const [initial] = ctx.registry.get(product).fibers;
               const parent = initial.parent;
               await initial.dispose();
-              document.body.insertAdjacentHTML('beforeend', markup);
-              const controller = new AbortController();
+              window.document.body.insertAdjacentHTML('beforeend', markup);
+              const controller = new window.AbortController();
               window.__ALLRICE_D_ENTRY_LIFETIME__ = controller.signal;
               await parent.plugin(product);
             },
