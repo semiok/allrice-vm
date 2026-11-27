@@ -207,6 +207,11 @@ export type PersonVmPrewarmTarget = Readonly<{
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
+  dispatchUpgradeStop?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    dispatch: () => Promise<void>,
+  ): Promise<void>;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */

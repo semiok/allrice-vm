@@ -10,13 +10,15 @@ import {
   DataAccessError,
   requireCurrentPlatformAdmin,
   readContentPrincipal,
+  readPersonVmWakeRoster,
+  getDatabase,
   requireDEntryNativeIdentity,
-  type getDatabase,
 } from '@allrice/database';
 import {
   PersonVmError,
   type PersonVmAction,
   type PersonVmAuthority,
+  type PersonVmBinding,
 } from '@allrice/person-vm';
 
 export async function authorizeProductionPersonVmDeletion(
@@ -193,6 +195,58 @@ export function createProductionPersonVmAuthority(lifetime?: AbortSignal) {
           return result;
         });
       });
+    },
+    dispatchUpgradeStop(
+      context: RequestContext,
+      expected: DEntryIdentity,
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      dispatch: () => Promise<void>,
+    ) {
+      const operation = operations.getStore();
+      return own(async () => {
+        const checking = active(signal, operation);
+        if (
+          !operation ||
+          !sameDEntryIdentity(operation.expected, expected) ||
+          operation.context.sessionId !== context.sessionId ||
+          context.actor.type !== 'user' ||
+          context.actor.id !== binding.personId ||
+          expected.personId !== binding.personId ||
+          expected.organizationId !== binding.organizationId
+        )
+          denied();
+        guard(operation, checking);
+        await getDatabase().begin(async (tx) => {
+          await tx`set local lock_timeout = '1500ms'`;
+          await tx`set local statement_timeout = '3000ms'`;
+          const roster = await readPersonVmWakeRoster(
+            tx,
+            binding,
+            [expected],
+            true,
+          );
+          if (!roster) denied();
+          const [session] = await tx`select s.id from allrice_sessions s
+            where s.id=${context.sessionId} and s.user_id=${binding.personId}
+              and s.revoked_at is null and s.expires_at > clock_timestamp()
+            for share of s nowait`;
+          if (!session) denied();
+          if (expected.threadId) {
+            const [thread] = await tx`select t.id from allrice_chat_sessions t
+              where t.id=${expected.threadId} and t.workspace_id=${expected.workspaceId}
+                and t.organization_id=${binding.organizationId} and t.owner_id=${binding.personId}
+                and t.execution_generation='4.0' and t.archived_at is null
+                and coalesce(t.employee_instance_id,t.employee_assignment_id)=${expected.employeeInstanceId}
+              for share of t nowait`;
+            if (!thread) denied();
+          }
+          guard(operation, checking);
+          // The authorization transaction orders revocation against dispatch.
+          // Work after dispatch is owned by the physical lease, not the login.
+          await dispatch();
+        });
+      }, operation);
     },
     close() {
       if (closing) return closing;

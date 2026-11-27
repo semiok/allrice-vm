@@ -35,6 +35,13 @@
 #    version. A failed smoke does not roll back by itself; its guidance reflects whether
 #    a default rollback target is recorded.
 set -euo pipefail
+unset DRAIN_TOKEN
+DRAIN_TOKEN=""
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  # No candidate subprocess may inherit the administrator's input descriptor.
+  { IFS= read -r -u 3 DRAIN_TOKEN || :; } 2>/dev/null
+  exec 3<&-
+fi
 BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P); . "$BIN/lib.sh"
 REPO="$HOME/allrice40-repo"; RELEASES="$HOME/allrice40-dev-releases"
 STATE="$HOME/allrice40-dev/qa"; LOG="$STATE/deploys.jsonl"; INFLIGHT="$STATE/deploy-inflight"
@@ -42,7 +49,7 @@ DISABLED="$M1_DEV_DISABLED"
 LOCK="$HOME/allrice40-dev/.local/deploy.lock"; SNAPSHOTS="$STATE/pre-migrate"; KEEP_SNAPSHOTS=2
 export PATH="$HOME/.local/opt/node-22.23.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 RESULT_FILE=""; RESULT_ID=""
-DRAIN_SOCKET=""; DRAIN_TOKEN=""; RELEASE_STOP_ATTEMPTED=""; RELEASE_STOP_UNCONFIRMED=""
+DRAIN_SOCKET=""; RELEASE_STOP_ATTEMPTED=""; RELEASE_STOP_UNCONFIRMED=""
 KEEP_RELEASES=3; BLOG=""; FAIL_REASON=""; INFLIGHT_MINE=""; LOCKED=""; BUILD_DIR=""; BUILT=""; PLIST_STAGE=""
 WEB_LABEL=ai.bplabs.allrice40-dev-web; WORKER_LABEL=ai.bplabs.allrice40-dev-worker
 WEB_PLIST="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
@@ -64,7 +71,7 @@ recovery_pair() { # Web plist, Worker plist, [expected SHA]
 ready_sha() { # url role release -> prints a matching verified sourceSha
   curl -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
 worker_boot() { # prints the bootId the ready Worker reports, or nothing; never fails
-  { curl -fsS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
+  { curl -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
 try: b=str(json.load(sys.stdin)["identity"]["bootId"])
 except Exception: b=""
 print(b if re.fullmatch("[0-9a-f-]{36}",b) else "")' ; }
@@ -107,18 +114,15 @@ vm_upgrade_candidates() {
   printf '%s\n' "$count"
 }
 
-load_drain_token() {
-  [ -n "$DRAIN_SOCKET" ] || return 1
-  if [ -z "$DRAIN_TOKEN" ]; then
-    # Read once in the release shell. Recovery can authenticate again if
-    # its current Worker also needs a drain.
-    { IFS= read -r -u 3 DRAIN_TOKEN || [ -n "$DRAIN_TOKEN" ]; } 2>/dev/null || return 1
-  fi
+worker_drain_cli() {
+  local boot=$1 pid=$2
+  shift 2
+  local args=()
+  if [ -n "$DRAIN_SOCKET" ]; then args+=(--socket "$DRAIN_SOCKET"); fi
+  "$M1_PY" "$BIN/person-vm-drain" --pid "$pid" --boot-id "$boot" "${args[@]}" "$@" <<<"$DRAIN_TOKEN"
 }
-
-read_drain_receipt() {
-  "$M1_PY" "$BIN/person-vm-drain" --socket "$DRAIN_SOCKET" --boot-id "$1" <<<"$DRAIN_TOKEN"
-}
+read_drain_receipt() { worker_drain_cli "$1" "$2"; }
+claim_drained_worker() { worker_drain_cli "$1" "$2" --claim-expiry "$3"; }
 
 validate_drain_receipt() {
   "$M1_PY" "$BIN/person-vm-drain" --verify-receipt --boot-id "$1" >/dev/null
@@ -146,8 +150,14 @@ wait_for_drained_worker_exit() { # pid, plist, release, port
   return 1
 }
 
+record_worker_exit_intent() {
+  [ -d "$INFLIGHT" ] || return 0
+  (umask 077; printf '%s\n' "$1" "$2" "$3" > "$INFLIGHT/worker-exit.tmp") &&
+    mv "$INFLIGHT/worker-exit.tmp" "$INFLIGHT/worker-exit"
+}
+
 stop_release_worker() {
-  local plist rel port process boot receipt count target status i
+  local plist rel port process boot receipt count target status i pid expire
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
   port=$(worker_port) || return 1
@@ -186,7 +196,21 @@ PYTHON
     }
     return
   fi
+  if [ "$process" = loaded ]; then
+    # Resume a previously acknowledged graceful shutdown that ended before
+    # launchd registration was removed. It cannot authorize a live process.
+    [ -f "$INFLIGHT/worker-exit" ] || return 1
+    [ "$(sed -n '1p' "$INFLIGHT/worker-exit")" = "$rel" ] || return 1
+    pid=$(sed -n '2p' "$INFLIGHT/worker-exit")
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    count=$(vm_upgrade_candidates) || return 1
+    [ "$count" = 0 ] || return 1
+    wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
+    "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$WORKER_LABEL" || return 1
+    return
+  fi
   [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
+  pid=${process#running }
   # Only an agent staged with this policy stays loaded with no process after a
   # successful SIGTERM. Unconditional KeepAlive starts a replacement Worker.
   if ! "$M1_PY" -c 'import plistlib,sys
@@ -196,7 +220,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     return 1
   fi
   boot=$(worker_boot) || return 1
-  if [ -z "$boot" ] || ! load_drain_token || ! receipt=$(read_drain_receipt "$boot"); then
+  if [ -z "$boot" ] || [ -z "$DRAIN_TOKEN" ] || ! receipt=$(read_drain_receipt "$boot" "$pid"); then
     say "Person VM drain missing or refused. Verify the current Worker socket and active tasks before retrying."
     return 1
   fi
@@ -204,16 +228,18 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
   [ "$count" = 0 ] || return 1
   target="gui/$M1_UID/$WORKER_LABEL"
   # A refused, changed, or unconfirmed Worker must never fall through to
-  # forceful bootout. The old Worker consumes the handoff during SIGTERM.
+  # forceful bootout. The exact boot consumes the handoff and exits itself.
   if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ] ||
     [ "$(worker_boot)" != "$boot" ] ||
     ! validate_drain_receipt "$boot" <<<"$receipt"; then
     say "The Worker identity or drain receipt changed. Release blocked."
     return 1
   fi
+  expire=$("$M1_PY" -c 'import json,sys; print(json.load(sys.stdin)["expiresAt"])' <<<"$receipt") || return 1
+  record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   RELEASE_STOP_UNCONFIRMED=1
-  if ! "$M1_LAUNCHCTL" kill SIGTERM "$target" ||
-    ! wait_for_drained_worker_exit "${process#running }" "$plist" "$rel" "$port"; then
+  if ! claim_drained_worker "$boot" "$pid" "$expire" ||
+    ! wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port"; then
     say "Worker graceful exit is unconfirmed. Release blocked. Check shutdown-status on its maintenance socket."
     return 1
   fi

@@ -1140,6 +1140,14 @@ async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
           throw new PersonVmError('LEASE_CONFLICT');
         return host.drainForUpgrade(context, signal);
       },
+      async claimShutdown(context, expiresAt, signal) {
+        if (shutdownProbe || stopping)
+          throw new PersonVmError('LEASE_CONFLICT');
+        await requireCurrentPlatformAdmin(context, undefined, false);
+        signal.throwIfAborted();
+        await host.assertWorkerShutdownSafe(signal, expiresAt);
+        return () => stopWorker('release upgrade');
+      },
     },
     shutdown: {
       authenticate: authenticatePlatformSession,

@@ -173,8 +173,7 @@ export async function prepareEmployeeEntry(
   prewarming?: Promise<void>,
 ) {
   const { selection, operationId } = input;
-  await (prewarming ??
-    prewarmEmployeeEntry(selection, signal, { trigger: 'open' }));
+  await (prewarming ?? prewarmEmployeeEntry(selection, signal));
   signal.throwIfAborted();
   opening();
   if (selection.threadId) return selection;

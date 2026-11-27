@@ -217,6 +217,7 @@ class DeployDevMigrations(unittest.TestCase):
                     [ "$MODE" != expired ] || year=2020
                     printf '{"bootId":"%s","stopped":2,"expiresAt":"%s-01-01T00:00:00Z"}\n' "$valid" "$year"
                   }
+                  claim_drained_worker() { echo claim; }
                   wait_for_drained_worker_exit() { [ "$MODE" != deferred ]; }
                   port_closed() { return 0; }
                   stop_job() { echo "stop-web $1"; }
@@ -226,14 +227,14 @@ class DeployDevMigrations(unittest.TestCase):
                 lines = p.stdout.splitlines()
                 if mode == 'success':
                     self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
-                    self.assertEqual(lines[:2], ['kill', 'bootout'])
+                    self.assertEqual(lines[:2], ['claim', 'bootout'])
                     self.assertIn('Person VM drain consumed:', p.stdout)
                     self.assertIn('stop-web', p.stdout)
                 else:
                     self.assertNotEqual(p.returncode, 0)
                     self.assertNotIn('bootout', lines)
                     self.assertNotIn('stop-web', p.stdout)
-                    self.assertEqual('kill' in lines, mode == 'deferred')
+                    self.assertEqual('claim' in lines, mode == 'deferred')
 
     def test_archived_names_are_known(self):
         known, pending = self.check(self.release(), FILES + ARCHIVED)

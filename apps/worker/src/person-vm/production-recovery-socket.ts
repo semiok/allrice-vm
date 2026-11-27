@@ -27,6 +27,11 @@ export async function openProductionRecoverySocket(input: {
       context: RequestContext,
       signal: AbortSignal,
     ): Promise<Readonly<{ stopped: number; expiresAt: string }>>;
+    claimShutdown?(
+      context: RequestContext,
+      expiresAt: string,
+      signal: AbortSignal,
+    ): Promise<() => void>;
   };
   shutdown?: {
     authenticate(token: string): Promise<RequestContext | null>;
@@ -42,8 +47,11 @@ export async function openProductionRecoverySocket(input: {
   const requests = new Set<Promise<void>>();
   const server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
     const recovery = request.method === 'POST' && request.url === '/recover';
+    const claim = request.url === '/shutdown-after-drain';
     const upgrade =
-      request.method === 'POST' && request.url === '/drain-for-upgrade'
+      request.method === 'POST' &&
+      (request.url === '/drain-for-upgrade' ||
+        (claim && input.upgrade?.claimShutdown))
         ? input.upgrade
         : undefined;
     const shutdown =
@@ -89,6 +97,23 @@ export async function openProductionRecoverySocket(input: {
           return;
         }
         try {
+          if (claim) {
+            const expected = request.headers['x-allrice-drain-expires'];
+            if (typeof expected !== 'string' || !upgrade.claimShutdown) {
+              writeStatus(400);
+              return;
+            }
+            const shutdown = await upgrade.claimShutdown(
+              context,
+              expected,
+              disconnected.signal,
+            );
+            if (!response.destroyed)
+              response.once('finish', () => setImmediate(shutdown));
+            else setImmediate(shutdown);
+            writeStatus(202);
+            return;
+          }
           const drained = await upgrade.drain(context, disconnected.signal);
           writeStatus(200, { ...drained, bootId: upgrade.bootId });
         } catch (error) {

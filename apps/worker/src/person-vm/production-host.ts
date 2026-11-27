@@ -179,7 +179,10 @@ export interface ProductionPersonVmHost {
     request: PlatformVmDeletionRequest,
     signal: AbortSignal,
   ): Promise<PlatformVmDeletionResult>;
-  assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
+  assertWorkerShutdownSafe(
+    signal: AbortSignal,
+    drainExpiresAt?: string,
+  ): Promise<void>;
   drainForUpgrade(
     context: RequestContext,
     signal: AbortSignal,
@@ -1267,14 +1270,20 @@ export function createProductionPersonVmHost(input: {
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
             };
             assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
-            const candidates = await store.listUpgradeCandidates(active);
-            if (
+            const deadline = AbortSignal.any([
+              active,
+              AbortSignal.timeout(UPGRADE_WAIT_MS),
+            ]);
+            let candidates = await store.listUpgradeCandidates(deadline);
+            while (
               candidates.some(
                 (row) => row.phase === 'starting' || !row.instanceId,
               )
-            )
-              throw new PersonVmError('LEASE_CONFLICT');
-            const waitDeadline = Date.now() + UPGRADE_WAIT_MS;
+            ) {
+              assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+              await sleep(1000, undefined, { signal: deadline, ref: false });
+              candidates = await store.listUpgradeCandidates(deadline);
+            }
             for (const row of candidates) {
               if (!row.instanceId) throw new PersonVmError('LEASE_LOST');
               const binding = {
@@ -1284,12 +1293,11 @@ export function createProductionPersonVmHost(input: {
                 instanceId: row.instanceId,
                 leaseEpoch: row.leaseEpoch,
               };
-              const requestId = randomUUID();
               const drain = () =>
                 vm.stopRunningForUpgrade(
                   binding,
-                  requestId,
-                  active,
+                  randomUUID(),
+                  deadline,
                   authorize,
                   async (request, reading) => {
                     const wake = scheduledWake;
@@ -1343,8 +1351,8 @@ export function createProductionPersonVmHost(input: {
                   },
                 );
               for (;;) {
-                active.throwIfAborted();
-                await authorize(active);
+                deadline.throwIfAborted();
+                await authorize(deadline);
                 assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
                 try {
                   await drain();
@@ -1357,10 +1365,13 @@ export function createProductionPersonVmHost(input: {
                       'ACTIVITY_UNKNOWN',
                       'LEASE_CONFLICT',
                     ].includes(error.code) ||
-                    Date.now() >= waitDeadline
+                    deadline.aborted
                   )
                     throw error;
-                  await sleep(1000, undefined, { signal: active, ref: false });
+                  await sleep(1000, undefined, {
+                    signal: deadline,
+                    ref: false,
+                  });
                 }
               }
             }
@@ -1402,7 +1413,15 @@ export function createProductionPersonVmHost(input: {
             ),
           );
         },
-        async assertWorkerShutdownSafe(signal: AbortSignal) {
+        async assertWorkerShutdownSafe(
+          signal: AbortSignal,
+          drainExpiresAt?: string,
+        ) {
+          if (
+            drainExpiresAt !== undefined &&
+            upgradeDrained?.expiresAt !== drainExpiresAt
+          )
+            throw new PersonVmError('RUNTIME_NOT_READY');
           if (gracefulStop) return;
           if (upgradeDraining || shutdownChecking)
             throw new PersonVmError('LEASE_CONFLICT');

@@ -160,7 +160,7 @@ it('keeps the New operation ID out of the prewarm selector and requires its exac
       JSON.parse(String(options?.body)),
     ]),
   ).toEqual([
-    ['/api/v1/d-entry/native-prewarm', { selection, trigger: 'open' }],
+    ['/api/v1/d-entry/native-prewarm', { selection, trigger: 'page' }],
     ['/api/v1/sessions?entry=4.0', { selection, operationId: id }],
   ]);
   expect(() =>

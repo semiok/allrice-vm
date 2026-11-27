@@ -927,7 +927,7 @@ export class PersonVmService
           lease,
           current,
           target && ((active) => assertPrewarmAuthority(target, active)),
-          foregroundOpen,
+          foregroundOpen ? target?.dispatchUpgradeStop : undefined,
         );
       },
       { joinOfflinePreparation: true },
@@ -995,7 +995,7 @@ export class PersonVmService
     lease: VmLease,
     signal: AbortSignal,
     assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
-    foregroundOpen = false,
+    dispatchUpgradeStop?: PersonVmPrewarmFence['dispatchUpgradeStop'],
   ) {
     const scheduled = 'purpose' in intent ? intent : undefined;
     const context = 'actor' in intent ? intent : undefined;
@@ -1038,7 +1038,11 @@ export class PersonVmService
       throw new PersonVmError('AUTHORIZATION_DENIED');
     if (row.phase === 'running' && this.needsUpgradeStop(row)) {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
-      if (!foregroundOpen || context.actor.type !== 'user' || !assertAuthority)
+      if (
+        !dispatchUpgradeStop ||
+        context.actor.type !== 'user' ||
+        !assertAuthority
+      )
         throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
       await assertAuthority(signal);
       await this.stopForUpgrade(
@@ -1049,8 +1053,9 @@ export class PersonVmService
         true,
         assertAuthority,
         undefined,
-        true,
+        dispatchUpgradeStop,
       );
+      await assertAuthority(signal);
     }
     if (row.phase === 'running') {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
@@ -1400,7 +1405,11 @@ export class PersonVmService
     }
     this.assertPrewarmTarget(row, target, true);
     if (row?.phase === 'running' && this.needsUpgradeStop(row)) {
-      if (!foregroundOpen || !target || context.actor.type !== 'user')
+      if (
+        !foregroundOpen ||
+        !target?.dispatchUpgradeStop ||
+        context.actor.type !== 'user'
+      )
         throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
       const opening = this.start(context, signal, target, true).finally(() => {
         this.upgradePrewarms.delete(identity.personId);
@@ -1806,7 +1815,7 @@ export class PersonVmService
     previousWorker: boolean,
     assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
     prepareWake?: PrepareUpgradeWake,
-    foregroundOpen = false,
+    dispatchUpgradeStop?: PersonVmPrewarmFence['dispatchUpgradeStop'],
   ) {
     const binding = bindingOf(row);
     if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
@@ -1854,7 +1863,7 @@ export class PersonVmService
       if (
         state !== 'stopped' &&
         state !== 'absent' &&
-        !(foregroundOpen && state === 'running')
+        !(dispatchUpgradeStop && state === 'running')
       )
         throw new PersonVmError('ACTIVITY_UNKNOWN');
       const assertCurrent = async (active: AbortSignal) => {
@@ -1867,12 +1876,20 @@ export class PersonVmService
         requestId,
         lease,
         row,
-        state === 'running'
+        state === 'running' && dispatchUpgradeStop
           ? {
               requestId,
-              signal,
-              assertCurrent,
+              signal: lease.signal,
+              assertCurrent: async (physical) => {
+                await assertCurrent(signal);
+                physical.throwIfAborted();
+              },
               auditAction: 'stop.upgrade-dispatch',
+              dispatch: (physical, nativeStop) =>
+                dispatchUpgradeStop(binding, signal, () => {
+                  physical.throwIfAborted();
+                  return nativeStop(physical);
+                }),
             }
           : undefined,
         'stop.upgrade',

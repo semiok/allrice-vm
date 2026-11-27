@@ -1,6 +1,7 @@
 import { stat } from 'node:fs/promises';
 import { request } from 'node:http';
 import { dirname } from 'node:path';
+import { PersonVmError } from '@allrice/person-vm';
 import { expect, it, vi } from 'vitest';
 import {
   deferred,
@@ -198,6 +199,17 @@ it('only drains through the private socket for the authenticated and exact Worke
   const context = modelBinding().context;
   const expiresAt = '2099-01-01T00:00:00.000Z';
   const drain = vi.fn(async () => ({ stopped: 2, expiresAt }));
+  const afterClaim = Promise.withResolvers<void>();
+  let drained = false;
+  drain.mockImplementation(async () => {
+    drained = true;
+    return { stopped: 2, expiresAt };
+  });
+  const claimShutdown = vi.fn(async (_context, expected: string) => {
+    if (!drained || expected !== expiresAt)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    return afterClaim.resolve;
+  });
   const socket = await openProductionRecoverySocket({
     authenticate: async () => null,
     recover: async () => 0,
@@ -207,18 +219,20 @@ it('only drains through the private socket for the authenticated and exact Worke
       authenticate: async (token) =>
         token === 'operator-session' ? context : null,
       drain,
+      claimShutdown,
     },
   });
-  function post(token: string, boot: string) {
+  function post(token: string, boot: string, claim?: string) {
     return new Promise<{ status?: number; body: string }>((resolve, reject) => {
       const req = request(
         {
           socketPath: socket.path,
-          path: '/drain-for-upgrade',
+          path: claim ? '/shutdown-after-drain' : '/drain-for-upgrade',
           method: 'POST',
           headers: {
             authorization: 'Bearer ' + token,
             'x-allrice-worker-boot': boot,
+            ...(claim && { 'x-allrice-drain-expires': claim }),
           },
         },
         (res) => {
@@ -233,6 +247,13 @@ it('only drains through the private socket for the authenticated and exact Worke
     });
   }
   try {
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', expiresAt)).status,
+    ).toBe(409);
+    expect(
+      (await post('operator-session', 'wrong-boot', expiresAt)).status,
+    ).toBe(409);
+
     expect((await post('employee-session', 'worker-upgrade-boot')).status).toBe(
       401,
     );
@@ -250,6 +271,13 @@ it('only drains through the private socket for the authenticated and exact Worke
       context,
       expect.any(AbortSignal),
     );
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', 'invalid')).status,
+    ).toBe(409);
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', expiresAt)).status,
+    ).toBe(202);
+    await afterClaim.promise;
   } finally {
     await socket.close();
   }

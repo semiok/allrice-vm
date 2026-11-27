@@ -18,15 +18,38 @@ export function createProductionCurrentPrewarm(input: {
   current: Pick<
     ReturnType<typeof createProductionPersonVmAuthority>,
     'withCurrentSelection'
-  >;
+  > &
+    Partial<
+      Pick<
+        ReturnType<typeof createProductionPersonVmAuthority>,
+        'dispatchUpgradeStop'
+      >
+    >;
 }): CurrentSelectionPrewarm {
-  return async (context, identity, trigger, physicalSignal) => {
+  return async (context, identity, request, physicalSignal) => {
     try {
       return await input.current.withCurrentSelection(
         context,
         identity,
         physicalSignal,
-        () => input.vm.prewarm(context, trigger, physicalSignal),
+        () => {
+          const dispatch = input.current.dispatchUpgradeStop;
+          const target = request.target;
+          return input.vm.prewarm(
+            context,
+            request.trigger === 'open' && target && dispatch
+              ? {
+                  ...request,
+                  target: {
+                    ...target,
+                    dispatchUpgradeStop: (binding, signal, stop) =>
+                      dispatch(context, identity, binding, signal, stop),
+                  },
+                }
+              : request,
+            physicalSignal,
+          );
+        },
       );
     } catch (error) {
       if (

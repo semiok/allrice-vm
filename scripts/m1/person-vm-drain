@@ -9,20 +9,30 @@ from pathlib import Path
 import re
 import socket
 import stat
+import struct
 import sys
+from tempfile import gettempdir
 from uuid import UUID
 
 
 class LocalConnection(http.client.HTTPConnection):
-    def __init__(self, path, timeout):
+    def __init__(self, path, timeout, pid):
         super().__init__('localhost', timeout=timeout)
         self.path = path
+        self.pid = pid
 
     def connect(self):
         channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         channel.settimeout(self.timeout)
         try:
             channel.connect(self.path)
+            # Darwin SOL_LOCAL/LOCAL_PEERPID. Never send the administrator
+            # session token to a socket owned by another process.
+            if self.pid is not None and (
+                sys.platform != 'darwin'
+                or struct.unpack('=i', channel.getsockopt(0, 2, 4))[0] != self.pid
+            ):
+                raise OSError('local socket peer does not match the Worker PID')
         except OSError:
             channel.close()
             raise
@@ -44,48 +54,88 @@ def verify_receipt(payload, boot_id):
         raise ValueError('Worker drain response invalid')
 
 
+def private_socket(path):
+    directory = path.parent.lstat()
+    target = path.lstat()
+    return (
+        path.is_absolute()
+        and path.name == 'owner'
+        and path.parent.name.startswith('ar-recovery-')
+        and stat.S_ISDIR(directory.st_mode)
+        and stat.S_IMODE(directory.st_mode) == 0o700
+        and directory.st_uid == os.getuid()
+        and stat.S_ISSOCK(target.st_mode)
+        and target.st_uid == os.getuid()
+    )
+
+
+def worker_socket(pid, hint):
+    if pid is None:
+        if hint is None or not private_socket(hint):
+            raise ValueError('private Worker socket required')
+        return hint
+    candidates = set(Path(gettempdir()).glob('ar-recovery-*/owner'))
+    if hint:
+        candidates.add(hint)
+    matched = []
+    for path in candidates:
+        try:
+            if not private_socket(path):
+                continue
+            connection = LocalConnection(str(path), 1, pid)
+            try:
+                connection.connect()
+            finally:
+                connection.close()
+        except OSError:
+            continue
+        matched.append(path.resolve(strict=True))
+    matches = set(matched)
+    if len(matches) != 1:
+        raise ValueError('expected one private socket for the exact Worker PID')
+    return matches.pop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket', type=Path)
     parser.add_argument('--verify-receipt', action='store_true')
+    parser.add_argument('--pid', type=int)
+    parser.add_argument('--claim-expiry')
     parser.add_argument('--boot-id', required=True, type=UUID)
     parser.add_argument('--timeout', type=int, default=600)
     options = parser.parse_args()
     if not 1 <= options.timeout <= 3600:
         parser.error('timeout must be 1–3600 seconds')
-    path = options.socket
-    if (path is not None) == options.verify_receipt:
-        parser.error('supply --socket or --verify-receipt')
+    if options.pid is not None and options.pid <= 0:
+        parser.error('a positive Worker PID is required')
+    if options.claim_expiry and options.pid is None:
+        parser.error('claiming shutdown requires a Worker PID')
     try:
         if options.verify_receipt:
             verify_receipt(json.loads(sys.stdin.read(4097)), options.boot_id)
             return 0
-        directory = path.parent.lstat()
-        target = path.lstat()
-        if (
-            not path.is_absolute()
-            or path.name != 'owner'
-            or not path.parent.name.startswith('ar-recovery-')
-            or not stat.S_ISDIR(directory.st_mode)
-            or stat.S_IMODE(directory.st_mode) != 0o700
-            or directory.st_uid != os.getuid()
-            or not stat.S_ISSOCK(target.st_mode)
-            or target.st_uid != os.getuid()
-        ):
-            raise ValueError('private Worker socket required')
+        path = worker_socket(options.pid, options.socket)
         token = sys.stdin.readline(4097).rstrip('\r\n')
         if not re.fullmatch(r'[^\s\x00-\x1f\x7f]{1,4096}', token):
             raise ValueError('a current platform session token is required on stdin')
-        connection = LocalConnection(str(path), options.timeout)
+        connection = LocalConnection(str(path), options.timeout, options.pid)
         try:
-            connection.request('POST', '/drain-for-upgrade', headers={
+            headers = {
                 'Authorization': 'Bearer ' + token,
                 'X-AllRice-Worker-Boot': str(options.boot_id),
                 'Content-Length': '0',
-            })
+            }
+            url = '/drain-for-upgrade'
+            expected = 200
+            if options.claim_expiry:
+                headers['X-AllRice-Drain-Expires'] = options.claim_expiry
+                url = '/shutdown-after-drain'
+                expected = 202
+            connection.request('POST', url, headers=headers)
             response = connection.getresponse()
             body = response.read(4097)
-            if response.status != 200:
+            if response.status != expected:
                 status = 'Worker declined drain (HTTP %d)' % response.status
                 try:
                     failure = json.loads(body)
@@ -99,6 +149,8 @@ def main():
                     if isinstance(request_id, str):
                         status += ' request=' + str(UUID(request_id))
                 raise ValueError(status)
+            if options.claim_expiry:
+                return 0
             payload = json.loads(body)
         finally:
             connection.close()

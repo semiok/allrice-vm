@@ -282,6 +282,10 @@ suite(
               instanceId: null,
               leaseEpoch: 2,
               assertAuthority: async () => {},
+              dispatchUpgradeStop: (_binding, active, stop) => {
+                active.throwIfAborted();
+                return stop();
+              },
             },
           },
           signal(),
