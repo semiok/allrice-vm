@@ -794,6 +794,9 @@ export function createProductionPersonVmHost(input: {
             ) {
               entry.idleContext = structuredClone(context);
               entry.idleAccessOrder = order;
+              // A verified foreground access owns the current roster check.
+              // Retire the wake-time roster, including any in-flight idle check.
+              delete entry.scheduledIdleRoster;
             }
           },
         }),
