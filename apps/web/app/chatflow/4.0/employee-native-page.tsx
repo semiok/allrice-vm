@@ -45,6 +45,7 @@ type Status =
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
 const closingNoticeMs = 10_000;
+const closingConfirmationMs = 60_000;
 
 type EntryWarmup = {
   lifetime: AbortController;
@@ -125,6 +126,7 @@ export function EmployeeNativePage({
     let retired = false;
     let mounted = false;
     let documentStarted = false;
+    let discardingPendingDocument = false;
     let remoteRevoked = false;
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
@@ -134,6 +136,7 @@ export function EmployeeNativePage({
     let superseded = false;
     let timer: number | undefined;
     let closingNotice: number | undefined;
+    let closingConfirmation: number | undefined;
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
@@ -160,6 +163,17 @@ export function EmployeeNativePage({
         },
       );
     }
+    function matchesDocument(url: string) {
+      const address = new URL(url);
+      const path = '/chatflow/4.0/document';
+      return (
+        address.origin === location.origin &&
+        ((address.pathname === path &&
+          address.searchParams.getAll('scopeId').length === 1 &&
+          address.searchParams.get('scopeId') === scopeId) ||
+          address.pathname.startsWith(path + '/' + scopeId + '/'))
+      );
+    }
     function retire() {
       return (replacing ??= (async () => {
         // A render change keeps the old iframe and its authenticated sender
@@ -174,6 +188,27 @@ export function EmployeeNativePage({
           return remote !== 'unknown';
         }
         send(pageRevoked);
+        // Before the inline lifecycle runs there is no child to acknowledge
+        // revoke. Observe a blank navigation before accepting local closure.
+        if (!documentStarted) {
+          try {
+            const win = frame.current.contentWindow;
+            const previous = frame.current.contentDocument;
+            if (
+              win &&
+              previous &&
+              (previous.URL === 'about:blank' ||
+                (matchesDocument(previous.URL) &&
+                  !Reflect.get(win, '__ALLRICE_EMPLOYEE_DOCUMENT__')))
+            ) {
+              discardingPendingDocument = true;
+              win.stop();
+              win.location.replace('about:blank');
+            }
+          } catch {
+            // An uninspectable child must supply its own completion.
+          }
+        }
         const [remote, entry] = await Promise.all([close(), local.promise]);
         return remote === 'closed' && entry === 'closed';
       })());
@@ -191,8 +226,15 @@ export function EmployeeNativePage({
         () => setStatus('closing'),
         closingNoticeMs,
       );
+      // Loss of either completion signal must not leave a perpetual spinner
+      // or enable a new page without the old page's actual close proof.
+      closingConfirmation = window.setTimeout(
+        () => setStatus('unknown'),
+        closingConfirmationMs,
+      );
       void retire().then((closed) => {
         window.clearTimeout(closingNotice);
+        window.clearTimeout(closingConfirmation);
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
@@ -218,16 +260,13 @@ export function EmployeeNativePage({
       if (!scopeId || node !== frame.current || !mounted) return;
       try {
         const doc = node.contentDocument;
-        if (doc?.URL === 'about:blank') return;
+        if (doc?.URL === 'about:blank') {
+          if (discardingPendingDocument && !documentStarted)
+            local.resolve('closed');
+          return;
+        }
         if (!doc) return failedDocument('unknown');
-        const address = new URL(doc.URL);
-        const path = '/chatflow/4.0/document';
-        const exact =
-          address.origin === location.origin &&
-          ((address.pathname === path &&
-            address.searchParams.getAll('scopeId').length === 1 &&
-            address.searchParams.get('scopeId') === scopeId) ||
-            address.pathname.startsWith(path + '/' + scopeId + '/'));
+        const exact = matchesDocument(doc.URL);
         const child = node.contentWindow as
           | (Window & { __ALLRICE_EMPLOYEE_DOCUMENT__?: { scopeId: string } })
           | null;
@@ -238,6 +277,7 @@ export function EmployeeNativePage({
           documentStarted = true;
           return;
         }
+        if (discardingPendingDocument && exact && !documentStarted) return;
         // The two authenticated document handlers return a JSON problem
         // before any owned document exists. An uninspectable or changed
         // document has no equivalent local completion proof.
@@ -502,6 +542,7 @@ export function EmployeeNativePage({
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
+      window.clearTimeout(closingConfirmation);
       if (activation.warmup) activation.warmup.progress.show = undefined;
       leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
@@ -607,9 +648,9 @@ function EntryStatus({
             {status === 'cancelled' ? '继续' : '重试'}
           </button>
         )}
-        {/* The existing employee selector accepts an empty value for the
-            default workspace view. Bare /chatflow reopens 4.0 on the trial host. */}
-        {status === 'failed' && <a href="/chatflow?employee=">返回员工页</a>}
+        {status === 'failed' && settled && (
+          <a href="/chatflow/4.0">返回员工页</a>
+        )}
       </section>
     </div>
   );
