@@ -349,41 +349,98 @@ export function createDEntryHttpHandler(
           return;
         }
         finishPrewarmReply = existing.finishReply;
+        async function verifyExisting(
+          ticket: NonNullable<typeof existing>,
+          active: AbortSignal,
+          pendingReply = false,
+        ) {
+          let threadCurrent = await ticket.observeThread(active, pendingReply);
+          const { context, identity } = await currentDEntryRequest(
+            deps,
+            token,
+            input,
+            active,
+          );
+          const ticketCurrent =
+            threadCurrent &&
+            (await ticket.recheck(context, identity, async (mode) => {
+              // The original observer can close while the starting ticket's
+              // coordination read is in flight. Verify the terminal thread
+              // and the exact failed ticket in the same final check.
+              if (mode === 'failed' && threadCurrent && !threadCurrent()) {
+                threadCurrent = await ticket.observeThread(
+                  active,
+                  pendingReply,
+                );
+                if (!threadCurrent) return false;
+              }
+              // A waiting reply checks the exact binding without repeating the
+              // immediate-ready probe that has already used its time budget.
+              if (pendingReply && plan && mode === 'ready')
+                return verify(
+                  context,
+                  identity,
+                  plan,
+                  active,
+                  'waiting',
+                  'publish',
+                );
+              return verify(
+                context,
+                identity,
+                ticket.plan,
+                active,
+                mode,
+                'publish',
+              );
+            }));
+          active.throwIfAborted();
+          if (!threadCurrent) ticket.assertNotRevoked();
+          const finalThread = threadCurrent;
+          if (finalThread && ticketCurrent)
+            return {
+              identity,
+              current: () => finalThread() && ticketCurrent(),
+            };
+        }
         if (preferReady) {
           const budget = new AbortController();
           const probe = AbortSignal.any([signal, budget.signal]);
+          const ready = track(
+            (async () => {
+              await existing.settled;
+              probe.throwIfAborted();
+              // Only an elapsed budget or an unsettled readiness result can
+              // take the waiting path. A completed negative check expires.
+              if (existing.ready())
+                return (await verifyExisting(existing, probe)) ?? false;
+            })(),
+          );
+          let qualified: Awaited<typeof ready>;
           try {
-            await Promise.race([
-              existing.settled,
-              delay(1000, false, { signal: probe, ref: false }),
+            qualified = await Promise.race([
+              ready,
+              delay(1000, undefined, { signal: probe, ref: false }),
             ]);
           } finally {
             budget.abort();
             signal.throwIfAborted();
           }
-        }
-        const threadOpen = await existing.observeThread(signal);
-        const { context, identity } = await currentDEntryRequest(
-          deps,
-          token,
-          input,
-          signal,
-        );
-        const mayPublish =
-          threadOpen &&
-          (await existing.recheck(context, identity, (mode) =>
-            verify(context, identity, existing.plan, signal, mode, 'publish'),
-          ));
-        signal.throwIfAborted();
-        if (!threadOpen) existing.assertNotRevoked();
-        if (mayPublish && mayPublish()) {
-          if (preferReady && existing.ready()) {
-            sendPrewarmReady(response, { identity, trigger });
+          if (qualified !== undefined) {
+            if (qualified && qualified.current() && existing.ready()) {
+              sendPrewarmReady(response, {
+                identity: qualified.identity,
+                trigger,
+              });
+            } else sendPrewarmStatus(response, { state: 'expired' });
             return;
           }
+        }
+        const waiting = await verifyExisting(existing, signal, preferReady);
+        if (waiting?.current()) {
           existing.publish();
           sendPrewarmAccepted(response, {
-            identity,
+            identity: waiting.identity,
             trigger,
             ticket: existing.ticket,
           });

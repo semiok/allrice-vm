@@ -16,6 +16,7 @@ import {
 import {
   dEntryNativePrewarmPort,
   installDEntryNativePrewarmPort,
+  type DEntryNativePrewarmPort,
 } from '../d-entry/native-prewarm.js';
 import {
   installDEntryNativeDataPort,
@@ -1827,6 +1828,115 @@ it.each([false, true])(
       expect(joined).toBe(false);
     } finally {
       finish.resolve();
+      await (closing ?? server.close());
+    }
+  },
+);
+
+it.each([
+  ['ready read', false],
+  ['ready read', true],
+  ['thread observer', false],
+] as const)(
+  'bounds a duplicate hot POST with a slow %s and joins the probe (target changed: %s)',
+  async (slow, changed) => {
+    const f = fixture();
+    const proof = deferred<AbortSignal>();
+    const secondIssue = deferred<void>();
+    const probing = deferred<AbortSignal>();
+    const finishProbe = deferred<void>();
+    const prewarm = vi.fn(() => proof.promise);
+    const watch = f.base.deps.watch.getMockImplementation()!;
+    let duplicate = false;
+    const originalThread = vi.fn(async (active: AbortSignal) => {
+      if (duplicate && slow === 'thread observer') {
+        probing.resolve(active);
+        await finishProbe.promise;
+      }
+    });
+    const currentThread = vi.fn(async (active: AbortSignal) => {
+      active.throwIfAborted();
+    });
+    f.base.deps.watch
+      .mockImplementationOnce(async () => ({
+        ...(await watch()),
+        assertTicketThread: originalThread,
+      }))
+      .mockImplementationOnce(async () => ({
+        ...(await watch()),
+        assertTicketThread: currentThread,
+      }));
+    const check = vi.fn<NonNullable<DEntryNativePrewarmPort['isCurrent']>>(
+      async (_context, _identity, _plan, active, mode, purpose) => {
+        if (duplicate && mode === 'issue' && purpose === undefined)
+          secondIssue.resolve();
+        if (
+          mode === 'ready' &&
+          purpose === 'publish' &&
+          slow === 'ready read'
+        ) {
+          probing.resolve(active);
+          await finishProbe.promise; // Simulate a read that has not joined on abort.
+        }
+        return !(mode === 'waiting' && purpose === 'publish' && changed);
+      },
+    );
+    const server = await nativeEntryServer(f.base, {
+      ...f.base.deps,
+      prewarm: {
+        prepare: async () => ({
+          key: 'same-running-vm',
+          target: f.base.binding,
+          running: true,
+        }),
+        isCurrent: check,
+        prewarm,
+      },
+    });
+    let closing: Promise<void> | undefined;
+    try {
+      const body = { ...f.base.body, trigger: 'page' };
+      const first = await server.request('native-prewarm', body);
+      expect(first.status).toBe(202);
+      const { ticket } = await first.json();
+      duplicate = true;
+      const responding = server.request('native-prewarm', body);
+      await secondIssue.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      proof.resolve(signal());
+      const active = await probing.promise;
+      const response = await responding;
+      expect(active.aborted).toBe(true);
+      if (changed) {
+        expect(response.status).toBe(410);
+        expect(await response.json()).toEqual({ state: 'expired' });
+      } else {
+        expect(response.status).toBe(202);
+        expect(await response.json()).toMatchObject({ ticket });
+      }
+      expect(prewarm).toHaveBeenCalledOnce();
+      expect(currentThread).toHaveBeenCalledTimes(2);
+      expect(
+        check.mock.calls.filter(
+          (call) => call[4] === 'waiting' && call[5] === 'publish',
+        ),
+      ).toHaveLength(1);
+      expect(
+        check.mock.calls.filter(
+          (call) => call[4] === 'ready' && call[5] === 'publish',
+        ),
+      ).toHaveLength(slow === 'ready read' ? 1 : 0);
+      expect(originalThread).toHaveBeenCalledTimes(2);
+
+      let joined = false;
+      closing = server.close().then(() => {
+        joined = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(joined).toBe(false);
+    } finally {
+      proof.resolve(signal());
+      finishProbe.resolve();
       await (closing ?? server.close());
     }
   },

@@ -394,7 +394,7 @@ export function createDEntryNativePrewarmPort(input: {
         canSharePrewarmTarget(plan, latest),
       );
     }
-    if (mode === 'ready')
+    if (mode === 'ready' || mode === 'waiting')
       return (
         vm?.phase === 'running' &&
         target.vmId !== null &&

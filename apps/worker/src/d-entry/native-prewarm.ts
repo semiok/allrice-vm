@@ -15,10 +15,16 @@ import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmVerificationMode =
-  'authority' | 'issue' | 'operation' | 'ready' | 'failed' | 'reuse';
+  | 'authority'
+  | 'issue'
+  | 'operation'
+  | 'ready'
+  | 'failed'
+  | 'reuse'
+  | 'waiting';
 type PrewarmReadMode = Exclude<
   PrewarmVerificationMode,
-  'authority' | 'issue' | 'reuse'
+  'authority' | 'issue' | 'reuse' | 'waiting'
 >;
 type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
@@ -203,7 +209,14 @@ export function createPrewarmOperations(
 
     const reservation = entry.plan.reservation;
     const started = reservation?.instance;
-    if (!started) return canIssue && sameOrigin;
+    if (!started)
+      return (
+        canIssue &&
+        (sameOrigin ||
+          (requested.vmId !== null &&
+            reservation?.vmId === requested.vmId &&
+            canSharePrewarmTarget({ target: origin, reservation }, requested)))
+      );
     // A delayed cold request needs a start that consumed its original target.
     // A ticket issued against an already assigned instance only proves that instance.
     return (
@@ -245,11 +258,17 @@ export function createPrewarmOperations(
     ) {
       const prior = plan.reuse;
       let publishedInstance = false;
-      const entry = [...tickets.values()].find((entry) => {
+      const candidate = [...tickets.values()].find((entry) => {
         if (expired(entry) || entry.revoked.aborted) return false;
+        const observerOpen = !entry.plan.assertTicketThread || !entry.closeJoin;
         if (prior)
-          return entry.plan === prior && belongs(entry, context, identity);
+          return (
+            observerOpen &&
+            entry.plan === prior &&
+            belongs(entry, context, identity)
+          );
         if (
+          observerOpen &&
           active(entry) &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
@@ -269,7 +288,11 @@ export function createPrewarmOperations(
         }
         return false;
       });
-      if (!entry) return { existing: undefined, publishedInstance };
+      if (!candidate) return { existing: undefined, publishedInstance };
+      const entry = candidate;
+      // If present, this POST's observer was installed before selection,
+      // while the original observer was still open.
+      const assertCurrentThread = plan.assertTicketThread;
       const mode = (): PrewarmReuseMode | undefined => {
         if (active(entry)) {
           if (entry.plan.orphanedInstanceId === undefined) return 'issue';
@@ -284,23 +307,49 @@ export function createPrewarmOperations(
         )
           return 'failed';
       };
+      async function observeClosedThread(
+        signal: AbortSignal,
+        error: DEntryTicketObserverClosed,
+      ) {
+        entry.revoked.throwIfAborted();
+        if (expired(entry) || entry.closedOnDeadline) return;
+        // Only a known startup failure with a joined observer can defer to
+        // this POST's observer. An in-progress or failed close has no proof.
+        const closing = entry.closeJoin;
+        if (
+          !entry.published ||
+          mode() !== 'failed' ||
+          !assertCurrentThread ||
+          !closing ||
+          !(await closing)
+        )
+          throw error;
+        signal.throwIfAborted();
+        await assertCurrentThread(signal);
+        return () => entry.closeJoin === closing && mode() === 'failed';
+      }
       const existing = {
         ...accepted(entry),
         plan: entry.plan,
-        async observeThread(signal: AbortSignal) {
+        async observeThread(signal: AbortSignal, preferCurrent = false) {
+          const assertOriginalThread = entry.plan.assertTicketThread;
+          if (!assertOriginalThread) return () => true;
+          if (preferCurrent && assertCurrentThread) {
+            if (!entry.closeJoin) await assertCurrentThread(signal);
+            if (entry.closeJoin)
+              return observeClosedThread(
+                signal,
+                new DEntryTicketObserverClosed(),
+              );
+            return () => !entry.closeJoin;
+          }
           try {
-            await entry.plan.assertTicketThread?.(signal);
-            return true;
+            await assertOriginalThread(signal);
+            return () => !entry.closeJoin;
           } catch (error) {
             signal.throwIfAborted();
-            if (
-              error instanceof DEntryTicketObserverClosed &&
-              entry.closedOnDeadline
-            ) {
-              entry.revoked.throwIfAborted();
-              return false;
-            }
-            throw error;
+            if (!(error instanceof DEntryTicketObserverClosed)) throw error;
+            return observeClosedThread(signal, error);
           }
         },
         assertNotRevoked() {
