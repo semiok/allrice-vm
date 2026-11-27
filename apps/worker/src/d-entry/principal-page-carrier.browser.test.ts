@@ -628,7 +628,11 @@ it.skipIf(!browserExecutable)(
       let found: string | undefined;
       await expect
         .poll(async () => {
-          const input = await page.locator('iframe').getAttribute('src');
+          const input = await page
+            .locator('iframe')
+            .evaluate(
+              (node) => (node as HTMLIFrameElement).contentDocument?.URL,
+            );
           if (!input) return false;
           const address = new URL(input, f.origin);
           const scope = address.searchParams.get('scopeId');
