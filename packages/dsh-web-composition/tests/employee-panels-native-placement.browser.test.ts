@@ -818,7 +818,7 @@ suite(
           'native-original-repeat-control.json',
           original,
           repeated,
-          'unmodified native repeat',
+          'native repeat with the same badge raster control',
         );
         fiveUnreadDeliverables = await unreadDeliveryBadge.isVisible();
         expect(fiveUnreadDeliverables).toBe(true);
@@ -1044,7 +1044,7 @@ suite(
           actualPngs,
           cleanup,
           measuredScope:
-            'One native 1440/light/list/experience panel. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
+            'One native 1440/light/list/experience panel with the unread badge compositing hint held constant across native captures. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
           failures: failures.map((error) => ({
             message: String(error),
             stack: error instanceof Error ? error.stack : null,
