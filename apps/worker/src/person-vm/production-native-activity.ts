@@ -123,6 +123,9 @@ export function createProductionNativeActivity(
           },
           activeScheduleDeliveries:
             status === 'idle' ? 0 : work.has('schedule') ? 1 : null,
+          ...(window && {
+            scheduleFingerprints: [...window.scheduleFingerprints],
+          }),
           coverage: window
             ? {
                 state: 'sampled' as const,

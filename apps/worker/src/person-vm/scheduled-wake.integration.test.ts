@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
@@ -231,6 +232,161 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(catalog).not.toHaveBeenCalled();
     } finally {
       await host.close();
+      await f.store().settle(claim!, { state: 'ready' });
+    }
+  });
+
+  it('uses a durable wake handoff for the exact upgrade stop while ordinary wake work is paused', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const scheduledAt = new Date(Date.now() + 600_000).toISOString();
+    f.reviseTime(scheduledAt);
+    const roster = await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+    );
+    expect(roster).not.toBeNull();
+    const catalog = vi.fn().mockReturnValue({
+      endpoint: f.origin,
+      receipt: { rosterDigest: roster!.digest, endpoints: [f.origin] },
+      revoked: signal,
+      bindingRef: f.origin.bindingRef,
+      owner: { readScheduleCatalog: f.catalog },
+    });
+    const host = createProductionScheduledWake({
+      startup: { catalog },
+      database: db,
+      lifetime: signal,
+      source: { start: f.start, assertDeliverable: vi.fn() },
+    });
+    const requestId = randomUUID();
+    const request = {
+      binding: f.binding,
+      requestId,
+      scheduledRoster: roster!,
+      assertStopCurrent: f.assertCurrent,
+    };
+    try {
+      await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
+        blocked: true,
+        reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+      });
+      await host.pause(signal);
+      await expect(host.prepareStopWithWake(request, signal)).resolves.toEqual({
+        blocked: true,
+        reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+      });
+      await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
+        ok: true,
+        nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
+        scheduleFingerprints: [expect.stringMatching(/^sha256:/)],
+      });
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toBeNull();
+      await db`update person_virtual_machines
+        set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+        where person_id=${f.binding.personId}`;
+      const stop = vi.fn(async () => {});
+      await expect(
+        host.dispatchUpgradeStop(
+          f.binding,
+          roster!,
+          randomUUID(),
+          signal,
+          stop,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const revoked = new Error('platform operator no longer current');
+      await expect(
+        host.dispatchUpgradeStop(
+          f.binding,
+          roster!,
+          requestId,
+          signal,
+          stop,
+          async () => {
+            throw revoked;
+          },
+        ),
+      ).rejects.toBe(revoked);
+      expect(stop).not.toHaveBeenCalled();
+      await host.dispatchUpgradeStop(
+        f.binding,
+        roster!,
+        requestId,
+        signal,
+        stop,
+      );
+      expect(stop).toHaveBeenCalledTimes(1);
+      await f.stop(requestId);
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
+        new Date(Date.parse(scheduledAt) - 120_000),
+      );
+      await db`update person_virtual_machines set lease_owner=null,lease_expires_at=null
+        where person_id=${f.binding.personId}`;
+      await db`update person_vm_scheduled_wakes set wake_at=now()-interval '1 second'
+        where plan_id=${requestId}`;
+      const claim = await f.store().claim(300_000);
+      expect(claim?.planId).toBe(requestId);
+      await expect(f.store().readClaimRoster(claim!)).resolves.toEqual(roster);
+    } finally {
+      await host.close();
+    }
+  });
+
+  it('cancels the dedicated wake scan while another connection still holds its table lock', async () => {
+    let locked!: () => void;
+    let release!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = db.begin(async (tx) => {
+      await tx`lock table person_vm_scheduled_wakes in access exclusive mode`;
+      locked();
+      await held;
+    });
+    const caller = new AbortController();
+    let read: Promise<unknown> | undefined;
+    async function blocked() {
+      const [row] = await db<{ count: number }[]>`select count(*)::int as count
+        from pg_locks where relation='person_vm_scheduled_wakes'::regclass
+          and mode='AccessShareLock' and not granted`;
+      return row?.count;
+    }
+    try {
+      await Promise.race([acquired, holder]);
+      read = createPostgresPersonVmScheduledWakeStore(db).nextCommittedWakeAt(
+        caller.signal,
+      );
+      void read.catch(() => {});
+      await vi.waitFor(async () => expect(await blocked()).toBe(1), {
+        interval: 20,
+        timeout: 1_500,
+      });
+      const reason = new Error(
+        'synthetic drain disconnected while read was active',
+      );
+      caller.abort(reason);
+      const deadline = new AbortController();
+      try {
+        expect(
+          await Promise.race([
+            read.catch((error: unknown) => error),
+            sleep(750, 'client did not close', { signal: deadline.signal }),
+          ]),
+        ).toBe(reason);
+      } finally {
+        deadline.abort();
+      }
+      await vi.waitFor(async () => expect(await blocked()).toBe(0), {
+        interval: 20,
+        timeout: 2_500,
+      });
+    } finally {
+      caller.abort();
+      release();
+      await Promise.allSettled([holder, read]);
     }
   });
 

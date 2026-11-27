@@ -174,6 +174,8 @@ export type PersonVmNativeActivityObservation = Readonly<{
   activity: PersonVmActivity;
   activeScheduleDeliveries: number | null;
   coverage: PersonVmNativeIdleCoverage;
+  /** Per-profile schedule catalogs in the authenticated roster's order. */
+  scheduleFingerprints?: readonly string[];
 }>;
 
 export interface PersonVmNativeActivityPort {

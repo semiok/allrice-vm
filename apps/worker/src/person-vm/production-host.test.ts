@@ -22,6 +22,7 @@ import {
 } from '@allrice/person-vm';
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
+import type * as ScheduledWake from './production-scheduled-wake.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -39,6 +40,13 @@ const io = vi.hoisted(() => ({
   read: vi.fn(),
   database: vi.fn(),
   dedicated: vi.fn(),
+  upgradeOperator: vi.fn<typeof Database.requireCurrentPlatformAdmin>(),
+  upgradeWake:
+    vi.fn<
+      () =>
+        | ReturnType<typeof ScheduledWake.createProductionScheduledWake>
+        | undefined
+    >(),
   diskPreprovision: vi.fn(),
   model:
     vi.fn<
@@ -105,7 +113,17 @@ vi.mock('@allrice/database', async (original) => ({
   ...(await original<typeof Database>()),
   getDatabase: io.database,
   createDedicatedDatabase: io.dedicated,
+  requireCurrentPlatformAdmin: io.upgradeOperator,
 }));
+vi.mock('./production-scheduled-wake.js', async (original) => {
+  const actual = await original<typeof ScheduledWake>();
+  return {
+    ...actual,
+    createProductionScheduledWake: (
+      input: Parameters<typeof actual.createProductionScheduledWake>[0],
+    ) => io.upgradeWake() ?? actual.createProductionScheduledWake(input),
+  };
+});
 vi.mock('@allrice/model-gateway', async (original) => ({
   ...(await original<typeof Model>()),
   createModelGateway: io.model,
@@ -525,6 +543,58 @@ it('refuses to prepare a scheduled stop without the production wake source', asy
   ).resolves.toEqual({ blocked: true, reason: 'SCHEDULE_WAKE_UNAVAILABLE' });
   expect(assertStopCurrent).not.toHaveBeenCalled();
   expect(io.dedicated).not.toHaveBeenCalled();
+});
+
+it('resumes startup and wake if final drain recovery made a near-term wake eligible', async () => {
+  const { context } = nativeEntryFixture();
+  const memory = new MemoryStore();
+  const physical = harness(memory);
+  await physical.service.create(context, signal());
+  await physical.service.start(context, signal());
+  const row = await memory.read(context.actor.id);
+  expect(row?.phase).toBe('running');
+  const value = fixture();
+  value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
+  io.upgradeOperator.mockResolvedValueOnce(context.actor.id);
+  const nextWake = vi.fn().mockResolvedValueOnce(null);
+  const wake = {
+    nextCommittedWakeAt: nextWake,
+    start: vi.fn(),
+    resume: vi.fn(),
+    close: vi.fn(async () => {}),
+    pause: vi.fn(async () => {}),
+    assertScheduledIdleCurrent: vi.fn(),
+    dispatchScheduledIdleStop: vi.fn(),
+    dispatchUpgradeStop: vi.fn(),
+    prepareStopWithWake: vi.fn(),
+    prepareUpgradeStop: vi.fn(),
+  };
+  io.upgradeWake.mockReturnValueOnce(wake);
+  const list = vi
+    .spyOn(PostgresPersonVmStore.prototype, 'listUpgradeCandidates')
+    .mockResolvedValueOnce([row!])
+    .mockResolvedValueOnce([]);
+  const recover = vi
+    .spyOn(PersonVmService.prototype, 'stopRunningForUpgrade')
+    .mockImplementationOnce(async () => {
+      nextWake.mockResolvedValueOnce(new Date(Date.now() - 1_000));
+    });
+  const reopen = vi.fn();
+  vi.spyOn(PersonVmService.prototype, 'fenceWorkerStartup').mockReturnValueOnce(
+    reopen,
+  );
+  const { host } = await open(value);
+  await expect(host.drainForUpgrade(context, signal())).rejects.toMatchObject({
+    code: 'ACTIVITY_UNKNOWN',
+  });
+  expect(list).toHaveBeenCalledTimes(2);
+  expect(recover).toHaveBeenCalledTimes(1);
+  expect(nextWake).toHaveBeenCalledTimes(2);
+  expect(reopen).toHaveBeenCalledTimes(1);
+  expect(wake.resume).toHaveBeenCalledTimes(1);
+  await expect(host.assertWorkerShutdownSafe(signal())).rejects.toMatchObject({
+    code: 'RUNTIME_NOT_READY',
+  });
 });
 
 it('constructs the real store/service/admission/startup with one SQL factory and the same nondefault platform snapshot', async () => {

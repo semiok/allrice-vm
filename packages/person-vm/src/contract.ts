@@ -178,6 +178,7 @@ export type PersonVmErrorCode =
   | 'EGRESS_BINDING_INVALID'
   | 'RUNTIME_NOT_READY'
   | 'ACTIVITY_UNKNOWN'
+  | 'UPGRADE_OPEN_REQUIRED'
   | 'VM_ACTIVE'
   | 'WEB_ENDPOINTS_PREPARING'
   | 'PROVIDER_FAILED'
@@ -206,6 +207,11 @@ export type PersonVmPrewarmTarget = Readonly<{
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
+  dispatchUpgradeStop?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    dispatch: () => Promise<void>,
+  ): Promise<void>;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
@@ -214,7 +220,10 @@ export interface PersonVmPort {
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
+    input: {
+      trigger: 'page' | 'input' | 'open';
+      target?: PersonVmPrewarmFence;
+    },
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

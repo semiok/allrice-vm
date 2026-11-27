@@ -139,6 +139,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<'absent' | 'stopped' | 'running' | 'unknown'>;
+  readAttachedStatus?(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ): ReturnType<PersonVmNativePort['status']>;
   create(
     binding: PersonVmBinding,
     receipt: PersonVmEgressReceipt,
@@ -595,15 +600,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (!/\b0\.7\.16\b/.test(version))
       throw new PersonVmError('PROVIDER_FAILED');
   }
-  /** For a fixed Host-authored read command, inside a physical lease that has
-   * independently verified this already attached disk. Reopen the original
-   * configuration without populating launch ownership or preparing the disk. */
-  async readAttachedProbe(
-    scope: PersonVmStartingScope,
+  /** Read the verified attached disk without changing the saved CLI config. */
+  private async readAttachedPaths(
+    binding: PersonVmBinding,
     mount: string,
-    commandSpec: PersonVmGuestCommand,
+    signal: AbortSignal,
   ) {
-    const { binding, signal } = scope;
     const home = join(this.options.socketRoot, binding.vmId);
     const target = join(mount, 'microsandbox');
     const paths = {
@@ -612,7 +614,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       config: join(mount, 'msb-config.json'),
     };
     assertSocketHome(home);
-    await scope.assertCurrent();
     signal.throwIfAborted();
     for (const directory of [this.options.socketRoot, target, paths.userHome]) {
       const stat = await lstat(directory);
@@ -641,8 +642,33 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     } finally {
       await config.close();
     }
+    signal.throwIfAborted();
+    return paths;
+  }
+  async readAttachedStatus(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ) {
+    const paths = await this.readAttachedPaths(binding, mount, signal);
+    const output = await this.runWithPaths(
+      paths,
+      ['list', '--format', 'json'],
+      signal,
+    );
+    return this.lifecycleState(this.parseStatus(binding, output));
+  }
+  /** Fixed Host-authored read inside an independently verified physical lease. */
+  async readAttachedProbe(
+    scope: PersonVmStartingScope,
+    mount: string,
+    commandSpec: PersonVmGuestCommand,
+  ) {
+    const { binding, signal } = scope;
+    await scope.assertCurrent();
+    const paths = await this.readAttachedPaths(binding, mount, signal);
     const directory = this.options.readonlyDshDirectory;
-    const artifact = await this.artifact(binding, signal, false, home);
+    const artifact = await this.artifact(binding, signal, false, paths.home);
     if (!directory || !artifact) throw new PersonVmError('PROVIDER_FAILED');
     const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
       this.runWithPaths(paths, args, active, nonzero);
@@ -686,9 +712,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     }
   }
   private async rawStatus(binding: PersonVmBinding, signal: AbortSignal) {
-    const rows: unknown = JSON.parse(
+    return this.parseStatus(
+      binding,
       await this.command(binding, ['list', '--format', 'json'], signal),
     );
+  }
+  private parseStatus(binding: PersonVmBinding, output: string) {
+    const rows: unknown = JSON.parse(output);
     if (!Array.isArray(rows)) throw new PersonVmError('PROVIDER_FAILED');
     const matches = rows.filter(
       (value: unknown) =>
@@ -702,7 +732,9 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     return (matches[0] as { status?: string }).status ?? 'Unknown';
   }
   async status(binding: PersonVmBinding, signal: AbortSignal) {
-    const status = await this.rawStatus(binding, signal);
+    return this.lifecycleState(await this.rawStatus(binding, signal));
+  }
+  private lifecycleState(status: string | undefined) {
     if (status === undefined) return 'absent' as const;
     if (status === 'Running') return 'running' as const;
     if (status === 'Stopped' || status === 'Created' || status === 'Crashed')

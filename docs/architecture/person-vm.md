@@ -114,6 +114,18 @@ macOS 对原盘及原密钥建立无覆盖的正式文件引用，核实同 inod
 | 公开缓存和根盘       | stock 仅写封签缓存。正式启动沿用 `MicrosandboxPersonVm`。同一封签的领用盘首开对盘内缓存重新验哈希，已验证的本地字节直接供 MSB 用 `flat` 和 `clone=reflink` 建个人根盘。 | 核对同一公开来源，由正常启动适配器使用 XFS 或 btrfs reflink。后续可用公开只读 lower 加个人加密 upper，继续复用同一根盘准备位置。 |
 | Guest 地址和运行时   | 工作台继续用既有可信 Web 封签的 `web.guestAddress` 和实际 MSB 端点检查，库存过程无 guest 地址。生产装配保留现有 MSB provider 及 Darwin Unix socket 路径限制。           | 由对应虚拟化运行时按已启动的绑定和 epoch 返回实际地址，供同一工作台启动与就绪检查消费。                                          |
 
+### 升级时停机与接管
+
+发布负责人先完成候选构建。给 `deploy-dev` 的文件描述符 3 提供当前平台管理员会话令牌。发布脚本关闭这个描述符后才启动构建子进程。令牌留在发布进程内，只交给经过同 PID 和同 boot 核验的本机维护连接。
+
+```sh
+deploy-dev --release-manager --require-person-vm-config 3<"$private_session_file"
+```
+
+脚本在切换前调用 `person-vm-drain`，以当前 Worker 的实际 PID 定位其私有 Unix socket。遇到多个 socket、缺失回执、候选仍在运行或活动未知时，发布停止。Worker 只按原生停机门卫处理空闲 VM，忙碌时最多等待到发布排空期限。定时唤醒离交接太近也会拒绝。回执包含 `bootId`、已停机数及 `expiresAt`。同一进程在有效期内消费回执并优雅退出，脚本确认退出、端口关闭和库存清空后才切换。回退和恢复同样核对实际当前 Worker。旧版 LaunchAgent 如不支持此协议，请由发布负责人先按旧版维护流程确认 VM 全部停机并停止旧 Worker，再开始首次迁移。
+
+数据库仍记录为运行中而当前 Worker 没有旧 Gateway 回执的 VM，会记录待接管告警。网页自动打开、恢复标签页和后台预热均不触发停机。本人点「打开员工」后，Worker 复核账号现权、独占物理租约、上一版 Worker 已退出及旧端口所有权，才停止确切 VM、读回、卸盘并写入 `stop.upgrade`。网页显示「版本已更新，正在重新启动员工」，随后以同一保留盘启动新代次。原生日程保留在盘上，由既有闲置停机流程重新登记。更换物理只读制品仍须验证原生挂载与封签的交接。
+
 ### 平台管理员删除
 
 Worker 在本机提供 `POST /internal/platform/person-vm-delete`，用现有的有效平台管理员登录鉴权。运维入口为 `scripts/m1/person-vm-delete <Worker 端口> <person UUID> <review|retain-disk|purge-disk>`，从终端静默读取平台管理员会话 token。

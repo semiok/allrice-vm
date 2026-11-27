@@ -3,11 +3,12 @@ import {
   sameDEntryIdentity,
   type DEntryIdentity,
   type DEntryNativePrewarmStatus,
+  type DEntryNativePrewarmTrigger,
   type DEntryNativePrewarmTicket,
   type RequestContext,
 } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
-import type { PersonVmPrewarmTarget } from '@allrice/person-vm';
+import { PersonVmError, type PersonVmPrewarmTarget } from '@allrice/person-vm';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
@@ -15,6 +16,7 @@ export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
   running?: boolean;
+  upgradeRestart?: boolean;
   assertTicketThread?(signal: AbortSignal): Promise<void>;
 };
 
@@ -47,7 +49,7 @@ export interface DEntryNativePrewarmPort {
   prewarm(
     context: RequestContext,
     identity: DEntryIdentity,
-    trigger: 'page' | 'input',
+    trigger: DEntryNativePrewarmTrigger,
     signal: AbortSignal,
     revoked: AbortSignal,
     plan?: PrewarmPlan,
@@ -87,6 +89,7 @@ export function createPrewarmOperations(
     identity: DEntryIdentity;
     sessionId: string;
     plan: PrewarmPlan;
+    foreground: boolean;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
     replies: number;
@@ -102,7 +105,9 @@ export function createPrewarmOperations(
   const pending = new Set<Promise<void>>();
   const lifetimeReleases = new Set<Promise<boolean>>();
   const active = (entry: Operation) =>
-    entry.state.state === 'accepted' || entry.state.state === 'starting';
+    entry.state.state === 'accepted' ||
+    entry.state.state === 'starting' ||
+    entry.state.state === 'restarting';
   const belongs = (
     entry: Operation,
     context: RequestContext,
@@ -140,9 +145,11 @@ export function createPrewarmOperations(
       plan: PrewarmPlan,
       authority: { revoked: AbortSignal; close(): Promise<void> },
       start: (signal: AbortSignal) => Promise<AbortSignal | void>,
+      trigger: DEntryNativePrewarmTrigger = 'page',
     ) {
       lifetime.throwIfAborted();
       authority.revoked.throwIfAborted();
+      const foreground = trigger === 'open';
       const now = Date.now();
       for (const [id, entry] of tickets) {
         if (entry.expires <= now) {
@@ -155,6 +162,8 @@ export function createPrewarmOperations(
           !entry.revoked.aborted &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
+          entry.plan.upgradeRestart === plan.upgradeRestart &&
+          (!plan.upgradeRestart || entry.foreground === foreground) &&
           (!plan.target.restoreRetained || entry.plan.target.restoreRetained) &&
           compatiblePrewarmGeneration(entry.plan.target, plan.target)
         ) {
@@ -186,6 +195,7 @@ export function createPrewarmOperations(
         identity,
         sessionId: context.sessionId,
         plan,
+        foreground,
         ticket,
         expires,
         replies: 0,
@@ -218,14 +228,21 @@ export function createPrewarmOperations(
       signal.addEventListener('abort', releaseExpired, { once: true });
       const task = Promise.resolve().then(async () => {
         let failed = false;
+        let explicitOpenRequired = false;
         try {
           signal.throwIfAborted();
-          operation.state = { state: 'starting' };
+          operation.state = {
+            state:
+              plan.upgradeRestart && foreground ? 'restarting' : 'starting',
+          };
           operation.proof = (await start(signal)) || undefined;
           operation.proof?.throwIfAborted();
           signal.throwIfAborted();
-        } catch {
+        } catch (error) {
           failed = true;
+          explicitOpenRequired =
+            error instanceof PersonVmError &&
+            error.code === 'UPGRADE_OPEN_REQUIRED';
         }
         if (!plan.assertTicketThread || failed || signal.aborted)
           failed = !(await operation.release()) || failed;
@@ -241,7 +258,11 @@ export function createPrewarmOperations(
           failed || signal.aborted || operation.proof?.aborted
             ? {
                 state: 'failed',
-                code: denied ? 'AUTHORITY_REVOKED' : 'START_UNAVAILABLE',
+                code: denied
+                  ? 'AUTHORITY_REVOKED'
+                  : explicitOpenRequired
+                    ? 'UPGRADE_OPEN_REQUIRED'
+                    : 'START_UNAVAILABLE',
               }
             : { state: 'ready' };
         discardUnpublished(operation);
@@ -281,6 +302,7 @@ export function createPrewarmOperations(
             !entry.revoked.aborted &&
             entry.closeJoin &&
             (entry.state.state === 'starting' ||
+              entry.state.state === 'restarting' ||
               entry.state.state === 'failed') &&
             entry.expires > Date.now()
           )

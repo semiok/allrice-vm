@@ -34,6 +34,8 @@ type Status =
   | 'warming'
   | 'accepted'
   | 'starting'
+  | 'restarting'
+  | 'restart-confirmation'
   | 'opening'
   | 'ready'
   | 'cancelled'
@@ -91,6 +93,7 @@ export function EmployeeNativePage({
   const [activation, setActivation] = useState<{
     query: string;
     confirmedQuery?: string;
+    foregroundOpen?: boolean;
     warmup?: EntryWarmup;
     ticket?: DEntryNativePrewarmTicket;
   }>({ query });
@@ -100,7 +103,9 @@ export function EmployeeNativePage({
   );
   const replace = useRef<(() => void) | undefined>(undefined);
   const cancel = useRef<(() => void) | undefined>(undefined);
-  const resume = useRef<(() => void) | undefined>(undefined);
+  const resume = useRef<((foregroundOpen?: boolean) => void) | undefined>(
+    undefined,
+  );
   const nextQuery = useRef(query);
   const lastPropQuery = useRef(query);
   if (lastPropQuery.current !== query) {
@@ -179,7 +184,7 @@ export function EmployeeNativePage({
       })());
     }
     function finish(
-      status: 'cancelled' | 'failed' | 'denied',
+      status: 'cancelled' | 'failed' | 'denied' | 'restart-confirmation',
       retainTicket = status === 'cancelled',
     ) {
       if (navigating || replace.current !== applyQuery) return;
@@ -273,11 +278,12 @@ export function EmployeeNativePage({
     };
     replace.current = applyQuery;
     cancel.current = () => finish('cancelled');
-    resume.current = () => {
+    resume.current = (foregroundOpen) => {
       const query = nextQuery.current;
       setActivation({
         query,
         confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+        foregroundOpen: query === activeQuery && foregroundOpen,
         ticket:
           resumable && query === activeQuery
             ? (ticket ?? activation.warmup?.progress.ticket)
@@ -423,14 +429,16 @@ export function EmployeeNativePage({
             progress.show = showPrewarm;
             if (progress.current) showPrewarm(progress.current);
             await result;
-          } else
-            await prewarmEmployeeEntry(selection, lifetime.signal, {
-              ticket,
-              accepted: (accepted) => {
-                ticket = accepted;
-              },
-              progress: showPrewarm,
-            });
+            return;
+          }
+          await prewarmEmployeeEntry(selection, lifetime.signal, {
+            ticket,
+            trigger: activation.foregroundOpen ? 'open' : 'page',
+            accepted: (accepted) => {
+              ticket = accepted;
+            },
+            progress: showPrewarm,
+          });
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -490,6 +498,11 @@ export function EmployeeNativePage({
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;
       if (!prepare) setFailed(true);
+      else if (
+        error instanceof EmployeeEntryError &&
+        error.code === 'UPGRADE_OPEN_REQUIRED'
+      )
+        finish('restart-confirmation');
       else
         finish(
           error instanceof EmployeeEntryError &&
@@ -545,7 +558,7 @@ export function EmployeeNativePage({
           stop={() => cancel.current?.()}
           retry={() => {
             if (initialUnavailable) location.reload();
-            else resume.current?.();
+            else resume.current?.(status === 'restart-confirmation');
           }}
         />
       )}
@@ -558,6 +571,8 @@ const messages = {
   warming: ['正在打开对话', '马上就好。'],
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  restarting: ['版本已更新，正在重新启动员工', '重启后会继续打开工作台。'],
+  'restart-confirmation': ['版本已更新', '打开员工工作台需要先重启员工。'],
   opening: ['工作台已就绪', '正在打开对话。'],
   failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
@@ -578,10 +593,16 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
+  const starting = [
+    'warming',
+    'accepted',
+    'starting',
+    'restarting',
+    'opening',
+  ].includes(status);
+  const resumable = ['cancelled', 'failed', 'restart-confirmation'].includes(
     status,
   );
-  const resumable = status === 'cancelled' || status === 'failed';
   return (
     <div className={styles.status}>
       <section>
@@ -604,7 +625,11 @@ function EntryStatus({
         )}
         {resumable && (
           <button type="button" disabled={!settled} onClick={retry}>
-            {status === 'cancelled' ? '继续' : '重试'}
+            {status === 'restart-confirmation'
+              ? '打开员工'
+              : status === 'cancelled'
+                ? '继续'
+                : '重试'}
           </button>
         )}
         {/* The existing employee selector accepts an empty value for the

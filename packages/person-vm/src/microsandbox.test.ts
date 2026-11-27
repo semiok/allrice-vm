@@ -366,6 +366,16 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     await f.service.start(f.rc, signal());
     const binding = await f.service.resolve(f.rc, signal());
     const fresh = f.reloadNative();
+    const config = join(f.mount, 'msb-config.json');
+    const saved = await readFile(config);
+    const statusStart = (await f.calls()).length;
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('running');
+    expect((await f.calls()).slice(statusStart)).toEqual([
+      ['list', '--format', 'json'],
+    ]);
+    expect(await readFile(config)).toEqual(saved);
     const guard = vi.fn(async () => undefined);
     const current = { binding, signal: signal(), assertCurrent: guard };
     const spec = { executable: 'node', args: ['journal-read-fixture'] };
@@ -386,6 +396,10 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(reads[2]).toContain('10s');
 
     await f.native.stop(binding, signal());
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('stopped');
+    expect(await readFile(config)).toEqual(saved);
     const stopped = (await f.calls()).length;
     await expect(
       fresh.readAttachedProbe(current, f.mount, spec),
