@@ -4,8 +4,8 @@ import { createServer } from 'node:http';
 import { finished } from 'node:stream/promises';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Schedule } from '@deepseek-ai/dsh-schedule/remote';
-import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
 import { afterEach, expect, it } from 'vitest';
+import { z } from 'zod';
 import {
   closeServer,
   listen,
@@ -13,6 +13,7 @@ import {
 import { setupNativeWebFixture } from './owner.native.fixture.js';
 
 const cli = process.env.ALLRICE_NATIVE_WEB_TEST_CLI;
+const wireArguments = z.record(z.string(), z.json());
 const roots: string[] = [];
 const cleanup: (() => Promise<void>)[] = [];
 
@@ -136,9 +137,13 @@ it.skipIf(!cli)(
       endpoint: keyof typeof Schedule.methods,
       args: Record<string, unknown>,
     ) {
-      if (!isRemoteJsonValue(args)) throw Error('Expected native wire JSON');
       const result = await scope.invokePage(
-        { kind: 'page', endpoint, scopeId: pageId, args },
+        {
+          kind: 'page',
+          endpoint,
+          scopeId: pageId,
+          args: wireArguments.parse(args),
+        },
         signal,
       );
       expect(result.endpoint).toBe(endpoint);
