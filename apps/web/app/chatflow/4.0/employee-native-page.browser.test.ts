@@ -170,13 +170,8 @@ suite('4.0 browser cold entry', () => {
               )!.text,
             );
         }
-        if (address.pathname === '/chatflow') {
-          if (!address.search)
-            return response.writeHead(307, { location: '/chatflow/4.0' }).end();
-          if (address.searchParams.get('employee') === '')
-            return html('<!doctype html><h1>员工</h1>');
-          return response.writeHead(404).end();
-        }
+        if (address.pathname === '/chatflow')
+          return response.writeHead(307, { location: '/chatflow/4.0' }).end();
         return html(
           '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
         );
@@ -446,12 +441,10 @@ suite('4.0 browser cold entry', () => {
       });
       await back.press('Enter');
       await returnPage.waitForURL(
-        (url) =>
-          url.pathname === '/chatflow' &&
-          url.searchParams.get('employee') === '',
+        (url) => url.pathname === '/chatflow/4.0' && !url.search,
       );
       await returnPage
-        .getByRole('heading', { name: '员工', exact: true })
+        .getByRole('heading', { name: '新建你的第一个员工', exact: true })
         .waitFor();
       await returnPage.close();
 

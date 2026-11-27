@@ -609,7 +609,7 @@ function EntryStatus({
         )}
         {/* The existing employee selector accepts an empty value for the
             default workspace view. Bare /chatflow reopens 4.0 on the trial host. */}
-        {status === 'failed' && <a href="/chatflow?employee=">返回员工页</a>}
+        {status === 'failed' && <a href="/chatflow/4.0">返回员工页</a>}
       </section>
     </div>
   );

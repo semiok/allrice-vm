@@ -146,7 +146,6 @@ export function proxy(request: NextRequest) {
       portal.kind === 'tenant' &&
       ((request.nextUrl.pathname.startsWith('/api/v1/admin') &&
         !tenantManagement) ||
-        request.nextUrl.pathname.startsWith('/chatflow/employees') ||
         request.nextUrl.pathname.startsWith('/employees'));
     if (tenantForbidden) {
       if (request.nextUrl.pathname.startsWith('/api/')) {
