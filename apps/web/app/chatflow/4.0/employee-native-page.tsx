@@ -171,6 +171,17 @@ export function EmployeeNativePage({
         },
       );
     }
+    function matchesDocument(url: string) {
+      const address = new URL(url);
+      const path = '/chatflow/4.0/document';
+      return (
+        address.origin === location.origin &&
+        ((address.pathname === path &&
+          address.searchParams.getAll('scopeId').length === 1 &&
+          address.searchParams.get('scopeId') === scopeId) ||
+          address.pathname.startsWith(path + '/' + scopeId + '/'))
+      );
+    }
     function retire() {
       return (replacing ??= (async () => {
         // A render change keeps the old iframe and its authenticated sender
@@ -195,7 +206,10 @@ export function EmployeeNativePage({
             if (
               win &&
               previous &&
-              (previous.URL === 'about:blank' || previous === retainedDocument)
+              (previous.URL === 'about:blank' ||
+                previous === retainedDocument ||
+                (matchesDocument(previous.URL) &&
+                  !Reflect.get(win, '__ALLRICE_EMPLOYEE_DOCUMENT__')))
             ) {
               discardingPendingDocument = true;
               win.stop();
@@ -256,14 +270,7 @@ export function EmployeeNativePage({
           return;
         }
         if (!doc) return failedDocument('unknown');
-        const address = new URL(doc.URL);
-        const path = '/chatflow/4.0/document';
-        const exact =
-          address.origin === location.origin &&
-          ((address.pathname === path &&
-            address.searchParams.getAll('scopeId').length === 1 &&
-            address.searchParams.get('scopeId') === scopeId) ||
-            address.pathname.startsWith(path + '/' + scopeId + '/'));
+        const exact = matchesDocument(doc.URL);
         const child = node.contentWindow as
           | (Window & { __ALLRICE_EMPLOYEE_DOCUMENT__?: { scopeId: string } })
           | null;
@@ -274,6 +281,7 @@ export function EmployeeNativePage({
           documentStarted = true;
           return;
         }
+        if (discardingPendingDocument && exact && !documentStarted) return;
         // The two authenticated document handlers return a JSON problem
         // before any owned document exists. An uninspectable or changed
         // document has no equivalent local completion proof.
