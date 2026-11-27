@@ -237,7 +237,10 @@ export function createAssignedNativeWebStartup(input: {
         // between the attempt completing and the waiter attaching.
         const changed = group.capacityChanged.signal;
         if ((await update(group, work)) !== 'wait-for-capacity') return;
-        const wake = AbortSignal.any([signal, changed]);
+        const exits = [...group.owners].flatMap(([id, owner]) =>
+          group.blockedEmployees.has(id) ? [] : [owner.jobExited],
+        );
+        const wake = AbortSignal.any([signal, changed, ...exits]);
         if (!wake.aborted) await once(wake, 'abort');
       }
     });
@@ -279,6 +282,30 @@ export function createAssignedNativeWebStartup(input: {
     ).endpoints.find(
       (entry) => entry.employeeInstanceId === employeeInstanceId,
     );
+  }
+  async function retireOneExitedEmployee(group: RunningGroup) {
+    for (const [id, owner] of group.owners) {
+      if (!owner.jobExited.aborted || group.blockedEmployees.has(id)) continue;
+      const endpoint = ownerEndpoint(group, id);
+      if (!endpoint) throw new PersonVmError('CLEANUP_INCOMPLETE');
+      try {
+        await retireEmployee(group, endpoint, owner, async () => {
+          const joined = owner.retireAfterJobExit(group.binding);
+          if (!joined) throw new PersonVmError('CLEANUP_INCOMPLETE');
+          await joined;
+        });
+        return true;
+      } catch (error) {
+        if (
+          !(error instanceof PersonVmError) ||
+          error.code !== 'CLEANUP_INCOMPLETE'
+        )
+          throw error;
+        // Keep this owner quarantined. Its exit signal must not spin a waiter
+        // or allow a different startup to borrow its still-unjoined slot.
+      }
+    }
+    return false;
   }
   function confirmArchive(group: RunningGroup, endpoint: Endpoint) {
     return input.archive?.confirm({
@@ -912,9 +939,11 @@ export function createAssignedNativeWebStartup(input: {
           await retireEmployee(group, prior, existing, () => joined);
           await scope.assertCurrent();
         }
-        // A waiter releases the allocator while retaining its cancellable
-        // admission. Capacity alone grants no right to close another owner.
-        if (employeeCapacityFull(group)) return 'wait-for-capacity';
+        if (
+          employeeCapacityFull(group) &&
+          (await retireOneExitedEmployee(group))
+        )
+          await scope.assertCurrent();
         // A roster can omit an occupied sibling. Only an exact committed
         // archive can retire a different employee under this allocation lock.
         const occupied = new Set(group.blockedEmployees.values());
@@ -946,6 +975,9 @@ export function createAssignedNativeWebStartup(input: {
             break;
           }
         }
+        // Preserve exact archived physical-slot reclaim before a capacity
+        // wait. Capacity alone grants no right to close another live owner.
+        if (employeeCapacityFull(group)) return 'wait-for-capacity';
         if (!slot) throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
         const endpoint = Object.freeze({ ...selected, ...slot });
         const profile = await input.readEmployeeProfile(signal);

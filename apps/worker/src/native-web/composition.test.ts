@@ -509,6 +509,90 @@ it('holds an unacknowledged start against the cap until exact stop and cancels i
     await f.service.close();
   }
 });
+it.each(['before queued', 'after queued', 'host join unknown'] as const)(
+  'only reclaims a naturally exited employee after exact local join: %s',
+  async (when) => {
+    const f = capacityFixture({ maxRunning: 2 });
+    const [first, sibling] = f.web.receipt.endpoints;
+    const next = { ...first!, employeeInstanceId: randomUUID() };
+    f.readRoster.mockResolvedValue({
+      ...f.binding,
+      digest: 'current-roster',
+      entries: [first!, sibling!, next],
+    });
+    const exit = new AbortController();
+    const joining = latch(),
+      joined = latch();
+    const firstOwner = {
+      ...catalogOwner(),
+      jobExited: exit.signal,
+      retireAfterJobExit: vi.fn(() => {
+        if (!exit.signal.aborted) return;
+        joining.resolve();
+        return joined.promise.then(() => {
+          if (when === 'host join unknown')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+        });
+      }),
+    };
+    const siblingOwner = catalogOwner(),
+      nextOwner = catalogOwner();
+    open
+      .mockResolvedValueOnce(firstOwner)
+      .mockResolvedValueOnce(siblingOwner)
+      .mockResolvedValueOnce(nextOwner);
+    const caller = new AbortController();
+    let pending: Promise<void> | undefined;
+    try {
+      await f.service.memoryGuestPlan(f.binding, signal(), f.web);
+      await f.service.start(f.binding, signal(), f.scope, f.web);
+      if (when === 'before queued') exit.abort();
+      pending = f.enroll(next, caller.signal);
+      void pending.catch(() => {});
+      if (when !== 'before queued') {
+        await vi.waitFor(() =>
+          expect(f.assertWebEndpoints).toHaveBeenCalledOnce(),
+        );
+        expect(firstOwner.retireAfterJobExit).not.toHaveBeenCalled();
+        exit.abort();
+      }
+      await joining.promise;
+      expect(f.bootstrap).not.toHaveBeenCalled();
+      expect(
+        f.service.catalog(f.binding, sibling!.employeeInstanceId).owner,
+      ).toBe(siblingOwner);
+      expect(firstOwner.close).not.toHaveBeenCalled();
+      joined.resolve();
+      if (when === 'host join unknown') {
+        const revoked = new Error('fixture cancelled demand');
+        caller.abort(revoked);
+        await expect(pending).rejects.toBe(revoked);
+        expect(() =>
+          f.service.catalog(f.binding, first!.employeeInstanceId),
+        ).toThrow('WEB_ENDPOINTS_PREPARING');
+        expect(f.bootstrap).not.toHaveBeenCalled();
+      } else {
+        await pending;
+        expect(f.bootstrap).toHaveBeenCalledOnce();
+        expect(
+          f.service.catalog(f.binding, next.employeeInstanceId).owner,
+        ).toBe(nextOwner);
+        expect(
+          f.service.owner(f.binding, first!.employeeInstanceId),
+        ).toBeUndefined();
+      }
+      expect(firstOwner.retireAfterJobExit).toHaveBeenCalledExactlyOnceWith(
+        f.binding,
+      );
+      expect(siblingOwner.close).not.toHaveBeenCalled();
+    } finally {
+      caller.abort();
+      joined.resolve();
+      await Promise.allSettled([pending]);
+      await f.service.close();
+    }
+  },
+);
 it.each([
   'live owner',
   'already exited',
@@ -553,7 +637,12 @@ it.each([
         return false;
       }),
     };
-    const f = fixture(undefined, undefined, { hotGuest, readRoster, archive });
+    const f = fixture(undefined, undefined, {
+      hotGuest,
+      readRoster,
+      archive,
+      ...(scenario === 'live owner' && { employeeRuntime: { maxRunning: 2 } }),
+    });
     const web = {
       ...f.web,
       receipt: { ...f.web.receipt, slots: f.web.receipt.slots!.slice(0, 2) },
@@ -1764,6 +1853,7 @@ function catalogOwner() {
   const revoked = new AbortController();
   return {
     revoked: revoked.signal,
+    jobExited: signal(),
     controlReady: vi.fn(() => true),
     readSessionsFor: vi.fn(),
     acquirePrincipal: vi.fn<NativeWebOwner['acquirePrincipal']>(() => {

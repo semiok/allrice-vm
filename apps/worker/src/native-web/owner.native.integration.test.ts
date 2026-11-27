@@ -1432,6 +1432,7 @@ it.skipIf(!cli)(
     disconnect.forEach((close) => close());
     await revoked;
     expect(f.owner.controlReady()).toBe(false);
+    expect(f.owner.jobExited.aborted).toBe(false);
     expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
     expect(f.waitSignal().aborted).toBe(false);
     expect(f.child.exitCode).toBeNull();
@@ -1488,6 +1489,7 @@ it.skipIf(!cli)(
     const revoked = once(f.owner.revoked, 'abort');
     disconnect.forEach((close) => close());
     await revoked;
+    expect(f.owner.jobExited.aborted).toBe(false);
     expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
     expect(f.waitSignal().aborted).toBe(false);
     expect(() =>
@@ -1496,9 +1498,10 @@ it.skipIf(!cli)(
         leaseEpoch: f.owner.binding.leaseEpoch + 1,
       }),
     ).toThrow('LEASE_LOST');
+    const exactExit = once(f.owner.jobExited, 'abort');
     f.child.kill('SIGKILL');
     await f.exited;
-    await new Promise<void>((done) => setImmediate(done));
+    await exactExit;
     await expect(f.owner.close()).rejects.toMatchObject({
       code: 'CLEANUP_INCOMPLETE',
     });
