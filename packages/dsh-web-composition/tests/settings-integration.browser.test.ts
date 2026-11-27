@@ -456,11 +456,9 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       await page.route('**/api/v1/auth/session', (route) =>
         route.fulfill({ status: 401 }),
       );
-      await page.route(host.origin + '/chatflow/4.0', (route) =>
-        route.fulfill({ status: 307, headers: { location: '/login' } }),
-      );
-      await page.route(host.origin + '/login', (route) =>
-        route.fulfill({ body: 'synthetic sign-in landing' }),
+      const entryUrl = host.origin + '/chatflow/4.0';
+      await page.route(entryUrl, (route) =>
+        route.fulfill({ body: 'synthetic 4.0 entry' }),
       );
       await page.goto(host.origin);
       await page.waitForFunction(() =>
@@ -595,7 +593,7 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         .getByText('当前密码不正确，或登录已过期。')
         .waitFor();
       await pane.getByRole('button', { name: '退出登录', exact: true }).click();
-      await page.waitForURL(host.origin + '/login');
+      await page.waitForURL(entryUrl);
     } finally {
       await context.close();
     }
