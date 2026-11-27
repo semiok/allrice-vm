@@ -395,6 +395,21 @@ suite(
         });
         return { entered, resume };
       }
+      function pauseAfterSuccessfulIssueRead() {
+        const { entered, resume } = gate();
+        const check = isCurrent.getMockImplementation()!;
+        isCurrent.mockImplementation(async (...args) => {
+          if (args[4] !== 'issue') return check(...args);
+          isCurrent.mockImplementation(check);
+          // Hold delivery of the real repeatable-read result to the handler.
+          const current = await check(...args);
+          expect(current).toBe(true);
+          entered.resolve();
+          await resume.promise;
+          return current;
+        });
+        return { entered, resume };
+      }
       function pauseAfterLeaseClaim() {
         const { entered, resume } = gate();
         const withLease = store.withLease.bind(store);
@@ -559,6 +574,7 @@ suite(
         pauseDispatch,
         pauseCreate,
         pauseBeforeIssue,
+        pauseAfterSuccessfulIssueRead,
         pauseAfterLeaseClaim,
         open,
         openTicket,
@@ -827,9 +843,13 @@ suite(
       },
     );
 
-    it.each(['same login', 'different login'] as const)(
-      'checks a cold POST prepared before the exact instance was saved by the %s',
-      async (login) => {
+    it.each([
+      ['same login', 'before issue'],
+      ['same login', 'after a successful issue read'],
+      ['different login', 'before issue'],
+    ] as const)(
+      'checks a cold POST prepared before the exact instance was saved by the %s (%s)',
+      async (login, timing) => {
         const f = await prewarmDeletionTarget();
         const entered = deferred<void>();
         const resume = deferred<void>();
@@ -844,7 +864,10 @@ suite(
             login === 'different login'
               ? (await createSession(f.personId)).token
               : undefined;
-          const paused = f.pauseBeforeIssue();
+          const paused =
+            timing === 'before issue'
+              ? f.pauseBeforeIssue()
+              : f.pauseAfterSuccessfulIssueRead();
           const opening = f.open();
           await Promise.race([
             paused.entered.promise,
@@ -890,70 +913,78 @@ suite(
       },
     );
 
-    it('rejects a delayed cold POST when its login only has a hot ticket for the instance started by another login', async () => {
-      const f = await prewarmDeletionTarget();
-      const proving = deferred<void>();
-      const resume = deferred<void>();
-      try {
-        const independent = (await createSession(f.personId)).token;
-        const paused = f.pauseBeforeIssue();
-        const opening = f.open();
-        await Promise.race([
-          paused.entered.promise,
-          opening.then((response) => {
-            throw Error(
-              'POST ended before its watch barrier: ' + response.status,
-            );
-          }),
-        ]);
-        const starter = await f.openTicket(independent);
-        const binding = await f.ready(starter, independent);
-        const healthy = await f.leaseRowVersion();
-        expect(healthy.lease_owner).toBeNull();
+    it.each(['before issue', 'after a successful issue read'] as const)(
+      'rejects a cold POST delayed %s when its login only has a hot ticket for the instance started by another login',
+      async (timing) => {
+        const f = await prewarmDeletionTarget();
+        const proving = deferred<void>();
+        const resume = deferred<void>();
+        try {
+          const independent = (await createSession(f.personId)).token;
+          const paused =
+            timing === 'before issue'
+              ? f.pauseBeforeIssue()
+              : f.pauseAfterSuccessfulIssueRead();
+          const opening = f.open();
+          await Promise.race([
+            paused.entered.promise,
+            opening.then((response) => {
+              throw Error(
+                'POST ended before its issue barrier: ' + response.status,
+              );
+            }),
+          ]);
+          expect(await store.read(f.personId)).toBeNull();
+          const starter = await f.openTicket(independent);
+          const binding = await f.ready(starter, independent);
+          const healthy = await f.leaseRowVersion();
+          expect(healthy.lease_owner).toBeNull();
 
-        const prove = f.proof.getMockImplementation()!;
-        f.proof.mockImplementationOnce(async (...args) => {
-          proving.resolve();
-          await resume.promise;
-          return prove(...args);
-        });
-        const hot = await f.openTicket();
-        await proving.promise;
-        expect(hot).not.toBe(starter);
-        expect(await f.status(hot)).toEqual({
-          status: 200,
-          json: { state: 'starting' },
-        });
+          const prove = f.proof.getMockImplementation()!;
+          f.proof.mockImplementationOnce(async (...args) => {
+            proving.resolve();
+            await resume.promise;
+            return prove(...args);
+          });
+          const hot = await f.openTicket();
+          await proving.promise;
+          expect(hot).not.toBe(starter);
+          expect(await f.status(hot)).toEqual({
+            status: 200,
+            json: { state: 'starting' },
+          });
 
-        paused.resume.resolve();
-        const delayed = await opening;
-        expect({ status: delayed.status, json: await delayed.json() }).toEqual(
-          expiredTicket,
-        );
-        // Hot proof precedes a call to the existing VM lifecycle in this fixture.
-        expect(f.dispatch).toHaveBeenCalledOnce();
-        expect(f.proof.mock.calls.map(([, , , current]) => current)).toEqual([
-          binding,
-          binding,
-        ]);
-        expect(await f.leaseRowVersion()).toEqual(healthy);
-        resume.resolve();
-        expect(await f.ready(hot)).toEqual(binding);
-        expect(await f.ready(starter, independent)).toEqual(binding);
-        expect(f.dispatch).toHaveBeenCalledTimes(2);
-        const [, employee, input] = f.dispatch.mock.calls[1]!;
-        expect(employee).toEqual(f.identity);
-        expect(input.target).toMatchObject({
-          vmId: binding.vmId,
-          instanceId: binding.instanceId,
-          leaseEpoch: binding.leaseEpoch,
-        });
-        expect(await f.leaseRowVersion()).toEqual(healthy);
-      } finally {
-        resume.resolve();
-        await f.close();
-      }
-    });
+          paused.resume.resolve();
+          const delayed = await opening;
+          expect({
+            status: delayed.status,
+            json: await delayed.json(),
+          }).toEqual(expiredTicket);
+          // Hot proof precedes a call to the existing VM lifecycle in this fixture.
+          expect(f.dispatch).toHaveBeenCalledOnce();
+          expect(f.proof.mock.calls.map(([, , , current]) => current)).toEqual([
+            binding,
+            binding,
+          ]);
+          expect(await f.leaseRowVersion()).toEqual(healthy);
+          resume.resolve();
+          expect(await f.ready(hot)).toEqual(binding);
+          expect(await f.ready(starter, independent)).toEqual(binding);
+          expect(f.dispatch).toHaveBeenCalledTimes(2);
+          const [, employee, input] = f.dispatch.mock.calls[1]!;
+          expect(employee).toEqual(f.identity);
+          expect(input.target).toMatchObject({
+            vmId: binding.vmId,
+            instanceId: binding.instanceId,
+            leaseEpoch: binding.leaseEpoch,
+          });
+          expect(await f.leaseRowVersion()).toEqual(healthy);
+        } finally {
+          resume.resolve();
+          await f.close();
+        }
+      },
+    );
 
     it.each(['issue', 'reuse', 'operation'] as const)(
       'uses the correct HTTP result when %s SQL sees revocation before its notification is handled',
