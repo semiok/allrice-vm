@@ -445,6 +445,7 @@ export function withNativeMemoryToolPublication(tool, version) {
     version.length > 256
   )
     throw Error('Invalid native memory tool registration');
+  const execute = tool.execute.bind(tool);
   const wrapped = {
     ...tool,
     async execute(args, exec) {
@@ -456,7 +457,7 @@ export function withNativeMemoryToolPublication(tool, version) {
       exec.signal.throwIfAborted();
       if (typeof ref !== 'string')
         throw Error('Native memory call unavailable');
-      return tool.execute(args, exec, ref);
+      return execute(args, exec, ref);
     },
   };
   witnessedNativeTools.add(wrapped);
@@ -587,8 +588,17 @@ export function observeNativePrompts(scope, lifetime, capture) {
   const turns = new WeakMap();
   const attempts = new WeakMap();
   const memoryAssemblies = new WeakMap();
-  const beforeMemoryAssembly = new WeakMap();
-  let toolRegistryRevision = 0;
+  const beforeMemoryAssembly = new Map();
+  const memoryTool = (agent, id) =>
+    original(scope.tools.get('mcp__allrice__' + id, agent));
+  const currentMemoryTools = (witness) =>
+    witness &&
+    !witness.changed &&
+    original(scope.agents.get(witness.agent.session.id)) ===
+      original(witness.agent) &&
+    witness.tools.memory_read === memoryTool(witness.agent, 'memory_read') &&
+    witness.tools.memory_remember ===
+      memoryTool(witness.agent, 'memory_remember');
   const inboxClaims = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
@@ -733,12 +743,26 @@ export function observeNativePrompts(scope, lifetime, capture) {
     { global: true },
   );
   if (capture) {
+    lifetime.addEventListener('abort', () => beforeMemoryAssembly.clear(), {
+      once: true,
+    });
+    scope.on(
+      'agent/disposed',
+      ({ agent }) => {
+        beforeMemoryAssembly.delete(original(agent.session));
+      },
+      { global: true },
+    );
     scope.on(
       'tools/change',
       () => {
-        toolRegistryRevision++;
+        // rc.2 broadcasts registry changes without a scope. Check only the
+        // two definitions visible to each active memory-capable attempt.
+        for (const witness of beforeMemoryAssembly.values()) {
+          if (!currentMemoryTools(witness)) witness.changed = true;
+        }
       },
-      { global: true },
+      { global: true, prepend: true },
     );
     scope.on(
       'system-prompt/assemble',
@@ -750,12 +774,16 @@ export function observeNativePrompts(scope, lifetime, capture) {
           original(scope.agents.get(agent.session.id)) === original(agent)
         ) {
           const session = original(agent.session);
+          const before = beforeMemoryAssembly.get(session);
           const tool = (id) => {
             const name = 'mcp__allrice__' + id;
             if (!assembly.tools.some((schema) => schema.name === name))
               return null;
-            const definition = original(scope.tools.get(name, agent));
-            return publishedMemoryTools.has(definition) ? definition : null;
+            const definition = before?.tools[id];
+            return currentMemoryTools(before) &&
+              publishedMemoryTools.has(definition)
+              ? definition
+              : null;
           };
           // One assembly per step. An unrelated/re-entrant assembly is not an
           // authority for this stream, even if it used the same wire schema.
@@ -782,7 +810,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
             step: frame.step,
             cursor: session.seq - 1,
             memoryTools: memoryAssemblies.get(session),
-            memoryToolRevision: beforeMemoryAssembly.get(session),
+            memoryToolWitness: beforeMemoryAssembly.get(session),
             calls: new Map(),
             dispatched: new Set(),
           });
@@ -806,8 +834,30 @@ export function observeNativePrompts(scope, lifetime, capture) {
       'session/event',
       (subject, event) => {
         const session = original(subject);
-        if (event.type === 'turn/start' || event.type === 'step/end')
-          beforeMemoryAssembly.set(session, toolRegistryRevision);
+        if (event.type === 'turn/start' || event.type === 'step/end') {
+          beforeMemoryAssembly.delete(session);
+          const agent = scope.agents.get(session.id);
+          if (
+            agent &&
+            original(agent.session) === session &&
+            capture() &&
+            !lifetime.aborted
+          ) {
+            const tools = {
+              memory_read: memoryTool(agent, 'memory_read'),
+              memory_remember: memoryTool(agent, 'memory_remember'),
+            };
+            if (
+              publishedMemoryTools.has(tools.memory_read) ||
+              publishedMemoryTools.has(tools.memory_remember)
+            )
+              beforeMemoryAssembly.set(session, {
+                agent,
+                tools,
+                changed: false,
+              });
+          }
+        }
         if (event.type === 'turn/end') beforeMemoryAssembly.delete(session);
         if (event.type === 'step/end' || event.type === 'turn/end') {
           attempts.delete(session);
@@ -901,6 +951,12 @@ export function observeNativePrompts(scope, lifetime, capture) {
           return false;
         sealedVersion = version;
         if (publishedMemoryTools.has(wrapped)) {
+          const toolId = wrapped.name.slice('mcp__allrice__'.length);
+          if (
+            !currentMemoryTools(attempt.memoryToolWitness) ||
+            attempt.memoryTools?.[toolId] !== wrapped
+          )
+            return false;
           const claimed = inboxClaims.get(session);
           if (
             claimed?.turn !== attempt.turn ||
@@ -929,7 +985,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 observers.has(observer.id) &&
                 attempts.get(session) === attempt &&
                 inboxClaims.get(session) === claimed &&
-                definition === original(scope.tools.get(exec.name, exec.agent))
+                currentMemoryTools(attempt.memoryToolWitness)
               )
                 return ref;
               return null;
@@ -1153,7 +1209,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
         session,
         toolSchemas,
         attempt?.id === attemptId &&
-          attempt.memoryToolRevision === toolRegistryRevision
+          currentMemoryTools(attempt.memoryToolWitness)
           ? attempt.memoryTools
           : null,
       );

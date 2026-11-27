@@ -508,6 +508,9 @@ it('only attests the sealed tool selected by this native prompt assembly, even w
     const versions = (id, schemas = [schema]) =>
       f.observe.memoryToolVersions(f.agent.session, id, schemas);
     expect(versions('active').memory_read).toBe('version-one');
+    tools.set('other-agent-tool', { name: 'other-agent-tool' });
+    f.events.emit('tools/change');
+    expect(versions('active').memory_read).toBe('version-one');
     expect(versions('other').memory_read).toBeNull();
     expect(
       versions('active', [{ ...schema, deferLoading: false }]).memory_read,
@@ -521,6 +524,10 @@ it('only attests the sealed tool selected by this native prompt assembly, even w
       type: 'step/end',
       data: { turn: 1, step: 1 },
     });
+    const versionTwo = tools.get(schema.name);
+    tools.set(schema.name, original);
+    f.events.emit('tools/change');
+    tools.set(schema.name, versionTwo);
     f.events.emit('tools/change');
     await assemble(assembly, { agent: f.agent }, async () => assembly);
     f.events.emit('agent/assistant-stream', {
@@ -533,6 +540,22 @@ it('only attests the sealed tool selected by this native prompt assembly, even w
       },
     });
     expect(versions('changed-during-assembly').memory_read).toBeNull();
+    f.events.emit('session/event', f.agent.session, {
+      type: 'step/end',
+      data: { turn: 1, step: 2 },
+    });
+    tools.set(schema.name, build('version-two'));
+    await assemble(assembly, { agent: f.agent }, async () => assembly);
+    f.events.emit('agent/assistant-stream', {
+      agent: f.agent,
+      frame: {
+        type: 'start',
+        attemptId: 'change-before-notification',
+        turn: 1,
+        step: 3,
+      },
+    });
+    expect(versions('change-before-notification').memory_read).toBeNull();
   } finally {
     f.lifetime.abort();
   }
@@ -819,11 +842,21 @@ it.each([false, true])(
       'fixture-release',
     );
     const sameName = withNativeToolEvidence({ ...tool }, 'different-release');
-    const f = promptFixture(true, new Map([[tool.name, tool]]));
+    const registry = new Map([[tool.name, tool]]);
+    const f = promptFixture(true, registry);
     const request = f.issue();
     const reader = f.open({ ...request, memoryCalls: memory });
     try {
       const text = 'synthetic original text';
+      if (memory) {
+        f.events.emit('session/event', f.agent.session, {
+          type: 'turn/start',
+          data: { turn: 1 },
+        });
+        const [assemble] = f.events.listeners('system-prompt/assemble');
+        const assembly = { tools: [tool] };
+        await assemble(assembly, { agent: f.agent }, async () => assembly);
+      }
       const message = {
         ...f.message(request),
         content: [{ type: 'text', text }],
@@ -851,13 +884,16 @@ it.each([false, true])(
       ).toBe('adopted');
       const faked = { id: 'short-circuit', name: tool.name, type: 'tool-call' };
       const actual = { id: 'real-body', name: tool.name, type: 'tool-call' };
+      const replaced = { ...actual, id: 'replacement-body' };
       const append = (type, seq, data) =>
         f.events.emit('session/event', f.agent.session, {
           type,
           seq,
           data: { turn: 1, step: 1, ...data },
         });
-      append('assistant/message', 7, { message: { content: [faked, actual] } });
+      append('assistant/message', 7, {
+        message: { content: [faked, actual, replaced] },
+      });
       f.events.emit('agent/assistant-stream', {
         agent: f.agent,
         frame: {
@@ -932,6 +968,17 @@ it.each([false, true])(
       }
       await executed;
       expect(runs).toBe(1);
+      if (memory) {
+        const replacement = withNativeMemoryToolPublication(
+          { ...tool },
+          'fixture-release',
+        );
+        registry.set(tool.name, replacement);
+        await expect(
+          invoke(replaced, (exec) => replacement.execute({}, exec)),
+        ).rejects.toThrow('Native memory call unavailable');
+        expect(runs).toBe(1);
+      }
     } finally {
       f.lifetime.abort();
       await reader.cancel();
