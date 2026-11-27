@@ -1061,49 +1061,57 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
     expect(source.readImmutableBundle).toHaveBeenCalledTimes(nativeReads * 2);
 
     const transientOwner = {};
-    const canceled = new AbortController();
     const firstStarted = deferred();
+    const denyFirst = deferred();
     const first = holdReleasedProfile(
       directory,
       {
         ...current,
         verificationOwner: transientOwner,
-        async readImmutableBundle(_reference, _bytes, signal) {
-          signal.throwIfAborted();
+        async readImmutableBundle() {
           firstStarted.resolve();
-          return new Promise((_, reject) =>
-            signal.addEventListener('abort', () => reject(signal.reason), {
-              once: true,
-            }),
-          );
-        },
-      },
-      canceled.signal,
-      manifestSha256,
-    );
-    const interrupted = expect(first).rejects.toHaveProperty(
-      'name',
-      'AbortError',
-    );
-    await firstStarted.promise;
-    const independentGraph = deferred();
-    const independent = holdReleasedProfile(
-      directory,
-      {
-        ...current,
-        verificationOwner: transientOwner,
-        async readImmutableGraph() {
-          independentGraph.resolve();
-          return native;
+          await denyFirst.promise;
+          throw Error('the first page lost its authority');
         },
       },
       lifetime,
       manifestSha256,
     );
-    await independentGraph.promise;
+    const denied = expect(first).rejects.toThrow('lost its authority');
+    await firstStarted.promise;
+    function otherScope(signal: AbortSignal) {
+      const graph = deferred();
+      return {
+        graph: graph.promise,
+        proof: holdReleasedProfile(
+          directory,
+          {
+            ...current,
+            verificationOwner: transientOwner,
+            async readImmutableGraph() {
+              graph.resolve();
+              return native;
+            },
+          },
+          signal,
+          manifestSha256,
+        ),
+      };
+    }
+    const canceled = new AbortController();
+    const waiting = otherScope(canceled.signal);
+    const interrupted = expect(waiting.proof).rejects.toHaveProperty(
+      'name',
+      'AbortError',
+    );
+    await waiting.graph;
     canceled.abort();
     await interrupted;
-    await expect(independent).resolves.toHaveProperty(
+    const independent = otherScope(lifetime);
+    await independent.graph;
+    denyFirst.resolve();
+    await denied;
+    await expect(independent.proof).resolves.toHaveProperty(
       'manifestSha256',
       manifestSha256,
     );

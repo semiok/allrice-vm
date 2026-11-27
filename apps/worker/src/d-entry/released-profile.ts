@@ -132,8 +132,22 @@ type Graph = z.infer<typeof DEntryProfileGraphSchema>;
 type Resource = { url: string; rev: string };
 const guestAttestations = new WeakMap<
   object,
-  { key: string; active: AbortSignal; verified: Promise<void> }
+  { key: string; verified: Promise<void> }
 >();
+async function waitForGuestProof(proof: Promise<void>, caller: AbortSignal) {
+  caller.throwIfAborted();
+  let cancel!: () => void;
+  const stopped = new Promise<never>((_, reject) => {
+    cancel = () => reject(caller.reason);
+    caller.addEventListener('abort', cancel, { once: true });
+  });
+  try {
+    await Promise.race([proof, stopped]);
+    caller.throwIfAborted();
+  } finally {
+    caller.removeEventListener('abort', cancel);
+  }
+}
 const parallelGuestEntries = 4;
 type SealedFiles = Map<string, Promise<Buffer>>;
 let loadedRelease: { key: string; files: SealedFiles } | undefined;
@@ -630,21 +644,22 @@ export async function holdReleasedProfile(
   for (;;) {
     active.throwIfAborted();
     const held = owner && guestAttestations.get(owner);
-    if (held?.key === key) {
+    if (owner && held?.key === key) {
       try {
-        await held.verified;
+        await waitForGuestProof(held.verified, active);
         break;
-      } catch (error) {
+      } catch {
         active.throwIfAborted();
-        if (!held.active.aborted) throw error;
-        // The originating request lost authority or disconnected. A different
-        // live page must prove the bytes with its own current scope.
+        // A rejected read may reflect the initiating page's authority rather
+        // than these bytes. Only successful equality is shared across scopes.
+        if (guestAttestations.get(owner) === held)
+          guestAttestations.delete(owner);
         continue;
       }
     }
     const verified = attestGuest();
     if (owner) {
-      const checking = { key, active, verified };
+      const checking = { key, verified };
       guestAttestations.set(owner, checking);
       void verified.catch(() => {
         if (guestAttestations.get(owner) === checking)
