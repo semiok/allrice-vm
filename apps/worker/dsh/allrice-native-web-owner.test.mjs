@@ -700,6 +700,7 @@ it('separates a native successful short circuit from entry into the sealed tool 
     },
     'fixture-release',
   );
+  const sameName = withNativeToolEvidence({ ...tool }, 'different-release');
   const f = promptFixture(true, new Map([[tool.name, tool]]));
   const request = f.issue();
   const reader = f.open(request);
@@ -760,7 +761,10 @@ it('separates a native successful short circuit from entry into the sealed tool 
       };
       return through(exec, () => next(exec));
     };
-    await invoke(faked, () => ({ isError: false }));
+    await invoke(faked, (exec) => {
+      expect(() => sameName.execute({}, exec)).toThrow();
+      return { isError: false };
+    });
     expect(runs).toBe(0);
     await invoke(actual, (exec) => tool.execute({}, exec));
     expect(runs).toBe(1);

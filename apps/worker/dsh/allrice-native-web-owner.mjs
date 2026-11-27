@@ -412,21 +412,24 @@ async function observePromptOrigins(
 // Version 1 covers ordered, exact text blocks only. No content or tool
 // arguments cross the owner carrier. An unsupported block has no proof.
 const nativeToolBodyClaims = new Map();
+const witnessedNativeTools = new WeakSet();
 
 // Only the exact, sealed registration may opt in. A successful around-dispatch
 // result, on its own, cannot mark entry into the registered implementation.
 export function withNativeToolEvidence(tool, version) {
   if (typeof version !== 'string' || !version || version.length > 256)
     throw Error('Native tool evidence requires a sealed version');
-  return {
+  const wrapped = {
     ...tool,
     execute(args, exec) {
       exec.signal.throwIfAborted();
-      if (!nativeToolBodyClaims.get(exec.token)?.(tool.name, version))
+      if (!nativeToolBodyClaims.get(exec.token)?.(wrapped, version))
         throw Error('Native tool invocation proof is unavailable');
       return tool.execute(args, exec);
     },
   };
+  witnessedNativeTools.add(wrapped);
+  return wrapped;
 }
 
 function adoptedTextDigest(message) {
@@ -696,8 +699,15 @@ export function observeNativePrompts(scope, lifetime, capture) {
           attempt.dispatched.has(callId)
         )
           return;
-        // More calls than can fit in the authenticated stream are unsupported.
-        if (attempt.calls.size >= 64) return;
+        const agent = scope.agents.get(session.id);
+        const definition = agent && original(scope.tools.get(name, agent));
+        // Unregistered names never occupy a pending witness slot. Ordinary
+        // result samples do not consume the opt-in tools' pending budget.
+        if (
+          !definition ||
+          (attempt.calls.size >= 64 && !witnessedNativeTools.has(definition))
+        )
+          return;
         attempt.calls.set(
           callId,
           attempt.calls.has(callId)
@@ -730,16 +740,17 @@ export function observeNativePrompts(scope, lifetime, capture) {
         call?.name !== exec.name ||
         !observer ||
         original(scope.agents.get(session.id)) !== original(exec.agent) ||
-        !observers.has(observer.id)
+        !observers.has(observer.id) ||
+        (observer.registryResult && !witnessedNativeTools.has(definition))
       )
         return next();
       attempt.calls.delete(exec.callId);
       attempt.dispatched.add(exec.callId);
       let sealedVersion;
       if (nativeToolBodyClaims.has(exec.token)) return next();
-      nativeToolBodyClaims.set(exec.token, (name, version) => {
+      nativeToolBodyClaims.set(exec.token, (wrapped, version) => {
         if (
-          name !== exec.name ||
+          wrapped !== definition ||
           sealedVersion ||
           exec.signal.aborted ||
           !capture() ||
