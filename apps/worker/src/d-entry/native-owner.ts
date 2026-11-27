@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type {
-  DEntryPrincipalIssue,
+  DEntryScopeIssue,
   DEntryPrincipalActivity,
 } from '@allrice/d-entry-principal/types';
 import {
@@ -18,6 +18,7 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { DataAccessError, getDEntryNativeRootPin } from '@allrice/database';
+import { nativeSessionRoot } from '@allrice/d-entry-principal/policy';
 
 const endpointSchema = z
   .object({
@@ -78,7 +79,7 @@ export type ResolvedDEntryNativeOwner = Readonly<{
    * fixed generated control scope. No browser-provided principal or grants. */
   acquirePrincipal(
     context: RequestContext,
-    input: DEntryPrincipalIssue,
+    input: DEntryScopeIssue,
     signal: AbortSignal,
   ): DEntryPrincipalActivity;
 }>;
@@ -212,28 +213,19 @@ export async function resolveDEntryNativeResource(input: {
   );
   if (entries.size !== catalog.items.length) return deny();
   const root = entries.get(pin.rootNativeSessionId);
-  if (!root || root.parentSessionId || root.origin === 'subagent')
+  if (
+    !root ||
+    root.parentSessionId !== pin.forkedFromNativeSessionId ||
+    root.origin === 'subagent'
+  )
     return deny();
-  function lineage(id: string) {
-    let cursor = entries.get(id);
-    if (!cursor) return;
-    const parent = cursor.parentSessionId ?? null;
-    const visited = new Set<string>();
-    while (cursor.sessionId !== pin.rootNativeSessionId) {
-      if (visited.has(cursor.sessionId) || !cursor.parentSessionId) return;
-      visited.add(cursor.sessionId);
-      cursor = entries.get(cursor.parentSessionId);
-      if (!cursor) return;
-    }
-    return { parent };
-  }
-  const resource = lineage(nativeSessionId);
   const currentSession = entries.get(nativeSessionId);
   if (
-    !resource ||
-    (input.requireLiveAgent && !currentSession?.agentAvailable) ||
+    !currentSession ||
+    nativeSessionRoot(entries, nativeSessionId) !== root ||
+    (input.requireLiveAgent && !currentSession.agentAvailable) ||
     (input.requireRunning &&
-      (!currentSession?.agentAvailable || !currentSession.running))
+      (!currentSession.agentAvailable || !currentSession.running))
   )
     return deny();
   // Re-read the actual business pin after the native read so a replacement
@@ -254,7 +246,11 @@ export async function resolveDEntryNativeResource(input: {
   signal.throwIfAborted();
   const grants = input.checkGrants;
   if (grants)
-    grants.checked(grants.nativeSessionIds.every((id) => !!lineage(id)));
+    grants.checked(
+      grants.nativeSessionIds.every(
+        (id) => nativeSessionRoot(entries, id) === root,
+      ),
+    );
   const facts = DEntryNativeResourceFactsSchema.parse({
     organizationId: identity.organizationId,
     personId: identity.personId,
@@ -262,10 +258,11 @@ export async function resolveDEntryNativeResource(input: {
     threadId: identity.threadId,
     nativeSessionId,
     rootNativeSessionId: pin.rootNativeSessionId,
-    parentNativeSessionId: resource.parent,
+    parentNativeSessionId:
+      currentSession === root ? null : currentSession.parentSessionId,
     bindingRef: owner.bindingRef,
   });
-  if (!input.requireLiveAgent || !currentSession) return facts;
+  if (!input.requireLiveAgent) return facts;
   let nativeAddress: SessionAddress;
   if (currentSession.origin === 'subagent') {
     if (!currentSession.parentSessionId) return deny();

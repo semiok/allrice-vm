@@ -31,7 +31,7 @@ const guestProgram = String.raw`
 import { networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { collectProfileArtifacts } from './collect-profile-artifacts.mjs';
-const [root, packageRoot, installAnchor] = process.argv.slice(2);
+const [root, packageRoot, installAnchor, terminalEnabled] = process.argv.slice(2);
 const addresses = (networkInterfaces().eth0 ?? []).filter(row => row.family === 'IPv4');
 const [entry] = addresses;
 const fields = entry?.address.split('.').map(Number);
@@ -47,6 +47,7 @@ await collectProfileArtifacts({
   packageRoot,
   installAnchor,
   host: entry.address,
+  terminalEnabled: terminalEnabled !== 'false',
 });
 `;
 
@@ -203,6 +204,7 @@ export function createEmployeeLinuxCapture(native, identity) {
             guestPackage,
             native.readonlyDshDirectory.guestDirectory +
               '/node_modules/@deepseek-ai/dsh/package.json',
+            String(identity.terminalEnabled ?? true),
           );
           phase = 'read-profile-bundles';
           const profileFile = join(output, 'profile-code.json');

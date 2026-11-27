@@ -1,5 +1,6 @@
 import { applyIndexInjections } from '@deepseek-ai/dsh-client-web';
 import {
+  EmployeeProfileBundleTimeout,
   nativeProfileDocument,
   readEmployeeDocument,
 } from '../../../apps/web/lib/d-entry/profile-browser';
@@ -26,8 +27,17 @@ const scope = globalThis as typeof globalThis & {
 };
 const initial = scope.__ALLRICE_EMPLOYEE_DOCUMENT__;
 const scopeId = initial?.scopeId ?? container?.dataset.scopeId;
-const fail = () =>
-  parent.postMessage({ type: pageStartupFailed, scopeId }, location.origin);
+const fail = (reason?: unknown) =>
+  parent.postMessage(
+    {
+      type: pageStartupFailed,
+      scopeId,
+      ...(reason instanceof EmployeeProfileBundleTimeout && {
+        reason: 'asset-timeout',
+      }),
+    },
+    location.origin,
+  );
 if (initial && !initial.claim()) initial.finish('closed');
 else if (initial && container) boot(container, initial);
 else {
@@ -72,7 +82,10 @@ function boot(
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
     installEmployeeDraftStorage(identity);
-    const document = nativeProfileDocument(container, close);
+    const document = nativeProfileDocument(container, close, (error) => {
+      fail(error);
+      close();
+    });
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
     scope.__ALLRICE_D_ENTRY_LIFETIME__ = document.signal;
@@ -92,8 +105,8 @@ function boot(
           { type: pageEditorMounted, scopeId },
           location.origin,
         );
-      if (result.state !== 'failed') return;
-      fail();
+      if (result.state !== 'failed' || closing) return;
+      fail(result.reason);
       close();
     });
   } catch {

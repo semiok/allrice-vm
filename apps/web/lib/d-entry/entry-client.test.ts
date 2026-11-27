@@ -153,7 +153,7 @@ it('keeps the New operation ID out of the prewarm selector and requires its exac
   vi.stubGlobal('fetch', fetch);
   await expect(
     prepareEmployeeEntry(input, new AbortController().signal, () => {}),
-  ).rejects.toMatchObject({ status: 403 });
+  ).rejects.toMatchObject({ status: 403, reason: 'response-mismatch' });
   expect(
     fetch.mock.calls.map(([path, options]) => [
       path,
@@ -169,6 +169,29 @@ it('keeps the New operation ID out of the prewarm selector and requires its exac
   expect(() =>
     employeeEntryQuery(query + '&workspaceId=' + selection.workspaceId, true),
   ).toThrow();
+});
+
+it('preserves the Worker authority refusal when the status response is HTTP 200', async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal(
+    'fetch',
+    vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ state: 'failed', code: 'AUTHORITY_REVOKED' }),
+      ),
+  );
+  const refused = expect(
+    prewarmEmployeeEntry(selection, new AbortController().signal, {
+      ticket: {
+        operationId: randomUUID(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        pollAfterMs: 1000,
+      },
+    }),
+  ).rejects.toMatchObject({ status: 403, reason: undefined });
+  await vi.advanceTimersByTimeAsync(1000);
+  await refused;
 });
 
 it('cannot dispatch creation after cancellation even if the HTTP prewarm resolves', async () => {
