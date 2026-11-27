@@ -74,6 +74,7 @@ type PromptOwner = NativeModelSelection &
     forkedFromNativeSessionId?: string;
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
+    assertObservedNow(): void;
     assertClaimed(
       signal: AbortSignal,
       occurrence: NativePromptOccurrence,
@@ -507,6 +508,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           active,
         );
         if (phase === 'seal') await scope.assertObserved(active);
+        else scope.assertObservedNow();
         active.throwIfAborted();
         if (
           !issued.executionRef ||
@@ -1035,6 +1037,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 requestId,
                 scopeId: issue.scopeId,
                 assertObserved: watch.assertObserved,
+                assertObservedNow: watch.assertObservedNow,
                 assertClaimed: observation.assertClaimed,
                 runId: randomUUID(),
               });

@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
-import { TextEncoder } from 'node:util';
+import { isDeepStrictEqual, TextEncoder } from 'node:util';
 import {
   createNativeRunTerminalAttestations,
   isNativeForkHeader,
@@ -464,17 +464,21 @@ export function withNativeMemoryToolPublication(tool, version) {
   return wrapped;
 }
 
-function readMemoryToolVersions(scope, session, toolNames) {
+function readMemoryToolVersions(scope, session, toolSchemas) {
   const agent = scope.agents.get(session.id);
-  if (!agent || original(agent.session) !== original(session) || !toolNames)
+  if (!agent || original(agent.session) !== original(session) || !toolSchemas)
     return null;
   const version = (toolId) => {
     const name = 'mcp__allrice__' + toolId;
-    return (
-      (toolNames.includes(name) &&
-        publishedMemoryTools.get(original(scope.tools.get(name, agent)))) ||
-      null
-    );
+    const found = toolSchemas.filter((schema) => schema.name === name);
+    const tool = original(scope.tools.get(name, agent));
+    const registered = tool && publishedMemoryTools.get(tool);
+    return registered &&
+      found.length === 1 &&
+      found[0].description === tool.description &&
+      isDeepStrictEqual(found[0].parameters, tool.parameters)
+      ? registered
+      : null;
   };
   return {
     memory_read: version('memory_read'),
@@ -518,7 +522,7 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
     request: request ?? null,
     human: null,
     ...(Array.isArray(config?.tools) && {
-      toolNames: config.tools.map(({ name }) => name),
+      toolSchemas: config.tools,
     }),
   };
   if (origin.delegated || !origin.prompts.length) return empty;
@@ -1668,7 +1672,7 @@ export function applyNativeWebOwner(
                       memoryToolVersions: readMemoryToolVersions(
                         scope,
                         found.session,
-                        origin.request.toolNames,
+                        origin.request.toolSchemas,
                       ),
                     },
                     inheritedPromptIndexes: origin.prompts.flatMap(

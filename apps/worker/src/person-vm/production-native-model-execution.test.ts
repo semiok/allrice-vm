@@ -91,6 +91,7 @@ beforeEach(() => {
         revoked: signal,
         close: vi.fn(async () => {}),
         assertObserved: vi.fn(async () => {}),
+        assertObservedNow: vi.fn(),
       }),
     );
 });
