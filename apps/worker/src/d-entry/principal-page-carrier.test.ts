@@ -1349,6 +1349,21 @@ it('uses actual DSH replies for create and fork registration on a page without a
     f.binding.vmId,
     'other',
   );
+  expect(f.findRoot).toHaveBeenCalledTimes(3);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('joins a fork from a registered ancestor but withholds registration after authority changes', async () => {
+  const f = await fixture(undefined, false, true);
+  const life = await open(f);
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
   f.host.catalog.items.push(summary('other-child', 'other'));
   f.findRoot.mockResolvedValueOnce(root).mockResolvedValueOnce(undefined);
   const lost = await f.invoke(life.scopeId, sessionToken, {
@@ -1362,7 +1377,11 @@ it('uses actual DSH replies for create and fork registration on a page without a
     f.binding.vmId,
     'other',
   );
-  expect(f.registerRoot).toHaveBeenCalledTimes(2);
+  expect(f.findRoot).toHaveBeenCalledTimes(2);
+  expect(f.registerRoot).not.toHaveBeenCalled();
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).toContain(
+    'native-forked',
+  );
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
