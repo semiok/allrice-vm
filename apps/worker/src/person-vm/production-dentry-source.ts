@@ -28,6 +28,7 @@ import {
 } from '../d-entry/native-data.js';
 import {
   currentDEntryNativeOwner,
+  DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
   type ResolvedDEntryNativeOwner,
 } from '../d-entry/native-owner.js';

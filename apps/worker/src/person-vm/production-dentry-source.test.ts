@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { PersonVmError } from '@allrice/person-vm';
 import type { RequestContext } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
@@ -104,6 +105,7 @@ function fixture() {
     },
   }));
   const resolveSendRoute = vi.fn(async () => route);
+  const confirmPhysical = vi.fn(async () => {});
   const signal = lifetime.signal;
   const participant = { participant: 'entry' };
   const admission = { participant: vi.fn(() => participant) };
@@ -151,6 +153,7 @@ function fixture() {
     startup: startup as unknown as Input['startup'],
     admission: admission as unknown as Input['admission'],
     lifetime: signal,
+    confirmPhysical,
     resolveSendRoute,
   });
   cleanup.push(source.close);
@@ -190,6 +193,7 @@ function fixture() {
     route,
     assertCurrent,
     readModels,
+    confirmPhysical,
     resolveSendRoute,
     owner,
     host,
@@ -239,6 +243,36 @@ it('publishes exact-generation readiness only after same Host artifact, native m
   await f.source.close();
   expect(f.uninstallProof).toHaveBeenCalledOnce();
   expect(currentDEntryNativeDataPort()).toBeUndefined();
+});
+
+it('requires the live physical proof even with the current employee already verified', async () => {
+  const f = fixture();
+  const uninstall = installDEntryNativeOwnerPort({
+    resolve: async () => f.owner,
+  });
+  try {
+    await f.prove();
+    f.confirmPhysical.mockRejectedValueOnce(
+      new PersonVmError('RUNTIME_NOT_READY'),
+    );
+    await expect(
+      f.port.confirmVerifiedEditor!(f.context, f.identity, f.signal),
+    ).resolves.toBeUndefined();
+    const ready = await f.port.confirmVerifiedEditor!(
+      f.context,
+      f.identity,
+      f.signal,
+    );
+    expect(ready?.binding).toEqual(f.binding);
+    expect(ready?.proof.aborted).toBe(false);
+    expect(f.confirmPhysical).toHaveBeenCalledWith(
+      f.context,
+      f.binding,
+      expect.any(AbortSignal),
+    );
+  } finally {
+    uninstall();
+  }
 });
 
 it('ties the selected prewarm proof to the revocation of the authenticated Host group', async () => {
