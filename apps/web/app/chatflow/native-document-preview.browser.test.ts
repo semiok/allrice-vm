@@ -1081,7 +1081,15 @@ suite('DSH native document previews', () => {
             image.evaluate((node: HTMLImageElement) => node.naturalWidth),
           )
           .toBeGreaterThan(500);
-        await image.hover();
+        const frame = await preview
+          .locator('[data-document-zoom-frame]')
+          .boundingBox();
+        expect(frame).not.toBeNull();
+        await page.mouse.move(
+          frame!.x + frame!.width / 2,
+          frame!.y + frame!.height - 20,
+        );
+        await preview.locator('[data-document-zoom-visible]').waitFor();
         const zoom = preview.getByRole('button', { name: '选择缩放比例' });
         await zoom.click();
         await page.getByRole('menuitem', { name: '150%', exact: true }).click();

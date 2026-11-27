@@ -254,7 +254,15 @@ suite(
           await fontNotice.waitFor();
           const viewport = preview.locator('[data-document-zoom-scrollport]');
           await viewport.waitFor();
-          await viewport.hover();
+          const frame = await preview
+            .locator('[data-document-zoom-frame]')
+            .boundingBox();
+          expect(frame).not.toBeNull();
+          await page.mouse.move(
+            frame!.x + frame!.width / 2,
+            frame!.y + frame!.height - 20,
+          );
+          await preview.locator('[data-document-zoom-visible]').waitFor();
           const zoom = preview.getByRole('button', { name: '选择缩放比例' });
           await zoom.click();
           await page
