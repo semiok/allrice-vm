@@ -248,6 +248,7 @@ suite(
           );
           await root(page).getByText(firstFile, { exact: true }).click();
           const preview = root(page);
+          const toolbar = preview.locator('header[aria-label="文件操作"]');
           const fontNotice = preview.getByRole('button', {
             name: '缺失 1 种字体，点击查看',
           });
@@ -288,9 +289,16 @@ suite(
               (call) => call.method === 'previewDeliverable',
             ).length;
           const before = await reads();
+          const metadataReads = async () =>
+            (await evidence(page)).calls.filter(
+              (call) =>
+                call.method === 'listDeliverables' &&
+                (call.input as { objectId?: string }).objectId === uid(300),
+            ).length;
+          const initialMetadataReads = await metadataReads();
 
           await page.evaluate(() => window.__panelDataFixture.holdFavorite());
-          await preview
+          await toolbar
             .getByRole('button', { name: '收藏', exact: true })
             .click();
           await expect
@@ -314,6 +322,7 @@ suite(
             .getByRole('alert')
             .filter({ hasText: '预览加载失败' });
           await warning.waitFor();
+          expect(await metadataReads()).toBe(initialMetadataReads + 1);
           const assertRetained = async (priorTop: number) => {
             const reading = await reader!.evaluate((node) => ({
               connected: node.isConnected,
@@ -346,9 +355,10 @@ suite(
           const footerTop = await reader!.evaluate((node) => node.scrollTop);
           await retry.click();
           await warning.waitFor({ state: 'hidden' });
-          await preview
+          await toolbar
             .getByRole('button', { name: '取消收藏', exact: true })
             .waitFor();
+          expect(await metadataReads()).toBe(initialMetadataReads + 2);
           await assertRetained(footerTop);
           await fontNotice.click();
           await missing.waitFor();
