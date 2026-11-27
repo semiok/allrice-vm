@@ -346,7 +346,7 @@ export function createDEntryHttpHandler(
         const mayPublish =
           threadOpen &&
           (await existing.recheck(context, identity, (mode) =>
-            verify(context, identity, existing.plan, signal, mode),
+            verify(context, identity, existing.plan, signal, mode, 'publish'),
           ));
         signal.throwIfAborted();
         if (!threadOpen) existing.assertNotRevoked();

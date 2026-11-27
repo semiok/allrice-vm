@@ -106,6 +106,8 @@ export interface DEntryNativePrewarmPort {
     plan: PrewarmPlan,
     signal: AbortSignal,
     mode: PrewarmVerificationMode,
+    /** A POST is about to publish its response, even if the original ticket is ready. */
+    purpose?: 'publish',
   ): Promise<boolean>;
   prewarm(
     context: RequestContext,
@@ -131,9 +133,9 @@ export const dEntryNativePrewarmPort: DEntryNativePrewarmPort = {
     if (!installed?.prepare) throw new DEntryNativeUnavailable();
     return installed.prepare(context, identity, signal);
   },
-  isCurrent(context, identity, plan, signal, mode) {
+  isCurrent(context, identity, plan, signal, mode, purpose) {
     if (!installed?.isCurrent) throw new DEntryNativeUnavailable();
-    return installed.isCurrent(context, identity, plan, signal, mode);
+    return installed.isCurrent(context, identity, plan, signal, mode, purpose);
   },
   prewarm(context, identity, trigger, signal, revoked, plan) {
     signal.throwIfAborted();
@@ -150,6 +152,7 @@ export function createPrewarmOperations(
     identity: DEntryIdentity;
     sessionId: string;
     plan: PrewarmPlan;
+    preparedTarget: PrewarmGeneration;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
     deadline: AbortSignal;
@@ -190,6 +193,30 @@ export function createPrewarmOperations(
     (!plan.orphanedInstanceId ||
       entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
     canSharePrewarmTarget(entry.plan, plan.target);
+  function ownsPreparedStart(entry: Operation, plan: PrewarmPlan) {
+    if (entry.plan.orphanedInstanceId !== plan.orphanedInstanceId) return false;
+    // The follow-up reuse check verifies this orphan's actual predecessor lease.
+    if (plan.orphanedInstanceId !== undefined) return true;
+
+    const requested = plan.target;
+    const origin = entry.preparedTarget;
+    const reservation = entry.plan.reservation;
+    const started = reservation?.instance;
+    // A delayed cold request needs a start that consumed its original target.
+    // A ticket issued against an already assigned instance only proves that instance.
+    return (
+      !plan.running &&
+      !entry.plan.running &&
+      requested.instanceId === null &&
+      origin.instanceId === null &&
+      !!started &&
+      started.personId === entry.identity.personId &&
+      started.organizationId === entry.identity.organizationId &&
+      compatiblePrewarmGeneration(origin, started) &&
+      (requested.vmId !== null || origin.vmId === null) &&
+      canSharePrewarmTarget({ target: origin, reservation }, requested)
+    );
+  }
   function discardUnpublished(entry: Operation) {
     if (entry.published || entry.replies || active(entry)) return;
     tickets.delete(entry.ticket.operationId);
@@ -224,8 +251,8 @@ export function createPrewarmOperations(
         prior
           ? entry.plan === prior
           : !expired(entry) &&
-            entry.plan.orphanedInstanceId === plan.orphanedInstanceId &&
-            sharesPending(entry, context, identity, plan),
+            sharesPending(entry, context, identity, plan) &&
+            ownsPreparedStart(entry, plan),
       );
       if (
         !entry ||
@@ -277,7 +304,8 @@ export function createPrewarmOperations(
             tickets.get(entry.ticket.operationId) === entry &&
             !expired(entry) &&
             !entry.revoked.aborted &&
-            belongs(entry, context, identity);
+            belongs(entry, context, identity) &&
+            (!!prior || ownsPreparedStart(entry, plan));
           const initial = mode();
           if (!initial || !live()) return;
           const verified = await verify(initial);
@@ -334,6 +362,7 @@ export function createPrewarmOperations(
         identity,
         sessionId: context.sessionId,
         plan,
+        preparedTarget: plan.target,
         ticket,
         expires,
         deadline,

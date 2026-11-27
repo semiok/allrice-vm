@@ -350,6 +350,7 @@ export function createDEntryNativePrewarmPort(input: {
     plan: PrewarmPlan,
     caller: AbortSignal,
     mode: PrewarmVerificationMode,
+    purpose?: 'publish',
   ) {
     const signal = AbortSignal.any([admission, caller]);
     signal.throwIfAborted();
@@ -360,7 +361,10 @@ export function createDEntryNativePrewarmPort(input: {
       plan.target.instanceId !== null && !plan.reservation?.instance;
     const stamp = await input.readCoordination?.(identity, context.sessionId);
     signal.throwIfAborted();
-    if (mode === 'issue' && stamp?.authorityRevision === null)
+    if (
+      (mode === 'issue' || purpose === 'publish') &&
+      stamp?.authorityRevision === null
+    )
       throw new DataAccessError('authorization_denied');
     if (
       !stamp?.authorityRevision ||

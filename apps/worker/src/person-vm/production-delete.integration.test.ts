@@ -385,12 +385,26 @@ suite(
       }
       function pauseBeforeIssue() {
         const { entered, resume } = gate();
+        const watchCurrent = watch.getMockImplementation()!;
         watch.mockImplementationOnce(async (...args) => {
-          const subscription = await dEntryHttpDefaults.watch(...args);
+          const subscription = await watchCurrent(...args);
           entered.resolve();
           await resume.promise;
           return subscription;
         });
+        return { entered, resume };
+      }
+      function pauseAfterLeaseClaim() {
+        const { entered, resume } = gate();
+        const withLease = store.withLease.bind(store);
+        vi.spyOn(store, 'withLease').mockImplementationOnce(
+          (person, options, work) =>
+            withLease(person, options, async (lease) => {
+              entered.resolve();
+              await resume.promise;
+              return work(lease);
+            }),
+        );
         return { entered, resume };
       }
       const proof = vi.fn<
@@ -525,6 +539,7 @@ suite(
         pauseDispatch,
         pauseCreate,
         pauseBeforeIssue,
+        pauseAfterLeaseClaim,
         open,
         openTicket,
         status,
@@ -855,70 +870,174 @@ suite(
       },
     );
 
-    it('returns the current authorization denial when issue SQL sees revocation before its notification is handled', async () => {
+    it('rejects a delayed cold POST when its login only has a hot ticket for the instance started by another login', async () => {
       const f = await prewarmDeletionTarget();
-      const feed = createDEntryAuthorityFeed(process.env.DATABASE_URL!);
-      const subscribe = feed.subscribe.bind(feed);
-      const blocked: (() => void)[] = [];
-      vi.spyOn(feed, 'subscribe').mockImplementation((listener, active) =>
-        subscribe(
-          {
-            ...listener,
-            changed(change) {
-              if (
-                change.table === 'allrice_memberships' &&
-                change.personId === f.personId
-              )
-                blocked.push(() => listener.changed(change));
-              else listener.changed(change);
-            },
-          },
-          active,
-        ),
-      );
-      f.watch.mockImplementation(
-        (context, selection, identity, signal, _feed, verify) =>
-          dEntryHttpDefaults.watch(
-            context,
-            selection,
-            identity,
-            signal,
-            feed,
-            verify,
-          ),
-      );
-      const productionCheck = dEntryHttpDefaults.prewarm.isCurrent!;
-      f.isCurrent.mockImplementation(async (...args) => {
-        const active = args[3];
-        if (args[4] === 'issue') {
-          const withdrawn =
-            await fixture.db`update allrice_memberships set active=false
-            where user_id=${f.personId} and organization_id=${f.owner.organizationId} and active
-            returning id`;
-          expect(withdrawn.length).toBeGreaterThan(0);
-          await feed.observeThroughCommit(active);
-          expect(blocked).toHaveLength(withdrawn.length);
-          expect(active.aborted).toBe(false);
-        }
-        return productionCheck(...args);
-      });
+      const proving = deferred<void>();
+      const resume = deferred<void>();
       try {
-        const response = await f.open();
-        expect(response.status).toBe(404);
-        expect(await response.json()).toMatchObject({
-          error: { code: 'RESOURCE_NOT_FOUND' },
+        const independent = (await createSession(f.personId)).token;
+        const paused = f.pauseBeforeIssue();
+        const opening = f.open();
+        await Promise.race([
+          paused.entered.promise,
+          opening.then((response) => {
+            throw Error(
+              'POST ended before its watch barrier: ' + response.status,
+            );
+          }),
+        ]);
+        const starter = await f.openTicket(independent);
+        const binding = await f.ready(starter, independent);
+        const healthy = await f.leaseRowVersion();
+        expect(healthy.lease_owner).toBeNull();
+
+        const prove = f.proof.getMockImplementation()!;
+        f.proof.mockImplementationOnce(async (...args) => {
+          proving.resolve();
+          await resume.promise;
+          return prove(...args);
         });
-        expect(f.dispatch).not.toHaveBeenCalled();
-        expect(await store.read(f.personId)).toBeNull();
+        const hot = await f.openTicket();
+        await proving.promise;
+        expect(hot).not.toBe(starter);
+        expect(await f.status(hot)).toEqual({
+          status: 200,
+          json: { state: 'starting' },
+        });
+
+        paused.resume.resolve();
+        const delayed = await opening;
+        expect({ status: delayed.status, json: await delayed.json() }).toEqual(
+          expiredTicket,
+        );
+        expect(f.dispatch).toHaveBeenCalledTimes(2);
+        expect(await f.leaseRowVersion()).toEqual(healthy);
+        resume.resolve();
+        expect(await f.ready(hot)).toEqual(binding);
+        expect(f.proof.mock.calls.map(([, , , current]) => current)).toEqual([
+          binding,
+          binding,
+        ]);
       } finally {
-        for (const notify of blocked) notify();
-        try {
-          await f.close();
-        } finally {
-          await feed.close();
-        }
+        resume.resolve();
+        await f.close();
       }
     });
+
+    it.each(['issue', 'reuse', 'operation'] as const)(
+      'uses the correct HTTP result when %s SQL sees revocation before its notification is handled',
+      async (mode) => {
+        const f = await prewarmDeletionTarget();
+        const feed = createDEntryAuthorityFeed(process.env.DATABASE_URL!);
+        const subscribe = feed.subscribe.bind(feed);
+        const blocked: (() => void)[] = [];
+        vi.spyOn(feed, 'subscribe').mockImplementation((listener, active) =>
+          subscribe(
+            {
+              ...listener,
+              changed(change) {
+                if (
+                  change.table === 'allrice_memberships' &&
+                  change.personId === f.personId
+                )
+                  blocked.push(() => listener.changed(change));
+                else listener.changed(change);
+              },
+            },
+            active,
+          ),
+        );
+        f.watch.mockImplementation(
+          (context, selection, identity, signal, _feed, verify) =>
+            dEntryHttpDefaults.watch(
+              context,
+              selection,
+              identity,
+              signal,
+              feed,
+              verify,
+            ),
+        );
+        const productionCheck = dEntryHttpDefaults.prewarm.isCurrent!;
+        f.isCurrent.mockImplementation(async (...args) => {
+          const active = args[3];
+          if (args[4] === mode) {
+            const withdrawn =
+              await fixture.db`update allrice_memberships set active=false
+                where user_id=${f.personId} and organization_id=${f.owner.organizationId} and active
+                returning id`;
+            expect(withdrawn.length).toBeGreaterThan(0);
+            await feed.observeThroughCommit(active);
+            expect(blocked).toHaveLength(
+              withdrawn.length * (mode === 'reuse' ? 2 : 1),
+            );
+            expect(active.aborted).toBe(false);
+          }
+          return productionCheck(...args);
+        });
+        async function expectDenied(response: Response) {
+          expect(response.status).toBe(404);
+          expect(await response.json()).toMatchObject({
+            error: { code: 'RESOURCE_NOT_FOUND' },
+          });
+        }
+        try {
+          if (mode === 'issue') {
+            await expectDenied(await f.open());
+            expect(f.dispatch).not.toHaveBeenCalled();
+            expect(await store.read(f.personId)).toBeNull();
+            return;
+          }
+
+          const prior = await f.ready(await f.openTicket());
+          nativeStates.set(prior.vmId, 'stopped');
+          // Emulate a prior worker loss before it published running. Its exact
+          // stopped instance, retained disk and port receipt are from real startup.
+          const orphaned =
+            await fixture.db`update person_virtual_machines set phase='starting'
+            where vm_id=${prior.vmId} and instance_id=${prior.instanceId} and phase='running'
+              and lease_epoch=${prior.leaseEpoch} and lease_owner is null
+            returning instance_id`;
+          expect(orphaned).toHaveLength(1);
+          const delayed = mode === 'reuse' ? f.pauseBeforeIssue() : undefined;
+          const opening = delayed && f.open();
+          if (delayed && opening)
+            await Promise.race([
+              delayed.entered.promise,
+              opening.then((response) => {
+                throw Error(
+                  'POST ended before its watch barrier: ' + response.status,
+                );
+              }),
+            ]);
+
+          const physical = f.pauseAfterLeaseClaim();
+          const original = await f.openTicket();
+          await physical.entered.promise;
+          expect(await f.row()).toMatchObject({
+            ...prior,
+            phase: 'starting',
+            leaseOwner: expect.any(String),
+          });
+          const claimed = await f.leaseRowVersion();
+          if (delayed && opening) {
+            delayed.resume.resolve();
+            await expectDenied(await opening);
+          } else {
+            expect(await f.status(original)).toEqual(expiredTicket);
+          }
+          expect(await f.leaseRowVersion()).toEqual(claimed);
+          expect(f.dispatch).toHaveBeenCalledTimes(2);
+        } finally {
+          for (const notify of blocked) notify();
+          try {
+            await f.close();
+          } finally {
+            await feed.close();
+          }
+        }
+      },
+    );
 
     it('does not issue a retained-disk ticket when an actual purge finishes during the prepared POST', async () => {
       const f = await prewarmDeletionTarget();
