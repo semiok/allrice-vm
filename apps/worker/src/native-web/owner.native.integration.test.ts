@@ -1777,19 +1777,21 @@ for (const method of [
       },
     );
 it.skipIf(!cli)(
-  '真实native control失联只撤可达资格，不重放；lifetime取消仍精确结束job并join',
+  '真实 native job 已退出时以原 wait 收口，关闭 owner 不再发 kill',
   { tags: [tag], timeout: 30000 },
   async () => {
     const f = await setup();
     const revoked = once(f.owner.revoked, 'abort');
     f.child.kill('SIGKILL');
     await revoked;
+    await f.exited;
+    await new Promise<void>((done) => setImmediate(done));
     expect(f.owner.controlReady()).toBe(false);
     await expect(
       f.owner.readSessions(new AbortController().signal),
     ).rejects.toBeDefined();
     await f.owner.close();
-    expect(f.kills()).toBe(1);
+    expect(f.kills()).toBe(0);
   },
 );
 
@@ -1964,6 +1966,9 @@ it.skipIf(!cli)(
     disconnect.forEach((close) => close());
     await revoked;
     expect(f.owner.controlReady()).toBe(false);
+    expect(f.owner.jobExited.aborted).toBe(false);
+    expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
+    expect(f.waitSignal().aborted).toBe(false);
     expect(f.child.exitCode).toBeNull();
     expect(f.kills()).toBe(0);
     await expect(
@@ -1971,6 +1976,113 @@ it.skipIf(!cli)(
     ).rejects.toBeDefined();
     await f.owner.close();
     expect(f.kills()).toBe(1);
+  },
+);
+it
+  .skipIf(!cli)
+  .each([
+    'history scope',
+    'unused terminal grant',
+    'unconfirmed owned PTY',
+  ] as const)(
+  'separates exact managed Web-job exit from remote resource closure after transport loss (%s)',
+  { tags: [tag], timeout: 30000 },
+  async (resource) => {
+    const create = NativeTransport.nativeWebTransport;
+    const disconnect: (() => void)[] = [];
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        const transport = create(...args);
+        return {
+          ...transport,
+          createWebSocket(input) {
+            const socket = transport.createWebSocket(input);
+            disconnect.push(() => socket.close());
+            return socket;
+          },
+        };
+      },
+    );
+    const f = await setup();
+    const active = new AbortController().signal;
+    const native = await f.owner.createRootFor(f.context, {}, active);
+    if (!native.ok) throw Error('The fixture root could not be created');
+    const issue = {
+      scopeId: randomUUID(),
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
+      },
+      root: {
+        nativeSessionId: native.value.sessionId,
+        rootOriginDigest: 'fixture-root-origin',
+        rootBindingRef: 'fixture-root-binding',
+      },
+    };
+    const ownsTerminal = resource === 'unconfirmed owned PTY';
+    const activity = f.owner.acquirePrincipal(
+      resource === 'history scope'
+        ? { ...issue, access: 'history' }
+        : {
+            scopeId: issue.scopeId,
+            identity: { ...issue.identity, threadId: null },
+            access: 'page',
+            terminalOwner: true,
+          },
+      active,
+      f.context,
+    );
+    const scope = await activity.run(active);
+    if (ownsTerminal) {
+      const id = randomUUID();
+      await expect(
+        scope.invokePage(
+          {
+            kind: 'page',
+            scopeId: issue.scopeId,
+            endpoint: 'terminal/create',
+            args: {
+              agentId: native.value.sessionId,
+              request: { id, cols: 80, rows: 24 },
+            },
+          },
+          active,
+        ),
+      ).resolves.toMatchObject({ value: { id, state: 'running' } });
+    }
+    const revoked = once(f.owner.revoked, 'abort');
+    disconnect.forEach((close) => close());
+    await revoked;
+    expect(f.owner.jobExited.aborted).toBe(false);
+    expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
+    expect(f.waitSignal().aborted).toBe(false);
+    expect(() =>
+      f.owner.retireAfterJobExit({
+        ...f.owner.binding,
+        leaseEpoch: f.owner.binding.leaseEpoch + 1,
+      }),
+    ).toThrow('LEASE_LOST');
+    const exactExit = once(f.owner.jobExited, 'abort');
+    f.child.kill('SIGKILL');
+    await f.exited;
+    await exactExit;
+    await expect(f.owner.close()).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    const joined = f.owner.retireAfterJobExit(f.owner.binding);
+    if (ownsTerminal) {
+      expect(joined).toBeUndefined();
+      // The test supplies the trusted stop hook separately from the job wait.
+      await f.owner.retireAfterNativeStop(f.owner.binding, active);
+    } else {
+      expect(joined).toBeDefined();
+      await joined;
+    }
+    expect(f.kills()).toBe(0);
+    expect(f.owner.controlReady()).toBe(false);
+    expect(scope.revoked.aborted).toBe(true);
   },
 );
 it.skipIf(!cli)(
@@ -2271,6 +2383,7 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
     } else {
       f.child.kill('SIGKILL');
       await f.exited;
+      await new Promise<void>((done) => setImmediate(done));
       await expect(f.owner.close()).rejects.toMatchObject({
         code: 'CLEANUP_INCOMPLETE',
       });
@@ -2282,7 +2395,7 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
       await f.owner.close();
     }
     expect(secondScope.revoked.aborted).toBe(true);
-    expect(f.kills()).toBe(1);
+    expect(f.kills()).toBe(mode === 'normal' ? 1 : 0);
   },
 );
 

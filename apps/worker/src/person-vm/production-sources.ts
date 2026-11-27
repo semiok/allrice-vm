@@ -110,11 +110,17 @@ export function createProductionPersonVmSources(
         lifetime.throwIfAborted();
         entry = installProductionDEntrySource({
           startup,
+          vm: host.vm,
           admission,
           lifetime,
           confirmPhysical: (context, identity, binding, active) =>
             host.current.withCurrentSelection(context, identity, active, () =>
-              host.vm.assertRunningReadiness(context, binding, active),
+              host.vm.assertRunningReadiness(
+                context,
+                binding,
+                active,
+                startup.slottedEntryReceipt(binding, identity, active),
+              ),
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);

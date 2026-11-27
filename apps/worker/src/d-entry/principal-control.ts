@@ -173,6 +173,9 @@ class Relay<T extends ScopeFrame | StreamFrame> {
     })();
     void this.done.catch(() => {});
   }
+  get acknowledgedClose() {
+    return this.closed;
+  }
   async next(): Promise<IteratorResult<T>> {
     while (true) {
       if (this.item) {
@@ -276,6 +279,7 @@ export function createDEntryPrincipalControl(
     DEntryPrincipalActivity & {
       local(): Promise<void>;
       fence(reason?: unknown): void;
+      hasUnconfirmedTerminalExit(): boolean;
     }
   >();
   const shutdown = new AbortController();
@@ -304,8 +308,12 @@ export function createDEntryPrincipalControl(
       const follows = new Map<string, AbortController>();
       let detachRun = () => {};
       let published = false;
+      let terminalDispatched = false;
       const opened = deferred<Extract<ScopeFrame, { type: 'opened' }>>();
       const activity = {
+        hasUnconfirmedTerminalExit() {
+          return terminalDispatched && !relay?.acknowledgedClose;
+        },
         fence(reason?: unknown) {
           revoked.abort(reason);
         },
@@ -416,6 +424,14 @@ export function createDEntryPrincipalControl(
                 }
                 let known = false;
                 try {
+                  // A lost create reply can still leave a native PTY. The
+                  // owning scope's closed frame means the Guest joined it.
+                  if (
+                    issue.access === 'page' &&
+                    issue.terminalOwner &&
+                    call.endpoint === 'terminal/create'
+                  )
+                    terminalDispatched = true;
                   const result = await TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].invoke(
@@ -695,6 +711,16 @@ export function createDEntryPrincipalControl(
       );
       if (results.some((result) => result.status === 'rejected'))
         throw unknown();
+    },
+    hasUnconfirmedTerminalExit() {
+      return [...activities].some((activity) =>
+        activity.hasUnconfirmedTerminalExit(),
+      );
+    },
+    async retireAfterJobExit() {
+      await control.drainLocal();
+      if (control.hasUnconfirmedTerminalExit()) throw unknown();
+      activities.clear();
     },
     async retireAfterNativeStop() {
       await control.drainLocal();

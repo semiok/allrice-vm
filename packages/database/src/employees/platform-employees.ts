@@ -58,6 +58,7 @@ import { frozenPackageSkills, validateSkillBundle } from '../skill-bundles.ts';
 import { getDatabase } from '../core/client.ts';
 import { assertCurrentPlatformSkillSources } from '../platform-content/retired-skills.ts';
 import { listEmployeeToolAvailability } from '../employee-administration.ts';
+import { captureNativeWebRosterChange } from './native-web-capacity.ts';
 import { synchronizeTenantEmployeeAccess } from '../tenant-employee-access.ts';
 import { requireTenantAdministrationAuthority } from '../tenant-administration.ts';
 import { isPlatformAdmin } from '../platform-authority.ts';
@@ -1729,6 +1730,47 @@ export async function materializePlatformEmployeeRevision(
       }
     }
     const tenantKey = materializedEmployeeKey(input.definition.key);
+    const [currentDeployment] = await transaction<
+      {
+        id: string;
+        active: boolean | null;
+        inherit_by_default: boolean | null;
+        status: string;
+      }[]
+    >`
+      select e.id,d.active,d.inherit_by_default,e.status from allrice_employees e
+      left join allrice_platform_employee_tenant_assignments d on d.tenant_employee_id=e.id
+        and d.organization_id=e.organization_id and d.workspace_id=e.workspace_id
+        and d.employee_id=${input.employeeId}
+      where e.organization_id=${workspace.organization_id}
+        and e.workspace_id=${workspace.id} and e.employee_key=${tenantKey}`;
+    const opensDeployment =
+      !currentDeployment?.active || currentDeployment.status !== 'active';
+    const willInherit =
+      currentDeployment?.inherit_by_default ?? input.inheritByDefault ?? true;
+    const prospectivePeople = opensDeployment
+      ? (
+          await transaction<{ user_id: string }[]>`
+          select distinct m.user_id from allrice_memberships m
+          join allrice_users u on u.id=m.user_id and u.status in ('active','disabled')
+          left join allrice_employee_assignments a on a.organization_id=m.organization_id
+            and a.workspace_id=${workspace.id} and a.user_id=m.user_id and a.employee_id=${currentDeployment?.id ?? null}
+          where m.organization_id=${workspace.organization_id} and m.active and m.role in ('admin','member')
+            and (m.workspace_id is null or m.workspace_id=${workspace.id})
+            and (a.selection_mode='include'
+              or (${willInherit} and coalesce(a.selection_mode,'inherit')='inherit'))
+        `
+        ).map(({ user_id }) => user_id)
+      : undefined;
+    const checkRoster = await captureNativeWebRosterChange(
+      transaction,
+      {
+        organizationId: workspace.organization_id,
+        workspaceId: workspace.id,
+        personIds: prospectivePeople,
+      },
+      opensDeployment ? { lockBeforeRead: true, whenEnabled: true } : {},
+    );
     const employees = await transaction<{ id: string }[]>`
       insert into allrice_employees (
         organization_id, workspace_id, employee_key, name, status
@@ -1788,9 +1830,20 @@ export async function materializePlatformEmployeeRevision(
         assigned_at = now(), updated_at = now()
     `;
 
-    await synchronizeTenantEmployeeAccess(transaction, {
-      organizationId: workspace.organization_id,
-      workspaceId: workspace.id,
+    await synchronizeTenantEmployeeAccess(
+      transaction,
+      {
+        organizationId: workspace.organization_id,
+        workspaceId: workspace.id,
+      },
+      {
+        employeeId: tenantEmployeeId,
+        newAssignmentPeople: prospectivePeople ?? [],
+      },
+    );
+    await checkRoster({
+      employeeId: tenantEmployeeId,
+      grantedPeople: new Set(prospectivePeople),
     });
     await transaction`
       delete from allrice_employee_dsh_skill_bindings

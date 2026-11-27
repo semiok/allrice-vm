@@ -181,6 +181,90 @@ export async function closeDEntryAuthorityFeeds() {
 }
 registerDatabaseCloseHook(closeDEntryAuthorityFeeds);
 
+/** Host-only notification hint. The receiver still proves a committed archive
+ * for its precise employee before taking any action on a native owner. */
+export async function subscribeDEntryEmployeeArchive(
+  scope: Pick<DEntryIdentity, 'organizationId' | 'personId'>,
+  changed: (employeeInstanceId: string | null) => Promise<void>,
+  signal: AbortSignal,
+) {
+  const pending = new Set<Promise<void>>();
+  let unsubscribe: (() => void) | undefined;
+  let retry: NodeJS.Timeout | undefined;
+  let closing = false;
+  const stopped = () => closing || signal.aborted;
+  function tracked(run: () => Promise<void>) {
+    const operation = Promise.resolve().then(run);
+    pending.add(operation);
+    void operation.then(
+      () => pending.delete(operation),
+      () => {
+        pending.delete(operation);
+        recover();
+      },
+    );
+  }
+  function recover() {
+    if (retry || stopped()) return;
+    retry = setTimeout(() => {
+      retry = undefined;
+      if (!stopped())
+        tracked(async () => {
+          await attach();
+          if (!stopped()) await changed(null); // Reconcile commits missed on the old feed.
+        });
+    }, 2000);
+    retry.unref();
+  }
+  async function attach() {
+    const stop = await defaultFeed().subscribe(
+      {
+        changed(change) {
+          if (
+            !stopped() &&
+            change.table === 'allrice_employee_instances' &&
+            change.organizationId === scope.organizationId &&
+            change.personId === scope.personId &&
+            change.id
+          ) {
+            const id = change.id;
+            tracked(() => changed(id));
+          }
+        },
+        lost: recover,
+      },
+      signal,
+    );
+    unsubscribe?.();
+    if (stopped()) stop();
+    else unsubscribe = stop;
+  }
+  await attach();
+  return async () => {
+    closing = true;
+    clearTimeout(retry);
+    unsubscribe?.();
+    await Promise.allSettled([...pending]);
+  };
+}
+
+export async function confirmDEntryEmployeeArchive(
+  identity: Omit<DEntryIdentity, 'threadId' | 'employeeVersionId'>,
+) {
+  const [row] = await getDatabase()<{ archived: boolean }[]>`
+    select exists (
+      select 1 from allrice_employee_instances i
+      join allrice_employee_instance_revisions r on r.instance_id=i.id
+      where i.id=${identity.employeeInstanceId}
+        and i.organization_id=${identity.organizationId}
+        and i.workspace_id=${identity.workspaceId}
+        and i.owner_id=${identity.personId}
+        and r.revision > ${identity.employeeRevision}
+        and r.operation='archive'
+    ) as archived`;
+  return row?.archived === true;
+}
+
 function affects(
   change: Change,
   context: RequestContext,
@@ -247,6 +331,13 @@ export type DEntryAuthorityObservation = Readonly<{
   subscribe(invalidate: () => void): () => void;
   observeThroughCommit(signal: AbortSignal): Promise<void>;
 }>;
+
+/** The original ticket observer was closed, independent of current authority. */
+export class DEntryTicketObserverClosed extends DataAccessError {
+  constructor() {
+    super('authorization_denied');
+  }
+}
 
 export type DEntryAuthoritySubscription = Readonly<{
   revoked: AbortSignal;
@@ -448,9 +539,9 @@ async function watchDEntryAuthority(
       },
       ...(ticketThread && {
         async assertTicketThread(active: AbortSignal) {
-          if (stopped) throw new DataAccessError('authorization_denied');
+          if (stopped) throw new DEntryTicketObserverClosed();
           await source.observeThroughCommit(AbortSignal.any([active, revoked]));
-          if (stopped) throw new DataAccessError('authorization_denied');
+          if (stopped) throw new DEntryTicketObserverClosed();
         },
       }),
       get expiresAt() {
