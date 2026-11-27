@@ -26,6 +26,7 @@ import {
   readNativeEmployeeMemoryOrdinal,
   rememberNativeEmployeeMemory,
   reconcileNativeEmployeeMemory,
+  restoreNativeEmployeeMemoryContext,
 } from './employee-memory-runtime.ts';
 import {
   getAdminEmployeeMemory,
@@ -66,6 +67,7 @@ export interface EmployeeMemoryModuleQualification {
  * closed; no host-supplied SQL or test assembly appears in these options. */
 export interface EmployeeMemoryPort {
   issueContext: typeof issueNativeEmployeeMemoryContext;
+  restoreContext: typeof restoreNativeEmployeeMemoryContext;
   readOrdinal: typeof readNativeEmployeeMemoryOrdinal;
   remember: typeof rememberNativeEmployeeMemory;
   reconcileRemember: typeof reconcileNativeEmployeeMemory;
@@ -209,6 +211,7 @@ export function createEmployeeMemoryPort(
 
   return {
     issueContext: issueNativeEmployeeMemoryContext,
+    restoreContext: restoreNativeEmployeeMemoryContext,
     readOrdinal: readNativeEmployeeMemoryOrdinal,
     async remember(context, target, input, signal) {
       const receipt = await rememberNativeEmployeeMemory(

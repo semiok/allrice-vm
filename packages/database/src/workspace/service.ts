@@ -75,7 +75,10 @@ import {
   insertMemoryRevision,
   type MemoryRow,
 } from './employee-memory-mutation.ts';
-import { requirePendingNativeMemorySource } from '../memory-native-source.ts';
+import {
+  requireLegacyMemorySessionSource,
+  requirePendingNativeMemorySource,
+} from '../memory-native-source.ts';
 import { assertEmployeeChatHumanSource } from '../employees/employee-chat-authority.ts';
 import { employeeAccessTransaction } from '../employees/employee-access-cancellation.ts';
 import { captureReferenceSelections } from '../reference-runtime.ts';
@@ -3031,16 +3034,7 @@ async function assertPendingMemorySource(
   if (await requirePendingNativeMemorySource(tx, context, scope, current))
     return;
   if (['message', 'checkpoint'].includes(current.source_type)) {
-    const [source] = await tx`select s.id from allrice_chat_sessions s
-      where s.organization_id=${scope.organizationId} and s.workspace_id=${scope.workspaceId}
-        and s.owner_id=${scope.ownerId} and coalesce(s.employee_instance_id,s.employee_assignment_id)=${scope.instanceId}
-        and s.archived_at is null
-        and ((${current.source_type}='message' and exists(select 1 from allrice_messages m
-          where m.id=${current.source_id} and m.organization_id=s.organization_id and m.workspace_id=s.workspace_id and m.owner_id=s.owner_id and m.session_id=s.id))
-          or (${current.source_type}='checkpoint' and exists(select 1 from allrice_context_checkpoints cp
-            where cp.id=${current.source_id} and cp.organization_id=s.organization_id and cp.workspace_id=s.workspace_id and cp.owner_id=s.owner_id and cp.session_id=s.id)))
-      for share of s`;
-    if (!source) throw new DataAccessError('authorization_denied');
+    await requireLegacyMemorySessionSource(tx, scope, current);
   } else if (current.source_type === 'file') {
     if (!current.source_id) throw new DataAccessError('not_found');
     await tx`select id from allrice_storage_objects where id=${current.source_id} and organization_id=${scope.organizationId} and workspace_id=${scope.workspaceId} for share`;

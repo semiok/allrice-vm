@@ -11,6 +11,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
+  EmployeePanelBody,
   EmployeePanelContent,
   EmployeePanelsEntries,
   useEmployeePanelsUnread,
@@ -23,7 +24,8 @@ const sessionId = container.dataset.nativeSessionId as SessionIdOf;
 const lifetime = new AbortController();
 Object.assign(globalThis, { __ALLRICE_D_ENTRY_LIFETIME__: lifetime.signal });
 const ctx = new Context();
-let openPanel: ((kind: 'files' | 'materials') => void) | undefined;
+type FixturePanel = 'files' | 'materials' | 'experience';
+let openPanel: ((kind: FixturePanel) => void) | undefined;
 // The independent BFF is exercised without starting a VM. Give the real
 // panel the same mounted-session value that its native Dock supplies.
 ctx.provide('sidebarRight', {
@@ -32,13 +34,14 @@ ctx.provide('sidebarRight', {
   openTab(id: string) {
     if (id === employeePanelKinds.files) openPanel?.('files');
     if (id === employeePanelKinds.materials) openPanel?.('materials');
+    if (id === employeePanelKinds.experience) openPanel?.('experience');
   },
 } as unknown as Context['sidebarRight']);
 const root = createRoot(container);
 ctx.inject(['allriceEmployeePanels'], (scope) => {
   const binding = scope.allriceEmployeePanels;
   function App() {
-    const [kind, setKind] = useState<'materials' | 'files'>('files');
+    const [kind, setKind] = useState<FixturePanel | null>('files');
     openPanel = setKind;
     const snapshot = useSyncExternalStore(
       (listener) => binding.port.subscribe(sessionId, listener),
@@ -58,7 +61,24 @@ ctx.inject(['allriceEmployeePanels'], (scope) => {
             />
           </nav>
         )}
-        {snapshot && (
+        <input aria-label="对话草稿" />
+        {snapshot && kind === 'experience' && (
+          <>
+            <button onClick={() => setKind(null)}>关闭记忆</button>
+            <EmployeePanelBody
+              {...({
+                ctx: scope,
+                binding,
+                sessionId,
+                kind,
+                useTabInfo: () => ({
+                  tab: { visible: true, signal: lifetime.signal },
+                }),
+              } as Parameters<typeof EmployeePanelBody>[0])}
+            />
+          </>
+        )}
+        {snapshot && kind && kind !== 'experience' && (
           <EmployeePanelContent
             key={kind}
             ctx={scope}

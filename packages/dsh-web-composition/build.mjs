@@ -81,7 +81,9 @@ ${js}
         return () => style.remove();
       });
       sidebar.apply(ctx);
+      const workbench = settings.bindEmployeeDocumentSettings(ctx);
       settings.apply(ctx, {
+        workbench,
         notifications: false,
         renderLauncher: sidebar.AllRiceSettingsLauncher,
       });

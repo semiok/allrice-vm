@@ -101,6 +101,18 @@ describe('native memory business boundary, with no production assembly', () => {
     };
     for (const action of [
       () => port.issueContext(context, target, live()),
+      () =>
+        port.restoreContext(
+          context,
+          {
+            workspaceId: target.workspaceId,
+            employeeInstanceId: target.employeeInstanceId,
+            threadId: target.threadId,
+            module: target.module,
+            b: stored.b,
+          },
+          live(),
+        ),
       () => port.readOrdinal(context, target, { number: 1 }, live()),
       () =>
         port.remember(

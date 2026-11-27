@@ -1,5 +1,5 @@
 /** Actual PG transactions, original memory writers and 990 caller lifecycle.
- * ONLY the missing module/B/call/human-source/restore producers are represented
+ * ONLY the missing module/B/call/human-source/first-admission producers are represented
  * by the explicitly named owner contract fixture below. Its relation and
  * private assembly mock are never installed in production or a public port. */
 import { randomUUID } from 'node:crypto';
@@ -17,6 +17,7 @@ import {
 import {
   AdoptedHumanSourceProjectionSchema,
   CurrentEmployeeBusinessProjectionSchema,
+  DefaultPartnerProfile,
   LogicalExecutionBindingProjectionSchema,
   RunMemoryContextV2StateSchema,
   renderMemoryDetailV2,
@@ -28,6 +29,12 @@ import {
 } from '@allrice/contracts';
 import { z } from 'zod';
 import * as client from './core/client.ts';
+import { contextCheckpointChecksum } from './conversation/conversation-checkpoint.ts';
+import {
+  createStorageMetadata,
+  DataAccessError,
+  markStorageReady,
+} from './data.ts';
 import {
   createEmployeeMemoryPort,
   EmployeeMemoryWriteOutcomeUnknown,
@@ -37,6 +44,12 @@ import {
   type NativeMemoryTarget,
 } from './employee-memory-runtime.ts';
 import { nativeMemorySource } from './memory-native-source.ts';
+import { readLockedNativeMemoryCurrent } from './memory-runtime-current.ts';
+import { withDedicatedCallerTransaction } from './business-runtime/caller-transaction.ts';
+import { readApplicationBuiltinModules } from './builtin-modules.ts';
+import { updateDEntryReleasePolicy } from './d-entry-release-policy.ts';
+import { authorizeFixturePlatformAdministrator } from './platform-authority.fixture.ts';
+import { approveSyntheticCurrentEmployeeExecution } from './current-execution.fixture.ts';
 import type * as MemoryRuntimeBinding from './memory-runtime-binding.ts';
 import {
   MemoryRuntimeModuleOriginSchema,
@@ -49,8 +62,17 @@ import {
   ensureBootstrapPortalPrincipal,
 } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
+import {
+  createEmployee,
+  manageEmployeeAssignments,
+  updateEmployeeStatus,
+} from './employees/employeehub.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
+import {
+  createChatSession,
+  ensureDefaultEmployee,
+  updateChatSession,
+} from './workspace/service.ts';
 import { insertEmployeeMemoryPair } from './workspace/employee-memory-mutation.ts';
 import type { EmployeeMemoryScope } from './workspace/employee-memory.ts';
 
@@ -120,7 +142,7 @@ type AuthorityRow = {
   facts: unknown;
   observations: unknown;
   revoked_sources: string[];
-  restore_expected: boolean;
+  first_allowed: boolean;
   source_revision: number;
 };
 
@@ -144,7 +166,7 @@ suite(
       execution_live boolean not null default true,
       revision integer not null default 1,config_ref text not null,
       facts jsonb not null,observations jsonb not null,
-      restore_expected boolean not null default false,reject_receipt boolean not null default false,receipt_gate text,commit_gate text,context_gate text)`;
+      first_allowed boolean not null default true,reject_receipt boolean not null default false,receipt_gate text,commit_gate text,context_gate text)`;
       await database.db`create table memory_runtime_source_contract_fixture(
       id uuid primary key references memory_runtime_owner_contract_fixture(id),
       source_allowed boolean not null default true,revoked_sources text[] not null default '{}',revision integer not null default 1)`;
@@ -408,17 +430,24 @@ suite(
           return { ...row, ...source! };
         };
         return {
-          current: async () => {
+          current: async () => this.projection(target, await read()),
+          firstContext: async (selector) => {
             const row = await read();
-            // A synthetic restore producer is explicit about its consistency
-            // requirement. No missing snapshot is silently granted fresh budget.
-            if (row.restore_expected) {
-              const [stored] =
-                await tx`select id from allrice_employee_memory_contexts
-              where organization_id=${this.scope.organizationId} and instance_id=${this.scope.instanceId} and budget_ref=${this.root.binding.b}`;
-              if (!stored) throw Error('fixture_restore_collection_incomplete');
-            }
-            return this.projection(target, row);
+            if (
+              !row.execution_live ||
+              !row.first_allowed ||
+              selector.workspaceId !== this.scope.workspaceId ||
+              selector.employeeInstanceId !== this.scope.instanceId ||
+              selector.threadId !== this.threadId ||
+              selector.nativeRequestRef !== this.rootRequest
+            )
+              throw new DataAccessError('authorization_denied');
+            const observations = z
+              .record(z.string(), ExecutionSchema)
+              .parse(row.observations);
+            return ExecutionSchema.parse(
+              observations[selector.nativeRequestRef],
+            );
           },
           actual: async (selector) => {
             const row = await read(),
@@ -474,6 +503,19 @@ suite(
       }
       issue(signal = live()) {
         return this.port.issueContext(this.context, this.target(), signal);
+      }
+      restore(signal = live(), b = this.root.binding.b) {
+        return this.port.restoreContext(
+          this.context,
+          {
+            workspaceId: this.scope.workspaceId,
+            employeeInstanceId: this.scope.instanceId,
+            threadId: this.threadId,
+            b,
+            module: memoryModule,
+          },
+          signal,
+        );
       }
       read(number: number, signal = live(), request = this.readRequest) {
         return this.port.readOrdinal(
@@ -551,7 +593,7 @@ suite(
           execution_live: boolean;
           config_ref: string;
           revoked_sources: string[];
-          restore_expected: boolean;
+          first_allowed: boolean;
           reject_receipt: boolean;
           receipt_gate: string | null;
           commit_gate: string | null;
@@ -589,7 +631,7 @@ suite(
       }
     }
 
-    async function setup(pairs: PersonalMemoryPair[] = []) {
+    async function setup(pairs: PersonalMemoryPair[] = [], custom = false) {
       const suffix = randomUUID();
       const principal = await ensureBootstrapPortalPrincipal({
         organizationSlug: `native-memory-${suffix}`,
@@ -598,17 +640,26 @@ suite(
         workspaceName: 'Default',
         email: `native-memory-${suffix}@example.test`,
         displayName: 'Owner',
-        role: 'member',
+        role: custom ? 'admin' : 'member',
       });
       const authenticated = (await authenticateSession(
         (await createSession(principal.user.id)).token,
         principal,
       ))!;
       const context = { ...authenticated, workspaceId: principal.workspaceId };
-      const assignment = await ensureDefaultEmployee(
-        context,
-        principal.workspaceId,
-      );
+      if (custom)
+        await authorizeFixturePlatformAdministrator(
+          database.db,
+          principal.user.id,
+        );
+      const assignment = custom
+        ? await createEmployee(context, {
+            workspaceId: principal.workspaceId,
+            name: 'Memory archive test employee',
+            description: 'Candidate write while the employee is archived',
+            partnerProfile: DefaultPartnerProfile,
+          })
+        : await ensureDefaultEmployee(context, principal.workspaceId);
       if (!assignment) throw Error('fixture_assignment_required');
       await ensureGeneralEmployeeInstance(database.db, assignment.id);
       const f = await new MissingProducerOwnerContractFixture(context, {
@@ -705,6 +756,223 @@ suite(
       return ids[0]!;
     }
 
+    it('reads current memory execution authority on the owner transaction and fences the real rollout writer until commit', async () => {
+      const f = await setup();
+      await authorizeFixturePlatformAdministrator(database.db, f.scope.ownerId);
+      approveSyntheticCurrentEmployeeExecution();
+      const policy = {
+        revision: 'selected-by-publisher',
+        defaultGeneration: '3.x' as const,
+        selections: [
+          {
+            organizationId: f.scope.organizationId,
+            personId: f.scope.ownerId,
+          },
+        ],
+      };
+      await updateDEntryReleasePolicy(f.context, policy);
+      const thread = await createChatSession(
+        f.context,
+        {
+          workspaceId: f.scope.workspaceId,
+          employeeInstanceId: f.scope.instanceId,
+          title: 'Memory current fence',
+        },
+        { executionGeneration: '4.0' },
+      );
+      const target = {
+        workspaceId: f.scope.workspaceId,
+        employeeInstanceId: f.scope.instanceId,
+        threadId: thread.id,
+        access: 'execute' as const,
+        module: memoryModule,
+      };
+      const modules = await readApplicationBuiltinModules('worker');
+      const run = <T>(work: (tx: Sql) => Promise<T>) =>
+        withDedicatedCallerTransaction(database.db, work, live());
+      const read = (tx: Sql) =>
+        readLockedNativeMemoryCurrent(tx, f.context, target, modules, live());
+      await expect(
+        run((tx) =>
+          readLockedNativeMemoryCurrent(
+            tx,
+            f.context,
+            { ...target, threadId: randomUUID() },
+            modules,
+            live(),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+      const reached = gate<number>();
+      const release = gate();
+      releases.push(() => release.resolve());
+      const caller = track(
+        run(async (tx) => {
+          expect(await read(tx)).toMatchObject({
+            scope: f.businessScope,
+            threadId: thread.id,
+            executionGeneration: '4.0',
+            module: memoryModule,
+          });
+          const [dbSession] = await tx<
+            { pid: number }[]
+          >`select pg_backend_pid() pid`;
+          reached.resolve(dbSession!.pid);
+          await release.promise;
+        }),
+      );
+      const callerPid = await Promise.race([
+        reached.promise,
+        caller.then(() => {
+          throw Error('current fence closed before it was observed');
+        }),
+      ]);
+      const applicationName = `memory-rollout-writer:${randomUUID().slice(0, 8)}`;
+      const writer = client.createDedicatedDatabase({
+        options: {
+          ...database.db.options,
+          connection: {
+            ...database.db.options.connection,
+            application_name: applicationName,
+          },
+        },
+      });
+      try {
+        vi.spyOn(client, 'getDatabase').mockReturnValueOnce(writer);
+        const withdraw = track(
+          updateDEntryReleasePolicy(f.context, {
+            ...policy,
+            selections: [],
+          }),
+        );
+        await expect
+          .poll(async () => {
+            const [blocked] = await database.db`
+            select 1 from pg_stat_activity
+            where application_name = ${applicationName}
+              and ${callerPid}=any(pg_blocking_pids(pid))
+          `;
+            return Boolean(blocked);
+          })
+          .toBe(true);
+        release.resolve();
+        await caller;
+        await withdraw;
+      } finally {
+        release.resolve();
+        await writer.end({ timeout: 2 });
+      }
+
+      await expect(run(read)).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+    });
+
+    it.each(['archive', 'assignment withdrawal'] as const)(
+      'commits the admitted candidate before real employee %s without a foreign-key lock inversion',
+      async (operation) => {
+        const f = await setup([], true);
+        const entered = gate();
+        const release = gate();
+        releases.push(() => release.resolve());
+        ownerFixture.assembly = {
+          current: f.current.bind(f),
+          async bind(...args) {
+            const reads = await f.bind(...args);
+            return {
+              ...reads,
+              async adopted(selector) {
+                const source = await reads.adopted(selector);
+                entered.resolve();
+                await release.promise;
+                return source;
+              },
+            };
+          },
+        };
+        const candidate = track(f.remember());
+        await Promise.race([
+          entered.promise,
+          candidate.then(() => {
+            throw Error('candidate returned before its insert was held');
+          }),
+        ]);
+
+        const applicationName = `memory-archive-writer:${randomUUID().slice(0, 8)}`;
+        const writer = client.createDedicatedDatabase({
+          options: {
+            ...database.db.options,
+            connection: {
+              ...database.db.options.connection,
+              application_name: applicationName,
+            },
+          },
+        });
+        const connection = vi
+          .spyOn(client, 'getDatabase')
+          .mockReturnValue(writer);
+        try {
+          const withdraw = track(
+            operation === 'archive'
+              ? updateEmployeeStatus(f.context, f.scope.employeeId, {
+                  workspaceId: f.scope.workspaceId,
+                  status: 'archived',
+                })
+              : manageEmployeeAssignments(f.context, {
+                  workspaceId: f.scope.workspaceId,
+                  employeeId: f.scope.employeeId,
+                  userIds: [],
+                }).then(() => undefined),
+          );
+          await expect
+            .poll(async () => {
+              const [blocked] = await database.db`
+            select 1 from pg_stat_activity
+            where application_name=${applicationName}
+            and ${f.pids[0]!}=any(pg_blocking_pids(pid))
+          `;
+              return Boolean(blocked);
+            })
+            .toBe(true);
+          release.resolve();
+          const outcomes = await Promise.allSettled([candidate, withdraw]);
+          expect(outcomes).toEqual([
+            {
+              status: 'fulfilled',
+              value: expect.objectContaining({
+                state: 'pending',
+                requiresConfirmation: true,
+              }),
+            },
+            { status: 'fulfilled', value: undefined },
+          ]);
+          connection.mockReturnValue(database.db);
+          expect(await effects(f)).toEqual({
+            memories: 1,
+            revisions: 1,
+            audits: 1,
+            operations: 1,
+          });
+          await expect(
+            f.remember({ summary: 'after withdrawal', details: null }),
+          ).rejects.toMatchObject({
+            code: 'authorization_denied',
+          });
+          expect(await effects(f)).toEqual({
+            memories: 1,
+            revisions: 1,
+            audits: 1,
+            operations: 1,
+          });
+        } finally {
+          connection.mockReturnValue(database.db);
+          release.resolve();
+          await writer.end({ timeout: 2 });
+        }
+      },
+    );
+
     it('pins the original adopted app version separately from current availability and config edits', async () => {
       const f = await setup([
         { summary: 'original pin', details: 'complete body' },
@@ -718,9 +986,9 @@ suite(
       });
       await f.change({
         config_ref: 'fixture-config-2',
-        restore_expected: true,
+        first_allowed: false,
       });
-      expect(await f.issue()).toBe(document);
+      expect(await f.restore()).toBe(document);
       expect((await f.state())!.module_release).toEqual(first.module_release);
       expect((await f.state())!.module_config_revision_ref).toBe(
         'fixture-config-1',
@@ -968,8 +1236,15 @@ suite(
     it('restores old B/pins and consumed UTF-8 budget across fresh dedicated sessions/config/edit, and never repairs a missing restore collection', async () => {
       const original = { summary: '原摘要😀', details: '原完整条件😀' },
         f = await setup([original]);
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      expect(await f.state()).toBeNull();
       const document = await f.issue(),
         initial = (await f.state())!;
+      await expect(f.restore(live(), 'different-B')).rejects.toThrow(
+        'fixture_stored_execution_denied',
+      );
       expect(await f.read(1)).toBe(renderMemoryDetailV2(1, original));
       const spent = (await f.state())!;
       const id = initial.state.pins[0]!.id,
@@ -1000,9 +1275,9 @@ suite(
       );
       await f.change({
         config_ref: 'fixture-config-2',
-        restore_expected: true,
+        first_allowed: false,
       });
-      expect(await f.issue()).toBe(document);
+      expect(await f.restore()).toBe(document);
       expect((await f.state())!.state).toEqual(spent.state);
       expect((await f.state())!.module_config_revision_ref).toBe(
         'fixture-config-1',
@@ -1014,14 +1289,212 @@ suite(
         spent.state.spentBytes +
           Buffer.byteLength(renderMemoryDetailV2(1, original), 'utf8'),
       );
+      await f.change({ execution_live: false });
+      const afterRead = await f.state();
+      expect(await f.restore()).toBe(document);
+      expect(await f.state()).toEqual(afterRead);
       await database.db`delete from allrice_employee_memory_contexts where id=${initial.id}`;
-      await expect(f.read(1)).rejects.toThrow(
-        'fixture_restore_collection_incomplete',
-      );
-      await expect(f.issue()).rejects.toThrow(
-        'fixture_restore_collection_incomplete',
-      );
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      await f.change({ execution_live: true });
+      await expect(f.read(1)).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      await expect(f.issue()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
       expect(await f.state()).toBeNull();
+    });
+
+    it.each([
+      ['a different original B', 'authorization_denied'],
+      ['a different original config', 'MEMORY_CONTEXT_UNAVAILABLE'],
+    ] as const)(
+      'rejects an owner reader returning %s for an existing context',
+      async (mismatch, code) => {
+        const f = await setup([{ summary: 'pinned', details: null }]);
+        await f.issue();
+        const before = await f.state();
+        const facts =
+          mismatch === 'a different original B'
+            ? { ...f.root, binding: { ...f.root.binding, b: 'other-B' } }
+            : { ...f.root, moduleConfigRevisionRef: 'other-config' };
+        await database.db`update memory_runtime_owner_contract_fixture
+        set facts=${database.db.json(facts)} where id=${f.id}`;
+        await expect(f.restore()).rejects.toMatchObject({ code });
+        expect(await f.state()).toEqual(before);
+      },
+    );
+
+    it('rechecks pinned source authority at dispatch after a concurrent revoke, without the original VM', async () => {
+      const f = await setup();
+      const candidate = await f.remember();
+      await f.port.confirm(f.context, await mutation(f, candidate.id), live());
+      const document = await f.issue();
+      await f.read(1);
+      await f.change({ execution_live: false, first_allowed: false });
+      const before = await f.state();
+      expect(await f.restore()).toBe(document);
+      const writer = await hold(
+        (tx) => tx`
+        update memory_runtime_source_contract_fixture
+        set source_allowed=false,revision=revision+1 where id=${f.id}
+      `,
+      );
+      try {
+        const dispatch = track(f.restore());
+        expect(await blockedBy(writer.pid)).toBe(f.pids.at(-1));
+        writer.release();
+        await writer.done;
+        await expect(dispatch).rejects.toThrow(
+          'fixture_actual_human_source_denied',
+        );
+        expect(await f.state()).toEqual(before);
+      } finally {
+        writer.release();
+        await writer.done;
+      }
+    });
+
+    it('refuses an issued context after the employee is archived through the real management writer', async () => {
+      const f = await setup(
+        [{ summary: 'before retirement', details: null }],
+        true,
+      );
+      const document = await f.issue();
+      await f.change({ execution_live: false, first_allowed: false });
+      expect(await f.restore()).toBe(document);
+      const issued = await f.state();
+      await updateEmployeeStatus(f.context, f.scope.employeeId, {
+        workspaceId: f.scope.workspaceId,
+        status: 'archived',
+      });
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      expect(await f.state()).toEqual(issued);
+    });
+
+    it.each(['message', 'checkpoint'] as const)(
+      'refuses a pinned legacy %s when its separate source conversation is archived',
+      async (sourceType) => {
+        const f = await setup();
+        const { workspaceId, organizationId, ownerId } = f.scope;
+        const session = await createChatSession(
+          f.context,
+          {
+            workspaceId,
+            employeeInstanceId: f.scope.instanceId,
+            title: 'Legacy source',
+          },
+          { executionGeneration: '3.x' },
+        );
+        const message = randomUUID();
+        await database.db`insert into allrice_messages(id,organization_id,workspace_id,session_id,owner_id,role,content)
+          values(${message},${organizationId},${workspaceId},${session.id},${ownerId},'user','{"text":"Legacy source","citations":[]}')`;
+        let sourceId = message;
+        if (sourceType === 'checkpoint') {
+          sourceId = randomUUID();
+          const checkpoint = {
+            sessionId: session.id,
+            harness: 'dsh' as const,
+            threadId: null,
+            generation: 1,
+            coveredThroughMessageId: message,
+            summaryVersion: 'extractive-v1' as const,
+            summary: 'Legacy source checkpoint',
+            configChecksum: `sha256:${'b'.repeat(64)}`,
+            estimatedTokens: 1,
+            messageCount: 1,
+          };
+          await database.db`insert into allrice_context_checkpoints(id,organization_id,workspace_id,session_id,owner_id,harness,thread_generation,covered_through_message_id,summary_version,summary,checksum,config_checksum,estimated_tokens,message_count)
+            values(${sourceId},${organizationId},${workspaceId},${session.id},${ownerId},'dsh',1,${message},${checkpoint.summaryVersion},${checkpoint.summary},${contextCheckpointChecksum(checkpoint)},${checkpoint.configChecksum},1,1)`;
+        }
+        await database.db.begin((tx) =>
+          insertEmployeeMemoryPair(
+            tx,
+            f.context,
+            f.scope,
+            { summary: 'Pinned legacy source', details: null },
+            {
+              sourceType,
+              sourceId,
+              sourceLabel: 'Previously confirmed',
+              trust: 'user_confirmed',
+              confidence: 1,
+              lifecycleState: 'durable',
+              memoryClass: 'work_note',
+            },
+          ),
+        );
+        const document = await f.issue();
+        expect(document).toContain('Pinned legacy source');
+        await f.change({ execution_live: false, first_allowed: false });
+        expect(await f.restore()).toBe(document);
+        const before = await f.state();
+        await updateChatSession(f.context, workspaceId, session.id, {
+          archived: true,
+        });
+        await expect(f.restore()).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        await f.change({ execution_live: true });
+        await expect(f.read(1)).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        expect(await f.state()).toEqual(before);
+      },
+    );
+
+    it('refuses a pinned file whose resource access expired without changing the memory row', async () => {
+      const f = await setup();
+      const id = randomUUID();
+      await createStorageMetadata(f.context, {
+        id,
+        workspaceId: f.scope.workspaceId,
+        category: 'uploads',
+        mediaType: 'text/plain',
+        sizeBytes: 1,
+        checksum: `sha256:${'f'.repeat(64)}`,
+        visibility: 'private',
+        retentionUntil: null,
+        immutable: false,
+      });
+      await markStorageReady(f.context, id);
+      await database.db.begin((tx) =>
+        insertEmployeeMemoryPair(
+          tx,
+          f.context,
+          f.scope,
+          { summary: 'Pinned file source', details: null },
+          {
+            sourceType: 'file',
+            sourceId: id,
+            sourceLabel: 'Previously confirmed',
+            trust: 'user_confirmed',
+            confidence: 1,
+            lifecycleState: 'durable',
+            memoryClass: 'work_note',
+          },
+        ),
+      );
+      const document = await f.issue();
+      expect(document).toContain('Pinned file source');
+      await f.change({ execution_live: false, first_allowed: false });
+      expect(await f.restore()).toBe(document);
+      const before = await f.state();
+      await database.db`update allrice_storage_objects
+        set created_at=clock_timestamp()-interval '2 minutes',
+          retention_until=clock_timestamp()-interval '1 minute' where id=${id}`;
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      await f.change({ execution_live: true });
+      await expect(f.read(1)).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      expect(await f.state()).toEqual(before);
     });
 
     it('shares root/child allowance, charges complete repeated reads and refuses the thirteenth without reset', async () => {

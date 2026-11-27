@@ -67,7 +67,7 @@ export function subscribeEmployeePanels(
 export function assertEmployeePanelsCurrent(
   binding: EmployeePanelsBinding,
   sessionId: SessionIdOf,
-  snapshot: EmployeePanelsSnapshot,
+  snapshot: Pick<EmployeePanelsSnapshot, 'scopeKey'>,
   signal: AbortSignal = binding.signal,
 ) {
   if (

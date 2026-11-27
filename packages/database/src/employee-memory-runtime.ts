@@ -10,6 +10,7 @@ import {
   CurrentEmployeeBusinessProjectionSchema,
   BuiltinEmployeeModuleRequirementProjectionSchema,
   LogicalExecutionBindingProjectionSchema,
+  OriginalExecutionSelectorProjectionSchema,
   OrdinaryOriginClassificationProjectionSchema,
   PersonalMemoryPairSchema,
   RememberPersonalMemoryInputSchema,
@@ -35,12 +36,14 @@ import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
 import {
   issueMemoryContextStorage,
   readMemoryContextStorageOrdinal,
+  restoreMemoryContextStorage,
   type MemoryContextStorageDraft,
 } from './memory-context-store.ts';
 import {
   memoryBusinessScope,
   nativeMemoryMetadataKey,
   nativeMemorySource,
+  requireLegacyMemorySourceForDispatch,
   requireStoredNativeMemorySource,
   sameMemoryBusinessScope,
   sourceMetadata,
@@ -78,6 +81,11 @@ export const NativeMemoryTargetSchema =
     module: memoryModule,
   }).strict();
 export type NativeMemoryTarget = z.input<typeof NativeMemoryTargetSchema>;
+const NativeMemoryRestoreTargetSchema =
+  OriginalExecutionSelectorProjectionSchema.extend({ module: memoryModule });
+type NativeMemoryRestoreTarget = z.input<
+  typeof NativeMemoryRestoreTargetSchema
+>;
 export const NativeMemoryReconcileTargetSchema =
   StoredHumanSourceSelectorProjectionSchema.extend({
     module: memoryModule,
@@ -118,6 +126,7 @@ const ExecutionFactSchema = z
 function currentTarget(
   target:
     | z.output<typeof NativeMemoryTargetSchema>
+    | z.output<typeof NativeMemoryRestoreTargetSchema>
     | z.output<typeof NativeMemoryReconcileTargetSchema>,
 ): EmployeeBusinessTargetProjection {
   return {
@@ -248,6 +257,7 @@ async function caller<T>(
   target: EmployeeBusinessTargetProjection,
   signal: AbortSignal,
   work: (bound: BoundMemory) => Promise<T>,
+  scopeLock: true | 'read' = true,
 ) {
   signal.throwIfAborted();
   const assembly = requireMemoryRuntimeAssembly();
@@ -267,7 +277,7 @@ async function caller<T>(
         target.workspaceId,
         target.employeeInstanceId,
         tx,
-        true,
+        scopeLock,
       );
       const reads = await assembly.bind(tx, context, target, signal);
       const current = requireCurrent(context, target, await reads.current());
@@ -291,7 +301,11 @@ async function caller<T>(
     signal,
   );
 }
-function qualifier(bound: BoundMemory, signal: AbortSignal) {
+function qualifier(
+  bound: BoundMemory,
+  signal: AbortSignal,
+  disclosureContext?: RequestContext,
+) {
   return async (origin: {
     source_type: string;
     source_id: string | null;
@@ -312,13 +326,20 @@ function qualifier(bound: BoundMemory, signal: AbortSignal) {
     )
       return denied();
     if (fact.excludedByMethodAuthoring) return false;
-    if (nativeMemorySource(origin.metadata))
-      await requireStoredNativeMemorySource(
-        bound.reads,
+    const native = await requireStoredNativeMemorySource(
+      bound.reads,
+      bound.scope,
+      origin,
+      signal,
+    );
+    if (disclosureContext && !native)
+      await requireLegacyMemorySourceForDispatch(
+        bound.tx,
+        disclosureContext,
         bound.scope,
         origin,
-        signal,
       );
+    signal.throwIfAborted();
     return true;
   };
 }
@@ -326,6 +347,7 @@ async function executionFor(
   bound: BoundMemory,
   target: z.output<typeof NativeMemoryTargetSchema>,
   signal: AbortSignal,
+  read: 'actual' | 'firstContext' = 'actual',
 ) {
   const selector = ActualNativeExecutionSelectorProjectionSchema.parse({
     workspaceId: target.workspaceId,
@@ -336,7 +358,7 @@ async function executionFor(
   const execution = requireExecution(
     bound.scope,
     currentTarget(target),
-    await bound.reads.actual(selector),
+    await bound.reads[read](selector),
   );
   signal.throwIfAborted();
   return execution;
@@ -347,6 +369,36 @@ function storageKey(bound: BoundMemory, execution: MemoryRuntimeExecution) {
     threadId: execution.binding.threadId,
     budgetRef: execution.binding.b,
   };
+}
+function contextOrigin(
+  execution: MemoryRuntimeExecution,
+): MemoryContextStorageDraft['origin'] {
+  return {
+    executionGeneration: '4.0',
+    nativeOwnerRef: execution.nativeOwnerRef,
+    nativeProfileRef: execution.nativeProfileRef,
+    rootNativeSessionRef: execution.binding.rootSessionRef,
+    moduleRelease: execution.moduleOrigin,
+    moduleConfigRevisionRef: execution.moduleConfigRevisionRef,
+  };
+}
+function requireRootContext(execution: MemoryRuntimeExecution) {
+  if (
+    execution.binding.nativeCall !== null ||
+    execution.parentSessionRef !== null ||
+    execution.nativeSessionRef !== execution.binding.rootSessionRef
+  )
+    return denied();
+}
+function requireOriginalContextOrigin(
+  origin: MemoryContextStorageDraft['origin'],
+  execution: MemoryRuntimeExecution,
+) {
+  if (
+    runtimePolicyDigest(origin) !==
+    runtimePolicyDigest(contextOrigin(execution))
+  )
+    return unavailable();
 }
 async function draft(
   bound: BoundMemory,
@@ -397,14 +449,7 @@ async function draft(
   const bytes = Buffer.byteLength(document, 'utf8');
   if (bound.current.module.kind !== 'builtin') return denied();
   return {
-    origin: {
-      executionGeneration: '4.0',
-      nativeOwnerRef: execution.nativeOwnerRef,
-      nativeProfileRef: execution.nativeProfileRef,
-      rootNativeSessionRef: execution.binding.rootSessionRef,
-      moduleRelease: execution.moduleOrigin,
-      moduleConfigRevisionRef: execution.moduleConfigRevisionRef,
-    },
+    origin: contextOrigin(execution),
     document,
     state: RunMemoryContextV2StateSchema.parse({
       schemaVersion: 2,
@@ -433,12 +478,13 @@ export async function issueNativeEmployeeMemoryContext(
     currentTarget(target),
     signal,
     async (bound) => {
-      const execution = await executionFor(bound, target, signal);
-      if (
-        execution.parentSessionRef !== null ||
-        execution.nativeSessionRef !== execution.binding.rootSessionRef
-      )
-        return denied();
+      const execution = await executionFor(
+        bound,
+        target,
+        signal,
+        'firstContext',
+      );
+      requireRootContext(execution);
       const saved = await issueMemoryContextStorage(
         bound.tx,
         storageKey(bound, execution),
@@ -446,18 +492,51 @@ export async function issueNativeEmployeeMemoryContext(
         signal,
         qualifier(bound, signal),
       );
-      if (
-        saved.origin.nativeOwnerRef !== execution.nativeOwnerRef ||
-        saved.origin.nativeProfileRef !== execution.nativeProfileRef ||
-        saved.origin.rootNativeSessionRef !== execution.binding.rootSessionRef
-      )
-        return unavailable();
+      requireOriginalContextOrigin(saved.origin, execution);
       return saved.document;
     },
   );
   signal.throwIfAborted();
   return document;
 }
+/** Reopen the original B without issuing or charging. The trusted Host also
+ * calls this at final dispatch, before incorporating and hashing the document.
+ * Never dispatch an earlier publication or a cached recovery result. */
+export async function restoreNativeEmployeeMemoryContext(
+  context: RequestContext,
+  input: NativeMemoryRestoreTarget,
+  signal: AbortSignal,
+) {
+  const target = NativeMemoryRestoreTargetSchema.parse(input);
+  const { module, ...selector } = target;
+  const authority = currentTarget({ ...selector, module });
+  const document = await caller(
+    context,
+    authority,
+    signal,
+    async (bound) => {
+      const execution = requireExecution(
+        bound.scope,
+        authority,
+        await bound.reads.stored(selector),
+      );
+      if (execution.binding.b !== selector.b) return denied();
+      requireRootContext(execution);
+      const saved = await restoreMemoryContextStorage(
+        bound.tx,
+        storageKey(bound, execution),
+        signal,
+        qualifier(bound, signal, context),
+      );
+      requireOriginalContextOrigin(saved.origin, execution);
+      return saved.document;
+    },
+    'read',
+  );
+  signal.throwIfAborted();
+  return document;
+}
+
 export async function readNativeEmployeeMemoryOrdinal(
   context: RequestContext,
   input: NativeMemoryTarget,
@@ -478,7 +557,7 @@ export async function readNativeEmployeeMemoryOrdinal(
         storageKey(bound, execution),
         ordinal,
         signal,
-        qualifier(bound, signal),
+        qualifier(bound, signal, context),
         {
           nativeOwnerRef: execution.nativeOwnerRef,
           nativeProfileRef: execution.nativeProfileRef,
