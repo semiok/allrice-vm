@@ -577,10 +577,9 @@ export function EmployeeNativePage({
           )
         : entry.selection;
       const { params } = entry;
-      if (selection.threadId && !entry.selection.threadId) {
+      if (selection.threadId && !entry.selection.threadId)
         params.set('threadId', selection.threadId);
-        selectedQuery = params.toString();
-      }
+      if (prepare && selection.threadId) selectedQuery = params.toString();
       const response = await fetch('/api/v1/d-entry/identity?' + params, {
         signal: lifetime.signal,
         cache: 'no-store',

@@ -412,18 +412,15 @@ suite('real AllRice sidebar in installed native profiles', () => {
     artifacts: string,
     legacyUrl: string;
   let readingAttempt: Record<string, unknown> | undefined;
+  let personalCreationPage: Page | undefined;
 
-  const open = async (
-    view: Page,
-    host: (typeof hosts)[number],
-    testingPersonalCreation = false,
-  ) => {
+  const open = async (view: Page, host: (typeof hosts)[number]) => {
     view.setDefaultTimeout(15_000);
     view.on('pageerror', (error) => errors.push(error.message));
     view.on('request', (request) => {
       const path = new URL(request.url()).pathname;
       if (
-        testingPersonalCreation &&
+        view === personalCreationPage &&
         path === '/api/v1/employee-instances' &&
         request.method() === 'POST'
       )
@@ -625,9 +622,7 @@ suite('real AllRice sidebar in installed native profiles', () => {
   it('opens the personal creation dialog and keeps the sidebar usable after server rejections', async ({
     onTestFinished,
   }) => {
-    const page = await context.newPage();
-    onTestFinished(() => page.close());
-    await open(page, hosts[0]!, true);
+    personalCreationPage = page;
     const workspace = {
       organizationId: randomUUID(),
       workspaceId: randomUUID(),
@@ -646,6 +641,13 @@ suite('real AllRice sidebar in installed native profiles', () => {
       },
     ];
     const createEndpoint = '**/api/v1/employee-instances';
+    onTestFinished(async () => {
+      personalCreationPage = undefined;
+      await page.unroute(createEndpoint);
+      await page.evaluate(() =>
+        window.__allriceSidebarTest!.setPersonalCreation(),
+      );
+    });
     await page.route(createEndpoint, async (route) => {
       const request = route.request();
       const index = createRequests.push(request) - 1;
@@ -1201,7 +1203,9 @@ suite('real AllRice sidebar in installed native profiles', () => {
       format: 'iife',
       write: false,
     });
-    const isolated = await browser.newContext();
+    const isolated = await browser.newContext({
+      viewport: { width: 1440, height: 740 },
+    });
     try {
       const carrier = await isolated.newPage();
       const host = hosts[0]!;
@@ -1225,7 +1229,7 @@ suite('real AllRice sidebar in installed native profiles', () => {
       await carrier.route(wrapper, (route) =>
         route.fulfill({
           contentType: 'text/html',
-          body: `<!doctype html><iframe name="a" src="${root('a')}"></iframe><iframe name="b" src="${root('employee')}"></iframe>`,
+          body: `<!doctype html><style>iframe { display: block; width: 100%; height: 300px; border: 0; }</style><iframe name="a" src="${root('a')}"></iframe><iframe name="b" src="${root('employee')}"></iframe>`,
         }),
       );
       await carrier.goto(wrapper, { waitUntil: 'commit' });
@@ -1239,6 +1243,28 @@ suite('real AllRice sidebar in installed native profiles', () => {
       const a = carrier.frame({ name: 'a' })!,
         b = carrier.frame({ name: 'b' })!;
       expect(new URL(a.url()).origin).toBe(new URL(b.url()).origin);
+      const scrollport = (frame: Frame) =>
+        frame.locator('[data-conversation-scroll]:visible').filter({
+          hasText: '请核对三条销售记录，计算合计，并简要说明结果。',
+        });
+      const readTop = (frame: Frame) =>
+        scrollport(frame).evaluate((node) => node.scrollTop);
+      for (const frame of [a, b])
+        await expect.poll(() => readTop(frame)).toBeGreaterThan(20);
+      await settle(carrier);
+      const aTop = await readTop(a);
+      const bTop = await readTop(b);
+      await scrollport(a).hover();
+      await carrier.mouse.wheel(0, -80);
+      await expect.poll(() => readTop(a)).toBeLessThan(aTop);
+      await expect
+        .poll(() =>
+          a.evaluate(
+            () => window.__allriceSidebarTest!.nativeScroll()?.scrollTop,
+          ),
+        )
+        .toBeLessThan(aTop);
+      expect(await readTop(b)).toBe(bTop);
       const editor = (frame: Frame) =>
         frame
           .locator('textarea:visible,[contenteditable=true]:visible')
