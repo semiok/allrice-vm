@@ -268,8 +268,8 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = page
-      .use(child, async () => {
+    const work = page.use(child, async () => {
+      try {
         let call;
         let check = () => page.assertCurrent(child);
         if (frame.endpoint === '$events') {
@@ -366,8 +366,7 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
         }
         child.throwIfAborted();
         await send({ type: 'end', streamId: id });
-      })
-      .catch(async (error) => {
+      } catch (error) {
         if (!child.aborted) {
           await send({
             type: 'error',
@@ -375,8 +374,10 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
             error: pageRemoteFailure(error),
           });
         }
-      })
-      .finally(() => streams.delete(id));
+      } finally {
+        streams.delete(id);
+      }
+    });
     streams.set(id, { cancel: () => controller.abort(), work });
     void work.catch((error) => stop.abort(error));
   }
