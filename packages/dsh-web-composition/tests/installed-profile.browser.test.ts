@@ -267,15 +267,11 @@ suite('installed AllRice native Web composition', () => {
       const running = page.getByText(/深度求索中.*用时/);
       await running.waitFor();
       await writeFile(join(host.root, 'fixture-plugin', 'issue-tool'), '');
-      const tool = page
-        .getByRole('button', { name: /读取文件|读取了文件/ })
-        .last();
-      await tool.waitFor();
-      if ((await tool.getAttribute('aria-expanded')) === 'false')
-        await tool.click();
       await page
-        .getByText('visible-tool-witness.txt', { exact: false })
-        .last()
+        .getByRole('button', {
+          name: '读取 visible-tool-witness.txt',
+          exact: true,
+        })
         .waitFor();
       expect(await running.isVisible()).toBe(true);
       const capture = async (name: string) => {
