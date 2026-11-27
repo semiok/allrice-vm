@@ -76,6 +76,11 @@ function fixture(useOpenAi = false) {
       name: route.model,
       provider: route.provider,
     })),
+    readCatalogModelInfo: vi.fn(async () => ({
+      id: route.model,
+      name: route.model,
+      provider: route.provider,
+    })),
     scopeStream: undefined,
     transport: {
       fetchOwned: vi.fn(),
