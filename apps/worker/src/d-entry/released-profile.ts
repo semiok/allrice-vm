@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import {
   DEntryProfileAddressSchema,
+  DEntryProfileChunkFilenameSchema,
   DEntryProfileFilePathSchema,
   DEntryProfileGraphSchema,
   DEntryProfileInjectionSchema,
@@ -98,6 +99,14 @@ const manifestSchema = z.object({
     graph: DEntryProfileGraphSchema,
     bootInjections: z.array(DEntryProfileInjectionSchema).min(1),
     files: z.array(bytesEntry.extend({ reference: z.string().min(1) })).min(1),
+    chunks: z
+      .array(
+        z.strictObject({
+          module: z.string().min(1),
+          file: DEntryProfileChunkFilenameSchema,
+        }),
+      )
+      .default([]),
     sourceBuiltClient: z.literal(true),
   }),
   managedEntry: z.literal('managed/employee-web-entry.js'),
@@ -535,6 +544,21 @@ export async function holdReleasedProfile(
       throw new DEntryNativeUnavailable();
     return row;
   }
+  const liveModules = verified(graph.entries, ({ id }) => id);
+  const chunks = verified(
+    manifest.profile.chunks.map(({ module, file }) => {
+      const live = liveModules.get(module);
+      const sealed = modules.get(module);
+      if (!live || !sealed) throw new DEntryNativeUnavailable();
+      const name = `plugins/${module}/${file}`;
+      return {
+        reference: `${name}?rev=${live.rev}`,
+        rev: live.rev,
+        row: proof(`${name}?rev=${sealed.rev}`),
+      };
+    }),
+    ({ reference }) => reference,
+  );
   async function readEntry(id: string, signal: AbortSignal) {
     const sealed = modules.get(id);
     if (!sealed) throw new DEntryNativeUnavailable();
@@ -702,18 +726,23 @@ export async function holdReleasedProfile(
       revision: string,
       caller: AbortSignal,
     ) {
-      const entry = checked.get(reference);
+      const entry = checked.get(reference) ?? chunks.get(reference);
       if (!entry || revision !== entry.rev)
         throw new DataAccessError('not_found');
       const current = AbortSignal.any([active, caller]);
       await assertCurrent(current);
-      const { data, media } = await readCombo(
-        entry.entries,
-        rc2Resource(entry.entries, entry.rev, true),
-        current,
-      );
+      const result =
+        'row' in entry
+          ? await readBytes(entry.row, current)
+          : await readCombo(
+              entry.entries,
+              rc2Resource(entry.entries, entry.rev, true),
+              current,
+            );
       await assertCurrent(current);
-      return { data, media };
+      return 'row' in entry
+        ? { ...result, data: Buffer.from(result.data) }
+        : { data: result.data, media: result.media };
     },
     readStatic(path: string, caller: AbortSignal) {
       if (isStatic(path)) return read(path, caller);

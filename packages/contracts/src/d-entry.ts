@@ -176,6 +176,12 @@ export const DEntryProfileAssetSchema = DEntryProfileBindingSchema.extend({
   reference: z.string().min(1).max(16384),
   revision: profileToken,
 });
+export const DEntryProfileChunkFilenameSchema = z
+  .string()
+  .regex(/^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$/u)
+  .refine(
+    (file) => file !== 'client.node.js' && !file.startsWith('client.node.'),
+  );
 export const DEntryProfileAddressSchema = z.strictObject({
   bindingRef: profileToken,
   graphRev: profileToken,

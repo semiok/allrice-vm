@@ -1,4 +1,4 @@
-import { pageUplink, pumpPageInput } from './page-uplink.js';
+import { pageDownlink, pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
   Remote,
@@ -1151,7 +1151,11 @@ class PrincipalService extends TypertRemoteService {
           );
           if (value === undefined || attachments.length)
             throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
-          yield { type: 'page-item', scopeId: scope.issue.scopeId, value };
+          yield {
+            type: 'page-item',
+            scopeId: scope.issue.scopeId,
+            value: pageDownlink(pageMethod.endpoint, value),
+          };
           continue;
         }
         let value: Extract<DEntryScopedStreamFrame, { type: 'item' }>['value'];

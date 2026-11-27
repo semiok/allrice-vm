@@ -53,9 +53,11 @@ it('admits native terminal methods with their ordinary stream uplink descriptor'
   const attach = descriptor('terminal', 'attach', {
     mode: 'stream',
     uplink: {
-      mode: 'strict',
-      typeSymbol: 'TerminalInput',
-      create: () => z.string(),
+      codec: {
+        mode: 'strict',
+        typeSymbol: 'TerminalInput',
+        create: () => z.string(),
+      },
     },
   });
   expect(

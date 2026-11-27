@@ -1407,6 +1407,22 @@ it('carries native terminal input, resize and output across the owned VM stream'
   const attach = vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
     if (args[0] !== 'terminal/attach') return dispatch(...args);
     return (async function* () {
+      yield {
+        type: 'snapshot',
+        sequence: 0,
+        screen: '',
+        writable: true,
+        info: {
+          id: 'terminal-fixture',
+          title: 'Terminal',
+          shell: { path: '/bin/sh', args: [], name: 'sh' },
+          cwd: '/work',
+          cols: 80,
+          rows: 24,
+          state: 'running',
+          exitCode: null,
+        },
+      };
       for await (const raw of args[2]) {
         inputs.push(inputCodec.parse(raw));
       }
@@ -1420,6 +1436,21 @@ it('carries native terminal input, resize and output across the owned VM stream'
   const streamId = 'terminal';
   const payload = { args: { agentId: 'root', id: 'terminal-fixture' } };
   send(peer, { type: 'open', streamId, endpoint: 'terminal/attach', payload });
+  const frameOverheadBytes =
+    Buffer.byteLength(
+      JSON.stringify({
+        type: 'item',
+        streamId: '199c8160-f4ab-4f45-8b01-51b581fdffee',
+        value: { type: 'input', value: null },
+      }),
+    ) - 4;
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: {
+      type: 'snapshot',
+      inputWindow: { maxBytes: 262_144, frameOverheadBytes },
+    },
+  });
   const write = { type: 'write', sequence: 1, data: 'ls\r' };
   const resize = { type: 'resize', sequence: 2, cols: 100, rows: 32 };
   send(peer, { type: 'item', streamId, value: write });
@@ -2279,6 +2310,33 @@ it(
     });
     expect(bad.status).toBe(404);
     await bad.body?.cancel();
+    const terminal = graph.entries.find(
+      ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
+    );
+    if (!terminal) throw Error('Native terminal missing from sealed graph');
+    const chunk = `plugins/${terminal.id}/client.terminal.js?rev=${terminal.rev}`;
+    const loadChunk = (reference: string, revision = terminal.rev) =>
+      f.publish('assets', scopeId, {
+        bindingRef: f.owner.bindingRef,
+        reference,
+        revision,
+      });
+    const terminalScript = await loadChunk(chunk);
+    expect(terminalScript.status).toBe(200);
+    expect(terminalScript.headers.get('content-type')).toContain('javascript');
+    expect(Buffer.from(await terminalScript.arrayBuffer())).toEqual(
+      await read(chunk, source),
+    );
+    for (const response of [
+      await loadChunk(chunk, 'wrong'),
+      await loadChunk(
+        chunk.replace('client.terminal.js', 'client.unsealed.js'),
+      ),
+      await loadChunk(chunk.replace('client.terminal.js', 'client.node.js')),
+    ]) {
+      expect(response.status).toBe(404);
+      await response.body?.cancel();
+    }
 
     async function blockedAsset() {
       const serverResponse = deferred<ServerResponse>();

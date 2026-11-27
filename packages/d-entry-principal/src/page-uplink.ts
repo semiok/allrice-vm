@@ -6,6 +6,33 @@ import type { CloseCommand, DEntryPageInput } from './types.js';
 const maxBytes = 262_144;
 const done = { done: true, value: undefined } as const;
 
+// The rc.2 private Gateway carrier wraps the browser value in an input command
+// and uses a UUID stream ID. Its public in-process dispatcher has no window
+// argument, so advertise this transport's budget on the native snapshot.
+const terminalWindow = Object.freeze({
+  maxBytes,
+  frameOverheadBytes:
+    Buffer.byteLength(
+      JSON.stringify({
+        type: 'item',
+        streamId: '0'.repeat(36),
+        value: { type: 'input', value: null },
+      }),
+    ) - 'null'.length,
+});
+
+export function pageDownlink(endpoint: string, value: JsonValue) {
+  if (
+    endpoint === 'terminal/attach' &&
+    value !== null &&
+    typeof value === 'object' &&
+    'type' in value &&
+    value.type === 'snapshot'
+  )
+    return { ...value, inputWindow: terminalWindow };
+  return value;
+}
+
 export function pageUplink(endpoint: string) {
   const queue: { value: JsonValue | undefined; bytes: number }[] = [];
   let buffered = 0;
