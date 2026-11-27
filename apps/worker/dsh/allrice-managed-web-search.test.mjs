@@ -1,136 +1,176 @@
 import { fileURLToPath, URL } from 'node:url';
+import { TextDecoder } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import Tools from '@deepseek-ai/dsh-tools';
 import Web from '@deepseek-ai/dsh-web';
 import * as NativeWeb from '@deepseek-ai/dsh-tool-web';
 import { afterEach, expect, it, vi } from 'vitest';
-import { apply } from './allrice-managed-web-search.mjs';
+import {
+  apply,
+  observeManagedSearchCalls,
+} from './allrice-managed-web-search.mjs';
 
 afterEach(() => vi.unstubAllGlobals());
 
-async function stage(sessionId, enabled = true) {
+const settings = {
+  cliPath: fileURLToPath(new URL('../package.json', import.meta.url)),
+  origin: 'http://172.16.0.5:52400',
+  capability: 'synthetic-epoch-capability',
+  adapterId: 'guest-profile',
+  enabled: true,
+};
+const result = {
+  sources: [{ url: 'https://one.example' }],
+  truncated: false,
+};
+const origin = (signal) => ({
+  signal,
+  proof: {
+    rootSessionId: 'root',
+    claims: [{ scopeId: 'exact-principal', requestId: 'original-prompt' }],
+    turn: 1,
+  },
+});
+const execution = (id) => ({
+  callId: id,
+  name: 'web_search',
+  arguments: { queries: ['test'] },
+  agent: { id: 'child', session: { id: 'child' } },
+  signal: new globalThis.AbortController().signal,
+});
+
+async function stage(enabled = true) {
   const registerSearchProvider = vi.fn();
-  await apply(
+  let run;
+  const turn = new globalThis.AbortController();
+  const open = observeManagedSearchCalls(
     {
-      web: { registerSearchProvider },
-      agents: {
-        currentInitiator: () =>
-          sessionId ? { session: { id: sessionId } } : undefined,
+      on(_event, listener) {
+        run = listener;
       },
     },
-    {
-      cliPath: fileURLToPath(new URL('../package.json', import.meta.url)),
-      origin: 'http://172.16.0.5:52400',
-      capability: 'synthetic-epoch-capability',
-      adapterId: 'guest-profile',
-      enabled,
-    },
+    settings.adapterId,
+    turn.signal,
+    () => origin(turn.signal),
   );
+  await apply({ web: { registerSearchProvider } }, { ...settings, enabled });
   expect(registerSearchProvider).toHaveBeenCalledOnce();
-  return registerSearchProvider.mock.calls[0][0];
+  return { provider: registerSearchProvider.mock.calls[0][0], run, open, turn };
 }
 
-it('registers the native provider ID and sends only the local capability', async () => {
-  const provider = await stage('active-session');
-  const result = {
-    sources: [{ url: 'https://one.example' }],
-    truncated: false,
-  };
-  const fetch = vi.fn(async () => globalThis.Response.json(result));
-  vi.stubGlobal('fetch', fetch);
-  const signal = new globalThis.AbortController().signal;
+it('binds the exact native arguments and consumes the proof once before delivering Search', async () => {
+  const { provider, run, open } = await stage();
+  let observed;
+  const host = vi.fn(async (url, options) => {
+    expect(url.href).toBe('http://172.16.0.5:52400/v1/web/search');
+    expect(options.headers.authorization).toBe(
+      'Bearer synthetic-epoch-capability',
+    );
+    expect(options.redirect).toBe('error');
+    const request = JSON.parse(options.body);
+    expect(request).toEqual({
+      adapterId: settings.adapterId,
+      sessionId: 'child',
+      ticket: expect.any(String),
+      query: 'test',
+      maxResults: 3,
+    });
+    const ownerRequest = { signal: new globalThis.AbortController().signal };
+    expect(open({ ...request, query: 'altered' }, ownerRequest).status).toBe(
+      404,
+    );
+    observed = open(request, ownerRequest).body.getReader();
+    expect(open(request, ownerRequest).status).toBe(404);
+    const proof = JSON.parse(
+      new TextDecoder().decode((await observed.read()).value),
+    );
+    expect(proof).toEqual({
+      ...origin().proof,
+      callId: 'first-call',
+      sessionId: 'child',
+    });
+    return globalThis.Response.json(result);
+  });
+  vi.stubGlobal('fetch', host);
   expect(provider.id).toBe('deepseek-official');
   expect(
-    await provider.search({ query: 'test', maxResults: 3 }, signal),
+    await run(execution('first-call'), () =>
+      provider.search({ query: 'test', maxResults: 3 }),
+    ),
   ).toEqual(result);
-  expect(fetch).toHaveBeenCalledExactlyOnceWith(
-    new URL('http://172.16.0.5:52400/v1/web/search'),
-    {
-      method: 'POST',
-      signal,
-      redirect: 'error',
-      headers: {
-        authorization: 'Bearer synthetic-epoch-capability',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        adapterId: 'guest-profile',
-        sessionId: 'active-session',
-        query: 'test',
-        maxResults: 3,
-      }),
-    },
+  expect(new TextDecoder().decode((await observed.read()).value)).toBe(
+    'ended\n',
   );
+  expect((await observed.read()).done).toBe(true);
+  expect(host).toHaveBeenCalledOnce();
 });
 
-it('requires the active native Session before dispatch', async () => {
-  const provider = await stage(undefined);
-  const fetch = vi.fn();
-  vi.stubGlobal('fetch', fetch);
-  await expect(provider.search({ query: 'test' })).rejects.toMatchObject({
-    code: 'WEB_PROVIDER_ERROR',
-  });
-  expect(fetch).not.toHaveBeenCalled();
-});
-
-it('does not announce Search as available without a configured Host route', async () => {
-  const provider = await stage('active-session', false);
+it('denies Search without a live exact tool scope, and without a configured Host route', async () => {
+  const { provider, run } = await stage(false);
+  const enabled = await stage();
   const fetch = vi.fn();
   vi.stubGlobal('fetch', fetch);
   expect(provider.available()).toBe(false);
-  await expect(provider.search({ query: 'test' })).rejects.toMatchObject({
-    code: 'WEB_PROVIDER_ERROR',
-  });
+  await expect(
+    run(execution('closed'), () => provider.search({ query: 'test' })),
+  ).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' });
+  await expect(
+    enabled.provider.search({ query: 'test' }),
+  ).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' });
+  await expect(
+    enabled.run(execution('valid'), () =>
+      enabled.provider.search({ query: 'different tool argument' }),
+    ),
+  ).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' });
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it('expires the native owner proof and cancels the active request when its turn ends', async () => {
+  const { provider, run, open, turn } = await stage();
+  let expired;
+  vi.stubGlobal('fetch', async (_url, options) => {
+    const request = JSON.parse(options.body);
+    const ownerRequest = { signal: new globalThis.AbortController().signal };
+    const reader = open(request, ownerRequest).body.getReader();
+    await reader.read();
+    turn.abort();
+    expect(options.signal.aborted).toBe(true);
+    expired = await reader.read();
+    expect(open(request, ownerRequest).status).toBe(404);
+    options.signal.throwIfAborted();
+  });
+  await expect(
+    run(execution('ended'), () => provider.search({ query: 'test' })),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(new TextDecoder().decode(expired.value)).toBe('ended\n');
 });
 
 it('runs native web_search with the unchanged DeepSeek provider selection and output', async () => {
   const ctx = new Context();
-  const reply = {
-    sources: [{ url: 'https://one.example', title: 'Weather reference' }],
-    truncated: false,
-  };
-  const fetch = vi.fn(async () => globalThis.Response.json(reply));
+  const fetch = vi.fn(async () => globalThis.Response.json(result));
   vi.stubGlobal('fetch', fetch);
   try {
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(Tools);
     await ctx.plugin(Web, { searchProvider: 'deepseek-official' });
-    await apply(
-      {
-        web: ctx.web,
-        agents: { currentInitiator: () => ({ session: { id: 'child' } }) },
-      },
-      {
-        cliPath: fileURLToPath(new URL('../package.json', import.meta.url)),
-        origin: 'http://172.16.0.5:52400',
-        capability: 'synthetic-epoch-capability',
-        adapterId: 'guest-profile',
-        enabled: true,
-      },
+    const turn = new globalThis.AbortController();
+    observeManagedSearchCalls(ctx, settings.adapterId, turn.signal, () =>
+      origin(turn.signal),
     );
+    await apply({ web: ctx.web }, settings);
     await ctx.plugin(NativeWeb, { fetch: false });
-    const result = await ctx.tools.execute({
-      name: 'web_search',
-      arguments: { queries: ['test'] },
-      callId: 'call',
-      agent: { id: 'child' },
-      signal: new globalThis.AbortController().signal,
+    const outcome = await ctx.tools.execute(execution('real-call'));
+    expect(outcome.isError).toBe(false);
+    expect(outcome.value).toEqual(result);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({
+      adapterId: settings.adapterId,
+      sessionId: 'child',
+      ticket: expect.any(String),
+      query: 'test',
+      maxResults: 8,
     });
-    expect(result.isError).toBe(false);
-    expect(result.value).toEqual(reply);
-    expect(fetch).toHaveBeenCalledExactlyOnceWith(
-      expect.any(URL),
-      expect.objectContaining({
-        body: JSON.stringify({
-          adapterId: 'guest-profile',
-          sessionId: 'child',
-          query: 'test',
-          maxResults: 8,
-        }),
-      }),
-    );
   } finally {
     await ctx.fiber.dispose();
   }

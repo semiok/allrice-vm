@@ -56,6 +56,7 @@ type PromptOwner = NativeModelSelection &
   Readonly<{
     runId: string;
     requestId: string;
+    scopeId: string;
     adapterId: string;
     root: string;
     authorityKey: string;
@@ -719,6 +720,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 authorityKey,
                 revoked,
                 requestId,
+                scopeId: issue.scopeId,
                 assertObserved: watch.assertObserved,
                 assertCurrent: watch.assertCurrent,
                 assertClaimed: observation.assertClaimed,
@@ -1018,64 +1020,77 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   )
                     continue;
                   const { owner } = fact.profile;
-                  const origin = await owner.readNativeSearchOriginFor(
+                  const watch = await owner.observeNativeSearchCallFor(
                     probe.context,
-                    wanted.sessionId,
+                    wanted,
                     active,
                   );
-                  if (!origin || origin.rootSessionId !== probe.root) continue;
-                  const proven = findPromptContributors(
-                    wanted.adapterId,
-                    origin.rootSessionId,
-                    binding,
-                    origin.promptIds,
-                  );
-                  if (
-                    !proven ||
-                    proven.first.authorityKey !== probe.authorityKey
-                  )
-                    continue;
-                  const { first, contributors } = proven;
-                  const context = structuredClone(first.context);
-                  const revoked = AbortSignal.any([
-                    live,
-                    fact.profile.revoked,
-                    ...contributors.map((member) => member.revoked),
-                  ]);
-                  async function assertCurrent(caller: AbortSignal) {
-                    const current = AbortSignal.any([caller, revoked]);
-                    current.throwIfAborted();
-                    await Promise.all(
-                      contributors.map(async (member) => {
-                        await member.assertClaimed(current);
-                        await member.assertCurrent(current);
-                      }),
-                    );
-                    const observed = await owner.readNativeSearchOriginFor(
-                      context,
-                      wanted.sessionId,
-                      current,
-                    );
-                    if (JSON.stringify(observed) !== JSON.stringify(origin))
+                  try {
+                    const { claims, rootSessionId } = watch.proof;
+                    if (rootSessionId !== probe.root)
                       throw new EgressError('DENIED');
-                    current.throwIfAborted();
+                    const key = (source: {
+                      scopeId: string;
+                      requestId: string;
+                    }) => JSON.stringify([source.scopeId, source.requestId]);
+                    const references = new Map<string, PromptOwner[]>();
+                    for (const entry of selected.values()) {
+                      const member = entry.scope;
+                      if (
+                        member.adapterId !== wanted.adapterId ||
+                        member.root !== rootSessionId ||
+                        !sameVmBinding(member.binding, binding) ||
+                        !entry.observation.inserted()
+                      )
+                        continue;
+                      const id = key(member);
+                      const entries = references.get(id) ?? [];
+                      entries.push(member);
+                      references.set(id, entries);
+                    }
+                    const proven = readNativePromptContributors(
+                      claims.map(key),
+                      (id) => {
+                        const entries = references.get(id);
+                        return entries?.length === 1 ? entries[0] : undefined;
+                      },
+                    );
+                    if (!proven) throw new EgressError('DENIED');
+                    const { first, contributors } = proven;
+                    const context = structuredClone(first.context);
+                    const revoked = AbortSignal.any([
+                      live,
+                      watch.signal,
+                      fact.profile.revoked,
+                      ...contributors.map((member) => member.revoked),
+                    ]);
+                    async function assertCurrent(caller: AbortSignal) {
+                      const current = AbortSignal.any([caller, revoked]);
+                      current.throwIfAborted();
+                      await Promise.all(
+                        contributors.map(async (member) => {
+                          await member.assertClaimed(current);
+                          await member.assertCurrent(current);
+                        }),
+                      );
+                      current.throwIfAborted();
+                    }
+                    bind(context, binding, signal, assertCurrent);
+                    return {
+                      context,
+                      close: watch.close,
+                      dispatch: (response, caller) =>
+                        dispatchSearch(
+                          { context, binding, signal: revoked, assertCurrent },
+                          wanted,
+                          response,
+                          caller,
+                        ),
+                    };
+                  } catch (error) {
+                    await watch.close();
+                    throw error;
                   }
-                  bind(context, binding, signal, assertCurrent);
-                  return {
-                    context,
-                    dispatch: (response, caller) =>
-                      dispatchSearch(
-                        {
-                          context,
-                          binding,
-                          signal: revoked,
-                          assertCurrent,
-                        },
-                        wanted,
-                        response,
-                        caller,
-                      ),
-                  };
                 }
                 throw new EgressError('DENIED');
               });

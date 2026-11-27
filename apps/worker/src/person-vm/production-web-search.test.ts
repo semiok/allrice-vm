@@ -13,12 +13,16 @@ import type {
   PersonVmBinding,
 } from '@allrice/person-vm';
 import { expect, it, vi } from 'vitest';
-import type { WebSearchProvider } from '@deepseek-ai/dsh-web';
-import { createHostSearch, readGuestSearch } from './production-web-search.js';
+import {
+  createHostSearch,
+  readGuestSearch,
+  type JoinedSearchProvider,
+} from './production-web-search.js';
 
 const wire = {
   adapterId: 'a'.repeat(64),
   sessionId: 'native-session',
+  ticket: randomUUID(),
   query: 'Shanghai weather',
   maxResults: 1,
 };
@@ -80,9 +84,12 @@ function fixture(limit = 1) {
     waitUntilReady: async () => binding,
     finish: release,
   };
-  const search = vi.fn<WebSearchProvider['search']>(async () => ({
-    sources: [{ url: 'https://one.example' }, { url: 'https://two.example' }],
-    truncated: false,
+  const search = vi.fn<JoinedSearchProvider['search']>(async () => ({
+    ok: true,
+    value: {
+      sources: [{ url: 'https://one.example' }, { url: 'https://two.example' }],
+      truncated: false,
+    },
   }));
   const checkBinding = vi.fn(async () => {});
   const assertCurrent = vi.fn(async () => {});
@@ -181,7 +188,10 @@ it('cancels the upstream and does not emit a result after revocation', async () 
       { once: true },
     );
     f.stop.abort();
-    return { sources: [{ url: 'https://one.example' }], truncated: false };
+    return {
+      ok: true,
+      value: { sources: [{ url: 'https://one.example' }], truncated: false },
+    };
   });
   const signal = new AbortController().signal;
   await local(
@@ -224,4 +234,29 @@ it('joins a revoked pre-activation error without retaining an unsafe permit', as
   ).rejects.toThrow('lease revoked during admission');
   expect(f.search).not.toHaveBeenCalled();
   expect(persisted.size).toBe(0);
+});
+
+it('leaves transport closure failures unknown instead of certifying the activation joined', async () => {
+  const f = fixture();
+  const failure = new Error('dispatcher closure unknown');
+  f.search.mockRejectedValueOnce(failure);
+  let activationEscaped = false;
+  f.admission.activate = async (_permit, invoke, active) => {
+    try {
+      return await invoke(active);
+    } catch (error) {
+      activationEscaped = true;
+      throw error;
+    }
+  };
+  await expect(
+    f.dispatch(
+      f.authority,
+      wire,
+      {} as ServerResponse,
+      new AbortController().signal,
+    ),
+  ).rejects.toBe(failure);
+  expect(activationEscaped).toBe(true);
+  expect(f.release).toHaveBeenCalledOnce();
 });

@@ -52,18 +52,21 @@ it('uses the native title source sequence after a later turn has started', () =>
   });
 });
 
-function fixture() {
+function fixture(claimed = () => true) {
   const callbacks = new Map();
   const agents = new Map();
   const sessions = new Map();
-  const delegations = observeDelegatedInputs({
-    on: (name, callback) => callbacks.set(name, callback),
-    sessions,
-    agents: {
-      get: (id) => agents.get(id),
-      isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+  const delegations = observeDelegatedInputs(
+    {
+      on: (name, callback) => callbacks.set(name, callback),
+      sessions,
+      agents: {
+        get: (id) => agents.get(id),
+        isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+      },
     },
-  });
+    claimed,
+  );
   function emit(name, payload) {
     callbacks.get(name)(payload);
   }
@@ -92,7 +95,18 @@ function fixture() {
   }
   function openRoot(root, turn, rpcId) {
     append(root, 'turn/start', { turn });
-    input(root, { id: rpcId, source: { kind: 'user', rpcId } }, turn);
+    input(
+      root,
+      {
+        id: rpcId,
+        source: {
+          kind: 'user',
+          rpcId,
+          principal: { kind: 'allrice-d-entry', scopeId: 'scope-' + rpcId },
+        },
+      },
+      turn,
+    );
   }
   function createChild(root, id) {
     const child = agent(id, root);
@@ -412,21 +426,51 @@ it('derives Search authority from the exact running turn and native child lineag
   f.openRoot(root, 1, 'original');
   const child = f.createChild(root, 'child');
   child.status = 'running';
-  expect(f.searchOrigin('root')).toEqual({
+  expect(f.searchOrigin('root').proof).toEqual({
     rootSessionId: 'root',
     turn: 1,
-    promptIds: ['original'],
+    claims: [{ scopeId: 'scope-original', requestId: 'original' }],
   });
   f.append(root, 'turn/end', { turn: 1 });
   f.openRoot(root, 2, 'next-login');
-  expect(f.searchOrigin('child')).toEqual({
+  expect(f.searchOrigin('child').proof).toEqual({
     rootSessionId: 'root',
     turn: 1,
-    promptIds: ['original'],
+    claims: [{ scopeId: 'scope-original', requestId: 'original' }],
   });
-  expect(f.searchOrigin('root')?.promptIds).toEqual(['next-login']);
+  expect(f.searchOrigin('root')?.proof.claims).toEqual([
+    { scopeId: 'scope-next-login', requestId: 'next-login' },
+  ]);
   child.status = 'idle';
   expect(f.searchOrigin('child')).toBeNull();
   f.append(root, 'turn/end', { turn: 2 });
   expect(f.searchOrigin('root')).toBeNull();
+});
+
+it('denies an unobserved direct root input and a same-ID direct child input', () => {
+  const rejected = fixture(() => false);
+  const noClaim = rejected.agent('root');
+  noClaim.status = 'running';
+  rejected.openRoot(noClaim, 1, 'same-rpc');
+  expect(rejected.searchOrigin('root')).toBeNull();
+
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'same-rpc');
+  const child = f.createChild(root, 'child');
+  child.status = 'running';
+  expect(f.searchOrigin('child')).not.toBeNull();
+  f.input(
+    child,
+    {
+      id: 'different-occurrence',
+      source: {
+        kind: 'user',
+        rpcId: 'same-rpc',
+        principal: { kind: 'allrice-d-entry', scopeId: 'scope-same-rpc' },
+      },
+    },
+    1,
+  );
+  expect(f.searchOrigin('child')).toBeNull();
 });

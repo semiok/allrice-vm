@@ -511,31 +511,35 @@ export function createEgressGateway(
                     if (value.includes(state.capability)) throw denied();
                   },
                 );
-                const context = resolved
-                  ? resolved.context
-                  : await options.authority.context(binding, serviceSignal);
-                await options.vm.assertAdmissionBinding(
-                  context,
-                  binding,
-                  serviceSignal,
-                );
-                await options.authority.allow(
-                  context,
-                  binding,
-                  service.id,
-                  serviceSignal,
-                );
-                stateFor(receipt);
-                serviceSignal.throwIfAborted();
-                if (resolved) await resolved.dispatch(res, serviceSignal);
-                else if (service.handle)
-                  await service.handle(
-                    req,
-                    res,
-                    { context, binding },
+                try {
+                  const context = resolved
+                    ? resolved.context
+                    : await options.authority.context(binding, serviceSignal);
+                  await options.vm.assertAdmissionBinding(
+                    context,
+                    binding,
                     serviceSignal,
                   );
-                else throw new EgressError('POLICY_INVALID');
+                  await options.authority.allow(
+                    context,
+                    binding,
+                    service.id,
+                    serviceSignal,
+                  );
+                  stateFor(receipt);
+                  serviceSignal.throwIfAborted();
+                  if (resolved) await resolved.dispatch(res, serviceSignal);
+                  else if (service.handle)
+                    await service.handle(
+                      req,
+                      res,
+                      { context, binding },
+                      serviceSignal,
+                    );
+                  else throw new EgressError('POLICY_INVALID');
+                } finally {
+                  await resolved?.close?.();
+                }
                 return;
               }
               if (

@@ -115,6 +115,7 @@ export type ManagedHostService = Readonly<{
           assertNoCapability?: (value: string) => void,
         ): Promise<{
           context: RequestContext;
+          close?(): Promise<void>;
           dispatch(
             response: ServerResponse,
             signal: AbortSignal,

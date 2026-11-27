@@ -213,9 +213,12 @@ export async function prepareNativeWebLaunch(
               mode: 0o600,
               contents: `import { applyNativeWebOwner } from './owner.mjs';
 import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+import { apply as applyManagedSearch, observeManagedSearchCalls } from './allrice-managed-web-search.mjs';
 export { inject, name } from './owner.mjs';
 export function apply(ctx, config) {
-  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter);
+  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter, {
+    applyManagedSearch, observeManagedSearchCalls,
+  });
 }
 `,
             },
@@ -262,6 +265,7 @@ export function apply(ctx, config) {
                         modelAdapter: {
                           ...modelAdapter,
                           id: auth.modelAdapterId,
+                          cliPath: config.cliPath,
                         },
                       }
                     : {}),
@@ -277,21 +281,6 @@ export function apply(ctx, config) {
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                {
-                  insert: [
-                    {
-                      id: 'allrice-managed-web-search',
-                      name: `file://${searchPlugin}`,
-                      config: {
-                        cliPath: config.cliPath,
-                        origin: modelAdapter.origin,
-                        capability: modelAdapter.capability,
-                        adapterId: auth.modelAdapterId,
-                        enabled: modelAdapter.webSearchEnabled === true,
-                      },
-                    },
-                  ],
-                },
                 {
                   id: 'agent-default-model',
                   config: {

@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { performance } from 'node:perf_hooks';
 import type { RequestContext } from '@allrice/contracts';
 import { EgressError, sendEgressResponse } from '@allrice/egress-gateway';
+import { runWithOwnedNativeFetch } from '@allrice/model-gateway';
 import type {
   PersonVmAdmissionBindingPort,
   PersonVmAdmissionBoundary,
@@ -30,6 +31,7 @@ const wireSearch = z
   .object({
     adapterId: z.string().regex(/^[a-f0-9]{64}$/),
     sessionId: z.string().min(1).max(256),
+    ticket: z.uuid(),
     query: z.string().trim().min(1).max(2_000),
     maxResults: z.number().int().min(1).max(20).optional(),
   })
@@ -77,11 +79,21 @@ export async function readGuestSearch(
 
 export type GuestSearchRequest = z.infer<typeof wireSearch>;
 
+export type JoinedSearchProvider = {
+  search(
+    request: Parameters<WebSearchProvider['search']>[0],
+    signal: AbortSignal,
+  ): Promise<
+    | { ok: true; value: Awaited<ReturnType<WebSearchProvider['search']>> }
+    | { ok: false; error: unknown }
+  >;
+};
+
 export function createHostSearchProvider(
   key: string | undefined,
-): WebSearchProvider | undefined {
+): JoinedSearchProvider | undefined {
   if (!key?.trim()) return undefined;
-  return new DeepSeekSearchProvider(() => ({
+  const provider = new DeepSeekSearchProvider(() => ({
     apiKey: key,
     baseURL: DEEPSEEK_DEFAULT_BASE_URL,
     apiVersion: DEEPSEEK_DEFAULT_API_VERSION,
@@ -89,6 +101,14 @@ export function createHostSearchProvider(
     maxTokens: DEEPSEEK_DEFAULT_MAX_TOKENS,
     maxUses: DEEPSEEK_DEFAULT_MAX_USES,
   }));
+  const endpoint = new URL(DEEPSEEK_DEFAULT_BASE_URL + '/messages');
+  return {
+    search(request, signal) {
+      return runWithOwnedNativeFetch(endpoint, maxResponseBytes, signal, () =>
+        provider.search(request, signal),
+      );
+    },
+  };
 }
 
 type SearchAuthority = {
@@ -104,7 +124,7 @@ export function createHostSearch({
   admission,
   requestsPerPersonPerMinute,
 }: {
-  provider: Pick<WebSearchProvider, 'search'>;
+  provider: JoinedSearchProvider;
   vm: PersonVmAdmissionBindingPort;
   admission: PersonVmAdmissionBoundary;
   requestsPerPersonPerMinute: number;
@@ -161,16 +181,20 @@ export function createHostSearch({
                   queued,
                   owned,
                 ]);
+                let transportJoined = true;
                 try {
                   await assertCurrent(current);
                   await vm.assertAdmissionBinding(context, binding, current);
                   current.throwIfAborted();
                   spend(binding.personId);
-                  const result = await provider
-                    .search({ query, maxResults }, current)
-                    .catch(() => {
-                      throw new EgressError('UNAVAILABLE');
-                    });
+                  transportJoined = false;
+                  const upstream = await provider.search(
+                    { query, maxResults },
+                    current,
+                  );
+                  transportJoined = true;
+                  if (!upstream.ok) throw new EgressError('UNAVAILABLE');
+                  const result = upstream.value;
                   const sources = result.sources.slice(0, maxResults ?? 20);
                   const body = Buffer.from(
                     JSON.stringify({
@@ -193,8 +217,7 @@ export function createHostSearch({
                   );
                   return { ok: true as const };
                 } catch (error) {
-                  // Provider search joins dispatch/content before returning, and the
-                  // shared HTTP writer joins response closure on failure.
+                  if (!transportJoined) throw error;
                   return { ok: false as const, error };
                 }
               },
