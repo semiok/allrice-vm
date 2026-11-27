@@ -17,6 +17,7 @@ import {
   pageCompletion,
   pageDocumentReady,
   pageEditorMounted,
+  pageMuxAttach,
   pageNavigate,
   pageRevoked,
   pageStartupFailed,
@@ -293,6 +294,8 @@ export function EmployeeNativePage({
         event.data?.scopeId !== scopeId
       )
         return;
+      if (event.data.type === pageMuxAttach && event.ports.length === 1)
+        carrier?.attachMux(event.ports[0]!);
       if (event.data.type === pageClosing) void close();
       if (event.data.type === pageStartupFailed) {
         if (prepare)

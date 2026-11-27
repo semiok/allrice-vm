@@ -55,6 +55,7 @@ export async function renderEmployeeDocument(
   const directoryJson = safeJson(directory);
   const attributes = [
     ['scope-id', scopeId],
+    ...(inline ? [['shared-mux', '1']] : []),
     ['binding-ref', bindingRef],
     ['graph-rev', graphRev],
     ['organization-id', tenant],

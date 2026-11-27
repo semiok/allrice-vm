@@ -44,7 +44,21 @@ it.skipIf(!browserExecutable).each([false, true])(
         ? { ...row, blank: true, cwd: '/work' }
         : row,
     );
-    const life = await open(f);
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const parentModule: { outputFiles: { text: string }[] } =
+      await require('esbuild').build({
+        entryPoints: ['apps/web/lib/d-entry/page-carrier.ts'],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        globalName: 'DEntryCarrier',
+        write: false,
+      });
     const unary: string[] = [];
     const listRead: unknown[] = [];
     const graph = DEntryProfileGraphSchema.parse(release.graph);
@@ -63,6 +77,7 @@ it.skipIf(!browserExecutable).each([false, true])(
           .end(Buffer.from(await result.arrayBuffer()));
       };
       try {
+        const scopeId = url.searchParams.get('scopeId');
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(chunk);
@@ -89,7 +104,7 @@ it.skipIf(!browserExecutable).each([false, true])(
           return await copy(
             await f.publish(
               kind,
-              life.scopeId,
+              scopeId!,
               Object.fromEntries(url.searchParams),
             ),
           );
@@ -110,7 +125,32 @@ it.skipIf(!browserExecutable).each([false, true])(
           response
             .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
             .end(
-              '<!doctype html><iframe src="/employee" style="width:100%;height:100vh"></iframe>',
+              `<!doctype html><iframe style="width:100%;height:100vh"></iframe>
+                <script>${parentModule.outputFiles[0]!.text}</script>
+                <script>
+                  const frame = document.querySelector('iframe');
+                  const carrier = DEntryCarrier.openNativePageCarrier(
+                    ${JSON.stringify(f.identity)}, ${JSON.stringify(f.selection)}, () => {}
+                  );
+                  carrier.ready.then(({scopeReference}) => {
+                    const scopeId = scopeReference.scopeId;
+                    function send(type, state) {
+                      frame.contentWindow.postMessage({ type, scopeId, state }, location.origin);
+                    }
+                    const finish = () => carrier.close().then(
+                      () => send('allrice:d-entry:completion','closed'),
+                      () => send('allrice:d-entry:completion','unknown')
+                    );
+                    window.finishCarrier = finish;
+                    window.addEventListener('message', (event) => {
+                      if (event.origin !== location.origin || event.source !== frame.contentWindow ||
+                        event.data?.scopeId !== scopeId) return;
+                      if (event.data.type === 'allrice:d-entry:mux-attach') carrier.attachMux(event.ports[0]);
+                      if (event.data.type === 'allrice:d-entry:close') void finish();
+                    });
+                    frame.src = '/employee?scopeId=' + encodeURIComponent(scopeId);
+                  });
+                </script>`,
             );
           return;
         }
@@ -146,14 +186,15 @@ it.skipIf(!browserExecutable).each([false, true])(
             },
           ],
         };
-        const bootstrap = await f.publish('bootstrap', life.scopeId);
+        if (!scopeId) return response.writeHead(404).end();
+        const bootstrap = await f.publish('bootstrap', scopeId);
         if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
         const bootJson = (await bootstrap.text()).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
-          <script data-scope-id="${life.scopeId}">${initialDocumentLifecycle}</script>
-          <div id="app" data-scope-id="${life.scopeId}" data-thread-id="${selection.threadId}"
+          <script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script>
+          <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
@@ -174,6 +215,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     ]);
     const page = await context.newPage();
     const streams = new Map<string, string>();
+    let socketCount = 0;
     const firstItems: string[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -186,6 +228,7 @@ it.skipIf(!browserExecutable).each([false, true])(
         errors.push(`${response.status()} ${new URL(response.url()).pathname}`);
     });
     page.on('websocket', (socket) => {
+      socketCount++;
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
@@ -221,6 +264,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       await page.locator('html[data-asset-timeout="asset-timeout"]').waitFor();
       expect(applicationReads).toBe(2);
       expect(browserBootstrapReads).toBe(0);
+      expect(socketCount).toBe(1);
       expect(unary).not.toContain('session/list');
       await context.close();
       return;
@@ -246,6 +290,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     }
     expect(await editor.isEditable()).toBe(true);
     expect(browserBootstrapReads).toBe(0);
+    expect(socketCount).toBe(1);
     await expect
       .poll(() => firstItems)
       .toEqual(
@@ -258,8 +303,11 @@ it.skipIf(!browserExecutable).each([false, true])(
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
-    closePage(life.peer);
-    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    await page.evaluate(() =>
+      (
+        window as Window & { finishCarrier: () => Promise<void> }
+      ).finishCarrier(),
+    );
     await context.close();
   },
 );

@@ -114,6 +114,7 @@ async function runOwner(
   const send = sendTo(peer);
   let streamId: string | undefined;
   let scopeId: string | undefined;
+  let resources: ReturnType<typeof pageStreams> | undefined;
   let operation: Promise<void> | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false,
@@ -155,6 +156,11 @@ async function runOwner(
           async (page) => {
             stop.signal.throwIfAborted();
             scopeId = page.scope.opened.scopeId;
+            resources = pageStreams(
+              page,
+              send,
+              AbortSignal.any([signal, stop.signal, page.signal]),
+            );
             await send({
               type: 'item',
               streamId: id,
@@ -179,7 +185,8 @@ async function runOwner(
           }
         });
       } else if (frame.streamId !== streamId) {
-        throw denied();
+        if (!resources || requestedClose) throw denied();
+        resources.accept(frame);
       } else if (
         frame.type === 'item' &&
         frame.value === 'close' &&
@@ -195,6 +202,7 @@ async function runOwner(
           break;
         }
         try {
+          await resources?.close();
           await operation;
           connected.throwIfAborted();
           if (!scopeId) {
@@ -247,16 +255,11 @@ async function runOwner(
     await notify(error);
   } finally {
     endPage(connected.reason);
-    await Promise.allSettled([operation, terminal]);
+    await Promise.allSettled([operation, terminal, resources?.close()]);
   }
 }
 
-async function runStreams(
-  page: DEntryPageHandle,
-  peer: WebSocket,
-  signal: AbortSignal,
-) {
-  const send = sendTo(peer);
+function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
   const streams = new Map<string, { cancel(): void; work: Promise<void> }>();
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
@@ -377,23 +380,40 @@ async function runStreams(
     streams.set(id, { cancel: () => controller.abort(), work });
     void work.catch((error) => stop.abort(error));
   }
+  return {
+    signal: active,
+    accept(frame: Frame) {
+      active.throwIfAborted();
+      const prior = streams.get(frame.streamId);
+      if (frame.type === 'open' && !prior) open(frame);
+      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
+      else throw denied();
+    },
+    async close() {
+      stop.abort();
+      await Promise.allSettled([...streams.values()].map(({ work }) => work));
+    },
+  };
+}
+
+async function runStreams(
+  page: DEntryPageHandle,
+  peer: WebSocket,
+  signal: AbortSignal,
+) {
+  const resources = pageStreams(page, sendTo(peer), signal);
   try {
     for await (const [message, binary] of on(peer, 'message', {
-      signal: active,
+      signal: resources.signal,
       close: ['close'],
       highWaterMark: 1,
       lowWaterMark: 1,
     })) {
       if (binary) throw denied();
-      const frame = parseRemoteStreamClientMessage(String(message));
-      const prior = streams.get(frame.streamId);
-      if (frame.type === 'open' && !prior) open(frame);
-      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
-      else throw denied();
+      resources.accept(parseRemoteStreamClientMessage(String(message)));
     }
   } finally {
-    stop.abort();
-    await Promise.allSettled([...streams.values()].map(({ work }) => work));
+    await resources.close();
   }
 }
 

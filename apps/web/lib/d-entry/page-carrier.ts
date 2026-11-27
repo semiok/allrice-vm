@@ -4,7 +4,10 @@ import {
   type DEntryIdentity,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
-import { parseRemoteStreamServerMessage } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
+import {
+  parseRemoteStreamClientMessage,
+  parseRemoteStreamServerMessage,
+} from '@deepseek-ai/dsh-api-gateway/stream-protocol';
 
 export {
   pageClosing,
@@ -58,6 +61,7 @@ export function openNativePageCarrier(
     nativeMuxUrl(location.origin, identity.organizationId, selection),
   );
   let scopeId: string | undefined;
+  let nativeMux: MessagePort | undefined;
   let requested = false,
     complete = false,
     dispatched = false,
@@ -71,9 +75,16 @@ export function openNativePageCarrier(
     send({ type: 'item', value: 'close' });
     send({ type: 'end' });
   }
+  function closeMux() {
+    if (!nativeMux) return;
+    nativeMux.postMessage({ type: 'close' });
+    nativeMux.close();
+    nativeMux = undefined;
+  }
   function fail(reason: unknown) {
     if (complete) return;
     complete = true;
+    closeMux();
     onRevoked();
     ready.reject(reason);
     // Local transport closure is still observed independently below.
@@ -104,7 +115,12 @@ export function openNativePageCarrier(
       if (typeof event.data !== 'string')
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
-      if (frame.streamId !== id) throw Error('Unexpected native page stream');
+      if (frame.streamId !== id) {
+        if (requested) return;
+        if (!nativeMux) throw Error('Unexpected native page stream');
+        nativeMux.postMessage({ type: 'frame', data: event.data });
+        return;
+      }
       if (setupCancelled) throw Error('Unexpected native page terminal');
       if (
         frame.type === 'error' &&
@@ -152,6 +168,7 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'close',
     (event) => {
+      closeMux();
       if (!dispatched) {
         fail(failure ?? Error('Native page carrier did not open'));
         joined.resolve();
@@ -168,19 +185,62 @@ export function openNativePageCarrier(
     },
     { once: true },
   );
+  function close() {
+    if (!requested && !complete) {
+      requested = true;
+      closeMux();
+      ready.reject(new DOMException('Page closed', 'AbortError'));
+      if (socket.readyState === WebSocket.OPEN) end();
+      if (socket.readyState === WebSocket.CONNECTING) socket.close();
+    }
+    return joined.promise;
+  }
   return {
     ready: ready.promise,
     get dispatched() {
       return dispatched;
     },
-    close() {
-      if (!requested && !complete) {
-        requested = true;
-        ready.reject(new DOMException('Page closed', 'AbortError'));
-        if (socket.readyState === WebSocket.OPEN) end();
-        if (socket.readyState === WebSocket.CONNECTING) socket.close();
+    attachMux(port: MessagePort) {
+      if (
+        !scopeId ||
+        nativeMux ||
+        requested ||
+        complete ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        port.postMessage({ type: 'close' });
+        port.close();
+        return;
       }
-      return joined.promise;
+      nativeMux = port;
+      port.onmessage = (event) => {
+        if (nativeMux !== port || requested || complete) return;
+        try {
+          if (event.data?.type === 'close') {
+            void close().catch(() => {});
+            return;
+          }
+          if (
+            event.data?.type !== 'frame' ||
+            typeof event.data.data !== 'string'
+          )
+            throw Error('Invalid native resource frame');
+          const frame = parseRemoteStreamClientMessage(event.data.data);
+          if (
+            frame.streamId === id ||
+            (frame.type === 'open' && frame.endpoint === '$d-entry/page')
+          )
+            throw Error('A borrowed mux cannot control its page');
+          socket.send(event.data.data);
+        } catch (error) {
+          failure = fail(error);
+        }
+      };
+      port.onmessageerror = () => {
+        failure = fail(Error('Invalid native resource frame'));
+      };
+      port.postMessage({ type: 'open' });
     },
+    close,
   };
 }

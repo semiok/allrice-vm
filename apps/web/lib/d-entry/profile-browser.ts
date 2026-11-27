@@ -1,3 +1,4 @@
+import { borrowPageMux, type NativePageSocket } from './page-mux-client';
 import {
   DEntryPageBorrowSchema,
   DEntryPageUnarySchema,
@@ -142,7 +143,7 @@ export function nativeProfileDocument(
   const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
   const pending = new Set<Promise<unknown>>();
-  const channels = new Map<WebSocket, Promise<void>>();
+  const channels = new Map<NativePageSocket, Promise<void>>();
   const done = pendingPageResult<void>();
   const owned = <T>(task: Promise<T>) => {
     pending.add(task);
@@ -164,7 +165,7 @@ export function nativeProfileDocument(
   let published:
     ReturnType<typeof DEntryProfileBootstrapSchema.parse> | undefined;
   let closing: Promise<void> | undefined;
-  let peer: WebSocket | undefined;
+  let peer: NativePageSocket | undefined;
   const receive = (event: MessageEvent) => {
     if (
       event.origin !== location.origin ||
@@ -277,9 +278,17 @@ export function nativeProfileDocument(
         expected.protocol = expected.protocol === 'https:' ? 'wss:' : 'ws:';
         if (new URL(input).href !== expected.href || peer)
           throw Error('Native connection is unavailable');
-        const socket = new WebSocket(
-          nativeMuxUrl(location.origin, organizationId, selection, scopeId),
-        );
+        const socket =
+          container.dataset.sharedMux === '1'
+            ? borrowPageMux(scopeId)
+            : new WebSocket(
+                nativeMuxUrl(
+                  location.origin,
+                  organizationId,
+                  selection,
+                  scopeId,
+                ),
+              );
         peer = socket;
         channels.set(
           socket,
