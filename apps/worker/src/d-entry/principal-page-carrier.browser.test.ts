@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it } from 'vitest';
 import {
@@ -27,9 +28,11 @@ it.skipIf(!browserExecutable).each([false, true])(
   { timeout: 60_000 },
   async (stall) => {
     const release = await buildProfileFixture();
-    const manifest: { files: { path: string }[] } = JSON.parse(
-      await readFile(join(release.directory, 'artifact.json'), 'utf8'),
-    );
+    const sealed = await readFile(join(release.directory, 'artifact.json'));
+    const manifest: {
+      files: { path: string }[];
+      profile: { files: { reference: string; sha256: string }[] };
+    } = JSON.parse(sealed.toString());
     const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
     const mime: Record<string, string> = {
       '.js': 'text/javascript',
@@ -63,6 +66,27 @@ it.skipIf(!browserExecutable).each([false, true])(
     const application = graph.batches.find(
       ({ phase }) => phase === 'application',
     )!;
+    const publicRoot =
+      '/_next/static/dsh-profile/' +
+      createHash('sha256').update(sealed).digest('hex') +
+      '/';
+    const bundles = graph.batches.map((batch) => ({
+      reference: batch.url,
+      revision: batch.rev,
+      sha256: manifest.profile.files.find(
+        (file) => file.reference === batch.url,
+      )!.sha256,
+      phase: batch.phase,
+    }));
+    const publicBundles = new Map(
+      bundles.map((bundle) => [
+        publicRoot + 'bundles/' + bundle.sha256 + '.js',
+        bundle,
+      ]),
+    );
+    const traffic: { kind: string; start: number; end?: number }[] = [];
+    let started = 0;
+    let firstRpc: number | undefined;
     let applicationReads = 0;
     let browserBootstrapReads = 0;
     f.web.on('request', async (request, response) => {
@@ -77,6 +101,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       try {
         const scopeId = url.searchParams.get('scopeId');
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
+          firstRpc ??= performance.now();
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(chunk);
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -99,13 +124,40 @@ it.skipIf(!browserExecutable).each([false, true])(
             response.write('/* deliberately incomplete application');
             return;
           }
-          return await copy(
+          const timing = { kind, start: performance.now(), end: 0 };
+          traffic.push(timing);
+          await copy(
             await f.publish(
               kind,
               scopeId!,
               Object.fromEntries(url.searchParams),
             ),
           );
+          timing.end = performance.now();
+          return;
+        }
+        const publicBundle = !stall && publicBundles.get(url.pathname);
+        if (publicBundle) {
+          const timing = {
+            kind: 'public-' + publicBundle.phase,
+            start: performance.now(),
+            end: 0,
+          };
+          traffic.push(timing);
+          expect(request.headers.cookie).toBeUndefined();
+          const bytes = await release.read(
+            publicBundle.reference,
+            new AbortController().signal,
+          );
+          await delay(180);
+          timing.end = performance.now();
+          response
+            .writeHead(200, {
+              'content-type': 'text/javascript',
+              'cache-control': 'public, max-age=31536000, immutable',
+            })
+            .end(bytes);
+          return;
         }
         if (staticFiles.has(url.pathname)) {
           const asset = await readFile(
@@ -195,7 +247,8 @@ it.skipIf(!browserExecutable).each([false, true])(
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
-            data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
+            data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"
+            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ phase: _phase, ...bundle }) => bundle))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
@@ -253,6 +306,7 @@ it.skipIf(!browserExecutable).each([false, true])(
         });
       });
     }
+    started = performance.now();
     await page.goto(f.origin);
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
@@ -289,6 +343,20 @@ it.skipIf(!browserExecutable).each([false, true])(
     expect(await editor.isEditable()).toBe(true);
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(1);
+    console.info(
+      'HOT_NATIVE_BENCHMARK ' +
+        JSON.stringify({
+          browser: browser.version(),
+          publicDelayMs: 180,
+          firstRpcMs: Math.round(firstRpc! - started),
+          editableMs: Math.round(performance.now() - started),
+          traffic: traffic.map(({ kind, start, end }) => ({
+            kind,
+            startMs: Math.round(start - started),
+            endMs: typeof end === 'number' ? Math.round(end - started) : null,
+          })),
+        }),
+    );
     await expect
       .poll(() => firstItems)
       .toEqual(
