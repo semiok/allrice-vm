@@ -226,6 +226,11 @@ suite('4.0 browser cold entry', () => {
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
       await assertWaiting('正在打开对话', '马上就好。');
+      const extensionHint =
+        '如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试';
+      expect(await page.getByText(extensionHint, { exact: true }).count()).toBe(
+        0,
+      );
       const animations = () =>
         spinner.evaluate(
           (element) => element.getAnimations({ subtree: true }).length,
@@ -248,6 +253,12 @@ suite('4.0 browser cold entry', () => {
         .getByRole('alert')
         .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
+      expect(
+        await page
+          .getByRole('alert')
+          .getByText(extensionHint, { exact: true })
+          .isVisible(),
+      ).toBe(true);
       expect(
         await page
           .getByRole('alert')

@@ -670,17 +670,14 @@ function EntryStatus({
   const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
     status,
   );
-  const resumable =
-    status === 'cancelled' || status === 'failed' || status === 'asset-timeout';
+  const failedOpening = status === 'failed' || status === 'asset-timeout';
+  const resumable = status === 'cancelled' || failedOpening;
   return (
     <div className={styles.status}>
       <section>
         <div
           role={
-            status === 'failed' ||
-            status === 'asset-timeout' ||
-            status === 'denied' ||
-            status === 'unknown'
+            failedOpening || status === 'denied' || status === 'unknown'
               ? 'alert'
               : 'status'
           }
@@ -689,6 +686,9 @@ function EntryStatus({
           {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
           <p>{description}</p>
+          {failedOpening && (
+            <p>如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试</p>
+          )}
         </div>
         {starting && (
           <button type="button" onClick={stop}>
