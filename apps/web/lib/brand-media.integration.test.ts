@@ -63,16 +63,10 @@ import {
   ensureGeneralEmployeeInstance,
   getEmployeeInstance,
 } from '../../../packages/database/src/employees/employee-instances.ts';
-import { createEmployeeAdministrationFixture } from '../../../packages/database/src/employee-administration.fixture.ts';
 import { approveSyntheticCurrentEmployeeExecution } from '../../../packages/database/src/current-execution.fixture.ts';
-import {
-  savePlatformEmployeeDraft,
-  assignPublishedPlatformEmployeeToWorkspace,
-} from '../../../packages/database/src/employees/platform-employees.ts';
 import {
   createChatSession,
   sendChatMessage,
-  getEmployeeWorkspace,
 } from '../../../packages/database/src/workspace/service.ts';
 import {
   EmployeeModuleError,

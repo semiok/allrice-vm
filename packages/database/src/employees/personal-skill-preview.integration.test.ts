@@ -45,10 +45,7 @@ import {
 } from '../tenant-employees.ts';
 import { getEmployeeWorkspace } from '../workspace/service.ts';
 import { createEmployeeInstance } from './employee-instances.ts';
-import {
-  savePlatformEmployeeDraft,
-  assignPublishedPlatformEmployeeToWorkspace,
-} from './platform-employees.ts';
+import { assignPublishedPlatformEmployeeToWorkspace } from './platform-employees.ts';
 import { runtimePolicyDigest } from '../runtime-policy.ts';
 import {
   freezePersonalSkills,

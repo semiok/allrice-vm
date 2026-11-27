@@ -591,7 +591,7 @@ commit;
     `${assignments}?${new URLSearchParams({ workspaceId, target: JSON.stringify({ type: 'all' }) })}`,
   );
   const employees = await platform();
-  for (const want of wanted) {
+  for (const want of sourceEmployees) {
     const id = employees.find((e) => e.employeeKey === want.key)?.id;
     const entry =
       id && (catalog.employees ?? []).find((e) => e.employeeId === id);

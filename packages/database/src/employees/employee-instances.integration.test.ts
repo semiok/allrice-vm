@@ -1,17 +1,7 @@
 import { assembleEmployeeKernel } from '../../../../apps/worker/src/employee-kernel.js';
 import { resolveEmployeeExecution } from './employeehub.ts';
 
-import { sceneSkillFixture } from './employee-scene-skills.fixture.ts';
 import type { RequestContext } from '@allrice/contracts';
-import {
-  listPersonalSceneSkills,
-  savePersonalSceneSkill,
-  getPersonalSceneSkillResource,
-} from './personal-scene-skills.ts';
-import {
-  inspectPersonalSceneSkill,
-  listPersonalSceneReads,
-} from './personal-scene-reads.ts';
 import { heartbeatJob } from '../execution/queue.ts';
 
 import { memoryPairDigest } from '../workspace/employee-memory.ts';
@@ -27,10 +17,7 @@ import {
   rejectConversationSteer,
 } from '../conversation/conversation-input.ts';
 
-import {
-  loadPersonalRuntimeSceneSkill,
-  prepareEmployeeContentContext,
-} from './employee-runtime-content.ts';
+import { prepareEmployeeContentContext } from './employee-runtime-content.ts';
 import { getEmployeeDetails } from './employee-content.ts';
 import {
   preparePersonNativeWebRoster,

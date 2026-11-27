@@ -31,7 +31,6 @@ import {
   changeAdminTenantEmployee,
 } from '../tenant-employees.ts';
 import { getEmployeeWorkspace } from '../workspace/service.ts';
-import { savePlatformEmployeeDraft } from './platform-employees.ts';
 import { createEmployeeInstance } from './employee-instances.ts';
 import {
   getPersonalSceneSkill,
