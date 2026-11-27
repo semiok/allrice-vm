@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import type { readPlatformModelSettings } from '@allrice/database';
 import { createDshGatewayProvider } from '@allrice/model-gateway';
 import {
   AttachmentId,
@@ -20,11 +21,13 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
 const state = vi.hoisted(() => ({
+  settings: vi.fn<typeof readPlatformModelSettings>(),
   subscription: vi.fn<() => Promise<{ slot: 1 | 2; revision: string }[]>>(),
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
   getDatabase: () => state.subscription,
+  readPlatformModelSettings: state.settings,
 }));
 vi.mock('../codex-subscription-home.js', () => ({
   codexSubscriptionHome: () => state.home,
@@ -36,7 +39,18 @@ beforeEach(async () => {
   state.subscription
     .mockReset()
     .mockResolvedValue([{ slot: 1, revision: '1' }]);
-  vi.stubEnv('ALLRICE_DSH_CODEX_MODEL', 'gpt-6.1-sol');
+  state.settings.mockReset().mockResolvedValue({
+    revision: 1,
+    configuration: {
+      connectionId: '52000000-0000-4000-8000-000000000001',
+      workModel: 'gpt-6.2-sol',
+      reasoningEffort: 'high',
+      timeoutMs: 300_000,
+      imageModel: 'auto',
+      imagesEnabled: false,
+    },
+    updatedAt: '2026-11-26T00:00:00.000Z',
+  });
 });
 afterEach(async () => {
   vi.unstubAllEnvs();
@@ -62,7 +76,7 @@ async function saveSyntheticGrant(expires = 4102444800000) {
   );
 }
 
-it('loads the pinned native model route from a stored subscription without making a model call', async () => {
+it('pins the platform selection to the current Host and reads newer settings for the next Host', async () => {
   await saveSyntheticGrant();
   const external = vi.fn<typeof fetch>();
   vi.stubGlobal('fetch', external);
@@ -73,7 +87,7 @@ it('loads the pinned native model route from a stored subscription without makin
   try {
     expect(host.route).toMatchObject({
       provider: 'openai-codex',
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.2-sol',
       transport: 'sse',
     });
     await expect(
@@ -82,7 +96,11 @@ it('loads the pinned native model route from a stored subscription without makin
         controller().signal,
       ),
     ).resolves.toMatchObject({
-      config: { provider: host.route.provider, model: host.route.model },
+      config: {
+        provider: host.route.provider,
+        model: host.route.model,
+        reasoningEffort: 'high',
+      },
     });
     await expect(
       host.llm.prepareCall(
@@ -90,7 +108,39 @@ it('loads the pinned native model route from a stored subscription without makin
         controller().signal,
       ),
     ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
-    expect(external).not.toHaveBeenCalled();
+    await expect(
+      host.readModelInfo(controller().signal),
+    ).resolves.toMatchObject({
+      name: 'GPT-6.2 Sol',
+      reasoning: { defaultEffort: 'high' },
+    });
+    const current = await state.settings.mock.results[0]!.value;
+    state.settings.mockResolvedValue({
+      ...current,
+      revision: 2,
+      configuration: {
+        ...current.configuration,
+        workModel: 'gpt-6.1-sol',
+        reasoningEffort: 'medium',
+      },
+    });
+    const next = await createProductionCodexRuntime(
+      controller().signal,
+      'next-owner',
+    );
+    try {
+      expect(host.route.model).toBe('gpt-6.2-sol');
+      expect(next.route.model).toBe('gpt-6.1-sol');
+      await expect(
+        next.readModelInfo(controller().signal),
+      ).resolves.toMatchObject({
+        reasoning: { defaultEffort: 'medium' },
+      });
+      expect(state.settings).toHaveBeenCalledTimes(2);
+      expect(external).not.toHaveBeenCalled();
+    } finally {
+      await next.close();
+    }
   } finally {
     try {
       await host.close();
@@ -192,6 +242,10 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
           'utf8',
         ),
       );
+      expect(payload).toMatchObject({
+        model: 'gpt-6.2-sol',
+        reasoning: { effort: 'high' },
+      });
       outboundImage = payload.input.some(
         (item: { content?: { type?: string; image_url?: string }[] }) =>
           Array.isArray(item.content) &&

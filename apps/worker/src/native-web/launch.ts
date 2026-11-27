@@ -270,6 +270,8 @@ export function apply(ctx, config) {
                   config: {
                     provider: modelAdapter.provider,
                     model: modelAdapter.model,
+                    reasoningEffort:
+                      modelAdapter.modelInfo.reasoning?.defaultEffort,
                   },
                 },
               ]

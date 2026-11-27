@@ -3,7 +3,8 @@ import { Context } from '@deepseek-ai/cordis';
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
-import { getDatabase } from '@allrice/database';
+import type { PlatformModelConfiguration } from '@allrice/contracts';
+import { getDatabase, readPlatformModelSettings } from '@allrice/database';
 import {
   ModelGatewayError,
   createOwnedModelTransport,
@@ -29,10 +30,13 @@ async function readSelectedSubscription() {
 }
 
 export function managedCodexModel(model: string) {
-  if (!['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model))
+  if (
+    !['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model)
+  )
     return { id: model };
   return {
     id: model,
+    ...(model === 'gpt-6.2-sol' ? { name: 'GPT-6.2 Sol' } : {}),
     contextWindow: 272000,
     input: ['text', 'image'] as ('text' | 'image')[],
     reasoningEfforts: {
@@ -77,6 +81,7 @@ async function openCodexGeneration(
   lifetime: AbortSignal,
   selection: Awaited<ReturnType<typeof readSelectedSubscription>>,
   model: string,
+  reasoning: PlatformModelConfiguration['reasoningEffort'],
   images: ReturnType<typeof createProductionModelImages> | undefined,
 ) {
   lifetime.throwIfAborted();
@@ -128,11 +133,13 @@ async function openCodexGeneration(
     await host
       .plugin(PiAi, {
         providers: {
-          [provider]: { transport: 'sse', models: [modelMetadata] },
+          [provider]: { transport: 'sse', models: [modelMetadata], reasoning },
         },
       })
       .await();
     const modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
+    if (modelInfo.reasoning?.defaultEffort !== reasoning)
+      throw new ModelGatewayError('BINDING_INVALID');
     await assertCurrent(revoked);
     return {
       revoked,
@@ -158,12 +165,12 @@ export async function createProductionCodexRuntime(
   readModelImage?: ReadProductionModelImage,
 ) {
   lifetime.throwIfAborted();
-  const model =
-    process.env.ALLRICE_DSH_CODEX_MODEL ??
-    process.env.ALLRICE_CODEX_MODEL ??
-    'gpt-6.1-sol';
-  if (!model || model.trim() !== model)
-    throw new ModelGatewayError('BINDING_INVALID');
+  // A Host and its existing guests share one pinned route. Activate the
+  // audited platform selection when constructing the next Host generation.
+  const {
+    configuration: { workModel: model, reasoningEffort },
+  } = await readPlatformModelSettings();
+  lifetime.throwIfAborted();
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const route = Object.freeze({
@@ -210,6 +217,7 @@ export async function createProductionCodexRuntime(
           revoked,
           selection,
           model,
+          reasoningEffort,
           images,
         );
         active.throwIfAborted();

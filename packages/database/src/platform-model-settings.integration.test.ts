@@ -42,19 +42,40 @@ integration('platform-wide model inheritance', () => {
         ),
       ).toBe(true);
       const settings = await readPlatformModelSettings();
-      const nextModel =
-        settings.configuration.workModel === 'gpt-6.1-sol'
-          ? 'gpt-6-luna'
-          : 'gpt-6.1-sol';
+      const nextModel = 'gpt-6.2-sol';
       await withFixturePlatformAdministrator(f.ownerId, async () => {
         await updatePlatformModelSettings(context, {
           expectedRevision: settings.revision,
           configuration: {
             ...settings.configuration,
             workModel: nextModel,
-            reasoningEffort: 'medium',
+            reasoningEffort: 'high',
           },
         });
+      });
+      const updated = await readPlatformModelSettings();
+      expect(updated).toMatchObject({
+        revision: settings.revision + 1,
+        configuration: { workModel: nextModel, reasoningEffort: 'high' },
+      });
+      const [entry] = await f.db`
+        select display_name,default_reasoning_effort from allrice_model_catalog_entries
+        where model=${nextModel}
+      `;
+      expect(entry).toEqual({
+        display_name: 'GPT-6.2 Sol',
+        default_reasoning_effort: 'high',
+      });
+      const [audit] = await f.db`
+        select decision,metadata from allrice_audit_events
+        where action='platform_models.update' and actor_id=${f.ownerId}
+      `;
+      expect(audit).toMatchObject({
+        decision: 'recorded',
+        metadata: {
+          revision: settings.revision + 1,
+          configuration: { workModel: nextModel, reasoningEffort: 'high' },
+        },
       });
       const after = await getEmployeeWorkspace(context, f.workspaceId);
       expect(after.employeeProfiles.map((profile) => profile.model)).toEqual(
@@ -62,7 +83,7 @@ integration('platform-wide model inheritance', () => {
           harness: 'dsh',
           provider: 'openai-codex',
           model: nextModel,
-          reasoningEffort: 'medium',
+          reasoningEffort: 'high',
         })),
       );
       expect(

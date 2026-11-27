@@ -16,6 +16,7 @@ import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/typ
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
@@ -567,11 +568,15 @@ it.skipIf(!cli)(
       origin: 'http://127.0.0.1:1',
       capability: 'a'.repeat(43),
       provider: 'openai-codex',
-      model: 'fixture-codex',
+      model: 'gpt-6.2-sol',
       modelInfo: {
         provider: 'openai-codex',
-        id: 'fixture-codex',
-        name: 'fixture-codex',
+        id: 'gpt-6.2-sol',
+        name: 'GPT-6.2 Sol',
+        reasoning: {
+          efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+          defaultEffort: ReasoningEffortId('high'),
+        },
       },
     };
     const f = await setupNativeWebFixture(
@@ -592,6 +597,7 @@ it.skipIf(!cli)(
         expect(catalog.value.default).toMatchObject({
           provider: route.provider,
           model: route.model,
+          reasoningEffort: 'high',
         });
         expect(catalog.value.routableProviders).toContain(route.provider);
         expect(catalog.value.failures).not.toContainEqual(
