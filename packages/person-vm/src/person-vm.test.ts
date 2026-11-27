@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   PersonVmError,
   PERSON_VM_COLD_MS,
@@ -8,7 +8,10 @@ import {
 import { PersonVmService } from './person-vm.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { runCommand } from './process.ts';
-import type { PersonVmBootstrapScope } from './guest-bootstrap.ts';
+import type {
+  PersonVmBootstrapScope,
+  PersonVmStartingScope,
+} from './guest-bootstrap.ts';
 import {
   context,
   harness,
@@ -19,6 +22,138 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  it.each([
+    'fresh disk and attach',
+    'previous disk',
+    'idempotent create',
+    'borrowed attachment',
+    'image changes before probe',
+    'image changes during probe',
+    'existing home',
+    'unjoined probe',
+  ] as const)(
+    'limits the first HOME receipt to an exact fresh start: %s',
+    async (state) => {
+      const h = harness();
+      const rc = context();
+      const employee = {
+        workspaceId: rc.workspaceId ?? randomUUID(),
+        employeeInstanceId: randomUUID(),
+        employeeRevision: 1,
+        employeeVersionId: randomUUID(),
+      };
+      const roster = {
+        personId: rc.actor.id,
+        organizationId: rc.organizationId,
+        entries: [employee],
+      };
+      const selectedEmployee = {
+        personId: roster.personId,
+        organizationId: roster.organizationId,
+        ...employee,
+      };
+      const port = { hostPort: 32171, guestPort: 32171 };
+      const { create, attach, inspectMount } = h.disk;
+      vi.spyOn(h.disk, 'create').mockImplementation(async (ref, scoped) => {
+        await create(ref, scoped);
+        if (state !== 'idempotent create')
+          return { device: 'synthetic', inode: ref.vmId };
+      });
+      if (state === 'borrowed attachment')
+        vi.spyOn(h.disk, 'attach').mockImplementation((disk, scoped) =>
+          attach(disk, scoped),
+        );
+      let probed = false;
+      if (
+        state === 'image changes before probe' ||
+        state === 'image changes during probe'
+      )
+        vi.spyOn(h.disk, 'inspectMount').mockImplementation(
+          (disk, active, expected) => {
+            if (state === 'image changes before probe' || probed)
+              return Promise.resolve({ state: 'unknown' });
+            return inspectMount!(disk, active, expected);
+          },
+        );
+      const observeHomes = vi.fn(
+        async (scope: PersonVmStartingScope, mount: string) => {
+          await scope.assertCurrent();
+          const during = await h.store.read(rc.actor.id);
+          expect(during?.instanceId).toBe(scope.binding.instanceId);
+          expect(during?.leaseOwner).toBeTruthy();
+          expect(during?.phase).toBe('starting');
+          expect(mount).toBe('/synthetic/' + scope.binding.vmId);
+          probed = true;
+          if (state === 'unjoined probe')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          return state !== 'existing home';
+        },
+      );
+      h.native.prepareWebEndpoints = vi.fn<
+        NonNullable<typeof h.native.prepareWebEndpoints>
+      >(async (binding, roster) => ({
+        binding,
+        rosterDigest: roster.digest,
+        slots: [port],
+        endpoints: roster.entries.map((entry) => ({ ...entry, ...port })),
+      }));
+      h.native.assertWebEndpoints = vi.fn(async () => {});
+      h.runtime.retireAfterNativeStop = vi.fn(async () => {});
+      const stage = vi.spyOn(h.runtime, 'memoryGuestPlan');
+      const service = new PersonVmService({
+        ...h.options,
+        nativeWeb: {
+          async prepare() {
+            return {
+              ...roster,
+              digest: `sha256:${createHash('sha256').update(JSON.stringify(roster)).digest('hex')}`,
+            };
+          },
+        },
+        readUnusedEmployeeHomes: observeHomes,
+      });
+      const previous =
+        state === 'previous disk' ? await service.create(rc, signal()) : null;
+      const starting = service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          selectedEmployee,
+          target: {
+            vmId: previous?.vmId ?? null,
+            instanceId: null,
+            leaseEpoch: 1,
+            assertAuthority: async () => {},
+          },
+        },
+        signal(),
+      );
+      if (state === 'unjoined probe') {
+        await expect(starting).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(observeHomes).toHaveBeenCalledOnce();
+        expect(stage).not.toHaveBeenCalled();
+        expect(h.log).toContain('native:stop');
+        return;
+      }
+      await expect(starting).resolves.toMatchObject({ ready: true });
+      const startup = stage.mock.calls[0]?.[2];
+      expect(startup?.selectedEmployee).toEqual(selectedEmployee);
+      expect(startup?.unusedEmployeeHomes).toBe(
+        state === 'fresh disk and attach' ? true : undefined,
+      );
+      expect(observeHomes).toHaveBeenCalledTimes(
+        [
+          'fresh disk and attach',
+          'existing home',
+          'image changes during probe',
+        ].includes(state)
+          ? 1
+          : 0,
+      );
+    },
+  );
   it('rejects a changed prewarm epoch under the lease before any disk or native side effect', async () => {
     const store = new MemoryStore(),
       h = harness(store),

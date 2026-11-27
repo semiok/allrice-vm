@@ -69,7 +69,17 @@ it('carries the exact current selection through the real H1 scope to the shared 
   expect(await f.invoke(active)).toBe(f.view);
   expect(f.vm.prewarm).toHaveBeenCalledExactlyOnceWith(
     f.base.context,
-    { trigger: 'page' },
+    {
+      trigger: 'page',
+      selectedEmployee: {
+        personId: f.base.identity.personId,
+        organizationId: f.base.identity.organizationId,
+        workspaceId: f.base.identity.workspaceId,
+        employeeInstanceId: f.base.identity.employeeInstanceId,
+        employeeRevision: f.base.identity.employeeRevision,
+        employeeVersionId: f.base.identity.employeeVersionId,
+      },
+    },
     active,
   );
   expect(source.identity).toHaveBeenCalledTimes(3);
@@ -77,6 +87,36 @@ it('carries the exact current selection through the real H1 scope to the shared 
   await f.invoke();
   expect(source.identity).toHaveBeenCalledTimes(6);
   expect(source.principal).toHaveBeenCalledTimes(6);
+});
+
+it('keeps the checked profile and original physical fence across the awaited grant', async () => {
+  const f = fixture();
+  const initial = { ...f.base.identity };
+  source.identity
+    .mockResolvedValue(initial)
+    .mockImplementationOnce(async () => {
+      f.base.identity.employeeVersionId = 'changed-caller-argument';
+      return initial;
+    });
+  const target = {
+    leaseEpoch: 1,
+    vmId: null,
+    instanceId: null,
+    assertAuthority: vi.fn(async () => {}),
+  };
+  await f.prewarm(
+    f.base.context,
+    f.base.identity,
+    { trigger: 'page', target },
+    signal(),
+  );
+  const [, prewarm] = f.vm.prewarm.mock.calls[0]!;
+  expect(prewarm.target).toBe(target);
+  expect(Object.isFrozen(prewarm.selectedEmployee)).toBe(true);
+  expect(prewarm.selectedEmployee).toMatchObject({
+    employeeVersionId: initial.employeeVersionId,
+  });
+  expect(prewarm.selectedEmployee).not.toHaveProperty('threadId');
 });
 
 it('rejects stale selection before any VM effect and preserves a later valid request', async () => {
@@ -170,7 +210,13 @@ it('the existing prewarm port consumes the named production callback with exact 
       signal(),
     );
     expect(f.vm.prewarm).toHaveBeenCalledOnce();
-    expect(f.vm.prewarm.mock.calls[0]![1]).toEqual({ trigger: 'input' });
+    expect(f.vm.prewarm.mock.calls[0]![1]).toMatchObject({
+      trigger: 'input',
+      selectedEmployee: {
+        employeeInstanceId: f.base.identity.employeeInstanceId,
+        employeeVersionId: f.base.identity.employeeVersionId,
+      },
+    });
     expect(source.identity).toHaveBeenCalledTimes(5);
   } finally {
     await assembly.close();

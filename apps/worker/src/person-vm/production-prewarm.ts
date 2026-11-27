@@ -11,7 +11,7 @@ import type { createProductionPersonVmAuthority } from './production-authority.j
 export type CurrentSelectionPrewarm = (
   context: RequestContext,
   identity: DEntryIdentity,
-  input: Parameters<PersonVmPort['prewarm']>[1],
+  input: Omit<Parameters<PersonVmPort['prewarm']>[1], 'selectedEmployee'>,
   physicalSignal: AbortSignal,
 ) => ReturnType<PersonVmPort['prewarm']>;
 export type CurrentSelectionEntryRecovery = (
@@ -69,12 +69,28 @@ export function createProductionCurrentPrewarm(input: {
   >;
 }): CurrentSelectionPrewarm {
   return async (context, identity, trigger, physicalSignal) => {
+    const expected = Object.freeze({ ...identity });
     try {
       return await input.current.withCurrentSelection(
         context,
-        identity,
+        expected,
         physicalSignal,
-        () => input.vm.prewarm(context, trigger, physicalSignal),
+        () =>
+          input.vm.prewarm(
+            context,
+            {
+              ...trigger,
+              selectedEmployee: Object.freeze({
+                personId: expected.personId,
+                organizationId: expected.organizationId,
+                workspaceId: expected.workspaceId,
+                employeeInstanceId: expected.employeeInstanceId,
+                employeeRevision: expected.employeeRevision,
+                employeeVersionId: expected.employeeVersionId,
+              }),
+            },
+            physicalSignal,
+          ),
       );
     } catch (error) {
       if (

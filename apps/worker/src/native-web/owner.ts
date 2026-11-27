@@ -233,7 +233,8 @@ export async function openNativeWebOwner(input: {
   stage('startup-authority');
   const stale = new AbortController(),
     carrier = new AbortController(),
-    waitAbort = new AbortController();
+    waitAbort = new AbortController(),
+    jobExited = new AbortController();
   // Business cancellation fences calls; the separate carrier survives to carry
   // typed close/closed/end until normal cleanup, actual loss or exact stop.
   const signal = AbortSignal.any([input.lifetime, stale.signal]);
@@ -610,6 +611,7 @@ export async function openNativeWebOwner(input: {
         if (waitAbort.signal.aborted) return;
         nativeJobExited = true;
         lost('NATIVE_JOB_EXITED');
+        jobExited.abort();
       },
       (error: unknown) => {
         if (!waitAbort.signal.aborted) lost(error);
@@ -682,6 +684,8 @@ export async function openNativeWebOwner(input: {
     return Object.freeze({
       binding,
       revoked: signal,
+      /** Positive exact managed wait. Transport loss cannot signal job exit. */
+      jobExited: jobExited.signal,
       modelAdapterId: installedModelAdapter,
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
