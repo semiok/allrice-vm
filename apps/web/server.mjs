@@ -15,6 +15,7 @@ import {
   closeDatabase,
   createBridgeConnectionAuthority,
   resolveProjectPreviewAccess,
+  readServicePersonVmEmployeePortSlots,
   installDevProducerLifecycle,
 } from '@allrice/database';
 import next from 'next';
@@ -87,6 +88,7 @@ export async function startAllRiceWeb({
 } = {}) {
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error('INVALID_WEB_PORT');
+  if (!dev) await readServicePersonVmEmployeePortSlots();
   const server = new AllRiceHttpServer();
   const lifecycle = await installDevProducerLifecycle('web');
   const cloudPreview = process.env.ALLRICE_CLOUD_PREVIEW_SOCKET

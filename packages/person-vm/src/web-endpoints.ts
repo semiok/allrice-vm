@@ -4,6 +4,7 @@ import { open, rename, rm } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import {
+  MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS,
   readPlatformPersonVmConfiguration,
   UuidSchema,
   type RequestContext,
@@ -333,6 +334,7 @@ export async function prepareWebEndpoints(input: {
   binding: PersonVmBinding;
   roster: PersonVmWebRoster;
   state: 'absent' | 'stopped' | 'running' | 'unknown';
+  employeePortSlots?: number;
   signal: AbortSignal;
 }): Promise<PersonVmWebEndpointReceipt> {
   input.signal.throwIfAborted();
@@ -364,8 +366,15 @@ export async function prepareWebEndpoints(input: {
   let failed = false,
     failure: unknown;
   try {
-    const count = readPlatformPersonVmConfiguration().employeePortSlots;
-    if (!Number.isSafeInteger(count) || count < 1) invalid();
+    const count =
+      input.employeePortSlots ??
+      readPlatformPersonVmConfiguration().employeePortSlots;
+    if (
+      !Number.isInteger(count) ||
+      count < 1 ||
+      count > MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS
+    )
+      invalid();
     if (roster.entries.length > count)
       throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
     const slots: WebPort[] = [];

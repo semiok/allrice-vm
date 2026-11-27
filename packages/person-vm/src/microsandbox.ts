@@ -179,6 +179,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
       memoryMiB?: number;
+      employeePortSlots?: number;
       runner?: CommandRunner;
       jobCleanupTimeoutMs?: number;
     },
@@ -898,6 +899,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       directory: paths.home,
       binding,
       roster,
+      employeePortSlots: this.options.employeePortSlots,
       state:
         state === 'absent' && paths.upgrade === 'pending' ? 'stopped' : state,
       signal,

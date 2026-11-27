@@ -76,7 +76,9 @@ async function bootstrapFixture(
   jobCleanupTimeoutMs?: number,
   artifacts?: Pick<
     ConstructorParameters<typeof MicrosandboxPersonVm>[0],
-    'readonlyDshRuntimeDisk' | 'readonlyCommandMemoryDirectory'
+    | 'readonlyDshRuntimeDisk'
+    | 'readonlyCommandMemoryDirectory'
+    | 'employeePortSlots'
   >,
 ) {
   const root = await directory(),
@@ -243,10 +245,11 @@ save();
   return {
     h,
     native,
-    reloadNative: (disk?: ReadonlyDshRuntimeDisk) =>
+    reloadNative: (disk?: ReadonlyDshRuntimeDisk, employeePortSlots?: number) =>
       new MicrosandboxPersonVm({
         ...nativeOptions,
         ...(disk && { readonlyDshRuntimeDisk: disk }),
+        ...(employeePortSlots && { employeePortSlots }),
       }),
     rc,
     service,
@@ -902,7 +905,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
     };
   }
-  it('首次 CLI create 发布八个回环槽，仅实际员工获得启动配置', async () => {
+  it('首次 CLI create 默认发布二十个回环槽，仅实际员工获得启动配置', async () => {
     const f = await bootstrapFixture(),
       assigned = roster(f);
     let startup: PersonVmWebStartup | undefined;
@@ -931,7 +934,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         (entry) => `127.0.0.1:${entry.hostPort}:${entry.guestPort}`,
       ),
     );
-    expect(mappings).toHaveLength(8);
+    expect(mappings).toHaveLength(20);
     expect(startup!.receipt.endpoints).toHaveLength(assigned.entries.length);
     expect(
       creation.flatMap((arg, index) =>
@@ -1027,19 +1030,25 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(create).not.toContain(`allow:ingress@127.0.0.1/32:tcp:${h}`);
     expect(create[create.indexOf('--net-default') + 1]).toBe('deny');
   });
-  it.each([true, false])(
-    'retained start assigns a new employee without changing native ports; combined inspection=%s',
-    async (combined) => {
-      const f = await bootstrapFixture('ok', await readonlyFixture());
+  it.each([
+    [true, 1],
+    [false, 20],
+  ] as const)(
+    'retained start still uses the verified physical pool; combined=%s, new config=%s',
+    async (combined, configured) => {
+      const f = await bootstrapFixture(
+        'ok',
+        await readonlyFixture(),
+        undefined,
+        {
+          employeePortSlots: 4,
+        },
+      );
       let assigned = roster(f, 1);
       let startup: PersonVmWebStartup | undefined;
       f.h.runtime.start = async (_binding, _signal, _scope, web) => {
         startup = web;
       };
-      if (!combined)
-        Object.defineProperty(f.native, 'startWithWebEndpoints', {
-          value: undefined,
-        });
       const service = new PersonVmService({
         ...f.h.options,
         native: f.native,
@@ -1051,6 +1060,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       await f.native.stop(await service.resolve(f.rc, signal()), signal());
       await service.stop(f.rc, signal());
       const previous = startup!.receipt;
+      expect(previous.slots).toHaveLength(4);
       const newEmployee = roster(f, 1).entries[0]!;
       const facts = {
         personId: assigned.personId,
@@ -1063,8 +1073,18 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         ...facts,
         digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
       };
+      const reopened = f.reloadNative(undefined, configured);
+      if (!combined)
+        Object.defineProperty(reopened, 'startWithWebEndpoints', {
+          value: undefined,
+        });
+      const resumed = new PersonVmService({
+        ...f.h.options,
+        native: reopened,
+        nativeWeb: { prepare: async () => assigned },
+      });
       const before = (await f.calls()).length;
-      expect((await service.start(f.rc, signal())).ready).toBe(true);
+      expect((await resumed.start(f.rc, signal())).ready).toBe(true);
       const calls = (await f.calls()).slice(before);
       const verbs = calls.map(([verb]) => verb);
       const start = verbs.indexOf('start');
@@ -1163,12 +1183,12 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toHaveLength(restores.length);
       const restored = restores.at(-1)!;
       expect(restored).toContain(`allrice-${binding.vmId}-web`);
-      expect(restored.filter((arg) => arg === '-p')).toHaveLength(8);
+      expect(restored.filter((arg) => arg === '-p')).toHaveLength(20);
       expect(
         restored.filter((arg) =>
           arg.startsWith('allow:ingress@127.0.0.1/32:tcp:'),
         ),
-      ).toHaveLength(8);
+      ).toHaveLength(20);
       expect(restored).toContain('allow:egress@host:tcp:38990');
       expect(restored).toContain('--volume');
       expect(used.every(([verb]) => verb !== 'rm')).toBe(true);

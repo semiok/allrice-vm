@@ -211,6 +211,8 @@ export * from './platform-repository-merges.ts';
 export { repositoryMergeRequestGate } from './platform-repository-merge-authority.ts';
 export {
   readServiceBuildIdentity,
+  readSealedPersonVmHostConfiguration,
+  readServicePersonVmEmployeePortSlots,
   verifyServiceBuildIdentity,
   ServiceBuildManifestSchema,
   type ServiceBuildIdentity,

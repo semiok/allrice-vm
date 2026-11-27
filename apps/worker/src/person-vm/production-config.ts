@@ -1,6 +1,3 @@
-import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
-import { open, readFile, realpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import {
   basename,
@@ -13,13 +10,12 @@ import {
 } from 'node:path';
 import {
   readServiceBuildIdentity,
-  ServiceBuildManifestSchema,
+  readSealedPersonVmHostConfiguration,
 } from '@allrice/database';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import { checkedReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
 import { z } from 'zod';
 
-const configPath = '.local/person-vm-host.json';
 const checksum = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const bareHash = z.string().regex(/^[a-f0-9]{64}$/);
 const absolute = z
@@ -252,8 +248,6 @@ export class ProductionHostConfigurationUnavailable extends Error {
     super('PERSON_VM_HOST_CONFIGURATION_UNAVAILABLE');
   }
 }
-const digest = (value: Buffer | string) =>
-  'sha256:' + createHash('sha256').update(value).digest('hex');
 function unavailable(): never {
   throw new ProductionHostConfigurationUnavailable();
 }
@@ -268,65 +262,24 @@ export async function readProductionHostConfiguration(signal: AbortSignal) {
   if (!build || build.service !== 'worker' || build.mode !== 'production')
     unavailable();
   try {
-    if (!process.argv[1]) unavailable();
-    const entrypoint = await realpath(process.argv[1]);
-    signal.throwIfAborted();
-    const ending = '/apps/worker/dist/index.js';
-    if (!entrypoint.endsWith(ending)) unavailable();
-    const root = entrypoint.slice(0, -ending.length);
-    const manifest = ServiceBuildManifestSchema.parse(
-      JSON.parse(
-        await readFile(join(root, '.local/dev-build-identity.json'), 'utf8'),
-      ),
-    );
-    signal.throwIfAborted();
-    const { manifestDigest, ...body } = manifest;
-    if (
-      digest(JSON.stringify(body)) !== manifestDigest ||
-      manifestDigest !== build.manifestDigest ||
-      body.sourceSha !== build.sourceSha ||
-      body.sourceTree !== build.sourceTree
-    )
-      unavailable();
-    const selected = manifest.files.filter((file) => file.path === configPath);
-    const expected = selected[0];
-    if (selected.length !== 1 || !expected || expected.scope !== 'worker')
-      unavailable();
-    const file = await open(
-      join(root, configPath),
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-    let value: ProductionHostConfiguration;
-    try {
-      signal.throwIfAborted();
-      const stat = await file.stat();
-      signal.throwIfAborted();
-      if (
-        !stat.isFile() ||
-        (stat.mode & 0o777) !== 0o600 ||
-        stat.uid !== process.getuid?.() ||
-        stat.size !== expected.bytes
-      )
-        unavailable();
-      const contents = await file.readFile();
-      signal.throwIfAborted();
-      if (
-        contents.length !== expected.bytes ||
-        digest(contents) !== expected.checksum
-      )
-        unavailable();
-      value = configuration.parse(JSON.parse(contents.toString('utf8')));
-    } finally {
-      await file.close();
-    }
+    const sealed = await readSealedPersonVmHostConfiguration(build, signal);
+    if (!sealed) unavailable();
+    const value = configuration.parse(sealed.configuration);
+    const defaults = readPlatformPersonVmConfiguration();
     signal.throwIfAborted();
     return Object.freeze({
       configuration: value,
-      platform: readPlatformPersonVmConfiguration(),
+      platform:
+        sealed.employeePortSlots === defaults.employeePortSlots
+          ? defaults
+          : Object.freeze({
+              ...defaults,
+              employeePortSlots: sealed.employeePortSlots,
+            }),
       applicationBuild: Object.freeze({
         sourceSha: build.sourceSha,
         sourceTree: build.sourceTree,
-        manifestDigest,
+        manifestDigest: sealed.manifestDigest,
       }),
     });
   } catch {

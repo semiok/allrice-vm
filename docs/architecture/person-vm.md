@@ -19,6 +19,8 @@ prepare/assertActive/revoke 均 host-only，不是可让模型调用的工具。
 
 v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），20 分钟策略只由 host 依据活动事实执行。
 
+员工端口位在新 VM 创建或旧 v1 VM 确认停止后的转换时一次发布，仅宿主回环可达。运维可在发布封存的 `.local/person-vm-host.json` 顶层设置 `employeePortSlots`。合法值为 1–20 的整数，缺字段默认 20，非法值记录字段名、原因和回退值后使用 20。Web 配额与 Worker 原生发布读同一封存值。已核实的 v2 物理槽宽随 VM 记录持久保存，配置上调或下调都不改变它。保盘保留槽宽，彻底擦除完成后清除原宽度。槽位总数独立于同时运行的员工数。
+
 普通路由的 MET-268/MET-271 调用 host-only `resolve(RequestContext, signal)` 与 `assertCurrentBinding(RequestContext, binding, signal)`。两者重新核本人/企业现权、运行阶段、精确 instance/epoch 与出口活性；不返回 ownerToken、不暴露内部表。RequestContext 必须来自各自可信会话/受管连接，不能由 guest header 或 JSON 反序列化生成。resolve 是本次快照，各次实际请求仍须 assert；启动/停止/接管中的租约不发新路由。
 
 正式共享 admission 路径另消费根出口 `PersonVmAdmissionBindingPort.assertAdmissionBinding(context, binding, signal)`，由同一个 `PersonVmService` 提供；未创建 shared host 即拒绝，不接另一 factory/DB 的权威。此口只核当前 user/企业、完整五字段、shared revoked 与内部 exact egress receipt，不公开 receipt/capability/ownerToken，不判断 ready 或授 dispatch 权。正常 freeze/physical lease 不构成资格错误；后续实际工作仍必须在同一 shared boundary 的 admit/queued/activate/finish 内，starting/stop/epoch/recovery 保证不变。egress.assertActive 只核本地 exact receipt，不能反调 VM 校验形成递归。

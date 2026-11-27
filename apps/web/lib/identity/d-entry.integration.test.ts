@@ -29,6 +29,7 @@ import {
 } from '../../../../packages/person-vm/src/test-support.ts';
 import * as client from '../../../../packages/database/src/core/client.ts';
 import * as firstEmployeeLimit from '../../../../packages/database/src/employees/d-entry-first-employee-limit.ts';
+import * as serviceBuild from '../../../../packages/database/src/service-build-identity.ts';
 import {
   createRuntimeFixtureDatabase,
   runtimeFixtureStorage,
@@ -2375,12 +2376,11 @@ suite(
       }
     });
 
-    it('enforces the verified physical width across workspaces after a platform increase, including stopped pools', async () => {
+    it('preserves the verified physical width across workspace writes when the platform cap changes in either direction', async () => {
       allowIsolatedSlotFixture();
       const f = await setup();
       const other = randomUUID();
-      const configuration = contracts.readPlatformPersonVmConfiguration();
-      const limit = configuration.employeePortSlots;
+      const limit = 4;
       await fixture.db`insert into allrice_workspaces(id,organization_id,slug,name)
         values(${other},${f.org},'slots','Other writable workspace')`;
       await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
@@ -2409,11 +2409,8 @@ suite(
       await clearPublished();
       await authorizeFixturePlatformAdministrator(fixture.db, f.user);
       const configured = vi
-        .spyOn(contracts, 'readPlatformPersonVmConfiguration')
-        .mockReturnValue({
-          ...configuration,
-          employeePortSlots: limit + 2,
-        });
+        .spyOn(serviceBuild, 'readServicePersonVmEmployeePortSlots')
+        .mockResolvedValue(20);
       try {
         await updateDEntryReleasePolicy(f.context, {
           revision: 'initial',
@@ -2440,6 +2437,7 @@ suite(
         expect(await (await create(input)).json()).toEqual({ instance });
         await fixture.db`update person_virtual_machines set phase='stopped',egress_receipt=null
           where person_id=${f.user}`;
+        configured.mockResolvedValue(1);
         const stoppedFull = await create(attempts[1 - winner]!);
         expect(stoppedFull.status).toBe(409);
         expect(await stoppedFull.json()).toMatchObject({
@@ -2487,6 +2485,7 @@ suite(
         expect(
           (await readPersonNativeWebRoster(f.context)).entries,
         ).toHaveLength(limit);
+        expect(configured).not.toHaveBeenCalled();
       } finally {
         configured.mockRestore();
         await clearPublished();
@@ -2522,6 +2521,9 @@ suite(
       const source = await secondAssignmentSource(f);
       await authorizeFixturePlatformAdministrator(fixture.db, admin.user);
       await clearPublished();
+      const configured = vi
+        .spyOn(serviceBuild, 'readServicePersonVmEmployeePortSlots')
+        .mockResolvedValue(1);
       try {
         const scope = { workspaceId: f.workspace, userIds: [f.user] };
         expect(
@@ -2532,9 +2534,6 @@ suite(
             )
           ).status,
         ).toBe(200);
-        await fixture.db`insert into person_virtual_machines
-          (person_id,vm_id,organization_id,instance_id,phase,disk_tier,native_created,lease_epoch,verified_web_slot_capacity)
-          values(${f.user},${randomUUID()},${f.org},${randomUUID()},'stopped','warm',true,1,1)`;
         const response = await publishReleasePolicy(
           rosterWrite(f, 'PUT', 'admin/d-entry-release-policy', {
             revision: 'initial',
@@ -2547,6 +2546,7 @@ suite(
           error: { code: 'QUOTA_EXCEEDED', message: '每人最多 1 个员工' },
         });
         expect((await readDEntryReleasePolicy()).revision).toBe('unpublished');
+        expect(configured).toHaveBeenCalledOnce();
         expect(
           await fixture.db`select id from allrice_audit_events
           where actor_id=${admin.user} and action='d_entry_release.update'`,
@@ -2557,6 +2557,7 @@ suite(
           where a.employee_id=${source}`,
         ).toEqual([]);
       } finally {
+        configured.mockRestore();
         await clearPublished();
         vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
       }

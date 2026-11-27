@@ -1,11 +1,8 @@
 import type postgres from 'postgres';
-import {
-  readPlatformPersonVmConfiguration,
-  type DEntryRolloutPolicy,
-  type RequestContext,
-} from '@allrice/contracts';
+import type { DEntryRolloutPolicy, RequestContext } from '@allrice/contracts';
 import { DataAccessError } from '../data.ts';
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
+import { readServicePersonVmEmployeePortSlots } from '../service-build-identity.ts';
 import { EmployeeAccessBusyError } from './employee-access-cancellation.ts';
 import { EmployeeInstanceError } from './employee-instances.ts';
 import {
@@ -111,11 +108,9 @@ async function assertCapacity(
         '当前工作台还没确认停机，停机后可以创建更多员工。',
       ),
     );
-  const { employeePortSlots } = readPlatformPersonVmConfiguration();
-  const capacity = Math.min(
-    employeePortSlots,
-    vm?.verified_web_slot_capacity ?? employeePortSlots,
-  );
+  const capacity =
+    vm?.verified_web_slot_capacity ??
+    (await readServicePersonVmEmployeePortSlots());
   if (after > capacity)
     refuseRoster(
       new EmployeeInstanceError(

@@ -1,11 +1,11 @@
 import { expect, it } from 'vitest';
 import { readPlatformPersonVmConfiguration } from './platform-person-vm-configuration.ts';
 
-it('keeps the application platform defaults at 2GiB and twenty minutes', () => {
+it('defaults to 2GiB, twenty minutes and twenty employee port slots', () => {
   expect(readPlatformPersonVmConfiguration()).toEqual({
     memoryMiB: 2 * 1024,
     idleMs: 20 * 60 * 1000,
-    employeePortSlots: 8,
+    employeePortSlots: 20,
     commandHighBytes: 1280 * 1024 ** 2,
     commandMaxBytes: 1280 * 1024 ** 2,
     commandSwapMaxBytes: 512 * 1024 ** 2,
@@ -31,7 +31,7 @@ it('has no request override and returns an immutable shared platform configurati
   expect(readPlatformPersonVmConfiguration()).toEqual({
     memoryMiB: 2 * 1024,
     idleMs: 20 * 60 * 1000,
-    employeePortSlots: 8,
+    employeePortSlots: 20,
     commandHighBytes: 1280 * 1024 ** 2,
     commandMaxBytes: 1280 * 1024 ** 2,
     commandSwapMaxBytes: 512 * 1024 ** 2,

@@ -35,10 +35,8 @@ vi.mock('node:fs/promises', async (original) => {
   };
 });
 vi.mock('@allrice/database', async () => ({
+  ...(await import('../../../../packages/database/src/service-build-identity.ts')),
   readServiceBuildIdentity: source.build,
-  ServiceBuildManifestSchema: (
-    await import('../../../../packages/database/src/service-build-identity.ts')
-  ).ServiceBuildManifestSchema,
 }));
 import {
   ProductionHostConfigurationUnavailable,
@@ -225,6 +223,36 @@ afterEach(async () => {
 });
 
 describe('private production Host configuration', () => {
+  it.each([1, 20])('uses the sealed employee pool width %s', async (width) => {
+    const original = value();
+    await seal({ ...original, employeePortSlots: width });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform.employeePortSlots).toBe(width);
+    expect(result.configuration).toEqual(original);
+  });
+
+  it.each([0, 21, 1.5, 'private-invalid-input', null])(
+    'defaults an invalid sealed width without logging the input',
+    async (width) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const original = value();
+      await seal({ ...original, employeePortSlots: width });
+      const result = await readProductionHostConfiguration(signal());
+      expect(result.platform.employeePortSlots).toBe(20);
+      expect(result.configuration).toEqual(original);
+      expect(warn.mock.calls).toEqual([
+        [
+          '[person-vm.host-configuration]',
+          {
+            field: 'employeePortSlots',
+            reason: 'invalid_slot_count',
+            fallback: 20,
+          },
+        ],
+      ]);
+    },
+  );
+
   it('keeps disk preprovision disabled when absent or explicitly off', async () => {
     const read = () => readProductionHostConfiguration(signal());
     expect((await read()).configuration.disk.preprovision).toBeUndefined();
