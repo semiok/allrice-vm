@@ -150,6 +150,7 @@ it
           table: 'workspaces',
           operation: 'put',
           key: nativeWorkspace.id,
+          value: {},
         });
         return root;
       });
@@ -519,6 +520,7 @@ it
       await context.close();
       return;
     }
+    if (!life) throw Error('Missing fixture page carrier');
     expect(
       await workbench
         .getByText(/选择一个工作区开始|Choose a workspace to start/)
