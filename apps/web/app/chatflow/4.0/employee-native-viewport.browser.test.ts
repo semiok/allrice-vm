@@ -27,6 +27,19 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       String(row.sessionId) === 'root' ? { ...row, cwd: '/work' } : row,
     );
+    const message = '你好，帮我检查工作台布局。';
+    f.host.catalog.pageRecords = [
+      {
+        type: 'event',
+        event: {
+          type: 'user/message',
+          seq: 0,
+          time: 1,
+          data: { role: 'user', source: { kind: 'user' }, content: message },
+          surfaceOp: 'append',
+        },
+      },
+    ];
     const version = {
       id: identity.employeeVersionId,
       manifest: {
@@ -224,6 +237,9 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       await iframe.waitFor();
       await workbench.locator('#chat-sidebar').waitFor();
       await workbench.locator('#app [data-phase="active"]').waitFor();
+      await workbench
+        .getByText(message, { exact: true })
+        .waitFor({ timeout: 5000 });
       expect(await editor.isEditable()).toBe(true);
     } catch (error) {
       throw Error(JSON.stringify(errors), { cause: error });
