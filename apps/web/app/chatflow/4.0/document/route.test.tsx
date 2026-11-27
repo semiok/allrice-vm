@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { GET, HEAD } from './route';
+import { HEAD as bootstrapHead } from '../../../api/v1/d-entry/profile/bootstrap/route';
 import {
   GET as documentAsset,
   POST as documentUpload,
@@ -163,6 +164,7 @@ it('preserves invalid empty/duplicate values on the page for the document parser
 
 it('does not let HEAD consume a page bootstrap', () => {
   expect(HEAD().status).toBe(405);
+  expect(bootstrapHead().status).toBe(405);
   expect(profileRequest).not.toHaveBeenCalled();
 });
 

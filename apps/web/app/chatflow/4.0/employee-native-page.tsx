@@ -541,7 +541,14 @@ export function EmployeeNativePage({
       frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
       mounted = true;
-      setSource('/chatflow/4.0/document?' + params);
+      const documentUrl = '/chatflow/4.0/document?' + params;
+      const retainedWindow = activation.retainFrame
+        ? frame.current?.contentWindow
+        : undefined;
+      // A child URL replacement must not insert a second history item that
+      // intercepts the outer page's Back/Forward after a thread switch.
+      if (retainedWindow) retainedWindow.location.replace(documentUrl);
+      else setSource(documentUrl);
     };
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;

@@ -319,13 +319,17 @@ suite('4.0 browser cold entry', () => {
         await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
+        const currentDocument = () =>
+          iframe.evaluate(
+            (node) => (node as HTMLIFrameElement).contentDocument?.URL,
+          );
         await expect
           .poll(async () => {
-            const src = await iframe.getAttribute('src');
-            return src && new URL(src, f.origin).searchParams.get('threadId');
+            const url = await currentDocument();
+            return url && new URL(url, f.origin).searchParams.get('threadId');
           })
           .toBe(threadId);
-        const source = new URL((await iframe.getAttribute('src'))!, f.origin);
+        const source = new URL((await currentDocument())!, f.origin);
         expect(await iframe.isVisible()).toBe(false);
         const child = page.frameLocator('iframe');
         await child
