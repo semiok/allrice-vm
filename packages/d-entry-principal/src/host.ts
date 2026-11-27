@@ -525,8 +525,6 @@ class Scope implements Projection {
         ? this.sessions.get(item.parentSessionId)
         : undefined;
     }
-    this.stopFollow(stop, followId);
-    throw stop.signal.reason;
   }
   private rememberPageEvents(ids: readonly SessionId[]) {
     const count = this.eventSessions.size;

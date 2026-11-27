@@ -306,9 +306,9 @@ async function runStreams(
       if (follow) {
         if (!page.scope.opened.followWithdrawals)
           throw new RemoteError(
-            'gateway/unavailable',
+            'remote-access/denied',
             'Native follow continuity unavailable',
-            {},
+            { action: 'session/follow', reason: 'continuity-unavailable' },
           );
         let pending;
         while ((pending = follow.pending())) await pending;

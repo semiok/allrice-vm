@@ -457,7 +457,10 @@ it('refuses to follow on an owner that cannot report native child withdrawal', a
   });
   expect(await channel.next('root')).toMatchObject({
     type: 'error',
-    error: { code: 'gateway/unavailable' },
+    error: {
+      code: 'remote-access/denied',
+      details: { reason: 'continuity-unavailable' },
+    },
   });
   expect(f.host.catalog.follows).toHaveLength(0);
 });
