@@ -1,5 +1,4 @@
 import {
-  createLegacyEnterpriseMaterialsMcpPort,
   createLegacyEmployeeMemoryMcpPort,
   createLegacyDeliverablesMcpPort,
   type LegacyMcpExecution,
@@ -21,7 +20,6 @@ export interface LegacyMcpCallAuthority extends LegacyMcpExecution {
   employeeInstanceId: string;
   nativeSessionRef: AllriceMcpScope['nativeSessionRef'];
   nativeCallRef: string;
-  contentGenerationId?: string;
 }
 
 /** Minimal existing inline-generation path. Returning null means the native
@@ -83,7 +81,6 @@ export function createLegacyAllriceMcpServices(options: {
     signal: AbortSignal,
   ) => Promise<PreparedMcpDeliverable | null>;
 }): AllriceMcpServices {
-  const references = createLegacyEnterpriseMaterialsMcpPort();
   const memory = createLegacyEmployeeMemoryMcpPort();
   const deliverables = createLegacyDeliverablesMcpPort(options.storage);
   async function authorized(scope: AllriceMcpScope, signal: AbortSignal) {
@@ -124,26 +121,6 @@ export function createLegacyAllriceMcpServices(options: {
   }
   return {
     executionGeneration: '3.x',
-    referenceRead: (scope, input, signal) =>
-      run(scope, signal, async (authority) => {
-        if (!authority.contentGenerationId)
-          return allriceMcpApiError(
-            scope,
-            'DEPENDENCY_UNAVAILABLE',
-            'The reference execution carrier is not bound.',
-          );
-        const result = await references.readExact(
-          {
-            ...authority,
-            contentGenerationId: authority.contentGenerationId,
-            requestId: scope.requestContext.requestId,
-          },
-          input,
-          signal,
-        );
-        if ('isError' in result) return result;
-        return { content: [{ type: 'text', text: result.modelContent }] };
-      }),
     memoryRead: (scope, input, signal) =>
       run(scope, signal, async (authority) => {
         // READOUT is the exact original rendered detail. No invented pin/hash

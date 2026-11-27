@@ -14,7 +14,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   ExecutionContextSchema,
-  ReferenceReadsSchema,
   RunMemoryContextV2StateSchema,
   renderMemoryDetailV2,
   type RequestContext,
@@ -25,11 +24,9 @@ import {
   createRuntimeFixtureDatabase,
   runtimeFixtureStorage,
 } from '../../../packages/database/src/runtime.fixture.ts';
-import { referenceToolFixture } from '../../../packages/database/src/reference-tool.fixture.ts';
 import { createRunAuthorityFixture } from '../../../packages/database/src/run-authority.fixture.ts';
 import { ensureGeneralEmployeeInstance } from '../../../packages/database/src/employees/employee-instances.ts';
 import { freezeEmployeeMemoryIndexV2 } from '../../../packages/database/src/employees/employee-documents.ts';
-import { changeReferencePublication } from '../../../packages/database/src/reference-library.ts';
 import { readWorkbenchFile } from '../../../packages/database/src/workbench-files.ts';
 import {
   authenticateSession,
@@ -77,14 +74,12 @@ suite(
   'AllRice SDK MCP → public M1 owner subsets → real legacy business carriers',
   () => {
     let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
-    let references: Awaited<ReturnType<typeof referenceToolFixture>>;
     const connections: (() => Promise<void>)[] = [];
     beforeAll(async () => {
       vi.stubEnv('ALLRICE_ASSISTANTS_ENABLED', '1');
       vi.stubEnv('ALLRICE_WORKBENCH_ENABLED', '1');
       f = await createRuntimeFixtureDatabase();
       vi.spyOn(database, 'getDatabase').mockReturnValue(f.db);
-      references = await referenceToolFixture(f);
     }, 120000);
     afterEach(async () => {
       for (const close of connections.splice(0).reverse()) await close();
@@ -129,11 +124,7 @@ suite(
         nativeSessionRef: authority.nativeSessionRef,
         executionGeneration: '3.x',
         requestContext: context,
-        enabledModules: [
-          'enterprise-materials',
-          'employee-memory',
-          'deliverables',
-        ],
+        enabledModules: ['employee-memory', 'deliverables'],
         moduleConfigRevisionRef: 'explicit-migration-fixture-only',
         nativeCallRef: authority.nativeCallRef,
       };
@@ -171,126 +162,6 @@ suite(
         },
       };
     }
-    async function referenceAuthority(
-      run: Awaited<ReturnType<typeof references.run>>,
-    ) {
-      const [session] =
-        await f.db`select coalesce(employee_instance_id,employee_assignment_id) instance_id
-      from allrice_chat_sessions where id=${run.scope.sessionId}`;
-      return {
-        executionGeneration: '3.x' as const,
-        context: run.execution.context,
-        sessionId: run.scope.sessionId,
-        employeeInstanceId: session!.instance_id as string,
-        nativeSessionRef: {
-          instanceId: 'migration-fixture',
-          profileId: session!.instance_id as string,
-          sessionId: run.scope.sessionId,
-        },
-        nativeCallRef: randomUUID(),
-        contentGenerationId: run.runtime.generationId,
-        worker: { ...run.worker, attempt: run.execution.job.attempt },
-      };
-    }
-    const receipts = async (runId: string) =>
-      ReferenceReadsSchema.parse(
-        (
-          await f.db`select reference_reads from allrice_employee_runs where run_id=${runId}`
-        )[0]!.reference_reads ?? [],
-      );
-
-    it('“读差旅上限并列出处” returns real bytes, exact manifest/file pins and the committed receipt identity', async () => {
-      const body = '差旅上限九百元。';
-      const saved = await references.publish(body);
-      const run = await references.run();
-      const { client } = await connect(
-        references.context,
-        await referenceAuthority(run),
-      );
-      const result = await client.callTool({
-        name: 'reference_read',
-        arguments: saved.pin,
-      });
-      expect(result.isError).not.toBe(true);
-      const page = JSON.parse(text(result));
-      expect(page).toMatchObject({
-        content: body,
-        sourceId: saved.sourceId,
-        revisionId: saved.revisionId,
-        digest: saved.pin.digest,
-        checksum: saved.pin.checksum,
-      });
-      const reads = await receipts(run.scope.runId);
-      expect(reads).toHaveLength(1);
-      expect(reads[0]).toMatchObject({
-        receiptId: page.citation.id,
-        runId: run.scope.runId,
-        generationId: run.runtime.generationId,
-        jobId: run.worker.jobId,
-        workerId: run.worker.workerId,
-        contentChecksum: hash(body),
-        citation: {
-          reference: saved.pin,
-          locator: { start: 0, end: body.length },
-        },
-      });
-      await client.callTool({ name: 'reference_read', arguments: saved.pin });
-      expect(await receipts(run.scope.runId)).toEqual(reads);
-    }, 120000);
-
-    it('keeps real private-source, changed-pin and revoked-membership refusals as module errors', async () => {
-      const saved = await references.publish('可见差旅规则。');
-      const privateSource = await references.publish('发布者私有资料。', {
-        audience: { scope: 'personal', departmentIds: [] },
-      });
-      const run = await references.run();
-      const { client } = await connect(
-        references.context,
-        await referenceAuthority(run),
-      );
-      for (const pin of [
-        privateSource.pin,
-        { ...saved.pin, digest: hash('wrong manifest') },
-        { ...saved.pin, checksum: hash('wrong bytes') },
-      ]) {
-        const result = await client.callTool({
-          name: 'reference_read',
-          arguments: pin,
-        });
-        expect(result.isError).toBe(true);
-        expect(JSON.parse(text(result)).code).toBe('REFERENCE_UNAVAILABLE');
-      }
-      expect(await receipts(run.scope.runId)).toEqual([]);
-      await client.callTool({ name: 'reference_read', arguments: saved.pin });
-      const before = await receipts(run.scope.runId);
-      await changeReferencePublication(references.publisher, saved.sourceId, {
-        workspaceId: references.publisher.workspaceId,
-        requestId: randomUUID(),
-        expectedRevision: 1,
-        action: 'delete',
-      });
-      expect(
-        (
-          await client.callTool({
-            name: 'reference_read',
-            arguments: saved.pin,
-          })
-        ).isError,
-      ).toBe(true);
-      expect(await receipts(run.scope.runId)).toEqual(before);
-      await f.db`update allrice_memberships set active=false where organization_id=${run.scope.organizationId} and user_id=${run.scope.ownerId}`;
-      expect(
-        (
-          await client.callTool({
-            name: 'reference_read',
-            arguments: saved.pin,
-          })
-        ).isError,
-      ).toBe(true);
-      // Restore only fixture identity for later independent cases.
-      await f.db`update allrice_memberships set active=true where organization_id=${run.scope.organizationId} and user_id=${run.scope.ownerId}`;
-    }, 120000);
-
     async function memoryDeliveryFixture() {
       const pair = {
         summary: '日报先给风险和下一步',

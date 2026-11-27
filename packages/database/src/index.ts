@@ -441,7 +441,6 @@ export * from './employees/employee-module-bindings.ts';
 export { createBusinessRuntimeCaller } from './business-runtime/caller-transaction.ts';
 // MET-272 M1 module allowlist: migration adapters only, not completed 4.0 ports.
 export type { LegacyMcpExecution } from './mcp-legacy-execution.ts';
-export { createLegacyEnterpriseMaterialsMcpPort } from './enterprise-materials-mcp-port.ts';
 export { createLegacyEmployeeMemoryMcpPort } from './employee-memory-mcp-port.ts';
 export {
   createLegacyDeliverablesMcpPort,

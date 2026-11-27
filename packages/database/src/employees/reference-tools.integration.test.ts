@@ -119,6 +119,8 @@ suite('R3 actual-read receipts and private Run authority', () => {
       origin: { kind: 'tool', toolName: 'workspace.reference.search' },
       runId: run.scope.runId,
       generationId: run.runtime.generationId,
+      jobId: run.worker.jobId,
+      workerId: run.worker.workerId,
       citation: {
         reference: saved.pin,
         locator: { start: 6000, end: text.length },
@@ -135,6 +137,10 @@ suite('R3 actual-read receipts and private Run authority', () => {
         })
       ).modelContent,
     );
+    expect(reread).toMatchObject({
+      ...saved.pin,
+      content: '差旅上限九百元。',
+    });
     expect(reread.citation.id).toBe(first[0]!.receiptId);
     expect(await receipts(run)).toEqual(first);
     const next = JSON.parse(
@@ -238,8 +244,11 @@ suite('R3 actual-read receipts and private Run authority', () => {
     expect(await receipts(run!)).toEqual([]);
   }, 120000);
 
-  it('rejects forged owner, Run, generation, lease and source pins without appending evidence', async () => {
+  it('rejects forged Run authority, private sources and changed pins without appending evidence', async () => {
     const saved = await x.publish('私有范围测试政策');
+    const privateSource = await x.publish('发布者私有资料。', {
+      audience: { scope: 'personal', departmentIds: [] },
+    });
     const run = await x.run();
     for (const scope of [
       { ...run.scope, ownerId: randomUUID() },
@@ -272,12 +281,14 @@ suite('R3 actual-read receipts and private Run authority', () => {
         saved.pin,
       ),
     ).rejects.toMatchObject({ code: 'EMPLOYEE_CONTENT_UNAVAILABLE' });
-    await expect(
-      invoke(run, 'workspace.reference.read', {
-        ...saved.pin,
-        digest: 'sha256:' + 'f'.repeat(64),
-      }),
-    ).rejects.toMatchObject({ code: 'REFERENCE_UNAVAILABLE' });
+    for (const pin of [
+      privateSource.pin,
+      { ...saved.pin, digest: 'sha256:' + 'f'.repeat(64) },
+      { ...saved.pin, checksum: 'sha256:' + 'e'.repeat(64) },
+    ])
+      await expect(
+        invoke(run, 'workspace.reference.read', pin),
+      ).rejects.toMatchObject({ code: 'REFERENCE_UNAVAILABLE' });
     expect(await receipts(run)).toEqual([]);
   }, 120000);
 
