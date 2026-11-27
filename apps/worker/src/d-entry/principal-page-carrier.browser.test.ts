@@ -527,6 +527,17 @@ it
         '[data-row-key="session:' + createdThread + '"]',
       );
       await row.waitFor({ timeout: 15_000 });
+      await expect
+        .poll(
+          () =>
+            editor.evaluate((node) =>
+              node
+                .closest('[data-conversation-session]')
+                ?.getAttribute('data-conversation-session'),
+            ),
+          { timeout: 10_000 },
+        )
+        .toBe(createdNativeId);
       const draft = '原生新会话草稿';
       await editor.fill(draft, { timeout: 15_000 });
       const draftPrefix =

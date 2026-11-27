@@ -540,8 +540,18 @@ suite(
           created,
           signal,
         );
+        const { thread: directoryRow, ...firstRoot } = first;
         expect(first.identity.threadId).toEqual(expect.any(String));
         expect(first.identity.threadId).not.toBe(f.thread.id);
+        expect(directoryRow).toMatchObject({
+          id: first.identity.threadId,
+          ownerId: f.user,
+          organizationId: f.org,
+          workspaceId: first.identity.workspaceId,
+          employeeInstanceId: first.identity.employeeInstanceId,
+          visibility: 'private',
+          archivedAt: null,
+        });
         expect(first).toMatchObject({
           rootNativeSessionId: created.nativeSessionId,
           vmId: binding.vmId,
@@ -561,7 +571,7 @@ suite(
             binding.vmId,
             created.nativeSessionId,
           ),
-        ).toEqual(first);
+        ).toEqual(firstRoot);
 
         const forked = {
           ...created,
