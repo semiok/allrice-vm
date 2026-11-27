@@ -7,6 +7,10 @@ import {
 } from '@allrice/contracts';
 import { z } from 'zod';
 import {
+  profileBundleTimeoutMs,
+  type EarlyProfileBootstrap,
+} from './initial-document';
+import {
   nativeMuxUrl,
   pageClosing,
   pageCompletion,
@@ -45,8 +49,6 @@ export function releasedBundleResolver(data: DOMStringMap) {
     return () => undefined;
   }
 }
-
-const profileBundleTimeoutMs = 30_000;
 
 export class EmployeeProfileBundleTimeout extends Error {
   constructor() {
@@ -139,6 +141,7 @@ export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
+  earlyBootstrap?: EarlyProfileBootstrap,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -158,6 +161,11 @@ export function nativeProfileDocument(
       () => pending.delete(task),
     );
     return task;
+  };
+  if (earlyBootstrap) owned(earlyBootstrap.bytes);
+  const cancel = () => {
+    lifetime.abort();
+    earlyBootstrap?.cancel();
   };
   void done.promise.catch(() => {});
   const query = new URLSearchParams({
@@ -191,7 +199,7 @@ export function nativeProfileDocument(
   window.addEventListener('message', receive);
   function stop() {
     if (closing) return closing;
-    lifetime.abort();
+    cancel();
     preloaded.clear();
     parent.postMessage({ type: pageClosing, scopeId }, location.origin);
     closing = (async () => {
@@ -208,7 +216,7 @@ export function nativeProfileDocument(
   return {
     signal: lifetime.signal,
     close: stop,
-    cancel: () => lifetime.abort(),
+    cancel,
     async bootstrap(signal: AbortSignal) {
       const active = AbortSignal.any([lifetime.signal, signal]);
       const inline = container.ownerDocument.getElementById(
@@ -234,6 +242,28 @@ export function nativeProfileDocument(
       )
         throw Error('Employee profile changed during startup');
       published = result;
+      const bootstrapBatch = result.graph.batches.find(
+        ({ phase }) => phase === 'bootstrap',
+      );
+      if (
+        inline &&
+        bootstrapBatch &&
+        earlyBootstrap &&
+        releasedBundle(bootstrapBatch) === earlyBootstrap.url
+      )
+        preloaded.set(
+          bootstrapBatch.url,
+          owned(
+            earlyBootstrap.bytes.catch((error: unknown) => {
+              if (
+                error instanceof DOMException &&
+                error.name === 'TimeoutError'
+              )
+                throw new EmployeeProfileBundleTimeout();
+              throw error;
+            }),
+          ),
+        );
       // The rc.2 injection interpreter leaves preload rows as hints. Fetch
       // only the co-sealed public bytes and let the native loader execute them.
       for (const injection of result.injections) {

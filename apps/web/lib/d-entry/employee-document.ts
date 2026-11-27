@@ -3,7 +3,10 @@ import {
   DataAccessError,
   readDEntryEmployeeDirectory,
 } from '@allrice/database';
-import { initialDocumentLifecycle } from './initial-document';
+import {
+  initialDocumentLifecycle,
+  publicBootstrapUrl,
+} from './initial-document';
 import { readDEntryWorkerJson, requestDEntryProfile } from './native-worker';
 import { profileAddress, profileDirectory, type profileInput } from './profile';
 import { readReleasedProfileAssets } from './released-profile-assets';
@@ -63,6 +66,13 @@ export async function renderEmployeeDocument(
       safeJson(bootstrap) +
       '</script>'
     : '';
+  const earlyBootstrap =
+    bootstrap &&
+    released &&
+    publicBootstrapUrl(bootstrap.graph.batches, released);
+  const earlyAttribute = earlyBootstrap
+    ? ` data-public-bootstrap-url="${escapeAttribute(earlyBootstrap)}"`
+    : '';
   const staticAsset = (path: string, fallback: string) =>
     released?.paths.has(path) ? released.root + path : fallback;
   const directoryJson = safeJson(directory);
@@ -86,7 +96,7 @@ export async function renderEmployeeDocument(
   ]
     .map(([key, value]) => `data-${key}="${escapeAttribute(value!)}"`)
     .join(' ');
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><script data-scope-id="${escapeAttribute(scopeId)}">${initialDocumentLifecycle}</script><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/index-BxpfOGf3.css', native + 'assets/index-BxpfOGf3.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/vendor-DV2921Zo.css', native + 'assets/vendor-DV2921Zo.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('managed/employee-web-entry.css', assets + '/managed/employee-web-entry.css')}"></head><body><div id="app" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script>${bootstrapScript}<script type="module" data-allrice-document-asset="entry" src="${staticAsset('managed/employee-web-entry.js', assets + '/managed/employee-web-entry.js')}"></script></body></html>`;
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><script data-scope-id="${escapeAttribute(scopeId)}"${earlyAttribute}>${initialDocumentLifecycle}</script><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/index-BxpfOGf3.css', native + 'assets/index-BxpfOGf3.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/vendor-DV2921Zo.css', native + 'assets/vendor-DV2921Zo.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('managed/employee-web-entry.css', assets + '/managed/employee-web-entry.css')}"></head><body><div id="app" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script>${bootstrapScript}<script type="module" data-allrice-document-asset="entry" src="${staticAsset('managed/employee-web-entry.js', assets + '/managed/employee-web-entry.js')}"></script></body></html>`;
   request.signal.throwIfAborted();
   return new Response(html, {
     headers: {

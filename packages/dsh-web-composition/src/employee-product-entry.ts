@@ -1,4 +1,5 @@
 import { applyIndexInjections } from '@deepseek-ai/dsh-client-web';
+import type { EarlyProfileBootstrap } from '../../../apps/web/lib/d-entry/initial-document';
 import {
   EmployeeProfileBundleTimeout,
   nativeProfileDocument,
@@ -21,6 +22,7 @@ const scope = globalThis as typeof globalThis & {
   __ALLRICE_EMPLOYEE_DOCUMENT__?: {
     scopeId: string;
     signal: AbortSignal;
+    earlyBootstrap?: EarlyProfileBootstrap;
     claim(): boolean;
     finish(state: 'closed' | 'unknown'): void;
   };
@@ -82,10 +84,15 @@ function boot(
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
     installEmployeeDraftStorage(identity);
-    const document = nativeProfileDocument(container, close, (error) => {
-      fail(error);
-      close();
-    });
+    const document = nativeProfileDocument(
+      container,
+      close,
+      (error) => {
+        fail(error);
+        close();
+      },
+      documentOwner.earlyBootstrap,
+    );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
     scope.__ALLRICE_D_ENTRY_LIFETIME__ = document.signal;

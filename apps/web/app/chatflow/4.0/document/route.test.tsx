@@ -248,7 +248,7 @@ it('requires the issued scope in the document address and leaves the two exact n
     ]),
     bundles: [
       {
-        reference: 'plugins/??bundle/client.js&rev=r1',
+        reference: bundle,
         revision: 'r1',
         sha256: '2'.repeat(64),
       },
@@ -260,6 +260,13 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(doc.status).toBe(200);
   expect(doc.headers.get('location')).toBeNull();
   const html = await doc.text();
+  expect(html).toContain(
+    'data-public-bootstrap-url="' +
+      assetRoot +
+      'bundles/' +
+      '2'.repeat(64) +
+      '.js"',
+  );
   expect(html).toContain('data-native-session-id="real-native-root"');
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
   expect(releasedAssets).toHaveBeenCalledExactlyOnceWith(claims.manifestSha256);
