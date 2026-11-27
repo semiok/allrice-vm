@@ -61,7 +61,7 @@ export async function prepareOpenAiResponsesRequest(
   request: Request,
   model: string,
   hostedSearch: boolean,
-) {
+): Promise<Request> {
   if (
     !request.body ||
     !/^application\/json(?:\s*;|$)/i.test(
@@ -113,16 +113,6 @@ export async function prepareOpenAiResponsesRequest(
     )
   )
     throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
-  if (type === 'message' && item.role === 'assistant') {
-    // output_text belongs to a provider-owned output item with a required
-    // id. EasyInputMessage accepts plain assistant text without that id.
-    return {
-      role: 'assistant',
-      content: Array.isArray(item.content)
-        ? item.content.map((part: { text: string }) => part.text).join('')
-        : item.content,
-    };
-  }
   const calls = new Map<string, string>();
   payload.input = payload.input.map((value: unknown) => {
     const item = record(value);
@@ -135,6 +125,15 @@ export async function prepareOpenAiResponsesRequest(
           !isNeutralContent(item.content, item.role === 'assistant')))
     )
       throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+    if (type === 'message' && item.role === 'assistant') {
+      // EasyInputMessage accepts plain assistant text without an output item id.
+      return {
+        role: 'assistant',
+        content: Array.isArray(item.content)
+          ? item.content.map((part: { text: string }) => part.text).join('')
+          : item.content,
+      };
+    }
     if (type !== 'message') {
       if (typeof item.call_id !== 'string' || !item.call_id)
         throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
