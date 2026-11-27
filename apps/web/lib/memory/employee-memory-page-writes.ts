@@ -58,7 +58,7 @@ export function createEmployeeMemoryPageWrites() {
       principal = actor;
     }
     const key = employeeKey(employee);
-    const state = stores.get(key) ?? { scopeId, writes: new Map() };
+    const state: PageState = stores.get(key) ?? { scopeId, writes: new Map() };
     stores.set(key, state);
     const target = {
       scopeId: state.scopeId,
