@@ -26,7 +26,7 @@ export async function openProductionRecoverySocket(input: {
     drain(
       context: RequestContext,
       signal: AbortSignal,
-    ): Promise<Readonly<{ stopped: number }>>;
+    ): Promise<Readonly<{ stopped: number; expiresAt: string }>>;
   };
   shutdown?: {
     authenticate(token: string): Promise<RequestContext | null>;

@@ -12,8 +12,10 @@ import {
 import {
   PersonVmError,
   type PersonVmIdleStopRequest,
+  type PersonVmBinding,
   type PersonVmScheduledIdleAuthority,
   type PersonVmService,
+  type PersonVmWebRoster,
 } from '@allrice/person-vm';
 import type {
   AssignedNativeWebCatalog,
@@ -178,6 +180,7 @@ export function createProductionScheduledWake(input: {
   async function prepare(
     request: PersonVmWakePreparation,
     signal: AbortSignal,
+    captureFingerprints?: (ordered: readonly string[]) => void,
   ): Promise<PrepareStopWithWakeResult> {
     const { binding } = request;
     const context = 'context' in request ? request.context : undefined;
@@ -288,6 +291,9 @@ export function createProductionScheduledWake(input: {
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
             }
             await assertCurrent(signal);
+            captureFingerprints?.(
+              batches.map(({ fingerprint }) => fingerprint),
+            );
           },
           async assertDeliverable(batches, signal) {
             await input.source.assertDeliverable(
@@ -319,10 +325,15 @@ export function createProductionScheduledWake(input: {
         throw new PersonVmError('AUTHORIZATION_DENIED');
     };
 
-  function dispatchPreparedStop(
-    isAvailable: () => boolean,
-  ): PersonVmScheduledIdleAuthority['dispatch'] {
-    return async (binding, roster, requestId, caller, stop) => {
+  function dispatchPreparedStop(isAvailable: () => boolean) {
+    return async (
+      binding: PersonVmBinding,
+      roster: PersonVmWebRoster,
+      requestId: string,
+      caller: AbortSignal,
+      stop: (active: AbortSignal) => Promise<void>,
+      authorizeDispatch?: Parameters<typeof store.withPreparedStopAuthority>[5],
+    ) => {
       const signal = AbortSignal.any([caller, lifetime]);
       signal.throwIfAborted();
       if (!isAvailable()) throw new PersonVmError('RUNTIME_NOT_READY');
@@ -335,6 +346,7 @@ export function createProductionScheduledWake(input: {
           if (!isAvailable()) throw new PersonVmError('RUNTIME_NOT_READY');
           await stop(active);
         },
+        authorizeDispatch,
       );
       if (!dispatched) throw new PersonVmError('AUTHORIZATION_DENIED');
     };
@@ -347,6 +359,7 @@ export function createProductionScheduledWake(input: {
     request: PersonVmWakePreparation,
     caller: AbortSignal,
     whilePaused: boolean,
+    captureFingerprints?: (ordered: readonly string[]) => void,
   ): Promise<PrepareStopWithWakeResult> {
     const signal = AbortSignal.any([caller, lifetime]);
     signal.throwIfAborted();
@@ -357,7 +370,7 @@ export function createProductionScheduledWake(input: {
       });
     const operation = Promise.resolve().then(() => {
       signal.throwIfAborted();
-      return prepare(request, signal);
+      return prepare(request, signal, captureFingerprints);
     });
     pending.add(operation);
     void operation.then(
@@ -369,16 +382,24 @@ export function createProductionScheduledWake(input: {
 
   return {
     assertScheduledIdleCurrent,
+    nextCommittedWakeAt: store.nextCommittedWakeAt,
     dispatchScheduledIdleStop,
     dispatchUpgradeStop,
     prepareStopWithWake(request: PersonVmWakePreparation, caller: AbortSignal) {
       return prepareOwnedStop(request, caller, false);
     },
-    prepareUpgradeStop(
+    async prepareUpgradeStop(
       request: Extract<PersonVmWakePreparation, { scheduledRoster: unknown }>,
       caller: AbortSignal,
     ) {
-      return prepareOwnedStop(request, caller, true);
+      let scheduleFingerprints: readonly string[] | undefined;
+      const plan = await prepareOwnedStop(request, caller, true, (ordered) => {
+        scheduleFingerprints = ordered;
+      });
+      if ('blocked' in plan) return plan;
+      if (!scheduleFingerprints?.length)
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      return { ...plan, scheduleFingerprints };
     },
     start() {
       lifetime.throwIfAborted();

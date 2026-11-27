@@ -196,7 +196,8 @@ it('joins authentication for a disconnected client before releasing the maintena
 
 it('only drains through the private socket for the authenticated and exact Worker boot', async () => {
   const context = modelBinding().context;
-  const drain = vi.fn(async () => ({ stopped: 2 }));
+  const expiresAt = '2099-01-01T00:00:00.000Z';
+  const drain = vi.fn(async () => ({ stopped: 2, expiresAt }));
   const socket = await openProductionRecoverySocket({
     authenticate: async () => null,
     recover: async () => 0,
@@ -239,7 +240,11 @@ it('only drains through the private socket for the authenticated and exact Worke
     expect(drain).not.toHaveBeenCalled();
     expect(await post('operator-session', 'worker-upgrade-boot')).toEqual({
       status: 200,
-      body: '{"stopped":2,"bootId":"worker-upgrade-boot"}',
+      body: JSON.stringify({
+        stopped: 2,
+        expiresAt,
+        bootId: 'worker-upgrade-boot',
+      }),
     });
     expect(drain).toHaveBeenCalledExactlyOnceWith(
       context,

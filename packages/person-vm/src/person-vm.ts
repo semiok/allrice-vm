@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { addAbortListener } from 'node:events';
 import {
   RequestContextSchema,
   UuidSchema,
@@ -99,6 +100,7 @@ type PrepareUpgradeWake = (
   signal: AbortSignal,
 ) => Promise<{
   nextWakeAt: string | null;
+  scheduleFingerprints: readonly string[];
   dispatch: PersonVmIdleStopDispatch;
 }>;
 
@@ -1342,7 +1344,14 @@ export class PersonVmService
     if (takeover) {
       // Another employee or login on this same physical VM must still prove
       // its own current authority and editor readiness after the transition.
-      await Promise.allSettled([takeover]);
+      const joined = Promise.allSettled([takeover]);
+      await new Promise<void>((resolve, reject) => {
+        const listener = addAbortListener(signal, () => reject(signal.reason));
+        void joined.then(() => {
+          listener[Symbol.dispose]();
+          resolve();
+        });
+      });
       signal.throwIfAborted();
       return this.prewarmCurrent(context, signal, target);
     }
@@ -1771,8 +1780,18 @@ export class PersonVmService
       await assertAuthority?.(signal);
       signal.throwIfAborted();
       await lease.guard();
-      await this.mounted(row, signal, lease);
-      const state = await this.options.native.status(binding, signal);
+      const mount = await this.options.disk.verifyAttachedMount?.(
+        { vmId: row.vmId, tier: row.diskTier },
+        signal,
+      );
+      if (!mount || !this.options.native.readAttachedStatus)
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      await lease.guard();
+      const state = await this.options.native.readAttachedStatus(
+        binding,
+        mount,
+        signal,
+      );
       // A lost host Gateway is not proof that the guest scheduler or a
       // continuable child has stopped. An old generation with no readable
       // control owner may only be reclaimed after terminal native readback.
@@ -1819,6 +1838,7 @@ export class PersonVmService
     await assertStopCurrent(signal);
     const wake = await prepareWake(preparation, signal);
     let cursor: PersonVmActivityCursor | undefined;
+    const now = this.now;
     const stopped = await this.commitStop(requestId, lease, row, {
       requestId,
       // The operator can cancel before dispatch. Once the exact native stop
@@ -1835,7 +1855,13 @@ export class PersonVmService
           !sameVmBinding(native.activity.binding, binding) ||
           native.activity.state !== 'known' ||
           native.coverage.state === 'unknown' ||
-          native.activeScheduleDeliveries !== 0
+          native.activeScheduleDeliveries !== 0 ||
+          checked.scheduleFingerprints.length !==
+            native.scheduleFingerprints?.length ||
+          checked.scheduleFingerprints.some(
+            (fingerprint, index) =>
+              fingerprint !== native.scheduleFingerprints?.[index],
+          )
         )
           throw new PersonVmError('ACTIVITY_UNKNOWN');
         if (
@@ -1853,6 +1879,11 @@ export class PersonVmService
       dispatch: (active, stop) =>
         wake.dispatch(active, (fenced) => {
           signal.throwIfAborted();
+          if (
+            wake.nextWakeAt !== null &&
+            Date.parse(wake.nextWakeAt) <= now().getTime()
+          )
+            throw new PersonVmError('ACTIVITY_UNKNOWN');
           if (!cursor) throw new PersonVmError('ACTIVITY_UNKNOWN');
           assertSample(binding, cursor, fenced);
           return stop(fenced);
@@ -2195,21 +2226,29 @@ export class PersonVmService
       !row.egressReceipt
     )
       return;
-    await this.mounted(row, signal, lease);
-    await lease.guard();
-    // This receipt already records a joined native stop. Revalidate the
-    // exact terminal instance without dispatching another stop.
-    if (!this.options.native.assertStopped)
-      throw new PersonVmError('ACTIVITY_UNKNOWN');
-    signal.throwIfAborted();
-    await this.options.native.assertStopped(bindingOf(row), signal);
-    const stoppedAudit: VmAudit | undefined = attempt.completed
-      ? undefined
-      : { requestId: attempt.requestId, action: 'stop', result: 'succeeded' };
-    await this.cleanup(row, lease, 'takeover', true, {
-      audit: stoppedAudit,
-      nativeAlreadyJoined: true,
-    });
+    const binding = bindingOf(row);
+    const finish = async () => {
+      await this.mounted(row, signal, lease);
+      await lease.guard();
+      // This receipt already records a joined native stop. Revalidate the
+      // exact terminal instance without dispatching another stop.
+      if (!this.options.native.assertStopped)
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      signal.throwIfAborted();
+      await this.options.native.assertStopped(binding, signal);
+      const stoppedAudit: VmAudit | undefined = attempt.completed
+        ? undefined
+        : { requestId: attempt.requestId, action: 'stop', result: 'succeeded' };
+      await this.cleanup(row, lease, 'takeover', true, {
+        audit: stoppedAudit,
+        nativeAlreadyJoined: true,
+      });
+    };
+    const fence = this.options.withPreviousGatewayFenced;
+    if (fence && row.egressReceipt && this.needsUpgradeStop(row)) {
+      const ports = this.receipt(binding, row.egressReceipt).gatewayPorts;
+      await fence(binding, ports, signal, finish);
+    } else await finish();
   }
 
   private async recoverIdleStop(

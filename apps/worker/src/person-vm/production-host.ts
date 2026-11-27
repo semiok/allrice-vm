@@ -157,6 +157,9 @@ export type ProductionPersonVmHostSources = Readonly<{
 }>;
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
+const UPGRADE_HANDOFF_MS = 30_000;
+type UpgradeDrainReceipt = Readonly<{ stopped: number; expiresAt: string }>;
+
 export interface ProductionPersonVmHost {
   prepareStopWithWake(
     request: PersonVmWakePreparation,
@@ -166,7 +169,7 @@ export interface ProductionPersonVmHost {
   drainForUpgrade(
     context: RequestContext,
     signal: AbortSignal,
-  ): Promise<Readonly<{ stopped: number }>>;
+  ): Promise<UpgradeDrainReceipt>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
   /** Trusted in-process maintenance only. The model authority verifies the
@@ -217,7 +220,8 @@ export function createProductionPersonVmHost(input: {
   let pauseIdle = false;
   let upgradeDraining = false;
   let shutdownChecking = false;
-  let upgradeDrained: Readonly<{ stopped: number }> | undefined;
+  let upgradeDrained: UpgradeDrainReceipt | undefined;
+  let upgradeHandoff: ReturnType<typeof setTimeout> | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
     PersonVmBinding,
@@ -420,6 +424,7 @@ export function createProductionPersonVmHost(input: {
     );
   }
   function close(): Promise<void> {
+    clearTimeout(upgradeHandoff);
     if (recoveredClose)
       return recoveredClose.error
         ? Promise.reject(recoveredClose.error)
@@ -1166,18 +1171,38 @@ export function createProductionPersonVmHost(input: {
           if (upgradeDraining || shutdownChecking || gracefulStop)
             throw new PersonVmError('LEASE_CONFLICT');
           if (upgradeDrained) {
+            const receipt = upgradeDrained;
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
-            return upgradeDrained;
+            if (
+              upgradeDrained !== receipt ||
+              Date.now() >= Date.parse(receipt.expiresAt)
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            return receipt;
           }
           upgradeDraining = true;
           pauseIdle = true;
           let reopen: (() => void) | undefined;
+          const resume = () => {
+            upgradeDrained = undefined;
+            pauseIdle = false;
+            reopen?.();
+            scheduledWake?.resume();
+          };
           try {
             await scheduledWake?.pause(active);
             // Join an already claimed wake before fencing the next startup.
             // The new gate must not strand a claim staged in the next epoch.
             reopen = vm.fenceWorkerStartup();
+            const pendingWake = await scheduledWake?.nextCommittedWakeAt();
+            const joinBudget = 4 * vmCleanupTimeoutMs + 5_000;
+            let wakeDeadline = pendingWake?.getTime() ?? Infinity;
+            const assertWakeWindow = (reserve: number) => {
+              if (!(Date.now() + reserve < wakeDeadline))
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+            };
+            assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
             const candidates = await store.listUpgradeCandidates(active);
             if (
               candidates.some(
@@ -1187,6 +1212,7 @@ export function createProductionPersonVmHost(input: {
               throw new PersonVmError('LEASE_CONFLICT');
             for (const row of candidates) {
               active.throwIfAborted();
+              assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
               if (!row.instanceId) throw new PersonVmError('LEASE_LOST');
               await vm.stopRunningForUpgrade(
                 {
@@ -1224,8 +1250,15 @@ export function createProductionPersonVmHost(input: {
                   );
                   if (!('ok' in plan))
                     throw new PersonVmError('ACTIVITY_UNKNOWN');
+                  if (plan.nextWakeAt !== null)
+                    wakeDeadline = Math.min(
+                      wakeDeadline,
+                      Date.parse(plan.nextWakeAt),
+                    );
+                  assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
                   return {
                     nextWakeAt: plan.nextWakeAt,
+                    scheduleFingerprints: plan.scheduleFingerprints,
                     dispatch: (checking, stop) =>
                       wake.dispatchUpgradeStop(
                         request.binding,
@@ -1233,6 +1266,11 @@ export function createProductionPersonVmHost(input: {
                         request.requestId,
                         checking,
                         stop,
+                        async (tx, fenced) => {
+                          await requireCurrentPlatformAdmin(context, tx);
+                          fenced.throwIfAborted();
+                          assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+                        },
                       ),
                   };
                 },
@@ -1240,16 +1278,19 @@ export function createProductionPersonVmHost(input: {
             }
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
-            return (upgradeDrained = Object.freeze({
+            active.throwIfAborted();
+            assertWakeWindow(UPGRADE_HANDOFF_MS);
+            const receipt = Object.freeze({
               stopped: candidates.length,
-            }));
+              expiresAt: new Date(
+                Date.now() + UPGRADE_HANDOFF_MS,
+              ).toISOString(),
+            });
+            upgradeHandoff = setTimeout(resume, UPGRADE_HANDOFF_MS).unref();
+            return (upgradeDrained = receipt);
           } finally {
             upgradeDraining = false;
-            if (!upgradeDrained) {
-              pauseIdle = false;
-              reopen?.();
-              scheduledWake?.resume();
-            }
+            if (!upgradeDrained) resume();
           }
         },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
@@ -1257,8 +1298,15 @@ export function createProductionPersonVmHost(input: {
           if (upgradeDraining || shutdownChecking)
             throw new PersonVmError('LEASE_CONFLICT');
           if (upgradeDrained) {
+            const receipt = upgradeDrained;
             if ((await store.listUpgradeCandidates(signal)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
+            if (
+              upgradeDrained !== receipt ||
+              Date.now() >= Date.parse(receipt.expiresAt)
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            clearTimeout(upgradeHandoff);
             gracefulStop = true;
             return;
           }

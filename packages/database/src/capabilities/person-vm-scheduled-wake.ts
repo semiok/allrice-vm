@@ -263,6 +263,22 @@ async function withWakeAuthority<T>(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
+    async nextCommittedWakeAt(): Promise<Date | null> {
+      const [row] = await sql<{ earliest: Date | null }[]>`
+        select min(greatest(p.wake_at,p.retry_at,p.claim_until)) as earliest
+        from person_virtual_machines vm
+        join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
+        where vm.phase in ('stopped','cold') and vm.disk_retained
+          and vm.egress_receipt is null and p.revoked_at is null
+          and p.wake_at is not null and p.state in ('waiting','claimed')
+          and p.plan_id=(
+            select a.request_id from person_vm_audit a
+            where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+              and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+              and a.action='stop' and a.result='succeeded'
+            order by a.id desc limit 1)`;
+      return row?.earliest ?? null;
+    },
     stage(plan: WakePlan): Promise<boolean> {
       return sql.begin(async (tx) => {
         const [row] = await tx<
@@ -444,6 +460,10 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       requestId: string,
       signal: AbortSignal,
       stop: (active: AbortSignal) => Promise<void>,
+      authorizeDispatch?: (
+        tx: TransactionSql,
+        active: AbortSignal,
+      ) => Promise<void>,
     ): Promise<boolean> {
       // Read deployments after taking the employee key lock so the next
       // statement also sees any deployments inserted before that lock.
@@ -481,6 +501,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
               and vm.lease_epoch=${binding.leaseEpoch} and vm.phase='running'
               and vm.lease_owner is not null and vm.lease_expires_at>clock_timestamp()`;
           if (current?.authorized !== true) return false;
+          await authorizeDispatch?.(tx, active);
           active.throwIfAborted();
           await stop(active);
           return true;

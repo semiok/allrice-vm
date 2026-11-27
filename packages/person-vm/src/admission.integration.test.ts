@@ -210,6 +210,19 @@ suite(
       const vm = new PersonVmService({
         ...h.options,
         store,
+        disk: {
+          ...h.options.disk,
+          async verifyAttachedMount({ vmId }) {
+            return h.mounts.has(vmId) ? '/synthetic/' + vmId : null;
+          },
+        },
+        native: {
+          ...h.native,
+          async readAttachedStatus(binding, mount, signal) {
+            expect(mount).toBe('/synthetic/' + binding.vmId);
+            return h.native.status(binding, signal);
+          },
+        },
         authority: {
           async authorize(request, action, signal) {
             const identity = await h.options.authority.authorize(
@@ -270,6 +283,8 @@ suite(
         vm.prewarm(h.rc, { trigger: 'page' }, signal()),
       ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
       expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(h.log.slice(events)).not.toContain('native:prepare');
+      expect(h.log.slice(events)).not.toContain('disk:attach');
       expect(reconciled).toBe(false);
       expect(await store.read(h.binding.personId)).toMatchObject({
         phase: 'running',
@@ -327,6 +342,7 @@ suite(
       const store = new PostgresPersonVmStore(h.physical.open);
       const cursor = { sourceId: 'upgrade-activity', revision: 'quiescent' };
       let rejectDetach = true;
+      let nativeSchedule = 'later-native-read';
       const disconnected = new AbortController();
       const stopNative = h.native.stop;
       h.native.stop = async (binding, active) => {
@@ -358,6 +374,7 @@ suite(
                 pendingApprovals: 0,
               },
               activeScheduleDeliveries: 0,
+              scheduleFingerprints: [nativeSchedule],
               coverage: {
                 state: 'sampled',
                 cursor,
@@ -395,11 +412,24 @@ suite(
             on conflict (plan_id) do nothing`;
         return {
           nextWakeAt: targetAt.toISOString(),
+          scheduleFingerprints: ['test-schedule'],
           dispatch: (active, stop) => stop(active),
         };
       };
       const authorize = async (active: AbortSignal) => active.throwIfAborted();
       try {
+        await expect(
+          vm.stopRunningForUpgrade(
+            h.binding,
+            planId,
+            signal(),
+            authorize,
+            prepare,
+          ),
+        ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+        expect(h.log).not.toContain('native:stop');
+        expect((await store.read(h.binding.personId))?.phase).toBe('running');
+        nativeSchedule = 'test-schedule';
         await expect(
           vm.stopRunningForUpgrade(
             h.binding,

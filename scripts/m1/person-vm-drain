@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Drain retained Person VMs through the current Worker's private socket."""
 import argparse
+from datetime import datetime, timezone
 import http.client
 import json
 import os
@@ -82,10 +83,14 @@ def main():
             connection.close()
         if (
             not isinstance(payload, dict)
-            or set(payload) != {'bootId', 'stopped'}
+            or set(payload) != {'bootId', 'stopped', 'expiresAt'}
             or payload['bootId'] != str(options.boot_id)
             or type(payload['stopped']) is not int
             or payload['stopped'] < 0
+            or not isinstance(payload['expiresAt'], str)
+            or not payload['expiresAt'].endswith('Z')
+            or datetime.fromisoformat(payload['expiresAt'][:-1] + '+00:00')
+                <= datetime.now(timezone.utc)
         ):
             raise ValueError('Worker drain response invalid')
         print(json.dumps(payload))

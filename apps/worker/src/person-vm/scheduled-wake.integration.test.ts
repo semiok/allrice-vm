@@ -231,6 +231,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(catalog).not.toHaveBeenCalled();
     } finally {
       await host.close();
+      await f.store().settle(claim!, { state: 'ready' });
     }
   });
 
@@ -276,7 +277,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
         ok: true,
         nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
+        scheduleFingerprints: [expect.stringMatching(/^sha256:/)],
       });
+      await expect(host.nextCommittedWakeAt()).resolves.toBeNull();
       await db`update person_virtual_machines
         set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
         where person_id=${f.binding.personId}`;
@@ -290,6 +293,19 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
           stop,
         ),
       ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const revoked = new Error('platform operator no longer current');
+      await expect(
+        host.dispatchUpgradeStop(
+          f.binding,
+          roster!,
+          requestId,
+          signal,
+          stop,
+          async () => {
+            throw revoked;
+          },
+        ),
+      ).rejects.toBe(revoked);
       expect(stop).not.toHaveBeenCalled();
       await host.dispatchUpgradeStop(
         f.binding,
@@ -300,6 +316,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       );
       expect(stop).toHaveBeenCalledTimes(1);
       await f.stop(requestId);
+      await expect(host.nextCommittedWakeAt()).resolves.toEqual(
+        new Date(Date.parse(scheduledAt) - 120_000),
+      );
       await db`update person_virtual_machines set lease_owner=null,lease_expires_at=null
         where person_id=${f.binding.personId}`;
       await db`update person_vm_scheduled_wakes set wake_at=now()-interval '1 second'
