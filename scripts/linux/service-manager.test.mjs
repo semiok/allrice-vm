@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
+import { resolveHostLayout } from './host-layout.mjs';
 import {
   assertDataMount,
   checkUnitPlacement,
@@ -213,32 +214,42 @@ test('installs idempotently, refuses replacement, and rolls back its own files o
   });
 });
 
-test('rejects an absent, wrong, read-only or shadowed data mount', () => {
-  const match = {
-    target: config.dataMount,
-    uuid: config.dataUuid,
-    options: 'rw,nosuid',
-  };
-  const other = { ...match, uuid: 'other' };
-  assertDataMount(
-    JSON.stringify({ filesystems: [match] }),
-    config.dataMount,
-    config.dataUuid,
-  );
-  for (const bad of [
-    [],
-    [other],
-    [{ ...match, options: 'ro' }],
-    [match, other],
-    [other, match],
-  ])
+test('uses the sealed platform and rejects a missing, wrong, read-only or shadowed data mount', async () => {
+  await fixture(async (root, seal) => {
+    const selected = {
+      ...config,
+      dataUuid: '11111111-2222-3333-4444-555555555555',
+    };
+    const release = await readLinuxRelease(root, await seal(selected));
+    expect(
+      resolveHostLayout(release.config, { platform: 'linux', arch: 'arm64' })
+        .socketRoot,
+    ).toBe('/run/ar');
     expect(() =>
+      resolveHostLayout(release.config, { platform: 'darwin', arch: 'arm64' }),
+    ).toThrow(/does not match/);
+    const match = {
+      target: selected.dataMount,
+      uuid: selected.dataUuid,
+      options: 'rw,nosuid',
+    };
+    const other = { ...match, uuid: config.dataUuid };
+    const verifyMount = (filesystems) =>
       assertDataMount(
-        JSON.stringify({ filesystems: bad }),
-        config.dataMount,
-        config.dataUuid,
-      ),
-    ).toThrow(/single writable/);
+        JSON.stringify({ filesystems }),
+        release.config.dataMount,
+        release.config.dataUuid,
+      );
+    verifyMount([match]);
+    for (const bad of [
+      [],
+      [other],
+      [{ ...match, options: 'ro' }],
+      [match, other],
+      [other, match],
+    ])
+      expect(() => verifyMount(bad)).toThrow(/single writable/);
+  });
 });
 
 test('refuses an existing vendor or runtime unit and a systemd drop-in', async () => {
@@ -302,19 +313,14 @@ test('holds installation across both writes and reload', async () => {
     const units = renderUnits(await readLinuxRelease(root, await seal()));
     const directory = join(root, 'units');
     await mkdir(directory);
-    let entered, release;
-    const inReload = new Promise((done) => {
-      entered = done;
-    });
-    const blocked = new Promise((done) => {
-      release = done;
-    });
+    const { promise: inReload, resolve: entered } = Promise.withResolvers();
+    const { promise: blocked, resolve: release } = Promise.withResolvers();
     const first = installUnitFiles(
       directory,
       units,
       () => {},
       async () => {
-        entered();
+        entered(undefined);
         await blocked;
       },
     );
@@ -329,7 +335,7 @@ test('holds installation across both writes and reload', async () => {
         ),
       ).rejects.toMatchObject({ code: 'EEXIST' });
     } finally {
-      release();
+      release(undefined);
       await first;
     }
     for (const [name, contents] of units)
