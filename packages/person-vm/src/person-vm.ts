@@ -1754,7 +1754,7 @@ export class PersonVmService
     const start = (
       nextTarget?: PersonVmPrewarmFence,
       firstDisk?: FirstPrewarmDisk,
-      startupObserver = observer,
+      startupObserver = observer ?? nextTarget,
     ) =>
       this.startForSelection(
         context,
@@ -1793,8 +1793,19 @@ export class PersonVmService
         target.instanceId === null &&
         exact?.vmId === target.vmId &&
         exact.leaseEpoch === target.leaseEpoch
-      )
-        target = { ...target, instanceId: exact.instanceId };
+      ) {
+        const current = await this.options.store.read(identity.personId);
+        const joinedTarget = { ...target, instanceId: exact.instanceId };
+        this.assertPrewarmTarget(current, joinedTarget);
+        if (
+          current?.phase !== 'running' ||
+          !sameVmBinding(bindingOf(current), exact)
+        )
+          throw new PersonVmError('LEASE_LOST');
+        await this.confirmRunning(current, context, signal, joinedTarget, true);
+        (observer ?? target).observeVmStart?.(exact);
+        return view(current, true);
+      }
       return this.prewarmCurrent(
         context,
         signal,
@@ -1816,11 +1827,12 @@ export class PersonVmService
       )
         throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
       const receipt: UpgradePrewarm['receipt'] = {};
+      const startupObserver = observer ?? target;
       const opening = start(target, undefined, {
-        ...observer,
+        ...startupObserver,
         observeVmStart(binding) {
           receipt.binding = binding;
-          observer?.observeVmStart?.(binding);
+          startupObserver.observeVmStart?.(binding);
         },
       }).finally(() => {
         this.upgradePrewarms.delete(identity.personId);

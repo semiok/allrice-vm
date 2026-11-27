@@ -74,7 +74,8 @@ export function canSharePrewarmTarget(
   );
 }
 
-/** An incomplete target gains specificity only from its own physical leases. */
+/** An incomplete target gains specificity only from its own physical leases
+ * or the exact local upgrade start it joined and revalidated. */
 export function observedPrewarmTarget({
   target,
   reservation,

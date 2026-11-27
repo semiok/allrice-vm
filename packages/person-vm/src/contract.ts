@@ -212,7 +212,8 @@ export type PersonVmPrewarmTarget = Readonly<{
 /** Host-only stages. A written candidate proves nothing until independently visible. */
 export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
 
-/** Host-only observations from this request's create and start leases. */
+/** Host-only observations of this request's create/start or the exact local
+ * upgrade start it joined and independently revalidated. */
 export type PersonVmPrewarmObserver = {
   observeVmReservation?(vmId: string): void;
   observeVmStart?(binding: PersonVmBinding): void;

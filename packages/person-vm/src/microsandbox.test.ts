@@ -1451,6 +1451,22 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     ]);
     expect(reserve).not.toHaveBeenCalled();
 
+    const invalid = f.reloadNative(undefined, undefined, {
+      memoryMiB: 3072,
+      restartMemory: { memoryMiB: 4097, reserve },
+    });
+    const invalidService = new PersonVmService({ ...options, native: invalid });
+    const beforeInvalid = (await f.calls()).length;
+    await expect(
+      invalidService.reconcileStoppedEntryForPrewarm(
+        f.rc,
+        prior,
+        signal(),
+        true,
+      ),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(await f.calls()).toHaveLength(beforeInvalid);
+
     const bad = JSON.parse(saved);
     bad.sandbox_defaults.cpus = 4;
     await writeFile(configuration, JSON.stringify(bad));

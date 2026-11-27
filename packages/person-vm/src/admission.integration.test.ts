@@ -11,7 +11,7 @@ import {
 } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../database/src/runtime.fixture.ts';
 import { createPostgresPersonVmScheduledWakeStore } from '../../database/src/capabilities/person-vm-scheduled-wake.ts';
-import { PersonVmError } from './contract.ts';
+import { PersonVmError, type PersonVmBinding } from './contract.ts';
 import { PersonVmService } from './person-vm.ts';
 import { PostgresPersonVmStore, type PersonVmSqlFactory } from './store.ts';
 import { PERSON_VM_IDLE_MS } from './contract.ts';
@@ -269,6 +269,7 @@ suite(
       vm.createAdmissionHost({ openSql: h.physical.open });
       const requestId = randomUUID();
       const events = h.log.length;
+      const observed: [string, PersonVmBinding][] = [];
       const warm = (
         rc: typeof h.rc,
         trigger: 'page' | 'input' | 'open' = 'open',
@@ -281,6 +282,9 @@ suite(
               vmId: h.binding.vmId,
               instanceId: null,
               leaseEpoch: 2,
+              observeVmStart(binding) {
+                observed.push([rc.sessionId, binding]);
+              },
               assertAuthority: async () => {},
               dispatchUpgradeStop: (_binding, active, stop) => {
                 active.throwIfAborted();
@@ -334,6 +338,12 @@ suite(
       };
       await expect(first).resolves.toMatchObject(expected);
       await expect(second).resolves.toMatchObject(expected);
+      const binding = await vm.resolve(h.rc, signal());
+      expect(binding.leaseEpoch).toBe(2);
+      expect(observed).toEqual([
+        [h.rc.sessionId, binding],
+        [later.sessionId, binding],
+      ]);
       expect(seen).toEqual(['fence', 'fence', 'release', 'start']);
       expect(h.log.slice(events)).toContain('native:stop');
       expect(h.log.slice(events)).toContain('native:start');

@@ -710,6 +710,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
   ) {
     signal.throwIfAborted();
+    if (this.options.restartMemory) this.restartMemoryPolicy();
     const paths = await this.readAttachedPaths(binding, mount);
     return this.namedStatus(binding, this.name(binding, paths), signal, paths);
   }
@@ -1267,6 +1268,9 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
   ) {
     const { binding } = web;
+    const memory = this.options.restartMemory
+      ? this.restartMemoryPolicy()
+      : undefined;
     const paths = this.homes.get(binding.vmId);
     if (!paths || paths.upgrade !== 'pending' || !web.slots)
       throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
@@ -1300,8 +1304,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         );
       await this.command(binding, ['snap', 'verify', reference], signal);
       const artifact = await this.artifact(binding, signal, false);
-      capacity = this.options.restartMemory
-        ? await this.reserveRestartMemory(binding, signal)
+      capacity = memory
+        ? await this.reserveRestartMemory(binding, signal, memory)
         : undefined;
       const active = capacity?.signal ?? signal;
       await capacity?.assertCurrent();
