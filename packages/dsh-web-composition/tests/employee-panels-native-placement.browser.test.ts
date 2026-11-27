@@ -789,6 +789,25 @@ suite(
           });
           await settle(page);
         }
+        const unreadDeliverablesName = '交付成果，5 项新增';
+        const unreadDeliveryBadge = native
+          .getByRole('button', { name: unreadDeliverablesName, exact: true })
+          .getByText('5', { exact: true });
+        await unreadDeliveryBadge.waitFor({ state: 'visible' });
+        const badgeRect = await unreadDeliveryBadge.boundingBox();
+        expect(badgeRect).not.toBeNull();
+        // Keep the rounded badge on its own paint layer before moving the app.
+        // Reparenting the app otherwise changes its subpixel edge rasterization.
+        await native.addStyleTag({
+          content: `button[aria-label=${JSON.stringify(unreadDeliverablesName)}] > span[aria-hidden="true"] { will-change: transform; }`,
+        });
+        await settle(native);
+        expect(
+          await unreadDeliveryBadge.evaluate(
+            (node) => getComputedStyle(node).willChange,
+          ),
+        ).toBe('transform');
+        expect(await unreadDeliveryBadge.boundingBox()).toEqual(badgeRect);
         original = await capture(native, 'native-original');
         refStart = await capture(reference, 'reference-start');
         expect(refStart.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
@@ -801,12 +820,6 @@ suite(
           repeated,
           'unmodified native repeat',
         );
-        const unreadDeliveryBadge = native
-          .getByRole('button', {
-            name: '交付成果，5 项新增',
-            exact: true,
-          })
-          .getByText('5', { exact: true });
         fiveUnreadDeliverables = await unreadDeliveryBadge.isVisible();
         expect(fiveUnreadDeliverables).toBe(true);
         const offset = { x: -nativeRoot.x, y: -nativeRoot.y };
