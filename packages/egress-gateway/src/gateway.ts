@@ -16,6 +16,7 @@ import {
   type EgressResponse,
   type ManagedHostService,
 } from './contract.js';
+import { createVmPublicProxy } from './public-proxy.js';
 
 function exact(a: PersonVmBinding, b: PersonVmBinding) {
   return (
@@ -36,6 +37,7 @@ type BindingState = {
   rollbackPending: boolean;
   installedMount: string | null;
   origin: string;
+  publicProxy?: ReturnType<typeof createVmPublicProxy>;
 };
 export class EgressPrepareRollbackError extends AggregateError {
   constructor(prepare: unknown, rollback: unknown) {
@@ -128,6 +130,7 @@ export function createEgressGateway(
     provisioner: EgressProvisioner;
     services?: readonly ManagedHostService[];
     lifetime?: AbortSignal;
+    publicProxy?: boolean;
     prepareRollbackSignal?: () => AbortSignal;
   },
 ) {
@@ -393,6 +396,13 @@ export function createEgressGateway(
         failures.map((result) => result.reason),
         'EGRESS_CLEANUP_INCOMPLETE',
       );
+    if (state.publicProxy) {
+      const counts = state.publicProxy.counts;
+      if (Object.values(counts).some(Boolean)) {
+        console.info('[allrice-vm-public-egress]', counts);
+        state.publicProxy = undefined;
+      }
+    }
   }
   const port: PersonVmEgressPort & {
     retireFailedPrepare(
@@ -434,6 +444,8 @@ export function createEgressGateway(
         );
         const origin = new URL(endpoint.guestOrigin);
         if (
+          (options.publicProxy &&
+            !['127.0.0.1', '::1'].includes(endpoint.host)) ||
           !Number.isInteger(endpoint.port) ||
           endpoint.port < 0 ||
           endpoint.port > 65535 ||
@@ -462,10 +474,28 @@ export function createEgressGateway(
           server: createServer(),
           origin: endpoint.guestOrigin,
         };
+        if (options.publicProxy) {
+          const active = options.lifetime
+            ? AbortSignal.any([state.controller.signal, options.lifetime])
+            : state.controller.signal;
+          state.publicProxy = createVmPublicProxy(active, () => {
+            stateFor(state.receipt);
+            active.throwIfAborted();
+          });
+        }
+        function ownRequest(work: () => Promise<void>) {
+          const operation = runHostRequest(work);
+          state.inflight.add(operation);
+          void operation
+            .finally(() => state.inflight.delete(operation))
+            .catch(() => {});
+        }
         // Epoch tombstone retained even on preparation failure; delayed prepare cannot revive it.
         states.set(binding.vmId, state);
         state.server.on('request', (req, res) => {
-          const operation = runHostRequest(async () => {
+          ownRequest(async () => {
+            if (state.publicProxy && /^https?:\/\//i.test(req.url ?? ''))
+              return state.publicProxy.http(req, res);
             const disconnect = new AbortController();
             res.once('close', () => disconnect.abort());
             const requestSignal = options.lifetime
@@ -569,12 +599,12 @@ export function createEgressGateway(
               );
             }
           });
-          state.inflight.add(operation);
-          void operation
-            .finally(() => state.inflight.delete(operation))
-            .catch(() => {});
         });
-        state.server.on('connect', (_req, socket) => socket.destroy());
+        state.server.on('connect', (req, socket, head) => {
+          const proxy = state.publicProxy;
+          if (!proxy) socket.destroy();
+          else ownRequest(() => proxy.connect(req, socket, head));
+        });
         state.server.on('upgrade', (_req, socket) => socket.destroy());
         try {
           await new Promise<void>((resolve, reject) => {
@@ -606,7 +636,17 @@ export function createEgressGateway(
           await options.provisioner.install(
             binding,
             mount,
-            { origin: origin.origin, capability: state.capability },
+            {
+              origin: origin.origin,
+              capability: state.capability,
+              ...(state.publicProxy
+                ? {
+                    publicProxyUrl: state.publicProxy.authorizationUrl(
+                      origin.origin,
+                    ),
+                  }
+                : {}),
+            },
             signal,
           );
           signal.throwIfAborted();

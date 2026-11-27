@@ -820,6 +820,9 @@ export function createProductionPersonVmHost(input: {
         authority: egressSource.authority,
         policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
+        publicProxy: ['127.0.0.1', '::1'].includes(
+          providers.configuration.egress?.listenAddress ?? '',
+        ),
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);

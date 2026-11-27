@@ -668,6 +668,36 @@ describe.sequential(
       ).rejects.toThrow('invalid_guest_memory_directory');
     });
 
+    it('passes the private proxy settings to DSH and its children after guest launch', async () => {
+      const guest = await bashGuest();
+      const launcher = join(guest.directory, 'launch-dsh.sh');
+      const settings = join(guest.directory, 'public-proxy.conf');
+      const proxy = 'http://vm-proxy:synthetic@172.16.0.5:34567/';
+      const plan = await createVmMemoryGuestPlan({
+        persistentDirectory: '/fixture/encrypted',
+      });
+      await writeFile(
+        launcher,
+        plan.files.find((file) => file.path.endsWith('/launch-dsh.sh'))!
+          .contents,
+      );
+      await writeFile(settings, proxy + '\n172.16.0.5\n', { mode: 0o600 });
+      const { stdout } = await execute(
+        '/bin/sh',
+        [
+          '-c',
+          'mkdir -p "$ALLRICE_MEMORY_PROC_ROOT/$$"; exec /bin/sh "$@"',
+          'fixture',
+          launcher,
+          '/bin/sh',
+          '-c',
+          'test "$http_proxy" = "$HTTP_PROXY" && test "$https_proxy" = "$HTTPS_PROXY" && printf "%s\\n%s\\n" "$https_proxy" "$NO_PROXY"',
+        ],
+        { env: { ...guest.env, ALLRICE_PUBLIC_PROXY_CONFIG: settings } },
+      );
+      expect(stdout).toBe(proxy + '\nlocalhost,127.0.0.1,[::1],172.16.0.5\n');
+    });
+
     it('receipt显式配置只生成同一公开程序，不给DSH配置共享nonce', async () => {
       const plan = await createVmMemoryGuestPlan({
         persistentDirectory: '/fixture/encrypted',

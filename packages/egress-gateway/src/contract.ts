@@ -128,6 +128,7 @@ export type ManagedHostService = Readonly<{
 export type GuestEgressAccess = Readonly<{
   origin: string;
   capability: string;
+  publicProxyUrl?: string;
 }>;
 export interface EgressProvisioner {
   /** Configured addressing only. Empty lease ports select port 0 for actual
