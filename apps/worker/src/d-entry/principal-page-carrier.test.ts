@@ -71,6 +71,40 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   await next.receive();
 });
 
+it('joins shared resource guards before releasing the page admission', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const entered = deferred();
+  const release = deferred();
+  f.authenticate.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return f.context;
+  });
+  send(life.peer, {
+    type: 'open',
+    streamId: 'resource',
+    endpoint: '$events',
+    payload: { args: {} },
+  });
+  try {
+    await entered.promise;
+    closePage(life.peer);
+    await expect
+      .poll(() => f.pageSignals.get(life.scopeId)?.aborted)
+      .toBe(true);
+    expect(f.data.admission.boundary.finish).not.toHaveBeenCalled();
+  } finally {
+    release.resolve();
+  }
+  expect(await life.receive('life')).toMatchObject({
+    type: 'item',
+    value: { type: 'closed' },
+  });
+  expect(await life.receive('life')).toMatchObject({ type: 'end' });
+  expect(f.data.admission.boundary.finish).toHaveBeenCalledOnce();
+});
+
 function observeProfileRequest(
   f: Awaited<ReturnType<typeof fixture>>,
   url: URL,

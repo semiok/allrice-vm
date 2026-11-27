@@ -433,6 +433,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     profileFailures,
     profileSource,
     profileUrl,
+    authenticate,
     historyIdentity,
     pageSignals,
     profileCompletion,

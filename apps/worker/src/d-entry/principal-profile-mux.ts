@@ -268,8 +268,8 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = Promise.resolve()
-      .then(async () => {
+    const work = page
+      .use(child, async () => {
         let call;
         let check = () => page.assertCurrent(child);
         if (frame.endpoint === '$events') {
