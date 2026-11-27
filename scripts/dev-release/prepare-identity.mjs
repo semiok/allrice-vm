@@ -64,18 +64,29 @@ if (hostConfiguration) {
   }
   const { employeeProfileRuntime } =
     await import('../person-vm-image/verify.mjs');
+  const configuredTerminal = config?.web?.terminalEnabled;
+  if (
+    configuredTerminal !== undefined &&
+    typeof configuredTerminal !== 'boolean'
+  )
+    throw Error('DEV_BUILD_PRIVATE_CONFIG_INVALID');
+  const terminalEnabled = configuredTerminal ?? true;
   const runtime = employeeProfileRuntime(config?.native);
   const { prepareEmployeeWebServiceArtifact } =
     await import('../../packages/dsh-web-composition/build-web-entry.mjs');
   const linuxCapture = runtime
     ? (
         await import('../person-vm-image/employee-profile.mjs')
-      ).createEmployeeLinuxCapture(config.native, runtime)
+      ).createEmployeeLinuxCapture(config.native, {
+        ...runtime,
+        terminalEnabled,
+      })
     : undefined;
   await prepareEmployeeWebServiceArtifact(
     join(root, 'apps/worker/dist/d-entry-web'),
     sourceSha,
     linuxCapture,
+    terminalEnabled,
   );
   await stageDshProfileAssets(root, sourceSha);
 }

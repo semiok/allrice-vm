@@ -8,7 +8,10 @@ import {
 } from '@allrice/contracts';
 
 export class EmployeeEntryError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly reason?: 'response-mismatch',
+  ) {
     super('Employee entry is unavailable');
   }
 }
@@ -187,6 +190,6 @@ export async function prepareEmployeeEntry(
     !next.threadId ||
     (operationId && operationId !== next.threadId)
   )
-    throw new EmployeeEntryError(403);
+    throw new EmployeeEntryError(403, 'response-mismatch');
   return next;
 }

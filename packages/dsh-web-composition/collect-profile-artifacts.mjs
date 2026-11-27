@@ -2,13 +2,14 @@ import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import {
   mkdir,
+  readdir,
   readFile,
   realpath,
   symlink,
   writeFile,
 } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL, URL } from 'node:url';
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -22,6 +23,7 @@ export async function collectProfileArtifacts({
   installAnchor,
   resolutionAnchor = installAnchor,
   host,
+  terminalEnabled = true,
 }) {
   const require = createRequire(resolutionAnchor);
   const fromNative = (name) =>
@@ -48,7 +50,18 @@ export async function collectProfileArtifacts({
   const overlay = join(profileDir, 'build-only.patch.yml');
   await writeFile(
     overlay,
-    '- id: web-runtime\n  config:\n    openBrowser: false\n    printUrl: false\n    surfaceContext: true\n',
+    JSON.stringify([
+      {
+        id: 'web-runtime',
+        config: { openBrowser: false, printUrl: false, surfaceContext: true },
+      },
+      ...(terminalEnabled
+        ? []
+        : [
+            { id: 'terminal-controller', disabled: true },
+            { id: 'ui-sidebar-terminal', disabled: true },
+          ]),
+    ]),
   );
   const profile = loadProfileDirectory(
     'allrice-artifact',
@@ -99,6 +112,14 @@ export async function collectProfileArtifacts({
     if (web.host !== host)
       throw new Error('Employee profile listener mismatch');
     const graph = modules.graph();
+    const terminalUi = graph.entries.some(
+      ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
+    );
+    if (
+      Boolean(root.get('terminalController')) !== terminalEnabled ||
+      terminalUi !== terminalEnabled
+    )
+      throw new Error('Employee profile terminal configuration mismatch');
     const picker = graph.entries.filter(({ id }) =>
       id.startsWith('@deepseek-ai/dsh-client-ui-directory-picker-'),
     );
@@ -112,9 +133,30 @@ export async function collectProfileArtifacts({
       bootInjections(graph).map((row) => JSON.stringify(row)),
     );
     const files = [];
+    const chunks = [];
     const references = [
       ...new Set([...graph.entries, ...graph.batches].map((row) => row.url)),
     ];
+    for (const { id, rev } of graph.entries) {
+      const entry = modules.clientPath(id);
+      if (!entry)
+        throw new Error('Employee browser bundle has no client entry');
+      const siblings = await readdir(dirname(entry), { withFileTypes: true });
+      for (const file of siblings.sort((a, b) =>
+        a.name.localeCompare(b.name),
+      )) {
+        // Match rc.2's package-local browser chunk convention.
+        if (
+          !file.isFile() ||
+          !/^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$/u.test(file.name) ||
+          file.name === 'client.node.js' ||
+          file.name.startsWith('client.node.')
+        )
+          continue;
+        chunks.push({ module: id, file: file.name });
+        references.push(`plugins/${id}/${file.name}?rev=${rev}`);
+      }
+    }
     for (const reference of references) {
       const url = new URL(reference, 'http://127.0.0.1/');
       const response = await modules.fetchBundle(new globalThis.Request(url));
@@ -158,6 +200,7 @@ export async function collectProfileArtifacts({
       graph,
       bootInjections: bootInjections(graph),
       files,
+      chunks,
       // No collected values are emitted: owner:true and current configuration
       // must never become a release's replayable runtime identity/preferences.
       injectionInputs: rows.map((row) => ({

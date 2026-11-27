@@ -119,6 +119,22 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   const patch = a.files.find((file) => file.path.endsWith('/owner.patch.json'));
   if (!patch) throw Error('actual native owner patch missing');
   const entries = JSON.parse(patch.contents);
+  const terminalIds = ['terminal-controller', 'ui-sidebar-terminal'];
+  expect(
+    entries.filter(({ id }: { id?: string }) => terminalIds.includes(id ?? '')),
+  ).toEqual([]);
+  const restricted = await prepareNativeWebLaunch(
+    { ...config, terminalEnabled: false },
+    binding,
+    profile,
+  );
+  const restrictedPatch = restricted.files.find((file) =>
+    file.path.endsWith('/owner.patch.json'),
+  );
+  if (!restrictedPatch) throw Error('actual native owner patch missing');
+  expect(JSON.parse(restrictedPatch.contents)).toEqual(
+    expect.arrayContaining(terminalIds.map((id) => ({ id, disabled: true }))),
+  );
   expect(entries[1].insert.map((entry: { id: string }) => entry.id)).toEqual([
     'allrice-current-principal',
     'allrice-native-web-owner',
