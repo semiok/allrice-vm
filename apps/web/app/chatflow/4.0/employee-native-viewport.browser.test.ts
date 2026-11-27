@@ -5,6 +5,7 @@ import { extname, join } from 'node:path';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
 import { expect, it, vi } from 'vitest';
 import * as database from '@allrice/database';
+import { deferred } from '../../../../../packages/d-entry-principal/test/host-fixture';
 import {
   buildProfileFixture,
   closes,
@@ -139,6 +140,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       '.wasm': 'application/wasm',
     };
     const errors: string[] = [];
+    const loadDocument = deferred<void>();
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const send = (type: string, data: string | Uint8Array) =>
@@ -175,8 +177,10 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
               ),
             );
         }
-        if (url.pathname === '/chatflow/4.0/document')
+        if (url.pathname === '/chatflow/4.0/document') {
+          await loadDocument.promise;
           return await relay(await documentRedirect(new Request(url)));
+        }
         const documentPrefix = '/chatflow/4.0/document/';
         if (url.pathname.startsWith(documentPrefix))
           return await relay(
@@ -225,6 +229,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
     });
     await page.goto(
       f.origin + '/chatflow/4.0?' + new URLSearchParams(selection),
+      { waitUntil: 'domcontentloaded' },
     );
     const iframe = page.locator('iframe[title="员工工作区"]');
     const workbench = iframe.contentFrame();
@@ -232,6 +237,19 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
     try {
+      try {
+        await iframe.waitFor({ state: 'attached' });
+        expect(
+          await iframe.evaluate((frame) => getComputedStyle(frame).visibility),
+        ).toBe('hidden');
+        expect(
+          await page.evaluate(
+            () => getComputedStyle(document.documentElement).overflowY,
+          ),
+        ).toBe('scroll');
+      } finally {
+        loadDocument.resolve();
+      }
       await editor.waitFor();
       await iframe.waitFor();
       await workbench.locator('#chat-sidebar').waitFor();
@@ -265,6 +283,9 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
         composer: input.closest('[data-composer-card]')!.getBoundingClientRect()
           .bottom,
         scrollHeight: document.scrollingElement!.scrollHeight,
+        overflowY: [document.documentElement, document.body].map(
+          (element) => getComputedStyle(element).overflowY,
+        ),
         height: innerHeight,
       }));
       expect(outer.bottom).toBeCloseTo(height, 0);
@@ -277,6 +298,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       expect(inner.composer).toBeGreaterThan(height - 32);
       expect(inner.composer).toBeLessThanOrEqual(height);
       expect(inner.scrollHeight).toBe(height);
+      expect(inner.overflowY).not.toContain('scroll');
       expect(outer.overflowY).not.toBe('scroll');
     }
     await context.close();
