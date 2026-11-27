@@ -507,6 +507,17 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       await page
         .getByRole('heading', { name: '已连接电脑', exact: true })
         .waitFor();
+      await page.getByText('暂无应用连接。', { exact: false }).waitFor();
+      await page.getByText('还没有连接电脑。', { exact: false }).waitFor();
+      const connections = await context.request.get(
+        `${origin}/api/v1/admin/tenants/${snow.organizationId}/mcp?workspaceId=${snow.workspaceId}&subjectId=${snow.user.id}`,
+      );
+      expect(connections.status()).toBe(200);
+      expect(await connections.json()).toMatchObject({
+        organizationId: snow.organizationId,
+        workspaceId: snow.workspaceId,
+        subjectId: snow.user.id,
+      });
       expect(await page.getByLabel('环境修改原因').count()).toBe(0);
       expect(await page.getByLabel('授权执行目标').count()).toBe(0);
       expect(
@@ -531,13 +542,16 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
       { page, context } = await pageFor();
     try {
       const start = requests.length;
-      await page.goto(resourcePage('validation', a.target));
+      const [initialRead] = await Promise.all([
+        page.waitForRequest(
+          `${origin}/api/v1/admin/tenants/${a.target.organizationId}/validation?workspaceId=${a.target.workspaceId}&subjectId=${a.target.subjectId}`,
+        ),
+        page.goto(resourcePage('validation', a.target)),
+      ]);
+      expect(initialRead.method()).toBe('GET');
       await page
         .getByRole('heading', { name: '运行检查', exact: true })
         .waitFor();
-      expect(requests.slice(start)).toContain(
-        `GET /api/v1/admin/tenants/${a.target.organizationId}/validation?workspaceId=${a.target.workspaceId}&subjectId=${a.target.subjectId}`,
-      );
       await page.getByLabel('选择验收 Run').selectOption(a.task.runId);
       await page.getByRole('region', { name: '真实任务检查结果' }).waitFor();
       await page.getByText('技术详情', { exact: true }).click();
@@ -607,10 +621,20 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
   it('configures real member quotas through UI, restores inheritance with CAS and prevents cross-origin updates', async () => {
     const { page, context } = await pageFor();
     try {
+      const start = requests.length;
       await page.goto(resourcePage('quotas', snow));
       await page
         .getByLabel('实际使用者', { exact: true })
         .selectOption(snow.user.id);
+      await page.getByRole('article', { name: '成员用量概览' }).waitFor();
+      expect(
+        await page
+          .getByRole('spinbutton', { name: '月 Token 上限', exact: true })
+          .count(),
+      ).toBe(0);
+      expect(requests.slice(start).every((r) => r.startsWith('GET '))).toBe(
+        true,
+      );
       await page.getByText('额度详情与调整', { exact: true }).click();
       expect(
         await page.getByLabel('月 Token 上限', { exact: true }).isEditable(),
@@ -712,6 +736,62 @@ integration('MET-151 management UI -> HTTP -> real isolated PostgreSQL', () => {
         )
         .toBe(2000);
       expect(await sandboxLimit.inputValue()).toBe('600000');
+    } finally {
+      await context.close();
+    }
+  });
+  it('stores a scoped cloud grant and an encrypted MCP binding through the management API', async () => {
+    vi.stubEnv('ALLRICE_RUNTIME_POLICY_ENABLED', '1');
+    vi.stubEnv('ALLRICE_CLOUD_RUNNER_ENABLED', '1');
+    vi.stubEnv('ALLRICE_CLOUD_MCP_ENABLED', '1');
+    vi.stubEnv('ALLRICE_MCP_CREDENTIAL_KEY', 'ab'.repeat(32));
+    const targetId = randomUUID();
+    await fixture.db`insert into allrice_execution_targets(id,organization_id,workspace_id,target_key,kind,label,state,capabilities) values(${targetId},${snow.organizationId},${snow.workspaceId},${`cloud.${targetId}`},'cloud_sandbox','Synthetic cloud target','online','["process.execute","browser.navigate"]')`;
+    const context = await contextFor();
+    const endpoint = `${origin}/api/v1/admin/tenants/${snow.organizationId}`;
+    const scope = { workspaceId: snow.workspaceId, subjectId: snow.user.id };
+    try {
+      const granted = await context.request.put(`${endpoint}/environments`, {
+        headers: { origin },
+        data: {
+          ...scope,
+          targetId,
+          action: 'cloud_grant',
+          reason: 'Synthetic cloud platform approval',
+        },
+      });
+      expect(granted.status()).toBe(200);
+      expect(
+        await fixture.db`select id from allrice_cloud_execution_grants where organization_id=${snow.organizationId} and owner_id=${snow.user.id} and target_id=${targetId} and enabled`,
+      ).toHaveLength(1);
+      expect(
+        await fixture.db`select id from allrice_bridge_devices where organization_id=${snow.organizationId}`,
+      ).toHaveLength(0);
+
+      const bearerToken = 'synthetic-browser-credential';
+      const mcpEndpoint = 'https://example.com/mcp';
+      const connection = await context.request.post(`${endpoint}/mcp`, {
+        headers: { origin },
+        data: {
+          ...scope,
+          name: 'Fixture MCP connection',
+          endpoint: mcpEndpoint,
+          bearerToken,
+          reason: 'Synthetic MCP connection configuration',
+        },
+      });
+      expect(connection.status()).toBe(200);
+      expect(await connection.json()).toMatchObject({
+        ...scope,
+        organizationId: snow.organizationId,
+      });
+      const [binding] =
+        await fixture.db`select b.created_by,b.organization_id,c.credential_envelope from allrice_connector_bindings b join allrice_mcp_binding_config c on c.binding_id=b.id where b.organization_id=${snow.organizationId} and c.endpoint=${mcpEndpoint}`;
+      expect(binding).toMatchObject({
+        created_by: platform.user.id,
+        organization_id: snow.organizationId,
+      });
+      expect(JSON.stringify(binding)).not.toContain(bearerToken);
     } finally {
       await context.close();
     }
