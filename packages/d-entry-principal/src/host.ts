@@ -498,22 +498,13 @@ class Scope implements Projection {
     let item = this.sessions.get(
       address.kind === 'session' ? address.sessionId : address.childSessionId,
     );
-    if (!item) {
-      if (address.kind === 'session')
-        throw new RemoteError('session/not-found', 'Session is unavailable', {
-          sessionId: address.sessionId,
-        });
-      throw new RemoteError('subagent/not-found', 'Subagent is unavailable', {
-        childSessionId: address.childSessionId,
-        parentSessionId: address.parentSessionId,
-      });
-    }
-    // rc.2 owns its unauthorized-parent error. If it nevertheless yields
-    // a frame, the forwarding loop still requires a bound ancestry proof.
+    // Let the native Gateway surface its exact validation error for an
+    // unbound address. Forwarding still requires positive ancestry proof.
     if (
-      address.kind === 'subagent' &&
-      (item.origin !== 'subagent' ||
-        item.parentSessionId !== address.parentSessionId)
+      !item ||
+      (address.kind === 'subagent' &&
+        (item.origin !== 'subagent' ||
+          item.parentSessionId !== address.parentSessionId))
     )
       return;
     while (item && !chain.has(item.sessionId)) {

@@ -427,3 +427,37 @@ it('honors browser backpressure and suppresses a child withdrawn before the next
     error: { code: 'remote-access/denied' },
   });
 });
+
+it('refuses to follow on an owner that cannot report native child withdrawal', async () => {
+  const f = await fixture();
+  observe(f);
+  const mock = vi.mocked(f.owner.acquirePrincipal);
+  const acquire = mock.getMockImplementation()!;
+  mock.mockImplementation((...args) => {
+    const activity = acquire(...args);
+    return {
+      ...activity,
+      async run(signal) {
+        const scope = await activity.run(signal);
+        return {
+          ...scope,
+          opened: { ...scope.opened, followWithdrawals: undefined },
+        };
+      },
+    };
+  });
+  const channel = await connect(f);
+  send(channel.peer, {
+    type: 'open',
+    streamId: 'root',
+    endpoint: 'session/follow',
+    payload: {
+      args: { request: { address: { kind: 'session', sessionId: 'root' } } },
+    },
+  });
+  expect(await channel.next('root')).toMatchObject({
+    type: 'error',
+    error: { code: 'gateway/unavailable' },
+  });
+  expect(f.host.catalog.follows).toHaveLength(0);
+});

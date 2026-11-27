@@ -301,12 +301,15 @@ async function runStreams(
       void inputError.catch((error: unknown) => stop.abort(error));
     }
     const source = (async () => {
-      if (
-        frame.endpoint === 'session/follow' &&
-        page.scope.opened.followWithdrawals
-      )
+      if (frame.endpoint === 'session/follow')
         follow = await page.watchFollow(child);
       if (follow) {
+        if (!page.scope.opened.followWithdrawals)
+          throw new RemoteError(
+            'gateway/unavailable',
+            'Native follow continuity unavailable',
+            {},
+          );
         let pending;
         while ((pending = follow.pending())) await pending;
         follow.signal.throwIfAborted();
@@ -352,6 +355,8 @@ async function runStreams(
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
         await page.assertCurrent(child);
+        follow?.signal.throwIfAborted();
+        if ('revoked' in stream) stream.revoked?.throwIfAborted();
         child.throwIfAborted();
         settled = true;
         await send({ type: 'end', streamId: id });
