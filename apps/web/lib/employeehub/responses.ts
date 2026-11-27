@@ -62,16 +62,6 @@ export function employeeHubErrorResponse(error: unknown) {
     });
   if (
     error instanceof EmployeeInstanceError &&
-    error.code === 'default_protected'
-  )
-    return apiProblem({
-      status: 409,
-      code: 'DEFAULT_EMPLOYEE_PROTECTED',
-      message: 'Rice is the protected default employee',
-      retryable: false,
-    });
-  if (
-    error instanceof EmployeeInstanceError &&
     error.code === 'd_entry_first_employee_limit'
   )
     return apiProblem({
@@ -130,10 +120,6 @@ export function employeeHubErrorResponse(error: unknown) {
       status = 409;
       code = 'SKILL_NOT_INSTALLED';
       message = 'Every selected skill version must be installed and enabled';
-    } else if (error.code === 'default_protected') {
-      status = 409;
-      code = 'DEFAULT_EMPLOYEE_PROTECTED';
-      message = 'Rice is the protected default employee';
     } else if (error.code === 'assignment_invalid') {
       status = 422;
       code = 'EMPLOYEE_ASSIGNMENT_INVALID';

@@ -7,7 +7,6 @@ import {
 import {
   employeeManifest,
   employeeManifestChecksum,
-  riceManifest,
 } from './employee-config.ts';
 import {
   projectEmployeeTaskSuggestions,
@@ -15,7 +14,13 @@ import {
 } from './task-suggestions.ts';
 
 function rice(): EmployeeDefinition {
-  return EmployeeDefinitionSchema.parse(riceManifest());
+  return EmployeeDefinitionSchema.parse(
+    employeeManifest({
+      key: 'test-employee',
+      name: 'Test employee',
+      description: 'Task suggestions fixture',
+    }),
+  );
 }
 describe('safe task display projection', () => {
   it('reads all four role types without changing legacy frozen manifests/checksums', () => {

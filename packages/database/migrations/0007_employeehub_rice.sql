@@ -153,7 +153,7 @@ create index allrice_employee_versions_history
 insert into allrice_runtime_metadata (key, value)
 values (
   'employeehub-schema',
-  '{"version":"0007","defaultEmployee":"Rice","provider":"codex","authMode":"chatgpt_subscription"}'::jsonb
+  '{"version":"0007","provider":"codex","authMode":"chatgpt_subscription"}'::jsonb
 )
 on conflict (key) do update
 set value = excluded.value,

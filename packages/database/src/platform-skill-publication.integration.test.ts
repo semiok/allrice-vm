@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -28,10 +29,7 @@ import { skillBundleChecksum, skillBytesChecksum } from './skill-bundles.ts';
 
 import { freezeSessionModelSnapshot } from './providers/model-pool.ts';
 import { authenticateSession, createSession } from './identity.ts';
-import {
-  getEmployeeWorkspace,
-  ensureDefaultEmployee,
-} from './workspace/service.ts';
+import { getEmployeeWorkspace } from './workspace/service.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -261,7 +259,7 @@ suite('P18 exact package publication authority with real PostgreSQL', () => {
     });
     if (!context) throw Error('Synthetic publication login failed');
     // Preserve an explicitly pre-existing legacy employee; managed workspaces no longer create one on read.
-    await ensureDefaultEmployee(context, f.workspaceId);
+    await createTestEmployeeAssignment(context, f.workspaceId);
     await f.preview();
     expect((await f.publish()).valid).toBe(true);
     const [assignment] =

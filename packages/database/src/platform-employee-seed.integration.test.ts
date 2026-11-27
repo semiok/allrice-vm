@@ -10,9 +10,9 @@ import {
 } from './identity.ts';
 import {
   compilePlatformEmployee,
+  createPlatformEmployeeDraft,
   getPlatformEmployee,
   listPlatformEmployees,
-  materializePlatformEmployeeRevision,
   publishPlatformEmployee,
   savePlatformEmployeeDraft,
 } from './employees/platform-employees.ts';
@@ -29,7 +29,7 @@ const suite =
     ? describe.sequential
     : describe.skip;
 
-suite('unmodified Rice seed in a freshly migrated database', () => {
+suite('an empty employee catalog in a freshly migrated database', () => {
   let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   beforeAll(async () => {
     f = await createRuntimeFixtureDatabase();
@@ -42,7 +42,7 @@ suite('unmodified Rice seed in a freshly migrated database', () => {
     await f?.close();
   });
 
-  it('lists Rice, reads its unavailable first revision, publishes a new revision and assigns it in qa-bootstrap order', async () => {
+  it('creates, publishes and assigns an employee only after an explicit admin action', async () => {
     const principal = await ensureBootstrapPortalPrincipal(
       {
         organizationSlug: `seed-${randomUUID()}`,
@@ -63,47 +63,32 @@ suite('unmodified Rice seed in a freshly migrated database', () => {
         workspaceId: principal.workspaceId,
       },
     ))!;
-    const [seed] =
-      await f.db`select r.* from allrice_platform_employee_revisions r
-      join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-    expect(seed!.revision).toBe(1);
-    expect(seed!.runtime_profile).not.toHaveProperty('distributionGeneration');
-
-    // The same entrypoints used by the bootstrap and admin APIs, with no seed repair.
-    const rice = (await listPlatformEmployees()).find(
-      (e) => e.employeeKey === 'rice',
-    )!;
-    expect(rice.currentPublished).toMatchObject({
-      id: seed!.id,
-      revision: 1,
-      runtimeProfile: null,
-    });
-    const detail = (await getPlatformEmployee(rice.id))!;
-    expect(detail.currentPublished).toEqual(rice.currentPublished);
-    const history = await readPlatformEmployeeHistoryRevision(
-      context,
-      rice.id,
-      seed!.id,
+    expect(await listPlatformEmployees()).toEqual([]);
+    const created = await createPlatformEmployeeDraft(
+      { key: 'test-employee', name: 'Test employee' },
+      principal.user.id,
     );
-    expect(history).toMatchObject({
-      checksum: seed!.checksum,
-      runtimeProfile: null,
-    });
+    const employeeId = created!.id;
+    const initial = created!.currentDraft!;
+    expect(initial).toMatchObject({ revision: 1, runtimeProfile: null });
+    expect(created!.currentPublished).toBeNull();
+    expect(initial.definition.capabilities.toolNames).toEqual([]);
+    const detail = (await getPlatformEmployee(employeeId))!;
+    expect(detail.currentDraft).toEqual(initial);
+    expect(
+      await readPlatformEmployeeHistoryRevision(
+        context,
+        employeeId,
+        initial.id,
+      ),
+    ).toMatchObject({ checksum: initial.checksum, runtimeProfile: null });
     const list = () =>
       listAdminTenantEmployees(
         context,
         principal.organizationId,
         principal.workspaceId,
       );
-    expect(
-      (await list()).employees.find((e) => e.employeeId === rice.id),
-    ).toMatchObject({
-      revision: 1,
-      canAssign: false,
-      toolNames: [],
-      skills: [],
-      deployment: null,
-    });
+    expect((await list()).employees).toEqual([]);
     expect(
       (
         await listOrganizationAiAssignments(
@@ -111,46 +96,23 @@ suite('unmodified Rice seed in a freshly migrated database', () => {
           principal.organizationId,
           principal.workspaceId,
         )
-      ).employees.find((e) => e.employeeId === rice.id),
-    ).toMatchObject({ canAssign: false });
-    await expect(
-      f.db.begin((tx) =>
-        materializePlatformEmployeeRevision(tx, {
-          employeeId: rice.id,
-          revision: seed as Parameters<
-            typeof materializePlatformEmployeeRevision
-          >[1]['revision'],
-          definition: detail.currentPublished!.definition,
-          workspaceIds: [principal.workspaceId],
-          actorLabel: principal.user.id,
-        }),
-      ),
-    ).rejects.toMatchObject({
-      name: 'ZodError',
-      issues: expect.arrayContaining([
-        expect.objectContaining({ path: ['distributionGeneration'] }),
-      ]),
-    });
+      ).employees,
+    ).toEqual([]);
 
     const definition = {
-      ...detail.currentPublished!.definition,
-      capabilities: {
-        ...detail.currentPublished!.definition.capabilities,
-        nativeSkillIds: [],
-        toolNames: [],
-        explicitToolNames: [],
-      },
+      ...initial.definition,
+      description: 'Explicitly configured test employee',
     };
-    const saved = await savePlatformEmployeeDraft(rice.id, {
+    const saved = await savePlatformEmployeeDraft(employeeId, {
       definition,
       expectedRevisionId: detail.currentDraft?.id ?? null,
     });
     // The HTTP PUT route compiles after saving, as does the review/publication path.
-    expect((await compilePlatformEmployee(rice.id)).errors).toEqual([]);
-    const review = await reviewEmployeePublication(context, rice.id);
+    expect((await compilePlatformEmployee(employeeId)).errors).toEqual([]);
+    const review = await reviewEmployeePublication(context, employeeId);
     expect(review.errors).toEqual([]);
     const published = await publishPlatformEmployee(
-      rice.id,
+      employeeId,
       {
         scope: 'assigned',
         expectedRevisionId: review.revisionId,
@@ -169,26 +131,24 @@ suite('unmodified Rice seed in a freshly migrated database', () => {
     expect(
       await changeAdminTenantEmployee(context, principal.organizationId, {
         workspaceId: principal.workspaceId,
-        employeeId: rice.id,
+        employeeId,
         revisionId: published.revisionId,
         action: 'assign',
         expectedVersion: null,
       }),
     ).toEqual({ changed: true });
     expect(
-      (await list()).employees.find((e) => e.employeeId === rice.id),
+      (await list()).employees.find((e) => e.employeeId === employeeId),
     ).toMatchObject({
       canAssign: true,
       deployment: { active: true, revisionId: published.revisionId },
     });
     expect(
-      (
-        await f.db`select * from allrice_platform_employee_revisions where id=${seed!.id}`
-      )[0],
-    ).toEqual(seed);
-    expect(
-      (await readPlatformEmployeeHistoryRevision(context, rice.id, seed!.id))
-        .runtimeProfile,
-    ).toBeNull();
+      await readPlatformEmployeeHistoryRevision(
+        context,
+        employeeId,
+        initial.id,
+      ),
+    ).toEqual(initial);
   });
 });

@@ -83,22 +83,6 @@ where e.id = a.employee_id
   and e.workspace_id = a.workspace_id
   and e.employee_key like 'builtin-%';
 
-update allrice_employee_assignments rice
-set is_default = true, active = true, updated_at = now()
-from allrice_employees e
-where e.id = rice.employee_id
-  and e.organization_id = rice.organization_id
-  and e.workspace_id = rice.workspace_id
-  and e.employee_key = 'default-assistant'
-  and not exists (
-    select 1 from allrice_employee_assignments current_default
-    where current_default.organization_id = rice.organization_id
-      and current_default.workspace_id = rice.workspace_id
-      and current_default.user_id = rice.user_id
-      and current_default.active
-      and current_default.is_default
-  );
-
 create index allrice_employee_assignments_admin_scope
   on allrice_employee_assignments (
     organization_id, workspace_id, employee_id, active, user_id

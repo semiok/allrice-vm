@@ -35,19 +35,15 @@ suite('default Rice project tool admission', () => {
     await f?.close();
   });
 
-  async function setup(rice: boolean) {
+  async function setup() {
     const source = await createEmployeeAdministrationFixture(f.db);
     const project = catalog.skills.find(
       (s) => s.name === 'project-development',
     )!;
-    const [platform] = rice
-      ? await f.db`select id from allrice_platform_employees where employee_key='rice'`
-      : [{ id: source.employeeId }];
-    const employeeId = platform!.id as string;
+    const employeeId = source.employeeId;
     await savePlatformEmployeeDraft(employeeId, {
       definition: {
         ...source.definition,
-        key: rice ? 'rice' : source.definition.key,
         capabilities: {
           ...source.definition.capabilities,
           nativeSkillIds: [source.skillId, project.id],
@@ -113,8 +109,8 @@ suite('default Rice project tool admission', () => {
     return { source, context, assignment, send, resolve, project };
   }
 
-  it('reduces only new Rice Runs, preserving custom development and immutable publication', async () => {
-    const x = await setup(true);
+  it('keeps published project eligibility for general and personal employees', async () => {
+    const x = await setup();
     const [before] =
       await f.db`select manifest,config_checksum from allrice_employee_versions where id=${x.assignment.currentVersion.id}`;
     for (const kind of ['general', 'custom'] as const) {
@@ -124,7 +120,7 @@ suite('default Rice project tool admission', () => {
       expect(snapshot.schemaVersion).toBe(2);
       if (snapshot.schemaVersion !== 2) throw Error('snapshot_version');
       const names = snapshot.capabilitySnapshot.bindings.toolNames;
-      expect(names.includes('workspace.project')).toBe(kind === 'custom');
+      expect(names).toContain('workspace.project');
       // Workflow installation/authoring does not depend on workspace.project.
       expect(names).toContain('workspace.skill.read');
       expect(
@@ -141,7 +137,7 @@ suite('default Rice project tool admission', () => {
       expect(project.requiredToolRefs).toContain('workspace.project');
       expect(
         project.requiredToolRefs.every((tool) => names.includes(tool)),
-      ).toBe(kind === 'custom');
+      ).toBe(true);
       const [persisted] =
         await f.db`select execution_snapshot from allrice_employee_runs where run_id=${sent.run.id}`;
       expect(
@@ -154,23 +150,22 @@ suite('default Rice project tool admission', () => {
   });
 
   it('does not remove project development from another published general employee', async () => {
-    const x = await setup(false);
+    const x = await setup();
     const resolved = await x.resolve((await x.send('general')).sent.run.id);
     expect(
       resolved.executionSnapshot?.capabilitySnapshot.bindings.toolNames,
     ).toContain('workspace.project');
   });
 
-  it('replays and resolves an old Rice Run with its original project qualification', async () => {
-    const x = await setup(true);
+  it('replays and resolves an old Run with its original project qualification', async () => {
+    const x = await setup();
     // Simulate the old tool selection at first INSERT, never rewrite a stored
     // snapshot or disable its immutability trigger. All admission checks stay real.
     const selectMemoryTools = toolSelection.freezeMemoryIndexToolNames;
     const oldSelection = vi
       .spyOn(toolSelection, 'freezeMemoryIndexToolNames')
       .mockImplementation((...args) => [
-        ...selectMemoryTools(...args),
-        'workspace.project',
+        ...new Set([...selectMemoryTools(...args), 'workspace.project']),
       ]);
     const original = await x
       .send('general')

@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
@@ -44,7 +45,6 @@ import {
   repositoryRequiredChecks,
 } from './platform-repository-publication-contracts.ts';
 import { repositoryCommitIdentity } from './platform-repository-git.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
 import { acceptedRepositoryFixture } from './platform-repository-publication.fixture.ts';
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -133,7 +133,7 @@ suite('private publication canonical queue and authority boundaries', () => {
     const [job] =
       await f.db`select id from allrice_jobs where run_id=${run.run.id}`;
     await f.db`update allrice_jobs set status='succeeded' where id=${job!.id}`;
-    const assignment = await ensureDefaultEmployee(
+    const assignment = await createTestEmployeeAssignment(
       execution,
       execution.workspaceId!,
     );

@@ -33,7 +33,7 @@ export async function GET(
     };
     const instanceId = (await params).id;
     const instance = await getEmployeeInstance(scope, instanceId);
-    if (await canUsePersonalEmployeeScenes(instance)) {
+    if (canUsePersonalEmployeeScenes(instance)) {
       const selection = PersonalSceneSkillQuerySchema.parse(
         Object.fromEntries(query),
       );

@@ -17,7 +17,7 @@ sha=$(git -C "$root" rev-parse HEAD)
 base="$HOME/allrice40-dev"; tools="$base/tools"; dest="$tools/$sha"; link="$base/bin"
 SCRIPTS="deploy-dev deploy-lock qa-instance smoke-test with-env backup-daily cloud-autostart schedule-recover m5-test"
 PYTOOLS="monitor wake-when m1-dog"
-FILES="lib.sh service_target.py m5-run m5_result.py qa-lease.py qa-bootstrap.mjs smoke-test.mjs smoke-entry.mjs rice-standard.json schedule-recover.sql schedule-recover-processes.py wake-when.threads wake_runtime.py deploy-result.py"
+FILES="lib.sh service_target.py m5-run m5_result.py qa-lease.py qa-bootstrap.mjs smoke-test.mjs smoke-entry.mjs schedule-recover.sql schedule-recover-processes.py wake-when.threads wake_runtime.py deploy-result.py"
 
 mkdir -p "$tools"
 if [ ! -d "$dest" ]; then

@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from './employee-assignment.fixture.ts';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type {
@@ -17,7 +18,6 @@ import {
   authenticateSession,
   createSession,
 } from './identity.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
 import { getStoredFile } from './data.ts';
 import { readArtifactBytes } from './artifact-review.ts';
 import {
@@ -545,7 +545,7 @@ suite(
         source_memory_revision_id: chosen.revisionId,
         content: chosen.content,
       });
-      const memberEmployee = await ensureDefaultEmployee(
+      const memberEmployee = await createTestEmployeeAssignment(
         member,
         member.workspaceId!,
       );
@@ -596,7 +596,10 @@ suite(
     it.each(['candidate', 'derived'] as const)(
       'excludes %s memory without relying on any experience review row',
       async (mode) => {
-        const instance = await ensureDefaultEmployee(owner, owner.workspaceId!);
+        const instance = await createTestEmployeeAssignment(
+          owner,
+          owner.workspaceId!,
+        );
         const memory = await createPersonalEmployeeMemory(owner, {
           instanceId: instance!.id,
           workspaceId: owner.workspaceId,

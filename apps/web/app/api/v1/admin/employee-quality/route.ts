@@ -38,12 +38,7 @@ function errorResponse(error: unknown) {
     const status = error.code === 'not_found' ? 404 : 409;
     return apiProblem({
       status,
-      code:
-        error.code === 'not_found'
-          ? 'RESOURCE_NOT_FOUND'
-          : error.code === 'default_protected'
-            ? 'DEFAULT_EMPLOYEE_PROTECTED'
-            : 'CONFLICT',
+      code: error.code === 'not_found' ? 'RESOURCE_NOT_FOUND' : 'CONFLICT',
       message:
         error.code === 'not_found'
           ? 'Employee quality resource not found'

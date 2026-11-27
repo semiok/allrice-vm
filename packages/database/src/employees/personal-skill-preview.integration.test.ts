@@ -83,7 +83,6 @@ suite('browser Skill source preview and confirmation', () => {
   let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   let admin: RequestContext;
   let source: Awaited<ReturnType<typeof createEmployeeAdministrationFixture>>;
-  let riceId: string;
   beforeAll(async () => {
     f = await createRuntimeFixtureDatabase();
     vi.spyOn(client, 'getDatabase').mockReturnValue(f.db);
@@ -95,18 +94,6 @@ suite('browser Skill source preview and confirmation', () => {
     source = await createEmployeeAdministrationFixture(f.db);
     await source.preview();
     expect((await source.publish()).valid).toBe(true);
-    const [rice] =
-      await f.db`select id from allrice_platform_employees where employee_key='rice'`;
-    riceId = rice!.id;
-    await savePlatformEmployeeDraft(riceId, {
-      definition: {
-        ...source.definition,
-        key: 'rice',
-        name: 'Platform assistant',
-      },
-    });
-    await source.preview(riceId);
-    expect((await source.publish(riceId)).valid).toBe(true);
   }, 120000);
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -137,10 +124,10 @@ suite('browser Skill source preview and confirmation', () => {
     ))!;
     return { ...p, context, slug };
   }
-  async function setup(rice = false) {
+  async function setup() {
     const owner = await principal();
     const peer = await principal(owner.slug);
-    const employeeId = rice ? riceId : source.employeeId;
+    const employeeId = source.employeeId;
     const e = (
       await listAdminTenantEmployees(
         admin,
@@ -157,11 +144,7 @@ suite('browser Skill source preview and confirmation', () => {
     });
     const assigned = (
       await getEmployeeWorkspace(owner.context, owner.workspaceId)
-    ).employees.find(
-      (item) =>
-        item.employeeKey ===
-        (rice ? 'default-assistant' : source.definition.key),
-    )!;
+    ).employees.find((item) => item.employeeKey === source.definition.key)!;
     return { owner, peer, assigned };
   }
   async function zip(path = 'SKILL.md') {
@@ -278,7 +261,7 @@ suite('browser Skill source preview and confirmation', () => {
     );
   }
   it('L1: previews, confirms and freezes 256 KiB plus all 32 resource entries, rejecting oversized bodies before writes', async () => {
-    const s = await setup(true),
+    const s = await setup(),
       body = '字'.repeat(87381) + 'x';
     const raw =
       '---\nname: maximum-web\ndescription: Exact package\n---\n' + body;
@@ -323,12 +306,12 @@ suite('browser Skill source preview and confirmation', () => {
     });
     expect(await counts()).toEqual(before);
   });
-  it.each(['rice', 'custom', 'professional'] as const)(
+  it.each(['custom', 'professional'] as const)(
     'catalog: projects actual base and enabled personal Skills for %s without writes',
     async (kind) => {
       const platform = await loadPlatformContentCatalog();
       await synchronizePlatformContent(platform);
-      const s = await setup(kind === 'rice');
+      const s = await setup();
       const second = await createEmployeeInstance(s.owner.context, {
         workspaceId: s.owner.workspaceId,
         assignmentId: s.assigned.id,
@@ -469,7 +452,7 @@ suite('browser Skill source preview and confirmation', () => {
     }
   });
   it('catalog: excludes uninstalled entries and enforces current read and write authority', async () => {
-    const s = await setup(true),
+    const s = await setup(),
       foreign = await setup();
     const installed = await installWeb(s);
     await f.db`update allrice_memberships set role='viewer' where user_id=${s.owner.user.id}`;
@@ -518,10 +501,10 @@ suite('browser Skill source preview and confirmation', () => {
         .status,
     ).toBe(403);
   });
-  it.each(['rice', 'custom', 'professional'] as const)(
+  it.each(['custom', 'professional'] as const)(
     'confirms the exact ZIP for an owned %s, stores resources and replays without new writes',
     async (kind) => {
-      const s = await setup(kind === 'rice');
+      const s = await setup();
       const id =
         kind === 'custom'
           ? (
@@ -619,7 +602,7 @@ suite('browser Skill source preview and confirmation', () => {
     },
   );
   it('updates the existing owner library only after confirming the complete unchanged binding set', async () => {
-    const s = await setup(true);
+    const s = await setup();
     const second = await createEmployeeInstance(s.owner.context, {
       workspaceId: s.owner.workspaceId,
       assignmentId: s.assigned.id,
@@ -756,7 +739,7 @@ suite('browser Skill source preview and confirmation', () => {
     expect(await counts()).toEqual(before);
   });
   it('binds an existing archive and confirms an unchanged update without additional quota or storage writes', async () => {
-    const s = await setup(true),
+    const s = await setup(),
       bytes = await zip();
     const first = await installWeb(s, s.assigned.id, bytes);
     const second = await createEmployeeInstance(s.owner.context, {
@@ -967,7 +950,7 @@ suite('browser Skill source preview and confirmation', () => {
     ).toBe(true);
   });
   it('native names: ordinary install and enable cannot shadow an owned scene, and enabled ordinary Skills block a scene save', async () => {
-    const s = await setup(true),
+    const s = await setup(),
       id = s.assigned.id;
     const installed = await installWeb(s);
     const payload = sceneSkillFixture();
@@ -1173,51 +1156,48 @@ suite('browser Skill source preview and confirmation', () => {
     expect(await counts()).toEqual(before);
   });
 
-  it.each([true, false])(
-    'previews an owned general instance (Rice=%s), preserving exact ZIP without writes',
-    async (rice) => {
-      const s = await setup(rice),
-        bytes = await zip(),
-        before = await counts();
-      const response = await send(
-        s.owner.context,
-        s.assigned.id,
-        s.owner.workspaceId,
-        bytes,
-      );
-      expect(response.status).toBe(200);
-      const body = await response.json();
-      expect(body).toMatchObject({
-        instanceId: s.assigned.id,
-        installed: false,
-        scriptsExecuted: false,
-        item: {
-          name: 'weekly',
-          displayName: 'Weekly summary',
-          version: '1.2.0',
-        },
-        source: { kind: 'zip', fileName: 'weekly.zip' },
-      });
-      const verified = new SkillPreviewTokens(key).verify(body.previewId, {
-        organizationId: s.owner.organizationId,
-        workspaceId: s.owner.workspaceId,
-        ownerId: s.owner.user.id,
-        instanceId: s.assigned.id,
-        digest: body.digest,
-      });
-      expect(verified.bytes.equals(bytes)).toBe(true);
-      expect(verified.preview.target).toEqual({
-        operation: 'install',
-        expectedInstallation: null,
-      });
-      expect(body.files.map((file: { path: string }) => file.path)).toEqual([
-        'SKILL.md',
-        'references/rules.md',
-        'scripts/never-run.js',
-      ]);
-      expect(await counts()).toEqual(before);
-    },
-  );
+  it('previews an owned general instance, preserving exact ZIP without writes', async () => {
+    const s = await setup(),
+      bytes = await zip(),
+      before = await counts();
+    const response = await send(
+      s.owner.context,
+      s.assigned.id,
+      s.owner.workspaceId,
+      bytes,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      instanceId: s.assigned.id,
+      installed: false,
+      scriptsExecuted: false,
+      item: {
+        name: 'weekly',
+        displayName: 'Weekly summary',
+        version: '1.2.0',
+      },
+      source: { kind: 'zip', fileName: 'weekly.zip' },
+    });
+    const verified = new SkillPreviewTokens(key).verify(body.previewId, {
+      organizationId: s.owner.organizationId,
+      workspaceId: s.owner.workspaceId,
+      ownerId: s.owner.user.id,
+      instanceId: s.assigned.id,
+      digest: body.digest,
+    });
+    expect(verified.bytes.equals(bytes)).toBe(true);
+    expect(verified.preview.target).toEqual({
+      operation: 'install',
+      expectedInstallation: null,
+    });
+    expect(body.files.map((file: { path: string }) => file.path)).toEqual([
+      'SKILL.md',
+      'references/rules.md',
+      'scripts/never-run.js',
+    ]);
+    expect(await counts()).toEqual(before);
+  });
   it('uses the same entry for an owned custom instance and rejects peer, tenant and CSRF substitution', async () => {
     const s = await setup(),
       bytes = await zip();

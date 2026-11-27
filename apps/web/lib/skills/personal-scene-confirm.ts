@@ -33,7 +33,7 @@ async function authorize(context: RequestContext, instanceId: string) {
   if (!context.sessionId || context.actor.type !== 'user')
     throw new DataAccessError('authorization_denied');
   const instance = await getEmployeeInstance(context, instanceId);
-  if (!(await canUsePersonalEmployeeScenes(instance)))
+  if (!canUsePersonalEmployeeScenes(instance))
     throw new DataAccessError('not_found');
 }
 

@@ -34,10 +34,7 @@ export async function POST(
       }
       return apiProblem({
         status: 409,
-        code:
-          error.code === 'default_protected'
-            ? 'DEFAULT_EMPLOYEE_PROTECTED'
-            : 'CONFLICT',
+        code: 'CONFLICT',
         message: 'Run feedback conflicts with the current employee state',
       });
     }

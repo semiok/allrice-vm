@@ -1,6 +1,5 @@
 import { legacyRuntimePackageFixture as buildEmployeeRuntimePackage } from '../platform-employees/legacy-runtime-package.fixture.ts';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   EmployeeDefinitionSchema,
@@ -10,8 +9,6 @@ import {
   PlatformEmployeeDefinitionSchema,
   SessionModelSnapshotSchema,
   withEmployeeCustomizationTools,
-  allRiceToolManifest,
-  employeeToolConfigurationErrors,
   freezeMemoryIndexToolNames,
   type EmployeeDefinition,
 } from '@allrice/contracts';
@@ -292,26 +289,6 @@ function run(
 }
 
 describe('current employee source policy: immutable original identities', () => {
-  it('the standard Rice publication declares only current tools', async () => {
-    const standard = PlatformEmployeeDefinitionSchema.parse(
-      JSON.parse(
-        await readFile(
-          new URL('../../../../scripts/m1/rice-standard.json', import.meta.url),
-          'utf8',
-        ),
-      ),
-    );
-    const known = new Set<string>(
-      allRiceToolManifest.map((tool) => tool.canonicalName),
-    );
-    for (const name of [
-      ...standard.capabilities.toolNames,
-      ...(standard.capabilities.explicitToolNames ?? []),
-    ])
-      expect(known.has(name), name).toBe(true);
-    expect(employeeToolConfigurationErrors(standard)).toEqual([]);
-  });
-
   it.each(['definition', 'plain', 'bundled'] as const)(
     'reads signed pre-A2 %s declarations without granting retired memory tools',
     (format) => {

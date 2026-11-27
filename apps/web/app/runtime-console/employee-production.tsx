@@ -1803,27 +1803,25 @@ function EmployeeTemplateEditor({
             <p className={styles.muted}>还没有发布记录。</p>
           )}
         </section>
-        {selected.employeeKey !== 'rice' ? (
-          <section className={styles.dangerZone}>
-            <h3>归档员工</h3>
-            <p className={styles.muted}>
-              归档会撤回全部租户分配并从员工目录隐藏；Rice 不允许归档。
-            </p>
-            <Field
-              label="归档原因"
-              value={archiveReason}
-              wide
-              onChange={setArchiveReason}
-            />
-            <button
-              className={styles.dangerButton}
-              disabled={busy || !archiveReason.trim()}
-              onClick={() => void archiveEmployee()}
-            >
-              归档员工
-            </button>
-          </section>
-        ) : null}
+        <section className={styles.dangerZone}>
+          <h3>归档员工</h3>
+          <p className={styles.muted}>
+            归档会撤回全部租户分配并从员工目录隐藏。
+          </p>
+          <Field
+            label="归档原因"
+            value={archiveReason}
+            wide
+            onChange={setArchiveReason}
+          />
+          <button
+            className={styles.dangerButton}
+            disabled={busy || !archiveReason.trim()}
+            onClick={() => void archiveEmployee()}
+          >
+            归档员工
+          </button>
+        </section>
       </>
     );
   }

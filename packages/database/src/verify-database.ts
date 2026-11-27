@@ -306,48 +306,6 @@ export async function verifyDatabase(sql: Sql): Promise<string> {
     throw new Error('DSH native Skill schema metadata is missing or invalid');
   }
 
-  // The baseline records that the catalog started Rice-only. Companies are later given
-  // other employees (platform employees assigned to them, custom employees), so the
-  // current employee count is not part of this check.
-  const employeeBaselineRows = await sql<
-    { version: string | undefined; migration_mode: string | undefined }[]
-  >`
-    select value ->> 'version' as version,
-      value ->> 'migrationMode' as migration_mode
-    from allrice_runtime_metadata
-    where key = 'employee-catalog-baseline'
-  `;
-  const resetMigrationApplied = expectedMigrations.includes(
-    '0049_rice_only_platform_reset.sql',
-  );
-  // Between 0049 and 0052 the reset left both Skill tables empty; from 0052 on they
-  // hold Skills by design, so they are only counted for a database in between.
-  const resetSkillsMustBeEmpty =
-    resetMigrationApplied &&
-    !expectedMigrations.includes('0052_foundational_dsh_skills.sql');
-  const resetSkillRows = resetSkillsMustBeEmpty
-    ? await sql<{ tenant_skills: string; platform_skills: string }[]>`
-        select
-          (select count(*)::text from allrice_dsh_skills) as tenant_skills,
-          case
-            when to_regclass('allrice_platform_dsh_skills') is null then '0'
-            else (select count(*)::text from allrice_platform_dsh_skills)
-          end as platform_skills
-      `
-    : [];
-  if (
-    expectedMigrations.includes('0047_rice_only_employee_baseline.sql') &&
-    (employeeBaselineRows[0]?.version !==
-      (resetMigrationApplied ? '0049' : '0047') ||
-      employeeBaselineRows[0]?.migration_mode !==
-        (resetMigrationApplied ? 'platform-reset' : 'fresh-only') ||
-      (resetSkillsMustBeEmpty &&
-        (resetSkillRows[0]?.tenant_skills !== '0' ||
-          resetSkillRows[0]?.platform_skills !== '0')))
-  ) {
-    throw new Error('Rice-only employee baseline is missing or invalid');
-  }
-
   const platformEmployeeRows = await sql<
     {
       version: string | undefined;
@@ -374,11 +332,6 @@ export async function verifyDatabase(sql: Sql): Promise<string> {
       to_regclass('allrice_platform_employee_tenant_assignments')::text as assignments,
       to_regclass('allrice_platform_dsh_skills')::text as skills
   `;
-  const platformRiceRows = await sql<{ count: string }[]>`
-    select count(*)::text as count
-    from allrice_platform_employees
-    where employee_key = 'rice' and current_published_revision_id is not null
-  `;
   if (
     expectedMigrations.includes('0048_platform_employee_production.sql') &&
     (platformEmployeeRows[0]?.version !== '0048' ||
@@ -387,28 +340,23 @@ export async function verifyDatabase(sql: Sql): Promise<string> {
       !platformEmployeeTables[0]?.employees ||
       !platformEmployeeTables[0]?.revisions ||
       !platformEmployeeTables[0]?.assignments ||
-      !platformEmployeeTables[0]?.skills ||
-      platformRiceRows[0]?.count !== '1')
+      !platformEmployeeTables[0]?.skills)
   ) {
     throw new Error(
       'Platform employee production schema is missing or invalid',
     );
   }
 
-  const employeeHubRows = await sql<
-    { version: string | undefined; default_employee: string | undefined }[]
-  >`
-    select value ->> 'version' as version,
-      value ->> 'defaultEmployee' as default_employee
+  const employeeHubRows = await sql<{ version: string | undefined }[]>`
+    select value ->> 'version' as version
     from allrice_runtime_metadata
     where key = 'employeehub-schema'
   `;
   if (
     expectedMigrations.includes('0007_employeehub_rice.sql') &&
-    (employeeHubRows[0]?.version !== '0007' ||
-      employeeHubRows[0]?.default_employee !== 'Rice')
+    employeeHubRows[0]?.version !== '0007'
   ) {
-    throw new Error('EmployeeHub/Rice schema metadata is missing or invalid');
+    throw new Error('EmployeeHub schema metadata is missing or invalid');
   }
 
   const conversationRuntimeRows = await sql<

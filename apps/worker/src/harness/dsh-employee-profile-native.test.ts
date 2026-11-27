@@ -92,7 +92,7 @@ it.each(['rice', 'custom', 'professional'] as const)(
           (tool) => tool.name === 'workspace.employee.profile.update',
         )!;
         expect(broker.description).toContain(
-          '本人基础 Rice 和本人定制员工允许 name、expressionStyle',
+          '本人创建的员工允许 name、expressionStyle',
         );
         expect(broker.description).toContain(
           '后台配发的专业通用员工只允许 expressionStyle',

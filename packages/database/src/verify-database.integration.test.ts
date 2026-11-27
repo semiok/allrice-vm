@@ -87,9 +87,20 @@ describeDatabase('db:verify on a prepared database (PostgreSQL)', () => {
     if (failures.length) throw failures[0];
   }, 30_000);
 
-  it('passes once a company has an employee besides Rice, as after assigning a platform employee', async () => {
+  it('starts without employees and still verifies after an explicit employee is added', async () => {
     const sql = getDatabase();
     await expect(verifyDatabase(sql)).resolves.toMatch(/database verified/);
+    const [empty] = await sql`
+      select not exists(select 1 from allrice_platform_employees) as platform,
+        not exists(select 1 from allrice_employees) as employees,
+        not exists(select 1 from allrice_employee_assignments) as assignments,
+        not exists(select 1 from allrice_employee_instances) as instances`;
+    expect(empty).toEqual({
+      platform: true,
+      employees: true,
+      assignments: true,
+      instances: true,
+    });
     const [organization] = await sql<{ id: string }[]>`
       insert into allrice_organizations (slug, name)
       values (${`verify-${randomUUID().slice(0, 8)}`}, 'Verify Co') returning id`;
@@ -102,14 +113,14 @@ describeDatabase('db:verify on a prepared database (PostgreSQL)', () => {
     await expect(verifyDatabase(sql)).resolves.toMatch(/database verified/);
   });
 
-  it('still fails when the employee baseline metadata is wrong', async () => {
+  it('still fails when the EmployeeHub metadata is wrong', async () => {
     const sql = getDatabase();
     await sql`
       update allrice_runtime_metadata
-      set value = jsonb_set(value, '{version}', '"0047"')
-      where key = 'employee-catalog-baseline'`;
+      set value = jsonb_set(value, '{version}', '"invalid"')
+      where key = 'employeehub-schema'`;
     await expect(verifyDatabase(sql)).rejects.toThrow(
-      'Rice-only employee baseline is missing or invalid',
+      'EmployeeHub schema metadata is missing or invalid',
     );
   });
 });

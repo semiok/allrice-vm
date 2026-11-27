@@ -28,8 +28,8 @@ import { recordCodexProviderStatus as recordCanonicalProviderStatus } from './pr
 import { replaceWorkerDshRuntimeInventory as replaceLegacyInventory } from './dsh-runtime-registry.ts';
 import { listPlatformEmployees as legacyListPlatformEmployees } from './platform-employees.ts';
 import { recordCodexProviderStatus as recordLegacyProviderStatus } from './provider-status.ts';
-import { ensureDefaultEmployee as canonicalEnsureDefaultEmployee } from './workspace/service.ts';
-import { ensureDefaultEmployee as legacyEnsureDefaultEmployee } from './workspace.ts';
+import { listChatSessions as canonicalListChatSessions } from './workspace/service.ts';
+import { listChatSessions as legacyListChatSessions } from './workspace.ts';
 
 describe('database domain compatibility facades', () => {
   it('keeps conversation root paths as identity-preserving re-exports', () => {
@@ -62,6 +62,6 @@ describe('database domain compatibility facades', () => {
 
   it('keeps memory and workspace root paths compatible', () => {
     expect(legacyEmbedKnowledgeText).toBe(canonicalEmbedKnowledgeText);
-    expect(legacyEnsureDefaultEmployee).toBe(canonicalEnsureDefaultEmployee);
+    expect(legacyListChatSessions).toBe(canonicalListChatSessions);
   });
 });

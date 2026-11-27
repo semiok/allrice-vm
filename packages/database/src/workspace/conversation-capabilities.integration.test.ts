@@ -271,9 +271,7 @@ suite(
       const general = await x.create('general', undefined, false);
       const custom = await x.create('custom', undefined, false);
       expect(await x.snapshot(general.id)).toBeNull();
-      expect((await x.send(general.id)).tools).not.toContain(
-        'workspace.project',
-      );
+      expect((await x.send(general.id)).tools).toContain('workspace.project');
       expect((await x.send(custom.id)).tools).toContain('workspace.project');
       await x.configure(false);
       await x.create('custom', custom.id);
@@ -297,7 +295,6 @@ suite(
             f.db,
             { ...x.scope(session.id), [key]: randomUUID() },
             tools,
-            true,
           ),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
       }
@@ -313,7 +310,7 @@ suite(
         select ${id},organization_id,workspace_id,owner_id,employee_assignment_id,employee_instance_id,employee_version_id,title,visibility,
           ${f.db.json({ ...frozen, sessionId: id, ...patch })} from allrice_chat_sessions where id=${session.id}`;
         await expect(
-          qualifyConversationProjectTools(f.db, x.scope(id), tools, true),
+          qualifyConversationProjectTools(f.db, x.scope(id), tools),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
       }
       // Tenant assignment revocation remains authoritative, despite frozen on.

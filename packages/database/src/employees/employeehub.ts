@@ -8,7 +8,6 @@ import {
   freezeEmployeePersonaDocuments,
   assertFrozenEmployeePersona,
 } from './employee-documents.ts';
-import { isBaseRiceInstance } from './employee-instance-policy.ts';
 import { freezeConnectedLocalToolNames } from './local-tool-qualification.ts';
 import { readChatNativeRootOrigin } from '../conversation/native-session-binding.ts';
 import {
@@ -92,7 +91,6 @@ import {
   applyEmployeeUserProfilePolicy,
   employeeManifest,
   employeeManifestChecksum,
-  riceEmployeeKey,
 } from './employee-config.ts';
 import { getDatabase } from '../core/client.ts';
 import { freezeSessionModelSnapshot } from '../providers/model-pool.ts';
@@ -100,10 +98,7 @@ import { freezeTaskRuntimePolicy } from '../task-runtime-policy.ts';
 import { freezeSandboxExecutionPolicy } from '../sandbox-execution-policy.ts';
 import { freezeNativePreferences } from '../user-preferences.ts';
 import { qualifyConversationProjectTools } from '../workspace/conversation-capabilities.ts';
-import {
-  ensureDefaultEmployee,
-  resolveWorkspaceId,
-} from '../workspace/service.ts';
+import { resolveWorkspaceId } from '../workspace/service.ts';
 
 interface EmployeeVersionRow {
   id: string;
@@ -281,7 +276,6 @@ export class EmployeeHubError extends Error {
       | 'version_conflict'
       | 'skill_not_installed'
       | 'provider_invalid'
-      | 'default_protected'
       | 'assignment_invalid',
   ) {
     super(code);
@@ -335,28 +329,8 @@ function capabilityBindings(manifest: EmployeeManifest) {
       };
 }
 
-function legacyManifest(row: EmployeeVersionRow): EmployeeManifest {
-  return EmployeeManifestSchema.parse({
-    schemaVersion: 1,
-    key: riceEmployeeKey,
-    name: row.name,
-    description: row.description || 'MET-50 同步基础员工版本（历史只读）。',
-    systemPrompt: row.system_prompt,
-    provider: {
-      provider: 'basic',
-      authMode: 'none',
-      model: 'allrice/basic-assistant-v1',
-      reasoningEffort: 'none',
-      sandbox: 'none',
-    },
-    capabilities: [],
-    skillVersionIds: [],
-  });
-}
-
 function versionSnapshot(row: EmployeeVersionRow) {
-  const parsed = EmployeeManifestSchema.safeParse(row.manifest);
-  const manifest = parsed.success ? parsed.data : legacyManifest(row);
+  const manifest = EmployeeManifestSchema.parse(row.manifest);
   return EmployeeVersionSnapshotSchema.parse({
     id: row.id,
     employeeId: row.employee_id,
@@ -415,7 +389,6 @@ export async function listEmployeeHub(
   workspaceIdInput?: string,
 ) {
   const workspaceId = await resolveWorkspaceId(context, workspaceIdInput);
-  await ensureDefaultEmployee(context, workspaceId);
   const canAdminister = await canAdministerEmployees(context, workspaceId);
   const sql = getDatabase();
   const assignments = await sql<EmployeeAssignmentRow[]>`
@@ -870,12 +843,11 @@ export async function manageEmployeeAssignments(
     const employees = await transaction<
       {
         id: string;
-        employee_key: string;
         status: 'active' | 'archived';
         version_id: string;
       }[]
     >`
-      select e.id, e.employee_key, e.status, v.id as version_id
+      select e.id, e.status, v.id as version_id
       from allrice_employees e
       join lateral (
         select id from allrice_employee_versions
@@ -891,9 +863,6 @@ export async function manageEmployeeAssignments(
     if (!employee || employee.status !== 'active') {
       throw new EmployeeHubError('not_found');
     }
-    if (employee.employee_key === riceEmployeeKey) {
-      throw new EmployeeHubError('default_protected');
-    }
     if (userIds.length > 0) {
       const members = await transaction<{ user_id: string }[]>`
         select distinct user_id
@@ -908,25 +877,14 @@ export async function manageEmployeeAssignments(
         throw new EmployeeHubError('assignment_invalid');
       }
     }
-    const removedDefaults =
-      userIds.length === 0
-        ? await transaction<{ user_id: string }[]>`
-            update allrice_employee_assignments
-            set active = false, is_default = false, selection_mode='exclude', updated_at = now()
-            where organization_id = ${context.organizationId}
-              and workspace_id = ${workspaceId}
-              and employee_id = ${employee.id} and active
-            returning user_id
-          `
-        : await transaction<{ user_id: string }[]>`
-            update allrice_employee_assignments
-            set active = false, is_default = false, selection_mode='exclude', updated_at = now()
-            where organization_id = ${context.organizationId}
-              and workspace_id = ${workspaceId}
-              and employee_id = ${employee.id} and active
-              and user_id not in ${transaction(userIds)}
-            returning user_id
-          `;
+    await transaction`
+      update allrice_employee_assignments
+      set active = false, is_default = false, selection_mode='exclude', updated_at = now()
+      where organization_id = ${context.organizationId}
+        and workspace_id = ${workspaceId}
+        and employee_id = ${employee.id} and active
+        and not (user_id = any(${transaction.array(userIds)}::uuid[]))
+    `;
     await cancelEmployeeAccessRuns(
       transaction,
       {
@@ -978,28 +936,6 @@ export async function manageEmployeeAssignments(
         and session.workspace_id = assignment.workspace_id
         and session.employee_version_id <> assignment.employee_version_id
     `;
-    for (const removed of removedDefaults) {
-      await transaction`
-        update allrice_employee_assignments rice
-        set is_default = true, active = true, updated_at = now()
-        from allrice_employees e
-        where e.id = rice.employee_id
-          and e.organization_id = rice.organization_id
-          and e.workspace_id = rice.workspace_id
-          and e.employee_key = ${riceEmployeeKey}
-          and rice.organization_id = ${context.organizationId}
-          and rice.workspace_id = ${workspaceId}
-          and rice.user_id = ${removed.user_id}
-          and rice.active and rice.selection_mode<>'exclude'
-          and not exists (
-            select 1 from allrice_employee_assignments current_default
-            where current_default.organization_id = rice.organization_id
-              and current_default.workspace_id = rice.workspace_id
-              and current_default.user_id = rice.user_id
-              and current_default.active and current_default.is_default
-          )
-      `;
-    }
     await transaction`
       insert into allrice_audit_events (
         organization_id, workspace_id, actor_id, action, resource_type,
@@ -1027,8 +963,8 @@ export async function updateEmployeeStatus(
   const sql = getDatabase();
   await employeeAccessTransaction(sql, async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
-    const employees = await transaction<{ id: string; employee_key: string }[]>`
-      select id, employee_key from allrice_employees
+    const employees = await transaction<{ id: string }[]>`
+      select id from allrice_employees
       where id = ${employeeId}
         and organization_id = ${context.organizationId}
         and workspace_id = ${workspaceId}
@@ -1036,12 +972,6 @@ export async function updateEmployeeStatus(
     `;
     const employee = employees[0];
     if (!employee) throw new EmployeeHubError('not_found');
-    if (
-      employee.employee_key === riceEmployeeKey &&
-      update.status !== 'active'
-    ) {
-      throw new EmployeeHubError('default_protected');
-    }
     await transaction`
       update allrice_employees set status = ${update.status}, updated_at = now()
       where id = ${employee.id}
@@ -1052,19 +982,15 @@ export async function updateEmployeeStatus(
         where organization_id=${context.organizationId} and workspace_id=${workspaceId}
           and tenant_employee_id=${employee.id} and active`;
     }
-    const removed =
-      update.status === 'archived'
-        ? await transaction<{ user_id: string }[]>`
+    if (update.status === 'archived') {
+      await transaction`
         update allrice_employee_assignments
         set active = false, is_default = false, updated_at = now()
         where organization_id = ${context.organizationId}
           and workspace_id = ${workspaceId}
           and employee_id = ${employee.id}
           and active
-        returning user_id
-      `
-        : [];
-    if (update.status === 'archived')
+      `;
       await cancelEmployeeAccessRuns(
         transaction,
         {
@@ -1075,27 +1001,6 @@ export async function updateEmployeeStatus(
         '管理员已停用 AI 员工',
         context,
       );
-    for (const assignment of removed) {
-      await transaction`
-        update allrice_employee_assignments rice
-        set is_default = true, active = true, updated_at = now()
-        from allrice_employees e
-        where e.id = rice.employee_id
-          and e.organization_id = rice.organization_id
-          and e.workspace_id = rice.workspace_id
-          and e.employee_key = ${riceEmployeeKey}
-          and rice.organization_id = ${context.organizationId}
-          and rice.workspace_id = ${workspaceId}
-          and rice.user_id = ${assignment.user_id}
-          and rice.active and rice.selection_mode<>'exclude'
-          and not exists (
-            select 1 from allrice_employee_assignments current_default
-            where current_default.organization_id = rice.organization_id
-              and current_default.workspace_id = rice.workspace_id
-              and current_default.user_id = rice.user_id
-              and current_default.active and current_default.is_default
-          )
-      `;
     }
     await transaction`
       insert into allrice_audit_events (
@@ -1606,7 +1511,6 @@ export async function prepareEmployeeRunBinding(
     !grantedCapabilities.includes('secret:use')
   )
     grantedCapabilities.push('secret:use');
-  const baseRice = instance ? await isBaseRiceInstance(instance, sql) : false;
   const conversationToolNames = await qualifyConversationProjectTools(
     sql,
     {
@@ -1616,7 +1520,6 @@ export async function prepareEmployeeRunBinding(
       sessionId: input.sessionId,
     },
     capabilityBindings(manifest.data).toolNames,
-    baseRice,
   );
   const memoryIndex = input.employeeDocuments === true && !!instance;
   const customizedTools = withEmployeeCustomizationTools(
@@ -1782,7 +1685,7 @@ export async function prepareEmployeeRunBinding(
       personalIdentity:
         !documentProjection?.persona &&
         instance &&
-        (instance.kind === 'custom' || baseRice) &&
+        instance.kind === 'custom' &&
         [
           instance.profile.role,
           instance.profile.mission,

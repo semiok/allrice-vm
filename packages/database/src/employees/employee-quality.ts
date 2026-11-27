@@ -82,10 +82,7 @@ const defaultCases = [
 export class EmployeeQualityError extends Error {
   constructor(
     public readonly code:
-      | 'not_found'
-      | 'release_gate_blocked'
-      | 'default_protected'
-      | 'invalid_transition',
+      'not_found' | 'release_gate_blocked' | 'invalid_transition',
   ) {
     super(code);
   }
@@ -335,13 +332,12 @@ export async function updateEmployeeRelease(
   await ensureQualityDefaults({ context, workspaceId, actorId: actor });
   const rows = await sql<
     {
-      employee_key: string;
       stable_version_id: string;
       candidate_version_id: string | null;
       stage: string;
     }[]
   >`
-    select e.employee_key, r.stable_version_id, r.candidate_version_id, r.stage
+    select r.stable_version_id, r.candidate_version_id, r.stage
     from allrice_employee_releases r
     join allrice_employees e on e.id = r.employee_id
     where r.organization_id = ${context.organizationId}
@@ -351,12 +347,6 @@ export async function updateEmployeeRelease(
   `;
   const current = rows[0];
   if (!current) throw new EmployeeQualityError('not_found');
-  if (
-    update.action === 'disable' &&
-    current.employee_key === 'default-assistant'
-  ) {
-    throw new EmployeeQualityError('default_protected');
-  }
   const candidate =
     update.candidateVersionId ?? current.candidate_version_id ?? undefined;
   if (
@@ -559,7 +549,7 @@ export async function getEmployeeQualityDashboard(
         and r.workspace_id = e.workspace_id
       where e.organization_id = ${context.organizationId}
         and e.workspace_id = ${workspaceId}
-      order by (e.employee_key = 'default-assistant') desc, e.name
+      order by e.name
     `,
     sql<
       {

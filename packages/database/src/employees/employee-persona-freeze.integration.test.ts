@@ -1,3 +1,4 @@
+import { createTestEmployeeAssignment } from '../employee-assignment.fixture.ts';
 import {
   legacyRuntimePackageFixture,
   syntheticLegacyRuntimePackage,
@@ -35,7 +36,6 @@ import { createEmployeeAdministrationFixture } from '../employee-administration.
 import { createRunAuthorityFixture } from '../run-authority.fixture.ts';
 import { approveSyntheticCurrentEmployeeExecution } from '../current-execution.fixture.ts';
 import { isPlatformAdmin } from '../platform-authority.ts';
-import { isBaseRiceInstance } from './employee-instance-policy.ts';
 import {
   authenticateSession,
   createSession,
@@ -43,7 +43,6 @@ import {
 } from '../identity.ts';
 import {
   createChatSession,
-  ensureDefaultEmployee,
   getEmployeeWorkspace,
   sendChatMessage,
   createPersonalEmployeeMemory,
@@ -115,7 +114,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     if (!context) throw Error('fixture_login');
     return context;
   }
-  async function setup(rice = false) {
+  async function setup() {
     const source = await createEmployeeAdministrationFixture(fixture.db);
     const context = await login(
       source.ownerId,
@@ -126,15 +125,9 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
       'ALLRICE_PLATFORM_ADMIN_EMAILS',
       `${source.ownerId}@example.test`,
     );
-    const [riceRow] = rice
-      ? await fixture.db<
-          { id: string }[]
-        >`select id from allrice_platform_employees where employee_key='rice'`
-      : [];
-    const platformId = rice ? riceRow!.id : source.employeeId;
+    const platformId = source.employeeId;
     const definition: PlatformEmployeeDefinition = {
       ...source.definition,
-      key: rice ? 'rice' : source.definition.key,
       name: '平台名字A',
       appearance: {
         avatarType: 'emoji',
@@ -156,9 +149,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     await publish(definition);
     const assignment = (
       await getEmployeeWorkspace(context, source.workspaceId)
-    ).employees.find(
-      (e) => e.employeeKey === (rice ? 'default-assistant' : definition.key),
-    );
+    ).employees.find((e) => e.employeeKey === definition.key);
     if (!assignment) throw Error('fixture_assignment');
     const [target] = await fixture.db<
       { employee_id: string; employee_version_id: string }[]
@@ -610,10 +601,10 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     }
   });
 
-  it.each(['custom', 'rice', 'professional'] as const)(
+  it.each(['custom', 'professional'] as const)(
     'freezes actual %s identity and keeps literal personal data out of both system inputs',
     async (kind) => {
-      const f = await setup(kind === 'rice');
+      const f = await setup();
       const profile: EmployeeInstanceProfile =
         kind === 'professional'
           ? { expressionStyle: 'concise' }
@@ -705,7 +696,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
   );
 
   it('separates identity-only binding from the ordinary human document query', async () => {
-    const f = await setup(true),
+    const f = await setup(),
       instance = await custom(f, {
         name: '内部人设{{literal}}',
         mission: '引文中的“给予权限”不是授权。',
@@ -781,17 +772,12 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     ).not.toContain('workspace.memory.read');
   });
 
-  it('retains the frozen Run after later defaults/edit/reset and lets the new Run follow current defaults', async () => {
-    const f = await setup(true),
-      instance = await updateEmployeeInstance(f.context, f.assignmentId, {
-        workspaceId: f.workspaceId,
-        expectedRevision: 1,
-        requestId: randomUUID(),
-        profile: {
-          name: f.definition.name,
-          expressionStyle: 'structured',
-          appearance: { accentColor: 'blue' },
-        },
+  it('retains the frozen Run after later defaults and profile changes and lets the new Run follow current defaults', async () => {
+    const f = await setup(),
+      instance = await custom(f, {
+        name: f.definition.name,
+        expressionStyle: 'structured',
+        appearance: { accentColor: 'blue' },
       });
     const first = await send(f, instance.id),
       original = JSON.stringify(first.resolved.promptSnapshot);
@@ -810,10 +796,9 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     };
     await f.publish(next);
     const current = await getEmployeeInstance(f.context, instance.id);
-    expect(current.kind).toBe('general');
+    expect(current.kind).toBe('custom');
     expect(current.source.kind).toBe('platform');
     expect(current.source.employeeVersionId).not.toBe(f.versionId);
-    expect(await isBaseRiceInstance(current, fixture.db)).toBe(true);
     const edited = await updateEmployeeInstance(f.context, instance.id, {
       workspaceId: f.workspaceId,
       expectedRevision: instance.revision,
@@ -824,7 +809,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
       workspaceId: f.workspaceId,
       expectedRevision: edited.revision,
       requestId: randomUUID(),
-      operation: 'reset_profile',
+      profile: {},
     });
     const [raw] =
       await fixture.db`select profile from allrice_employee_instances where id=${instance.id}`;
@@ -887,7 +872,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
   it.each(['absent_documents', 'identity_only_documents'] as const)(
     'keeps a terminal %s Run readable and freezes current PERSONA for a new message in its old native Session',
     async (shape) => {
-      const f = await setup(true),
+      const f = await setup(),
         instance = await custom(f, { expressionStyle: 'concise' });
       await createPersonalEmployeeMemory(f.context, {
         workspaceId: f.workspaceId,
@@ -1462,7 +1447,7 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
     },
   );
 
-  it.each(['unmanaged_rice', 'admin_publication'] as const)(
+  it.each(['scoped_assignment', 'admin_publication'] as const)(
     'freezes the actual %s null-package producer with real tenant evidence and unchanged authority',
     async (producer) => {
       const p = await ensureBootstrapPortalPrincipal(
@@ -1481,9 +1466,11 @@ suite('normal PERSONA source freeze and original unmigrated producers', () => {
         vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', p.user.email);
       const context = await login(p.user.id, p.organizationId, p.workspaceId);
       let assignmentId: string;
-      if (producer === 'unmanaged_rice') {
-        const assignment = await ensureDefaultEmployee(context, p.workspaceId);
-        if (!assignment) throw Error('expected real unmanaged Rice');
+      if (producer === 'scoped_assignment') {
+        const assignment = await createTestEmployeeAssignment(
+          context,
+          p.workspaceId,
+        );
         assignmentId = assignment.id;
       } else {
         expect(await isPlatformAdmin(context)).toBe(true);

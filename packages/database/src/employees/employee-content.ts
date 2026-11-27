@@ -57,10 +57,7 @@ import {
   type ContentSetRow,
   type ContentRevisionRow,
 } from './employee-content-model.ts';
-import {
-  isBaseRiceInstance,
-  canUsePersonalEmployeeScenes,
-} from './employee-instance-policy.ts';
+import { canUsePersonalEmployeeScenes } from './employee-instance-policy.ts';
 import { assertPersonalSceneNames } from './personal-scene-names.ts';
 import { validateSceneSkillPackage } from './employee-scene-skill-package.ts';
 import { assertEmployeeContentRetirement } from './employee-content-retirement.ts';
@@ -648,18 +645,6 @@ export async function mutateEmployeeContentInTransaction(
     input.ownership.ownerId !== context.actor.id
   )
     throw new DataAccessError('authorization_denied');
-  // Rice is admitted only through the existing controlled package
-  // writers. Do not expose the legacy raw draft/activate HTTP interface.
-  if (
-    input.ownership.scope === 'personal' &&
-    target.instanceId &&
-    !options.authorize &&
-    (await isBaseRiceInstance(
-      await getEmployeeInstance(context, target.instanceId, tx),
-      tx,
-    ))
-  )
-    throw new DataAccessError('authorization_denied');
   await options.authorize?.();
   const sources = bindCallerSourceQueries(
     tx,
@@ -730,7 +715,7 @@ export async function mutateEmployeeContentInTransaction(
         target.instanceId,
         tx,
       );
-      if (await canUsePersonalEmployeeScenes(instance, tx))
+      if (canUsePersonalEmployeeScenes(instance))
         await assertPersonalSceneNames(
           tx,
           context,
@@ -960,10 +945,7 @@ export async function freezeEmployeeRuntimeContent(
     instanceId: input.instanceId,
   };
   const platform = await platformContent(context, target, sql);
-  if (
-    input.personalScenes &&
-    !(await canUsePersonalEmployeeScenes(instance, sql))
-  )
+  if (input.personalScenes && !canUsePersonalEmployeeScenes(instance))
     throw new DataAccessError('authorization_denied');
   const rows = input.personalScenes
     ? []
@@ -1193,7 +1175,7 @@ export async function readPersonalEmployeeSceneLayer(
     lock,
   );
   const instance = await getEmployeeInstance(context, instanceId, sql);
-  if (!(await canUsePersonalEmployeeScenes(instance, sql)))
+  if (!canUsePersonalEmployeeScenes(instance))
     throw new DataAccessError('not_found');
   const [row] = await sql<ContentSetRow[]>`
     select * from allrice_employee_content_sets
@@ -1398,14 +1380,7 @@ async function readDetailsProfile(
           safetyBoundaries: [],
         };
   const personal = instance.profile;
-  const rice =
-    ownerView &&
-    instance.kind === 'general' &&
-    (await isBaseRiceInstance(
-      await getEmployeeInstance(context, instance.id, tx),
-      tx,
-    ));
-  const custom = instance.kind === 'custom' || rice ? personal : {};
+  const custom = instance.kind === 'custom' ? personal : {};
   const defaults = {
     name: platformDefinition?.name ?? manifest?.name ?? row.name,
     description:
@@ -1442,7 +1417,7 @@ async function readDetailsProfile(
       ? (personal.expressionStyle ?? defaultExpression)
       : undefined,
     personalFields: Object.keys(
-      instance.kind === 'custom' || rice
+      instance.kind === 'custom'
         ? personal
         : {
             ...(personal.expressionStyle
@@ -1453,12 +1428,10 @@ async function readDetailsProfile(
     canMaintainPersonal,
     editableFields: !canMaintainPersonal
       ? []
-      : instance.kind === 'custom' || rice
+      : instance.kind === 'custom'
         ? EmployeeInstanceProfileSchema.keyof().options
         : ['expressionStyle'],
-    // Shared administration has no owner profile permissions or default-reset control.
-    isDefaultRice: ownerView ? rice : undefined,
-    canArchive: ownerView && canMaintainPersonal && !rice,
+    canArchive: ownerView && canMaintainPersonal,
     defaults,
     overrides: personal,
     ...(defaultSource !== undefined ? { defaultSource } : {}),

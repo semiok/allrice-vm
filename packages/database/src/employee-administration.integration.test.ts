@@ -313,24 +313,15 @@ suite('MET-151 policy and exact employee publication administration', () => {
       ).toHaveLength(0);
     },
   );
-  it('repairs inherited Rice identity only in newly created or saved drafts', async () => {
-    const [source] = await fixture.db<{ id: string }[]>`
-      select id from allrice_platform_employees where employee_key = 'rice'
-    `;
-    expect(source).toBeDefined();
-    const before = await getPlatformEmployee(source!.id);
-    const policy = before!.currentDraft!.definition.systemPrompt;
-    expect(policy).toContain(
-      'You are Rice, the default AI employee in AllRice.',
-    );
+  it('normalizes only the shipped identity when saving a draft', async () => {
+    const policy =
+      'You are an AI employee in AllRice. Your name and role are defined by IDENTITY.md.';
     const created = await createPlatformEmployeeDraft({
       key: `office-${randomUUID()}`,
       name: 'Office 文档助手',
     });
     const original = created!.currentDraft!;
-    expect(original.definition.systemPrompt).not.toContain('You are Rice');
     expect(original.definition.systemPrompt).toContain('PERSONA.md');
-    expect(await getPlatformEmployee(source!.id)).toEqual(before);
     const saved = await savePlatformEmployeeDraft(created!.id, {
       expectedRevisionId: original.id,
       definition: {
@@ -338,8 +329,8 @@ suite('MET-151 policy and exact employee publication administration', () => {
         systemPrompt: policy + '\nPreserve this custom rule.',
       },
     });
-    expect(saved!.currentDraft!.definition.systemPrompt).not.toContain(
-      'You are Rice',
+    expect(saved!.currentDraft!.definition.systemPrompt).toContain(
+      'PERSONA.md',
     );
     expect(saved!.currentDraft!.definition.systemPrompt).toContain(
       'Preserve this custom rule.',

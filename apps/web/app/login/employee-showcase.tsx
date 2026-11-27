@@ -4,19 +4,11 @@ import { useEffect, useRef, type CSSProperties } from 'react';
 
 const employees = [
   {
-    name: 'Rice',
-    initial: 'R',
-    description: '研究、分析与日常工作',
-    color: '#3b82f6',
-    scale: 1,
-    opacity: 1,
-  },
-  {
     name: 'Office 文档助手',
     initial: 'O',
     description: '文档、表格与演示文稿',
     color: '#f97316',
-    scale: 0.96,
+    scale: 1,
     opacity: 1,
   },
   {

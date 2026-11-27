@@ -7,16 +7,28 @@ import {
   employeeManifest,
   employeeManifestChecksum,
   employeeManifestTemplateChecksum,
-  riceManifest,
 } from './employee-config.js';
 
-describe('Rice employee manifest', () => {
+function testManifest(
+  skillVersionIds: string[] = [],
+  partnerProfile?: Parameters<typeof employeeManifest>[0]['partnerProfile'],
+) {
+  return employeeManifest({
+    key: 'test-employee',
+    name: 'Test employee',
+    description: 'Employee manifest test',
+    skillVersionIds,
+    partnerProfile,
+  });
+}
+
+describe('employee manifest', () => {
   it('has a stable identity and canonical skill ordering', () => {
     const first = randomUUID();
     const second = randomUUID();
-    const manifest = riceManifest([second, first, second]);
+    const manifest = testManifest([second, first, second]);
     expect(manifest.schemaVersion).toBe(2);
-    expect(manifest.name).toBe('Rice');
+    expect(manifest.name).toBe('Test employee');
     expect(manifest.provider).toMatchObject({
       provider: 'dsh',
       route: 'openai-codex',
@@ -25,7 +37,6 @@ describe('Rice employee manifest', () => {
     });
     expect(manifest.skillVersionIds).toEqual([first, second].sort());
     if (manifest.schemaVersion === 2) {
-      expect(manifest.isDefaultRice).toBe(true);
       expect(manifest.runtimePolicy.harness).toBe('dsh');
       expect(manifest.runtimePolicy.provider).toBe('openai-codex');
       expect(manifest.capabilityBindings.skillVersionIds).toEqual(
@@ -37,16 +48,16 @@ describe('Rice employee manifest', () => {
 
   it('changes the immutable checksum when a SkillVersion changes', () => {
     const skillVersionId = randomUUID();
-    expect(employeeManifestChecksum(riceManifest())).not.toBe(
-      employeeManifestChecksum(riceManifest([skillVersionId])),
+    expect(employeeManifestChecksum(testManifest())).not.toBe(
+      employeeManifestChecksum(testManifest([skillVersionId])),
     );
-    expect(employeeManifestTemplateChecksum(riceManifest())).toBe(
-      employeeManifestTemplateChecksum(riceManifest([skillVersionId])),
+    expect(employeeManifestTemplateChecksum(testManifest())).toBe(
+      employeeManifestTemplateChecksum(testManifest([skillVersionId])),
     );
   });
 
   it('freezes the partner profile into the employee manifest', () => {
-    const manifest = riceManifest([], {
+    const manifest = testManifest([], {
       role: '产品经理工作伙伴',
       mission: '把需求和数据转成可执行的产品决策。',
       communicationStyle: 'concise',

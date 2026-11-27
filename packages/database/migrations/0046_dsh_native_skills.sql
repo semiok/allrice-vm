@@ -91,7 +91,7 @@ where id in (select id from allrice_retired_skill_objects);
 insert into allrice_runtime_metadata (key, value)
 values (
   'dsh-native-skills',
-  '{"version":"0046","issue":"MET-92","provider":"allrice","legacySkillHub":"retired","initialEmployee":"Rice"}'::jsonb
+  '{"version":"0046","issue":"MET-92","provider":"allrice","legacySkillHub":"retired"}'::jsonb
 )
 on conflict (key) do update
 set value = excluded.value,

@@ -69,17 +69,6 @@ export const writingGetCalls: readonly {
     owner: 'createGovernedBridgeOperationLedger',
     reason: `${LEASE_RENEWAL} The factory only assembles the policy admission and ledger closures the heartbeat transaction runs.`,
   },
-  ...[
-    'apps/web/app/api/v1/employee-instances/route.ts',
-    'apps/web/app/api/v1/employees/route.ts',
-    'apps/web/app/api/v1/workspace/route.ts',
-  ].map((route) => ({
-    route,
-    file: 'packages/database/src/workspace/service.ts',
-    owner: 'ensureDefaultEmployee',
-    reason:
-      'Provisions the default employee on first read in its own short transaction (employee-deployments advisory mutex, then insert). Only employee deployment administration shares that key; Worker admission does not.',
-  })),
 ];
 
 /** Lock clauses reviewed on a GET path (file, owner function, clause). */
