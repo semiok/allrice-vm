@@ -301,11 +301,13 @@ it.skipIf(!browserExecutable).each([false, true])(
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
-    await page.evaluate(() =>
-      (
-        window as Window & { finishCarrier: () => Promise<void> }
-      ).finishCarrier(),
-    );
+    await page.evaluate(async () => {
+      const finish: unknown = Reflect.get(window, 'finishCarrier');
+      if (typeof finish !== 'function')
+        throw Error('Fixture carrier unavailable');
+      await finish();
+    });
+
     await context.close();
   },
 );
