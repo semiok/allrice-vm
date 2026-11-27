@@ -168,7 +168,7 @@ wait_for_drained_worker_exit() { # pid, plist, release, port
       "running $pid") ;;
       loaded)
         output=$("$M1_LAUNCHCTL" print "gui/$M1_UID/$WORKER_LABEL") || return 1
-        if ! kill -0 "$pid" 2>/dev/null &&
+        if { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } &&
           printf '%s\n' "$output" | /usr/bin/awk '
             $1=="last" && $2=="exit" && $3=="code" && $4=="=" { seen++; code=$5 }
             $1=="pid" && $2=="=" { pid++ }
@@ -190,6 +190,7 @@ record_worker_exit_intent() {
 
 stop_release_worker() {
   local plist rel port process boot receipt count target status i pid expire
+  local mode=${1:-release}
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
   port=$(worker_port) || return 1
@@ -232,10 +233,17 @@ PYTHON
   if [ "$process" = loaded ]; then
     # Resume a previously acknowledged graceful shutdown that ended before
     # launchd registration was removed. It cannot authorize a live process.
-    [ -f "$INFLIGHT/worker-exit" ] || return 1
-    [ "$(sed -n '1p' "$INFLIGHT/worker-exit")" = "$rel" ] || return 1
-    pid=$(sed -n '2p' "$INFLIGHT/worker-exit")
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [ -f "$INFLIGHT/worker-exit" ]; then
+      [ "$(sed -n '1p' "$INFLIGHT/worker-exit")" = "$rel" ] || return 1
+      pid=$(sed -n '2p' "$INFLIGHT/worker-exit")
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    else
+      # This job may have exited before the first PID could be recorded.
+      # Only exact same-version recovery can restart it without that witness.
+      RELEASE_STOP_UNCONFIRMED=1
+      [ "$mode" = restore ] || return 1
+      pid=""
+    fi
     count=$(vm_upgrade_candidates) || return 1
     [ "$count" = 0 ] || return 1
     wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
@@ -298,7 +306,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
 stop_both() {
   local mode=${1:-restore}
   if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
-  stop_release_worker || return 1
+  stop_release_worker "$mode" || return 1
   if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
   RELEASE_STOP_ATTEMPTED=1
   stop_job "$WEB_LABEL" "$(web_port)"
@@ -460,6 +468,9 @@ restore() {
     && cmp -s "$INFLIGHT/web.plist" "$WEB_PLIST" && cmp -s "$INFLIGHT/worker.plist" "$WORKER_PLIST" \
     || { say "could not put back the saved launchd files from $INFLIGHT"; return 1; }
   start_both_on "$prev" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
+  # Health alone does not prove this boot recovered its wake owner. Keep
+  # the restored Worker running and retain the witness until plans settle.
+  verify_no_committed_vm_wakes || return 1
   say "previous version ${prev:0:8} is healthy again"
 }
 # Keep a final error/signal handler while the EXIT cleanup runs; replacing an

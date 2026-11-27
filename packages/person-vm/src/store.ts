@@ -337,11 +337,18 @@ async function hasPreviousUpgradeStop(
     where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
       and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
       and vm.lease_epoch=${binding.leaseEpoch} and vm.phase='failed'
-      and a.action='stop.upgrade-dispatch'
+      and a.action='stop.upgrade-dispatch' and a.result in ('started','succeeded')
+      and not exists (
+        select 1 from person_vm_audit denial
+        where denial.vm_id=a.vm_id and denial.person_id=a.person_id
+          and denial.organization_id=a.organization_id and denial.lease_epoch=a.lease_epoch
+          and denial.action=a.action and denial.request_id=a.request_id
+          and denial.id>a.id and denial.result='denied'
+      )
     order by a.id desc limit 1`,
   );
-  // When the last dispatch was denied, it never acquired native authority.
-  // An unconfirmed authorized attempt still needs an exact native join.
+  // A denial cancels its own dispatch only. A later, unapproved retry
+  // cannot erase the need to join an earlier physical attempt.
   return attempt?.result === 'started' || attempt?.result === 'succeeded';
 }
 
@@ -550,7 +557,18 @@ export class PostgresPersonVmStore implements PersonVmStore {
     }
   }
 
-  async listUpgradeCandidates(signal: AbortSignal) {
+  listUpgradeCandidates(signal: AbortSignal) {
+    return this.lifecycleCandidates(signal, 'upgrade');
+  }
+
+  listJoinedIdleStopCandidates(signal: AbortSignal) {
+    return this.lifecycleCandidates(signal, 'idle-recovery');
+  }
+
+  private async lifecycleCandidates(
+    signal: AbortSignal,
+    kind: 'upgrade' | 'idle-recovery',
+  ) {
     signal.throwIfAborted();
     const sql = this.openSql();
     let ending: Promise<void> | undefined;
@@ -563,10 +581,23 @@ export class PostgresPersonVmStore implements PersonVmStore {
       const rows = await sql.begin(async (tx) => {
         signal.throwIfAborted();
         await tx`set local statement_timeout = '2000ms'`;
-        return tx`select * from person_virtual_machines
-          where phase in ('running','starting') or lease_owner is not null
-            or (phase='failed' and (native_created or egress_receipt is not null))
-          order by person_id`;
+        if (kind === 'upgrade')
+          return tx`select * from person_virtual_machines
+            where phase in ('running','starting') or lease_owner is not null
+              or (phase='failed' and (native_created or egress_receipt is not null))
+            order by person_id`;
+        return tx`select vm.* from person_virtual_machines vm
+          cross join lateral (
+            select a.result from person_vm_audit a
+            where a.vm_id=vm.vm_id and a.person_id=vm.person_id
+              and a.organization_id=vm.organization_id and a.lease_epoch=vm.lease_epoch
+              and a.action='stop.idle-dispatch'
+            order by a.id desc limit 1
+          ) idle
+          where vm.phase in ('running','failed') and vm.native_created and vm.disk_retained
+            and vm.instance_id is not null and idle.result='succeeded'
+            and (vm.lease_owner is null or vm.lease_expires_at<=now())
+          order by vm.person_id`;
       });
       signal.throwIfAborted();
       return rows.map(fromRow);

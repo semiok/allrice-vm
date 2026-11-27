@@ -356,6 +356,7 @@ suite(
         const store = new PostgresPersonVmStore(h.physical.open);
         let ownEpoch = 0;
         let fenced = false;
+        let rejectRead = false;
         const joins: boolean[] = [];
         const vm = new PersonVmService({
           ...h.options,
@@ -375,6 +376,7 @@ suite(
             },
             async stopIdle(...args) {
               expect(fenced).toBe(true);
+              if (rejectRead) throw new PersonVmError('PROVIDER_FAILED');
               await h.native.stopIdle!(...args);
               throw new Error('synthetic failure after joined native stop');
             },
@@ -435,6 +437,13 @@ suite(
         await expect(open('page')).rejects.toMatchObject({
           code: 'UPGRADE_OPEN_REQUIRED',
         });
+        h.states.set(h.binding.vmId, 'running');
+        rejectRead = true;
+        await expect(open('open')).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        rejectRead = false;
+        h.states.set(h.binding.vmId, 'stopped');
         if (entry === 'foreground') {
           await expect(open('open')).resolves.toMatchObject({
             phase: 'running',
@@ -1032,6 +1041,7 @@ suite(
       'commit-rejected',
       'commit-ack-lost',
       'native-proof-rejected',
+      'native-readback-failed',
       'relogin',
       'system-ok',
       'system-revoked',
@@ -1119,6 +1129,14 @@ suite(
           outcome === 'commit-rejected' || outcome === 'system-recovery';
         const recovering = commitRejected || outcome === 'commit-ack-lost';
         const nativeProofRejected = outcome === 'native-proof-rejected';
+        const nativeReadbackFailed = outcome === 'native-readback-failed';
+        if (nativeReadbackFailed) {
+          const stopIdle = h.native.stopIdle!;
+          h.native.stopIdle = async (...args) => {
+            await stopIdle(...args);
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          };
+        }
         const samplePurposes: (string | undefined)[] = [];
         let mono = 0,
           runningJobs = 0,
@@ -1238,7 +1256,11 @@ suite(
                     (outcome === 'wake-plan-changed' && prepared > 1)
                   )
                     return { blocked: true };
-                  if (recovering || nativeProofRejected) {
+                  if (
+                    recovering ||
+                    nativeProofRejected ||
+                    nativeReadbackFailed
+                  ) {
                     // Model the durable plan returned by the Workflow port.
                     await db`insert into person_vm_scheduled_wakes
                       (person_id,organization_id,vm_id,instance_id,lease_epoch,plan_id,receipt_ids,
@@ -1247,7 +1269,16 @@ suite(
                       ${binding.instanceId},${binding.leaseEpoch},${scheduledRequestId ?? attempt.requestId},
                       array[${randomUUID()}]::uuid[],${wakeAt},${wakeAt},'waiting')
                       on conflict (plan_id) do nothing`;
-                    return { ok: true, nextWakeAt: wakeAt.toISOString() };
+                    return {
+                      ok: true,
+                      nextWakeAt: wakeAt.toISOString(),
+                      ...(nativeReadbackFailed && {
+                        dispatch: (
+                          active: AbortSignal,
+                          stop: (signal: AbortSignal) => Promise<void>,
+                        ) => stop(active),
+                      }),
+                    };
                   }
                   if (outcome === 'wake-plan-revoked-at-dispatch')
                     return {
@@ -1327,7 +1358,7 @@ suite(
             await expect(reconcile).rejects.toMatchObject({
               code: 'AUTHORIZATION_DENIED',
             });
-          else if (recovering || nativeProofRejected)
+          else if (recovering || nativeProofRejected || nativeReadbackFailed)
             await expect(reconcile).rejects.toBeInstanceOf(Error);
           else await reconcile;
         } finally {
@@ -1358,6 +1389,39 @@ suite(
               and action='stop' and result='succeeded'`;
           expect(success).toEqual([]);
           expect(await wake.claim(90_000)).toBeNull();
+          return;
+        }
+        if (nativeReadbackFailed) {
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: attempt.requestId,
+            completed: false,
+          });
+          await expect(
+            service.assertWorkerShutdownSafe(binding, signal()),
+          ).rejects.toMatchObject({
+            code: 'CLEANUP_INCOMPLETE',
+          });
+          const restarted = new PersonVmService(h.options);
+          expect(
+            (await store.listJoinedIdleStopCandidates(signal())).map(
+              ({ vmId }) => vmId,
+            ),
+          ).toContain(binding.vmId);
+          await expect(
+            restarted.recoverJoinedIdleStop(binding, signal()),
+          ).resolves.toBe(true);
+          expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
+            1,
+          );
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: attempt.requestId,
+            completed: true,
+          });
+          await db`update person_vm_scheduled_wakes set wake_at=least(now()-interval '1 second', target_at)
+            where plan_id=${attempt.requestId}`;
+          await expect(wake.claim(90_000)).resolves.toMatchObject({
+            planId: attempt.requestId,
+          });
           return;
         }
         if (outcome === 'system-recovery') {

@@ -1129,6 +1129,67 @@ export function createProductionPersonVmHost(input: {
         scheduledWake = wake;
         wake.start();
       }
+
+      function inspectIdle(
+        binding: PersonVmBinding,
+        inspect: (signal: AbortSignal) => Promise<void>,
+      ) {
+        if (pauseIdle || inspectingIdle.has(binding.personId)) return;
+        inspectingIdle.add(binding.personId);
+        return own(async () => {
+          try {
+            if (pauseIdle || lifetime.aborted) return;
+            await inspect(
+              AbortSignal.any([
+                lifetime,
+                AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
+              ]),
+            );
+          } catch (error) {
+            if (!lifetime.aborted && !(error instanceof PersonVmError))
+              console.error('[person-vm] idle reconciliation failed');
+          } finally {
+            inspectingIdle.delete(binding.personId);
+          }
+        });
+      }
+
+      if (scheduledWake)
+        void own(async () => {
+          while (!lifetime.aborted) {
+            try {
+              if (!pauseIdle) {
+                const active = AbortSignal.any([
+                  lifetime,
+                  AbortSignal.timeout(3000),
+                ]);
+                for (const row of await store.listJoinedIdleStopCandidates(
+                  active,
+                )) {
+                  if (!row.instanceId) continue;
+                  const binding = {
+                    personId: row.personId,
+                    organizationId: row.organizationId,
+                    vmId: row.vmId,
+                    instanceId: row.instanceId,
+                    leaseEpoch: row.leaseEpoch,
+                  };
+                  // After a restart, ownedVms has no record of a stop the
+                  // previous Worker joined without publishing its receipt.
+                  await inspectIdle(binding, async (signal) => {
+                    await vm.recoverJoinedIdleStop(binding, signal);
+                  });
+                }
+              }
+            } catch {
+              if (!lifetime.aborted)
+                console.warn(
+                  '[person-vm] idle stop recovery inventory unavailable',
+                );
+            }
+            await sleep(5000, undefined, { signal: lifetime, ref: false });
+          }
+        }).catch(() => {}); // Host close aborts and joins the recovery loop.
       if (
         providers.configuration.lifecycle.idleStopEnabled === true &&
         bound.nativeActivity &&
@@ -1156,33 +1217,19 @@ export function createProductionPersonVmHost(input: {
               idleContext,
               scheduledIdleRoster,
             } of ownedVms.values()) {
-              if (inspectingIdle.has(binding.personId)) continue;
-              inspectingIdle.add(binding.personId);
-              void own(async () => {
-                try {
-                  if (pauseIdle || lifetime.aborted) return;
-                  const active = AbortSignal.any([
-                    lifetime,
-                    AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
-                  ]);
-                  if (scheduledIdleRoster)
-                    await admission.reconcileScheduledIdle(
-                      binding,
-                      scheduledIdleRoster,
-                      active,
-                    );
-                  else if (idleContext)
-                    await admission.reconcileIdle(
-                      { ...idleContext, requestId: randomUUID() },
-                      binding,
-                      active,
-                    );
-                } catch (error) {
-                  if (!lifetime.aborted && !(error instanceof PersonVmError))
-                    console.error('[person-vm] idle reconciliation failed');
-                } finally {
-                  inspectingIdle.delete(binding.personId);
-                }
+              void inspectIdle(binding, async (active) => {
+                if (scheduledIdleRoster)
+                  await admission.reconcileScheduledIdle(
+                    binding,
+                    scheduledIdleRoster,
+                    active,
+                  );
+                else if (idleContext)
+                  await admission.reconcileIdle(
+                    { ...idleContext, requestId: randomUUID() },
+                    binding,
+                    active,
+                  );
               });
             }
           }
@@ -1488,20 +1535,23 @@ export function createProductionPersonVmHost(input: {
             throw new PersonVmError('RUNTIME_NOT_READY');
           shutdownChecking = true;
           pauseIdle = true;
-          const reopen = vm.fenceWorkerStartup();
+          let reopen: (() => void) | undefined;
           try {
             if (inspectingIdle.size)
               throw new PersonVmError('ACTIVITY_UNKNOWN');
             await assertNoCommittedWake(signal);
             await scheduledWake?.pause(signal);
             signal.throwIfAborted();
+            // The current wake may already own the next epoch. Let it join
+            // before closing the startup path it still needs.
+            reopen = vm.fenceWorkerStartup();
             for (const { binding } of ownedVms.values())
               await vm.assertWorkerShutdownSafe(binding, signal);
             await assertNoCommittedWake(signal);
             gracefulStop = true;
           } catch (error) {
             pauseIdle = false;
-            reopen();
+            reopen?.();
             scheduledWake?.resume();
             throw error;
           } finally {

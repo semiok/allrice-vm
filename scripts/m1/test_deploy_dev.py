@@ -276,11 +276,12 @@ class DeployDevMigrations(unittest.TestCase):
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
 
-        for mode in ('early', 'late'):
+        for mode in ('before-first-read', 'early', 'late', 'pending-wake'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r'''
                   mkdir -p "$STATE"
                   rm -f "$STATE/fixture-loaded"
+                  if [ "$MODE" = before-first-read ]; then touch "$STATE/fixture-loaded"; fi
                   job_state() {
                     if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
                   }
@@ -298,10 +299,13 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
                 self.assertIn('Worker exit unconfirmed', p.stdout)
                 state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
-                with open(os.path.join(state, 'worker-exit')) as f:
-                    self.assertEqual(f.read().splitlines(), [
-                        self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
-                    ])
+                if mode == 'before-first-read':
+                    self.assertFalse(os.path.exists(os.path.join(state, 'worker-exit')))
+                else:
+                    with open(os.path.join(state, 'worker-exit')) as f:
+                        self.assertEqual(f.read().splitlines(), [
+                            self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
+                        ])
                 self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
                 # The original process can disappear after the refusal was recorded.
                 write(os.path.join(self.home, 'allrice40-dev/qa/fixture-loaded'), '')
@@ -310,12 +314,33 @@ class DeployDevMigrations(unittest.TestCase):
                   M1_LAUNCHCTL=test_launchctl
                   test_launchctl() { test "$1" = bootout; }
                   job_state() { echo loaded; }
-                  wait_for_drained_worker_exit() { test "$1" = 73001 && echo joined-original; }
+                  wait_for_drained_worker_exit() {
+                    if [ "$MODE" = before-first-read ]; then
+                      test -z "$1" || return 1
+                    else
+                      test "$1" = 73001 || return 1
+                    fi
+                    echo joined-original
+                  }
+                  dev_sql() {
+                    case "$1" in
+                      *to_regclass*) echo t ;;
+                      *'select not exists'*) [ "$MODE" != pending-wake ] && echo t || echo f ;;
+                      *) command psql -X -At -c "$1" ;;
+                    esac
+                  }
                   vm_upgrade_candidates() { echo 0; }
                   stop_job() { :; }
                   start_both_on() { echo "restarted $1"; }
                   recover
-                ''', FILES, CONTRACT='row:1')
+                ''', FILES, CONTRACT='row:1', MODE=mode)
+                if mode == 'pending-wake':
+                    self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+                    self.assertIn('joined-original', p.stdout)
+                    self.assertIn('restarted ' + 'a' * 40, p.stdout)
+                    self.assertNotIn('is healthy again', p.stdout)
+                    self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                    continue
                 self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
                 self.assertIn('joined-original', p.stdout)
                 self.assertIn('restarted ' + 'a' * 40, p.stdout)

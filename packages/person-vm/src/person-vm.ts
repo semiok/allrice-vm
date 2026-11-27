@@ -1591,6 +1591,11 @@ export class PersonVmService
       };
       await lease.audit(row, { ...dispatch, result: 'started' });
       let dispatchApproved = false;
+      let joinedRecorded = false;
+      const recordJoin = async () => {
+        await lease.audit(row, { ...dispatch, result: 'succeeded' });
+        joinedRecorded = true;
+      };
       try {
         await this.options.native.stopIdle(
           bindingOf(row),
@@ -1602,16 +1607,20 @@ export class PersonVmService
           },
           runDispatch &&
             ((active, stop) =>
-              runDispatch(active, (fenced) => {
+              runDispatch(active, async (fenced) => {
                 fenced.throwIfAborted();
                 dispatchApproved = true;
-                return stop(fenced);
+                await stop(fenced);
+                // Persist the physical command's join before its separate
+                // final status read. A failed readback can then be recovered
+                // with the original plan and request.
+                if (!idle.auditAction) await recordJoin();
               })),
         );
         if (!dispatchApproved) throw new PersonVmError('ACTIVITY_UNKNOWN');
         // Record the provider's completed, joined stop before any egress or
         // disk cleanup. A prior intent alone cannot activate its wake plan.
-        await lease.audit(row, { ...dispatch, result: 'succeeded' });
+        if (!joinedRecorded) await recordJoin();
         stopped = true;
       } catch (error) {
         if (!dispatchApproved) {
@@ -1749,6 +1758,14 @@ export class PersonVmService
         true,
       );
     }
+    if (
+      row.phase === 'failed' ||
+      (this.options.store instanceof PostgresPersonVmStore &&
+        (await this.options.store.idleStopReceipt(binding))?.completed ===
+          false)
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    signal.throwIfAborted();
     // Production has no public VM-wide autonomous freeze/drain witness.
     // A running VM remains with its current owner, even after SIGTERM.
     if (state !== 'stopped' && state !== 'absent')
@@ -1799,6 +1816,13 @@ export class PersonVmService
           )
             throw new PersonVmError('CLEANUP_INCOMPLETE');
           const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
+          const idle = await lease.idleStopReceipt?.(binding);
+          if (idle && !idle.completed) {
+            await this.finishDispatchedIdleStop(lease, row, idle, signal);
+            return;
+          }
+          if (row.phase === 'failed')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
           await this.mounted(row, signal, lease);
           const state = await this.options.native.status(binding, signal);
           if (state !== 'stopped' && state !== 'absent')
@@ -2649,6 +2673,16 @@ export class PersonVmService
       const ports = this.receipt(binding, row.egressReceipt).gatewayPorts;
       await fence(binding, ports, signal, finish);
     } else await finish();
+  }
+
+  /** Finish a previously authorized, joined stop. This never starts a VM,
+   * dispatches a new stop, or admits native work. */
+  recoverJoinedIdleStop(binding: PersonVmBinding, signal: AbortSignal) {
+    return this.recoverIdleStop(
+      binding,
+      async (active) => active.throwIfAborted(),
+      signal,
+    );
   }
 
   private async recoverIdleStop(

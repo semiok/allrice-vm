@@ -647,6 +647,48 @@ it('requires an exact explicit shutdown claim and leaves every committed wake wi
   await host.assertWorkerShutdownSafe(signal());
 });
 
+it('joins the claimed wake before fencing its next epoch on ordinary shutdown', async () => {
+  const value = fixture();
+  value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
+  const order: string[] = [];
+  let finishWake!: () => void;
+  const activeWake = new Promise<void>((resolve) => {
+    finishWake = resolve;
+  });
+  io.upgradeWake.mockReturnValueOnce({
+    nextCommittedWakeAt: vi.fn().mockResolvedValue(null),
+    start: vi.fn(),
+    resume: vi.fn(),
+    close: vi.fn(async () => {}),
+    pause: vi.fn(async () => {
+      order.push('pause');
+      await activeWake;
+      order.push('wake joined');
+    }),
+    assertScheduledIdleCurrent: vi.fn(),
+    dispatchScheduledIdleStop: vi.fn(),
+    dispatchUpgradeStop: vi.fn(),
+    prepareStopWithWake: vi.fn(),
+    prepareUpgradeStop: vi.fn(),
+  });
+  vi.spyOn(
+    PersonVmService.prototype,
+    'fenceWorkerStartup',
+  ).mockImplementationOnce(() => {
+    order.push('fence');
+    return () => {};
+  });
+  const { host } = await open(value);
+  const shutdown = host.assertWorkerShutdownSafe(signal());
+  try {
+    await vi.waitFor(() => expect(order).toEqual(['pause']));
+  } finally {
+    finishWake();
+  }
+  await shutdown;
+  expect(order).toEqual(['pause', 'wake joined', 'fence']);
+});
+
 it('constructs the real store/service/admission/startup with one SQL factory and the same nondefault platform snapshot', async () => {
   const factory = vi.spyOn(
     PostgresPersonVmStore.prototype,
