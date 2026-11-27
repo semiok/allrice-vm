@@ -44,24 +44,23 @@ suite(
         (s) => s.name === 'project-development',
       )!;
       const employeeId = source.employeeId;
-      await savePlatformEmployeeDraft(employeeId, {
-        definition: {
-          ...source.definition,
-          ...(retiredAlias ? { key: 'rice' } : {}),
-          capabilities: {
-            ...source.definition.capabilities,
-            nativeSkillIds: [
-              source.skillId,
-              ...(projectTool ? [project.id] : []),
-            ],
-            toolNames: [
-              'workspace.skill.read',
-              'workspace.export.create',
-              ...(projectTool ? ['workspace.project'] : []),
-            ],
-          },
+      const definition = {
+        ...source.definition,
+        ...(retiredAlias ? { key: 'rice' } : {}),
+        capabilities: {
+          ...source.definition.capabilities,
+          nativeSkillIds: [
+            source.skillId,
+            ...(projectTool ? [project.id] : []),
+          ],
+          toolNames: [
+            'workspace.skill.read',
+            'workspace.export.create',
+            ...(projectTool ? ['workspace.project'] : []),
+          ],
         },
-      });
+      };
+      await savePlatformEmployeeDraft(employeeId, { definition });
       await source.preview(employeeId);
       expect((await source.publish(employeeId)).valid).toBe(true);
       if (retiredAlias) {
@@ -72,6 +71,14 @@ suite(
             and d.tenant_employee_id=e.id and e.employee_key='rice'
           returning e.id`;
         expect(tenant?.id).toBeTruthy();
+        await savePlatformEmployeeDraft(employeeId, {
+          definition: {
+            ...definition,
+            description: 'Retained published employee',
+          },
+        });
+        await source.preview(employeeId);
+        expect((await source.publish(employeeId)).valid).toBe(true);
       }
       const context = (await authenticateSession(
         (await createSession(source.ownerId)).token,
