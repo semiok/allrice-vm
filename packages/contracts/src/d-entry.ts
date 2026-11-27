@@ -151,7 +151,12 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
 });
+export const DEntryPageLocaleSchema = z.enum([
+  'settings/describe',
+  'settings/mutate',
+]);
 export const DEntryPageUnarySchema = z.enum([
+  ...DEntryPageLocaleSchema.options,
   'session/list',
   'session/attachment',
   'session/page',

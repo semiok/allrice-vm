@@ -14,6 +14,7 @@ import {
 } from 'node:net';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
@@ -40,6 +41,98 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+it('reads the sealed language default and persists only a native language preference', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const registry = host.typert.local;
+  const lookup = registry.get.bind(registry);
+  const gateway = host.typertGateway;
+  const dispatch = gateway.invoke.bind(gateway);
+  const template = lookup('session/list')!;
+  let preference = 'zh';
+  const writes = vi.fn();
+  const languageView = () => ({
+    ns: 'locale',
+    value: { preference },
+    revision: 2,
+  });
+  const lookupSpy = vi.spyOn(registry, 'get').mockImplementation((endpoint) => {
+    if (endpoint !== 'settings/describe' && endpoint !== 'settings/mutate')
+      return lookup(endpoint);
+    return {
+      ...template,
+      id: `@deepseek-ai/dsh-api-settings-controller#${endpoint}`,
+      result: { mode: 'strict', create: () => z.json(), jsonSchema: {} },
+    };
+  });
+  const dispatchSpy = vi
+    .spyOn(gateway, 'invoke')
+    .mockImplementation(async (request) => {
+      if (request.namespace !== 'settings') return dispatch(request);
+      if (request.method === 'describe')
+        return {
+          writable: true,
+          hasDocument: true,
+          namespaces: [languageView(), { ns: 'llm-pi-ai' }],
+        };
+      writes(request.args);
+      preference = 'en';
+      return languageView();
+    });
+  try {
+    const life = await open(f);
+    const call = (endpoint: string, args: object, token = sessionToken) =>
+      f.invoke(life.scopeId, token, { endpoint, payload: { args } });
+    const describe = async () => {
+      const response = await call('settings/describe', {});
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          hasDocument: false,
+          namespaces: [{ ns: 'locale', value: { preference: 'zh' } }],
+        },
+      },
+    });
+    expect((await call('settings/describe', {}, otherToken)).status).toBe(404);
+    const ops = [{ op: 'set', path: ['preference'], value: 'en' }];
+    const denied = await call('settings/mutate', {
+      ns: 'llm-pi-ai',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await denied.json()).toMatchObject({ result: { ok: false } });
+    expect(writes).not.toHaveBeenCalled();
+    const changed = await call('settings/mutate', {
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await changed.json()).toMatchObject({
+      result: { ok: true, value: { ns: 'locale' } },
+    });
+    expect(writes).toHaveBeenCalledExactlyOnceWith({
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: { namespaces: [{ ns: 'locale', value: { preference: 'en' } }] },
+      },
+    });
+    closePage(life.peer);
+    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+  } finally {
+    dispatchSpy.mockRestore();
+    lookupSpy.mockRestore();
+  }
+});
 
 it('qualifies a new 4.0 editor without writing on upgrade, then prepares its root once on explicit open', async () => {
   const f = await fixture(undefined, true);
