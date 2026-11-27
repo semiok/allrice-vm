@@ -249,7 +249,12 @@ async function firstBytes(
 ) {
   let bytes = Buffer.from(head);
   let complete = false;
-  const request = Promise.withResolvers<Buffer>();
+  let ready!: (bytes: Buffer) => void;
+  let invalid!: (error: unknown) => void;
+  const request = new Promise<Buffer>((resolve, reject) => {
+    ready = resolve;
+    invalid = reject;
+  });
   function inspect() {
     if (!bytes.length) return;
     try {
@@ -260,11 +265,11 @@ async function firstBytes(
         return;
       complete = true;
       socket.pause();
-      request.resolve(bytes);
+      ready(bytes);
     } catch {
       complete = true;
       socket.pause();
-      request.reject(denied());
+      invalid(denied());
     }
   }
   const data = (chunk: Buffer) => {
@@ -275,7 +280,7 @@ async function firstBytes(
     socket.on('data', data);
     inspect();
     if (!complete) socket.resume();
-    return await waitFor(request.promise, signal);
+    return await waitFor(request, signal);
   } finally {
     socket.pause();
     socket.off('data', data);

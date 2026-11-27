@@ -51,6 +51,13 @@ vi.mock('node:net', async (original) => {
 });
 
 const cleanup: (() => Promise<void>)[] = [];
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((close) => close()));
   network.attempted.mockClear();
@@ -276,8 +283,8 @@ it('uses validated fallback addresses and accepts only parsed HTTP inside a plai
 });
 
 it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async () => {
-  const received = Promise.withResolvers<Buffer>();
-  const peerClosed = Promise.withResolvers<void>();
+  const received = deferred<Buffer>();
+  const peerClosed = deferred<void>();
   const port = await listen(
     createTcpServer((socket) => {
       socket.once('close', () => peerClosed.resolve());
@@ -292,7 +299,7 @@ it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async
   client.on('error', () => {});
   try {
     expect((await received.promise)[0]).toBe(22);
-    const ended = Promise.withResolvers<void>();
+    const ended = deferred<void>();
     client.once('close', () => ended.resolve());
     vm.stop.abort();
     await vm.drain();
@@ -304,8 +311,8 @@ it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async
 
 it('joins a pending system lookup and never starts a synthetic DNS fallback after revoke', async () => {
   const vm = await setup();
-  const began = Promise.withResolvers<void>();
-  const result = Promise.withResolvers<{ address: string; family: 4 }[]>();
+  const began = deferred<void>();
+  const result = deferred<{ address: string; family: 4 }[]>();
   network.dns.mockImplementation(() => {
     began.resolve();
     return result.promise;
