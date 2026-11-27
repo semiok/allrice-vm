@@ -2,15 +2,18 @@ import { on } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEntryNativeOwnerRequestSchema,
+  DEntryPageLocaleSchema,
   DEntryPageRpcRequestSchema,
 } from '@allrice/contracts';
 import type {
   DEntryPrincipalControlScope,
   DEntryScopedUnaryCall,
+  NativeUnary,
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { rpcIdSchema } from '@deepseek-ai/dsh-client-connection';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import {
   isRemoteJsonValue,
   RemoteError,
@@ -35,13 +38,18 @@ function encodeResult(
   rpcId: string,
   result: Awaited<ReturnType<DEntryPrincipalControlScope['invoke']>>,
 ) {
+  if (DEntryPageLocaleSchema.safeParse(result.endpoint).success) {
+    if (!isRemoteJsonValue(result.value))
+      throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+    return Response.json(reply(rpcId, { ok: true, value: result.value }));
+  }
   const parts = new FormData();
   const attachments: {
     path: readonly (string | number)[];
     codec: 'bytes';
     part: string;
   }[] = [];
-  const codec = TYPERT_REMOTE.methods[result.endpoint].result;
+  const codec = TYPERT_REMOTE.methods[result.endpoint as NativeUnary].result;
   const value = codec.create().parse(result.value);
   const encoded = codec.encode
     ? codec.encode(value, (bytes, path) => {
@@ -123,8 +131,11 @@ export function createDEntryPageRpc(
             input.scopeId,
             signal,
             async (page, active) => {
+              const locale = DEntryPageLocaleSchema.safeParse(input.endpoint);
+              if (locale.success && !isRemoteJsonValue(input.payload.args))
+                throw new SyntaxError('Invalid native language request');
               const authorize = async () =>
-                input.endpoint === 'session/list'
+                locale.success || input.endpoint === 'session/list'
                   ? undefined
                   : authorizeDEntryNativeInvocation(
                       page.authorize,
@@ -134,20 +145,26 @@ export function createDEntryPageRpc(
                       active,
                     );
               const invocation = await authorize();
-              const call: DEntryScopedUnaryCall = invocation
-                ? ({
+              const call: DEntryScopedUnaryCall = locale.success
+                ? {
                     scopeId: input.scopeId,
-                    endpoint: invocation.endpoint,
-                    args: invocation.payload.args,
-                  } as DEntryScopedUnaryCall) // Exact unary selector and its generated input codec above.
-                : {
-                    scopeId: input.scopeId,
-                    endpoint: 'session/list',
-                    args: TYPERT_REMOTE.methods['session/list']
-                      .input({ strict: true })
-                      .create()
-                      .parse(input.payload.args),
-                  };
+                    endpoint: locale.data,
+                    args: input.payload.args as Record<string, JsonValue>,
+                  }
+                : invocation
+                  ? ({
+                      scopeId: input.scopeId,
+                      endpoint: invocation.endpoint,
+                      args: invocation.payload.args,
+                    } as DEntryScopedUnaryCall) // Exact unary selector and its generated input codec above.
+                  : {
+                      scopeId: input.scopeId,
+                      endpoint: 'session/list',
+                      args: TYPERT_REMOTE.methods['session/list']
+                        .input({ strict: true })
+                        .create()
+                        .parse(input.payload.args),
+                    };
               let native: Response;
               let sessionIds: string[] | undefined;
               try {

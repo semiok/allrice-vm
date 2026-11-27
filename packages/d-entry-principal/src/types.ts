@@ -1,7 +1,10 @@
 import { z } from 'zod';
 import { DEntryIdentitySchema, UuidSchema } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
-import type { DEntryIdentity } from '@allrice/contracts';
+import type {
+  DEntryIdentity,
+  DEntryPageLocaleSchema,
+} from '@allrice/contracts';
 import type { RemoteAccessBaseline } from '@deepseek-ai/dsh-api-remote-access';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
@@ -75,13 +78,25 @@ type Calls<K extends keyof NativeMethods> = {
     args: InputOf<NativeMethods[E]>;
   }>;
 }[K];
-export type DEntryScopedUnaryCall = Calls<NativeUnary>;
-export type DEntryScopedUnaryResult = {
-  [E in NativeUnary]: Readonly<{
-    endpoint: E;
-    value: OutputOf<NativeMethods[E]>;
-  }>;
-}[NativeUnary];
+type LocaleUnary = z.infer<typeof DEntryPageLocaleSchema>;
+export type DEntryPageLocaleCall = Readonly<{
+  scopeId: string;
+  endpoint: LocaleUnary;
+  args: Readonly<Record<string, JsonValue>>;
+}>;
+export type DEntryPageLocaleResult = Readonly<{
+  endpoint: LocaleUnary;
+  value: JsonValue;
+}>;
+export type DEntryScopedUnaryCall = Calls<NativeUnary> | DEntryPageLocaleCall;
+export type DEntryScopedUnaryResult =
+  | DEntryPageLocaleResult
+  | {
+      [E in NativeUnary]: Readonly<{
+        endpoint: E;
+        value: OutputOf<NativeMethods[E]>;
+      }>;
+    }[NativeUnary];
 export type DEntryScopedStreamCall =
   | Calls<'session/control' | 'session/follow'>
   | Readonly<{

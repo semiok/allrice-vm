@@ -51,6 +51,15 @@ const editorCatalogEntry: Extract<
       ? { kind: 'deny', reason: 'call-required' }
       : { kind: 'allow' },
 };
+// The guest event relay projects this native notification down to locale.
+const localeEvents: RemoteAccessBinding = {
+  resource: { kind: 'global' },
+  role: {
+    name: 'allrice-employee-locale-events',
+    resource: 'global',
+    actions: ['event:settings/document-updated'],
+  },
+};
 const writeRole: RemoteAccessRole<'session'> = {
   name: 'allrice-current-root-write',
   resource: 'session',
@@ -75,8 +84,8 @@ export function principalPolicy(
       )
         return [];
       return value.issue.access === 'execute'
-        ? [...value.bindings, editorCatalogEntry]
-        : value.bindings;
+        ? [...value.bindings, editorCatalogEntry, localeEvents]
+        : [...value.bindings, localeEvents];
     },
   };
 }

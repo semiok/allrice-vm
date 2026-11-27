@@ -25,7 +25,8 @@ import {
 } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
 import { z } from 'zod';
 import { TYPERT, TYPERT_REMOTE } from '#principal-artifacts';
-import { UuidSchema } from '@allrice/contracts';
+import { DEntryPageLocaleSchema, UuidSchema } from '@allrice/contracts';
+import { parseLocaleInvocation, projectLocaleResult } from './page-locale.js';
 import {
   issueSchema,
   principalPolicy,
@@ -728,6 +729,43 @@ class PrincipalService extends TypertRemoteService {
       'allricePrincipal/invokeScoped',
     );
     const raw = object.parse(input.call);
+    const locale = DEntryPageLocaleSchema.safeParse(raw.endpoint);
+    if (locale.success) {
+      const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
+      const method =
+        locale.data === 'settings/describe' ? 'describe' : 'mutate';
+      if (method === 'mutate' && scope.issue.access !== 'execute')
+        throw Error('PRINCIPAL_WRITE_DENIED');
+      const args = parseLocaleInvocation(method, raw.args);
+      return scope.own(async () => {
+        const active = AbortSignal.any([signal, scope.abort.signal]);
+        return scope.current(async () => {
+          active.throwIfAborted();
+          const descriptor = this.ctx.typert.local.get(locale.data);
+          if (
+            descriptor?.id !==
+              `@deepseek-ai/dsh-api-settings-controller#${locale.data}` ||
+            descriptor.result.mode !== 'strict'
+          )
+            throw Error('PRINCIPAL_ENDPOINT_DENIED');
+          const output = await this.ctx.typertGateway.invoke({
+            namespace: 'settings',
+            method,
+            args,
+            peer: scope.parent,
+            signal: active,
+          });
+          active.throwIfAborted();
+          return {
+            endpoint: locale.data,
+            value: projectLocaleResult(
+              method,
+              descriptor.result.create().parse(output),
+            ),
+          };
+        }, active);
+      });
+    }
     const key = z
       .enum([
         'session/list',
@@ -982,6 +1020,12 @@ class PrincipalService extends TypertRemoteService {
           if (eventReady ? frame.type === 'ready' : frame.type !== 'ready')
             throw Error('PRINCIPAL_EVENT_GENERATION_INVALID');
           eventReady = true;
+          if (
+            frame.type === 'emit' &&
+            frame.event === 'settings/document-updated' &&
+            frame.args[0] !== 'locale'
+          )
+            continue;
           value = frame;
         } else if (raw.endpoint === 'remoteAccess/follow')
           value = Access.methods['remoteAccess/follow'].result
