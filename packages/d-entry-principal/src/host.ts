@@ -331,6 +331,19 @@ class Scope implements Projection {
       return dispatch();
     }
   }
+  async readCatalog<T>(read: () => Promise<T>, signal: AbortSignal) {
+    await this.refresh(signal);
+    while (true) {
+      const { cut, value } = await this.current(async () => {
+        const cut = this.refreshQueue;
+        return { cut, value: await read() };
+      }, signal);
+      signal.throwIfAborted();
+      // The native list filters after I/O. A concurrent hint can temporarily
+      // remove permissions mid-read and return an incomplete, successful list.
+      if (cut === this.refreshQueue) return value;
+    }
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closing = Promise.resolve().then(async () => {
@@ -717,6 +730,7 @@ class PrincipalService extends TypertRemoteService {
     const raw = object.parse(input.call);
     const key = z
       .enum([
+        'session/list',
         'session/attachment',
         'session/page',
         'session/projections',
@@ -731,7 +745,7 @@ class PrincipalService extends TypertRemoteService {
     return scope.own(async () => {
       const active = AbortSignal.any([signal, scope.abort.signal]);
       active.throwIfAborted();
-      const value = await this.native(scope, key, args, () => {
+      const dispatch = () => {
         active.throwIfAborted();
         const slash = key.indexOf('/');
         return this.ctx.typertGateway.invoke({
@@ -741,10 +755,19 @@ class PrincipalService extends TypertRemoteService {
           peer: scope.currentPeer(),
           signal: active,
         });
-      });
+      };
+      // rc.2 filters the catalog through RemoteAccess for this non-owner peer.
+      const value = await (key === 'session/list'
+        ? scope.readCatalog(dispatch, active)
+        : this.native(scope, key, args, dispatch));
       active.throwIfAborted();
       // Literal branches retain the source descriptor/result relationship.
       switch (key) {
+        case 'session/list':
+          return {
+            endpoint: key,
+            value: Native.methods[key].result.create().parse(value),
+          };
         case 'session/attachment':
           return {
             endpoint: key,
@@ -823,6 +846,11 @@ class PrincipalService extends TypertRemoteService {
           .input({ strict: true })
           .create()
           .parse(raw.args);
+      else if (raw.endpoint === 'session/control')
+        Native.methods['session/control']
+          .input({ strict: true })
+          .create()
+          .parse(raw.args);
       else {
         if (raw.endpoint !== 'session/follow')
           throw Error('PRINCIPAL_ENDPOINT_DENIED');
@@ -836,7 +864,10 @@ class PrincipalService extends TypertRemoteService {
       const endpoint = events
         ? REMOTE_EVENT_STREAM_ENDPOINT
         : z.string().parse(raw.endpoint);
-      if (endpoint === 'remoteAccess/follow') {
+      if (
+        endpoint === 'remoteAccess/follow' ||
+        endpoint === 'session/control'
+      ) {
         // The new stream's baseline is a current catalog read even when the
         // native change hint for a withdrawn child has not arrived yet.
         await scope.refresh(active);
@@ -954,6 +985,10 @@ class PrincipalService extends TypertRemoteService {
           value = frame;
         } else if (raw.endpoint === 'remoteAccess/follow')
           value = Access.methods['remoteAccess/follow'].result
+            .create()
+            .parse(next.value);
+        else if (raw.endpoint === 'session/control')
+          value = Native.methods['session/control'].result
             .create()
             .parse(next.value);
         else

@@ -83,11 +83,23 @@ export function installEmployeeProductOwner(ctx: Context) {
     signal.removeEventListener('abort', clear);
     clear();
   });
-  ctx.inject(['uiWorkspace'], (native) => {
-    if (signal.aborted) return;
-    native.uiWorkspace.openSession(
-      nativeSessionId as Parameters<typeof native.uiWorkspace.openSession>[0],
-    );
+  ctx.inject(['uiWorkspace', 'sessions'], (native) => {
+    native.effect(() => {
+      const list = native.sessions.list;
+      const open = () => {
+        if (signal.aborted) return;
+        // rc.2 cannot retain a Session until its native summary has arrived.
+        const root = list
+          .getSnapshot()
+          .ids.find((id) => id === nativeSessionId);
+        if (root === undefined) return;
+        unsubscribe();
+        native.uiWorkspace.openSession(root);
+      };
+      const unsubscribe = list.subscribe(open);
+      open();
+      return unsubscribe;
+    }, 'AllRice employee native root');
   });
 
   const workspaceTask = Promise.resolve().then(() => {

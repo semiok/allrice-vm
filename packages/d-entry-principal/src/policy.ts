@@ -28,6 +28,29 @@ const readRole: RemoteAccessRole<'session'> = {
   resource: 'session',
   actions: readEndpoints,
 };
+const editorCatalogActions = ['session/list', 'session/control'] as const;
+const editorReadRole: RemoteAccessRole<'session'> = {
+  ...readRole,
+  actions: [...readEndpoints, ...editorCatalogActions],
+};
+// rc.2 enters these argumentless catalog methods on the global resource,
+// then checks the same action on each returned session. Keep this entry
+// permission out of browser snapshots, which are evaluated without args.
+const editorCatalogEntry: Extract<
+  RemoteAccessBinding,
+  { resource: { kind: 'global' } }
+> = {
+  role: {
+    name: 'allrice-editor-catalog-entry',
+    resource: 'global',
+    actions: editorCatalogActions,
+  },
+  resource: { kind: 'global' },
+  condition: ({ args }) =>
+    args === undefined
+      ? { kind: 'deny', reason: 'call-required' }
+      : { kind: 'allow' },
+};
 const writeRole: RemoteAccessRole<'session'> = {
   name: 'allrice-current-root-write',
   resource: 'session',
@@ -45,11 +68,15 @@ export function principalPolicy(
   return {
     bindings(principal) {
       const value = scopes.get(principal.scopeId);
-      return value?.active &&
-        !value.parent.signal.aborted &&
-        sameDEntryIdentity(value.issue.identity, principal.identity)
-        ? value.bindings
-        : [];
+      if (
+        !value?.active ||
+        value.parent.signal.aborted ||
+        !sameDEntryIdentity(value.issue.identity, principal.identity)
+      )
+        return [];
+      return value.issue.access === 'execute'
+        ? [...value.bindings, editorCatalogEntry]
+        : value.bindings;
     },
   };
 }
@@ -79,7 +106,7 @@ export function projectSessions(
     }
     if (String(cursor.sessionId) !== issue.root.nativeSessionId) continue;
     bindings.push({
-      role: readRole,
+      role: issue.access === 'execute' ? editorReadRole : readRole,
       resource: { kind: 'session', id: entry.sessionId },
     });
     if (entry === root && issue.access === 'execute')
