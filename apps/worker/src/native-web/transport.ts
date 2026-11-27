@@ -27,6 +27,7 @@ export type NativeOwnedUnary =
   | 'session/modelCatalog'
   | 'session/list'
   | 'session/projections'
+  | 'workspace/create'
   | 'goals/get'
   | 'schedule/catalog';
 

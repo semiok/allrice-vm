@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { WorkspaceId } from '@deepseek-ai/dsh-workspace';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
   clientRequestSchema,
@@ -784,12 +785,37 @@ export async function openNativeWebOwner(input: {
         return readCurrent(
           caller,
           (active) => input.vm.assertCurrentBinding(context, binding, active),
-          async () => {
+          async (active) => {
+            const path = input.launch.command.workdir;
+            if (!path) throw new PersonVmError('PROVIDER_FAILED');
+            // Native create is idempotent for the current real directory.
+            // Resolve it from this authenticated Host rather than retaining a
+            // workspace ID that may have been removed by the native UI.
+            const registration = await readUnaryReply(
+              'workspace/create',
+              { request: { path } },
+              AbortSignal.any([
+                active,
+                AbortSignal.timeout(input.cleanupTimeoutMs),
+              ]),
+            );
+            const { workspace } = z
+              .object({
+                workspace: z.object({ workspaceId: UuidSchema }),
+              })
+              .parse(replyValue(registration));
+            await input.vm.assertCurrentBinding(context, binding, active);
+            active.throwIfAborted();
             const method = TYPERT_REMOTE.methods['session/create'];
             const args = method
               .input({ strict: true })
               .create()
-              .parse({ request });
+              .parse({
+                request: {
+                  ...request,
+                  workspaceId: WorkspaceId(workspace.workspaceId),
+                },
+              });
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.

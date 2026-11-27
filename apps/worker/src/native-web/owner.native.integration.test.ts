@@ -17,6 +17,7 @@ import { TYPERT_REMOTE as SUBAGENTS_REMOTE } from '@deepseek-ai/dsh-subagent/rem
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
+import { z } from 'zod';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
@@ -112,6 +113,90 @@ function observeSinglePrompt(signal: AbortSignal) {
   };
   return { beforePrompt, observed: observed.promise };
 }
+
+it.skipIf(!cli)(
+  'links outer and native blank sessions to the same real rc.2 workspace before workspace/follow',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const f = await setup();
+    const signal = AbortSignal.timeout(15000);
+    const outer = await f.owner.createRootFor(f.context, {}, signal);
+    const scopeId = randomUUID();
+    const activity = f.owner.acquirePrincipal(
+      {
+        scopeId,
+        access: 'page',
+        identity: {
+          ...f.principalProfile,
+          organizationId: f.owner.binding.organizationId,
+          personId: f.owner.binding.personId,
+          threadId: null,
+        },
+      },
+      signal,
+      f.context,
+    );
+    const page = await activity.run(signal);
+    const invoke = (endpoint: string, request: Record<string, string>) =>
+      page.invokePage(
+        { kind: 'page', scopeId, endpoint, args: { request } },
+        signal,
+      );
+    const create = async () =>
+      NATIVE_REMOTE.methods['session/create'].result
+        .create()
+        .parse((await invoke('session/create', {})).value).sessionId;
+    const baseline = async () => {
+      const stream = page.streamPage(
+        { kind: 'page', scopeId, endpoint: 'workspace/follow', args: {} },
+        signal,
+      );
+      const feed = stream[Symbol.asyncIterator]();
+      try {
+        const first = await feed.next();
+        expect(first.done).toBe(false);
+        return z
+          .object({
+            type: z.literal('baseline'),
+            value: z.object({
+              items: z.array(
+                z.object({
+                  workspaceId: z.string(),
+                  sessionIds: z.array(z.string()),
+                }),
+              ),
+            }),
+          })
+          .parse(first.value?.value).value.items;
+      } finally {
+        await feed.return?.();
+      }
+    };
+    try {
+      const native = await create();
+      expect(native).not.toBe(outer.value.sessionId);
+      const [original] = await baseline();
+      expect(original?.sessionIds).toEqual(
+        expect.arrayContaining([outer.value.sessionId, native]),
+      );
+      await invoke('workspace/delete', { workspaceId: original!.workspaceId });
+      const afterScoped = await create();
+      const [replacement] = await baseline();
+      expect(replacement?.workspaceId).not.toBe(original?.workspaceId);
+      expect(replacement?.sessionIds).toContain(afterScoped);
+
+      await invoke('workspace/delete', {
+        workspaceId: replacement!.workspaceId,
+      });
+      const afterOuter = await f.owner.createRootFor(f.context, {}, signal);
+      const [next] = await baseline();
+      expect(next?.workspaceId).not.toBe(replacement?.workspaceId);
+      expect(next?.sessionIds).toContain(afterOuter.value.sessionId);
+    } finally {
+      await activity.close();
+    }
+  },
+);
 
 it.skipIf(!cli)(
   'kills the real rc.2 PTY on login-owner withdrawal and keeps the DSH Host available',
@@ -213,7 +298,7 @@ it.skipIf(!cli)(
     expect(created.ok).toBe(true);
     const sessions = await f.owner.readSessions(signal);
     expect(sessions.ok).toBe(true);
-    expect(f.current).toHaveBeenCalledTimes(4);
+    expect(f.current).toHaveBeenCalledTimes(5);
     expect(f.child.exitCode).toBe(null);
     await Promise.all([f.owner.close(), f.owner.close()]);
     expect(f.owner.controlReady()).toBe(false);
