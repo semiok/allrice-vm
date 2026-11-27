@@ -539,8 +539,10 @@ export function EmployeeNativePage({
         params.set('threadId', selection.threadId);
         selectedQuery = params.toString();
       }
-      const identity = await (hotIdentity?.read ??
-        readEmployeeEntryIdentity(selection, lifetime.signal));
+      const speculative = await hotIdentity?.read.catch(() => undefined);
+      const identity =
+        speculative ??
+        (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;

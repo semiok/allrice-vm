@@ -54,6 +54,8 @@ suite('4.0 browser entry with a running employee', () => {
       let cold = false;
       let coldIdentities = 0;
       let readyPolls = 0;
+      let hotTransient = false;
+      let hotIdentities = 0;
       const ticket = randomUUID();
       f.web.on('request', async (request, response) => {
         const address = new URL(request.url!, f.origin);
@@ -101,9 +103,11 @@ suite('4.0 browser entry with a running employee', () => {
             };
             requests.push(timing);
             const reject = cold && ++coldIdentities === 2;
+            const earlyFailure = hotTransient && ++hotIdentities === 1;
             await delay(240);
             timing.end = performance.now();
             if (reject) return response.writeHead(403).end();
+            if (earlyFailure) return response.writeHead(503).end();
             return response
               .writeHead(200, { 'content-type': 'application/json' })
               .end(
@@ -215,8 +219,10 @@ suite('4.0 browser entry with a running employee', () => {
             ]);
             const prewarm = phases.find(({ phase }) => phase === 'prewarm')!;
             const identity = phases.find(({ phase }) => phase === 'identity')!;
-            const document = phases.find(({ phase }) => phase === 'document')!;
-            expect(document.start).toBeGreaterThanOrEqual(
+            const documentRequest = phases.find(
+              ({ phase }) => phase === 'document',
+            )!;
+            expect(documentRequest.start).toBeGreaterThanOrEqual(
               Math.max(prewarm.end!, identity.end!),
             );
             expect(identity.start).toBeLessThan(prewarm.end!);
@@ -229,7 +235,7 @@ suite('4.0 browser entry with a running employee', () => {
               prewarmEndMs: Math.round(prewarm.end! - start),
               identityStartMs: Math.round(identity.start - start),
               identityEndMs: Math.round(identity.end! - start),
-              documentStartMs: Math.round(document.start - start),
+              documentStartMs: Math.round(documentRequest.start - start),
             });
           }
         } finally {
@@ -262,6 +268,30 @@ suite('4.0 browser entry with a running employee', () => {
       ).toEqual(['identity', 'identity', 'prewarm']);
       expect(await denied.locator('iframe').count()).toBe(0);
       expect(deniedSockets).toEqual([]);
+      await denied.close();
+
+      cold = false;
+      hotTransient = true;
+      const retryOffset = requests.length;
+      const recovered = await context.newPage();
+      await recovered.goto(url);
+      await recovered
+        .frameLocator('iframe[title="员工工作区"]')
+        .getByRole('textbox', { name: '消息' })
+        .fill('验证热态早期瞬时失败后能打开');
+      expect(hotIdentities).toBe(2);
+      const recovery = requests.slice(retryOffset);
+      expect(recovery.map(({ phase }) => phase).sort()).toEqual([
+        'document',
+        'identity',
+        'identity',
+        'prewarm',
+      ]);
+      expect(
+        recovery.filter(({ phase }) => phase === 'identity')[1]!.start,
+      ).toBeGreaterThanOrEqual(
+        recovery.find(({ phase }) => phase === 'prewarm')!.end!,
+      );
       await context.close();
     },
   );
