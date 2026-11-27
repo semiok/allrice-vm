@@ -83,8 +83,10 @@ function fixture() {
   current.mockResolvedValue(identity);
   policy.mockResolvedValue({
     revision: 'fixture',
-    defaultGeneration: '4.0',
-    selections: [],
+    defaultGeneration: '3.x',
+    selections: [
+      { organizationId: binding.organizationId, personId: binding.personId },
+    ],
   });
   const readModels = vi.fn<Parameters<Proof>[0]['readModels']>(async () => ({
     ok: true,

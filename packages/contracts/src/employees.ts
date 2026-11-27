@@ -203,6 +203,12 @@ export const CreateEmployeeInstanceInputSchema = z
   })
   .strict();
 
+export const CreatePersonalEmployeeInstanceInputSchema =
+  CreateEmployeeInstanceInputSchema.omit({ assignmentId: true }).extend({
+    expectedOwnerId: UuidSchema,
+    profile: EmployeeInstanceProfileSchema.required({ name: true }),
+  });
+
 const instanceProfileWriteFields = {
   workspaceId: UuidSchema,
   expectedRevision: z.number().int().positive(),

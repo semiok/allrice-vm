@@ -72,7 +72,8 @@ async function readRoster(
       const assignments = await tx<{ id: string; materialized: boolean }[]>`
         select a.id,exists(select 1 from allrice_employee_instances i
           join allrice_employee_instance_revisions r on r.instance_id=i.id and r.revision=1
-          where i.id=a.id and i.assignment_id=a.id and i.kind='general'
+          -- A personal custom employee owns its root instance directly.
+          where i.id=a.id and i.assignment_id=a.id
             and i.organization_id=a.organization_id and i.workspace_id=a.workspace_id
             and i.owner_id=a.user_id) materialized from allrice_employee_assignments a
         join allrice_employees e on e.id=a.employee_id and e.organization_id=a.organization_id

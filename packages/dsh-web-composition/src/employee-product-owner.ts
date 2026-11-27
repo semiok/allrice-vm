@@ -174,7 +174,15 @@ export function installEmployeeProductOwner(ctx: Context) {
       bindEmployeeSidebar(ctx, {
         getSnapshot: sidebar.getSnapshot,
         subscribe: sidebar.subscribe,
-        createEmployee: () => notice('当前入口暂无法创建员工。'),
+        createEmployee: {
+          workspace: {
+            organizationId,
+            workspaceId: selection.workspaceId,
+            viewerId,
+          },
+          headers: requestHeaders,
+          onCreated: (instance) => navigate(instance.id),
+        },
         openArchive: () => notice('当前入口暂无法打开归档。'),
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),
       });
