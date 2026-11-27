@@ -1373,6 +1373,9 @@ suite(
             leaseOwner: null,
           });
           expect(await store.idleStopReceipt(binding)).toBeUndefined();
+          await expect(
+            service.assertWorkerShutdownSafe(binding, signal()),
+          ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
           await host.reconcileIdle(
             { ...attempt, requestId: randomUUID() },
             binding,

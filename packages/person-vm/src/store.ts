@@ -73,6 +73,7 @@ export interface VmLease {
     binding: PersonVmBinding,
   ): ReturnType<typeof readIdleStopReceipt>;
   hasPreviousUpgradeStop?(binding: PersonVmBinding): Promise<boolean>;
+  hasUnjoinedIdleStop?(binding: PersonVmBinding): Promise<boolean>;
   hasCompletedDiskDeletion?(owner: DiskPoolOwner): Promise<boolean>;
   hasRetainedDiskRows?(vmIds: readonly string[]): Promise<boolean>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
@@ -323,6 +324,22 @@ async function readIdleStopReceipt(
         completed: record.completed === true,
       }
     : undefined;
+}
+
+async function hasUnjoinedIdleStop(
+  session: VmSqlSession,
+  binding: PersonVmBinding,
+) {
+  const [attempt] = await session.query(
+    () => session.client`
+    select a.result from person_virtual_machines vm
+    join person_vm_audit a using (person_id, organization_id, vm_id, lease_epoch)
+    where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+      and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+      and vm.lease_epoch=${binding.leaseEpoch} and a.action='stop.idle-dispatch'
+    order by a.id desc limit 1`,
+  );
+  return attempt?.result === 'started';
 }
 
 async function hasPreviousUpgradeStop(
@@ -613,6 +630,15 @@ export class PostgresPersonVmStore implements PersonVmStore {
     const session = new VmSqlSession(this.openSql());
     try {
       return await readIdleStopReceipt(session, binding);
+    } finally {
+      await session.end();
+    }
+  }
+
+  async hasUnjoinedIdleStop(binding: PersonVmBinding) {
+    const session = new VmSqlSession(this.openSql());
+    try {
+      return await hasUnjoinedIdleStop(session, binding);
     } finally {
       await session.end();
     }
@@ -1006,6 +1032,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
                 ),
             }),
         idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
+        hasUnjoinedIdleStop: (binding) => hasUnjoinedIdleStop(session, binding),
         hasPreviousUpgradeStop: (binding) =>
           hasPreviousUpgradeStop(session, binding),
         hasCompletedDiskDeletion: async (owner) => {
@@ -1322,6 +1349,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
           if (!found) throw new PersonVmError('LEASE_LOST');
         },
         idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
+        hasUnjoinedIdleStop: (binding) => hasUnjoinedIdleStop(session, binding),
         hasPreviousUpgradeStop: (binding) =>
           hasPreviousUpgradeStop(session, binding),
         audit: async (value, event) => {

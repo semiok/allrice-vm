@@ -1783,13 +1783,15 @@ export class PersonVmService
         true,
       );
     }
-    if (
-      row.phase === 'failed' ||
-      (this.options.store instanceof PostgresPersonVmStore &&
-        (await this.options.store.idleStopReceipt(binding))?.completed ===
-          false)
-    )
-      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const store = this.options.store;
+    if (store instanceof PostgresPersonVmStore) {
+      const idle = await store.idleStopReceipt(binding);
+      if (
+        idle?.completed === false ||
+        (await store.hasUnjoinedIdleStop(binding))
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+    }
     signal.throwIfAborted();
     // Production has no public VM-wide autonomous freeze/drain witness.
     // A running VM remains with its current owner, even after SIGTERM.
@@ -1846,7 +1848,7 @@ export class PersonVmService
             await this.finishDispatchedIdleStop(lease, row, idle, signal);
             return;
           }
-          if (row.phase === 'failed')
+          if (await lease.hasUnjoinedIdleStop?.(binding))
             throw new PersonVmError('CLEANUP_INCOMPLETE');
           await this.mounted(row, signal, lease);
           const state = await this.options.native.status(binding, signal);
