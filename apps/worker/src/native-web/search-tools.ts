@@ -9,15 +9,9 @@ import {
 import { PersonVmError } from '@allrice/person-vm';
 
 export function nativeWebBundlePatches() {
-  const workspace = createRequire(
-    new URL(
-      '../../../../packages/dsh-web-composition/package.json',
-      import.meta.url,
-    ),
-  );
-  const cli = createRequire(workspace.resolve('@deepseek-ai/dsh/package.json'));
+  const require = createRequire(import.meta.url);
   return ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'].map((name) => {
-    const directory = dirname(cli.resolve(name + '/package.json'));
+    const directory = dirname(require.resolve(name + '/package.json'));
     const bundle = readProfileManifest('dsh', directory).dsh?.bundle;
     if (!bundle) throw new PersonVmError('PROVIDER_FAILED');
     return bundlePatchPaths(directory, bundle).flatMap((path) =>
