@@ -27,10 +27,13 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable).each([false, true])(
-  'boots the rc.2 composer or reports a stalled application body (stall=%s)',
+it
+  .skipIf(!browserExecutable)
+  .each(['attached', 'unattached', 'stall'] as const)(
+  'rc.2 workspace/follow and the blank composer (%s)',
   { timeout: 60_000 },
-  async (stall) => {
+  async (scenario) => {
+    const stall = scenario === 'stall';
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -58,6 +61,34 @@ it.skipIf(!browserExecutable).each([false, true])(
     const { TYPERT } = await import(
       pathToFileURL(fromCli.resolve(`${runnerModule}/typert`)).href
     );
+    const workspaceModule = '@deepseek-ai/dsh-api-workspace-controller';
+    const { default: WorkspaceController } = await import(
+      pathToFileURL(fromCli.resolve(workspaceModule)).href
+    );
+    const { TYPERT: WorkspaceMetadata } = await import(
+      pathToFileURL(fromCli.resolve(`${workspaceModule}/typert`)).href
+    );
+    const nativeWorkspace = {
+      id: randomUUID(),
+      path: '/work',
+      title: 'Fixture work',
+      sessionIds: scenario === 'unattached' ? [] : ['root'],
+      archivedSessionIds: [],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    f.host.host.provide('workspaceRegistry', {
+      list: () => [nativeWorkspace],
+      get: (id: string) =>
+        id === nativeWorkspace.id ? nativeWorkspace : undefined,
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+    });
+    await f.host.host.plugin(WorkspaceController, {
+      documentsDirectory: '/work',
+    });
+    f.host.host.typert.register(WorkspaceMetadata);
+
     await f.host.host.plugin(SystemPrompt);
     await f.host.host.plugin(ToolRuntime);
     await f.host.host.plugin(CordisRunner);
@@ -220,6 +251,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     const page = await context.newPage();
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
+    const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('console', (message) => {
@@ -242,6 +274,12 @@ it.skipIf(!browserExecutable).each([false, true])(
           ['baseline', 'snapshot'].includes(frame.value.type)
         )
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
+        if (
+          frame.type === 'item' &&
+          frame.value.type === 'baseline' &&
+          streams.get(frame.streamId) === 'workspace/follow'
+        )
+          workspaceBaselines.push(frame.value.value);
       });
     });
     if (stall) {
@@ -274,6 +312,31 @@ it.skipIf(!browserExecutable).each([false, true])(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
     try {
+      // The iframe loads its native bundles before opening workspace/follow.
+      // Navigation alone does not mean the browser has even sent that open.
+      await expect
+        .poll(() => workspaceBaselines.length, { timeout: 15_000 })
+        .toBeGreaterThan(0);
+      expect(workspaceBaselines).toMatchObject([
+        {
+          items: [
+            {
+              workspaceId: nativeWorkspace.id,
+              sessionIds: scenario === 'unattached' ? [] : ['root'],
+            },
+          ],
+        },
+      ]);
+      if (scenario === 'unattached') {
+        await workbench
+          .locator('[data-composer-input][contenteditable="false"]')
+          .waitFor({ timeout: 15_000 });
+        await workbench
+          .getByText(/选择一个工作区开始|Choose a workspace to start/)
+          .waitFor({ timeout: 15_000 });
+        await context.close();
+        return;
+      }
       await editor.fill('未发送的原生草稿', { timeout: 15_000 });
     } catch (error) {
       throw Error(
@@ -281,14 +344,25 @@ it.skipIf(!browserExecutable).each([false, true])(
           unary,
           streamEndpoints: [...streams.values()],
           firstItems,
+          workspaceBaselines,
           startupReplies: Object.fromEntries(startupReplies),
           errors,
-          text: (await workbench.locator('body').innerText()).slice(0, 300),
+          text: (
+            await workbench
+              .locator('body')
+              .innerText({ timeout: 1_000 })
+              .catch(() => '')
+          ).slice(0, 300),
         }),
         { cause: error },
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    expect(
+      await workbench
+        .getByText(/选择一个工作区开始|Choose a workspace to start/)
+        .count(),
+    ).toBe(0);
     await expect
       .poll(() => firstItems)
       .toEqual(

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
+import { WorkspaceId } from '@deepseek-ai/dsh-workspace';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
   clientRequestSchema,
@@ -532,12 +533,11 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
-  async function readSessionReply(
-    endpoint: 'create' | 'modelCatalog',
+  async function readNativeReply(
+    method: 'session/create' | 'session/modelCatalog' | 'workspace/create',
     args: object,
     signal: AbortSignal,
   ) {
-    const method = 'session/' + endpoint;
     const rpcId = randomUUID();
     const body = JSON.stringify(
       clientRequestSchema.parse({
@@ -547,12 +547,12 @@ export async function openNativeWebOwner(input: {
         payload: { args },
       }),
     );
-    const wire = await transport.readSessionReply(endpoint, body, signal);
+    const wire = await transport.readNativeReply(method, body, signal);
     const reply = serverResponseSchema.parse(JSON.parse(wire));
     if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
     return reply.result;
   }
-  function replyValue(result: Awaited<ReturnType<typeof readSessionReply>>) {
+  function replyValue(result: Awaited<ReturnType<typeof readNativeReply>>) {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
@@ -604,8 +604,8 @@ export async function openNativeWebOwner(input: {
             readCurrent(active, guard, async (signal) => {
               const method = TYPERT_REMOTE.methods['session/modelCatalog'];
               const args = method.input({ strict: true }).create().parse({});
-              const result = await readSessionReply(
-                'modelCatalog',
+              const result = await readNativeReply(
+                'session/modelCatalog',
                 args,
                 signal,
               );
@@ -758,17 +758,42 @@ export async function openNativeWebOwner(input: {
         return readCurrent(
           caller,
           (active) => input.vm.assertCurrentBinding(context, binding, active),
-          async () => {
+          async (active) => {
+            const path = input.launch.command.workdir;
+            if (!path) throw new PersonVmError('PROVIDER_FAILED');
+            // Native create is idempotent for the current real directory.
+            // Resolve it from this authenticated Host rather than retaining a
+            // workspace ID that may have been removed by the native UI.
+            const registration = await readNativeReply(
+              'workspace/create',
+              { request: { path } },
+              AbortSignal.any([
+                active,
+                AbortSignal.timeout(input.cleanupTimeoutMs),
+              ]),
+            );
+            const { workspace } = z
+              .object({
+                workspace: z.object({ workspaceId: UuidSchema }),
+              })
+              .parse(replyValue(registration));
+            await input.vm.assertCurrentBinding(context, binding, active);
+            active.throwIfAborted();
             const method = TYPERT_REMOTE.methods['session/create'];
             const args = method
               .input({ strict: true })
               .create()
-              .parse({ request });
+              .parse({
+                request: {
+                  ...request,
+                  workspaceId: WorkspaceId(workspace.workspaceId),
+                },
+              });
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.
-            const result = await readSessionReply(
-              'create',
+            const result = await readNativeReply(
+              'session/create',
               args,
               AbortSignal.timeout(input.cleanupTimeoutMs),
             ).catch((error: unknown) => {

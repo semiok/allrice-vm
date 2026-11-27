@@ -248,6 +248,7 @@ export function apply(ctx, config) {
                   artifactPath: artifact.path,
                   nonce: auth.nonce,
                   baseUrl: auth.origin,
+                  workdir: config.workdir,
                   ...(modelAdapter
                     ? {
                         modelAdapter: {

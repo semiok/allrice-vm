@@ -607,6 +607,8 @@ class Scope implements Projection {
   }
 }
 
+type DefaultWorkspace = { path: string; ensure(): Promise<string> };
+
 /** Actual guest service; only the trusted Node API Peer can issue a scope.
  * The public Host face is the Cordis plugin, not a constructor for consumers. */
 class PrincipalService extends TypertRemoteService {
@@ -625,6 +627,7 @@ class PrincipalService extends TypertRemoteService {
   private graphObserver?: {
     ready: boolean;
     current(): boolean;
+    defaultWorkspace(): DefaultWorkspace | undefined;
     close(): Promise<void>;
   };
   private graphRetirement = Promise.resolve();
@@ -736,6 +739,7 @@ class PrincipalService extends TypertRemoteService {
     },
     owner?: {
       current(): boolean;
+      defaultWorkspace?(): DefaultWorkspace | undefined;
       publish(): Promise<void>;
       retire(): Promise<void>;
     },
@@ -746,6 +750,7 @@ class PrincipalService extends TypertRemoteService {
     const observer = {
       ready: false,
       current: () => owner?.current() ?? true,
+      defaultWorkspace: () => owner?.defaultWorkspace?.(),
       close: () => {
         if (retiring) return retiring;
         observer.ready = false;
@@ -1196,6 +1201,24 @@ class PrincipalService extends TypertRemoteService {
           raw,
           'unary',
         );
+        let nativeArgs = args;
+        const workspace = this.graphObserver?.defaultWorkspace();
+        if (endpoint === 'session/create' && workspace) {
+          const { request } = Native.methods[endpoint]
+            .input({ strict: true })
+            .create()
+            .parse(args);
+          if (
+            request.workspaceId === undefined &&
+            (request.cwd === undefined || request.cwd === workspace.path)
+          ) {
+            const workspaceId = await workspace.ensure();
+            active.throwIfAborted();
+            const create = { ...request, workspaceId };
+            delete create.cwd;
+            nativeArgs = { request: create };
+          }
+        }
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
         const modelInput =
           endpoint === 'session/prompt' ||
@@ -1232,13 +1255,18 @@ class PrincipalService extends TypertRemoteService {
         }
         let value: unknown;
         try {
-          value = await this.ctx.typertGateway.invoke({
-            namespace: descriptor.namespace,
-            method: descriptor.method,
-            args,
-            peer: modelInput ? scope.currentPeer() : scope.parent,
-            signal: active,
-          });
+          const dispatch = () =>
+            this.ctx.typertGateway.invoke({
+              namespace: descriptor.namespace,
+              method: descriptor.method,
+              args: nativeArgs,
+              peer: modelInput ? scope.currentPeer() : scope.parent,
+              signal: active,
+            });
+          // The registry call above can overlap a catalog refresh.
+          value = await (nativeArgs === args
+            ? dispatch()
+            : scope.current(dispatch, active));
           if (terminal) terminal.possiblyAllocated = true;
         } catch (error) {
           // These rc.2 failures occur before any allocation. A success or
