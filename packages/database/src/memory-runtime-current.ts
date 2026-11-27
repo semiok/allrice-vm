@@ -7,7 +7,7 @@ import {
   type EmployeeBusinessTargetProjection,
   type RequestContext,
 } from '@allrice/contracts';
-import type { Sql } from 'postgres';
+import type { Sql, TransactionSql } from 'postgres';
 import { DataAccessError } from './data.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { resolveEmployeeSessionInstance } from './employees/employee-instances.ts';
@@ -16,7 +16,7 @@ import { resolveEmployeeSessionInstance } from './employees/employee-instances.t
  * Application build verification takes place before opening the transaction.
  * Historical source readers do not use this live execution gate. */
 export async function readLockedNativeMemoryAuthority(
-  tx: Sql,
+  tx: Sql | TransactionSql,
   context: RequestContext,
   input: EmployeeBusinessTargetProjection,
   applicationModules: ApplicationBuiltinModulesProjection,

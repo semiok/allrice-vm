@@ -72,6 +72,7 @@ files:
     - scripts/rice-bridge-pdf-guardian.test.mjs
     - scripts/rice-bridge-terminal-runtime.test.mjs
   manual:
+    - apps/worker/src/native-web/owner.native-memory.integration.test.ts
     - apps/worker/src/native-web/owner.native-schedule.integration.test.ts
     - apps/worker/src/native-web/owner.native.integration.test.ts
     - scripts/acceptance/workday/native-entry.fixture.test.ts
