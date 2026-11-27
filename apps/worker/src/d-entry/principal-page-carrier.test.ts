@@ -63,7 +63,12 @@ it('reads the sealed language default and persists only a native language prefer
     return {
       ...template,
       id: `@deepseek-ai/dsh-api-settings-controller#${endpoint}`,
-      result: { mode: 'strict', create: () => z.json(), jsonSchema: {} },
+      result: {
+        mode: 'strict',
+        typeSymbol: 'test#NativeLocaleJson',
+        create: () => z.json(),
+        jsonSchema: {},
+      },
     };
   });
   const dispatchSpy = vi
@@ -106,6 +111,12 @@ it('reads the sealed language default and persists only a native language prefer
       expectedRevision: 2,
     });
     expect(await denied.json()).toMatchObject({ result: { ok: false } });
+    const wrongField = await call('settings/mutate', {
+      ns: 'locale',
+      ops: [{ op: 'set', path: ['provider'], value: 'en' }],
+      expectedRevision: 2,
+    });
+    expect(await wrongField.json()).toMatchObject({ result: { ok: false } });
     expect(writes).not.toHaveBeenCalled();
     const changed = await call('settings/mutate', {
       ns: 'locale',
