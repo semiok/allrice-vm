@@ -113,7 +113,8 @@ export async function pumpPageInput(
 ) {
   while (true) {
     const item = await input.next();
-    if (item.done || item.value === 'close') return;
+    if (item.done) return false;
+    if (item.value === 'close') return true;
     receive(item.value);
   }
 }

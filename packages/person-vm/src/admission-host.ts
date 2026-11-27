@@ -47,7 +47,7 @@ import {
 import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
-  context: RequestContext;
+  authorize(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   operationId: string;
   owner: string;
   source: string;
@@ -111,6 +111,12 @@ export class PersonVmAdmissionHost
   private readonly stoppedEntryPermits = new Map<
     string,
     Set<PersonVmAdmissionPermit>
+  >();
+  // Exact local owners only. Retain releases after a failed DB acknowledgement
+  // if we never dispatched the transfer or have already joined it.
+  private readonly publicEgressReleases = new Map<
+    string,
+    Map<string, string>
   >();
   // Only failed admit calls that never returned a handle/callback. Not TTL takeover.
   private readonly unacknowledged = new Set<string>();
@@ -586,11 +592,95 @@ export class PersonVmAdmissionHost
     input: { participant: PersonVmAdmissionParticipant; operationId: string },
     signal: AbortSignal,
   ) {
-    await this.authorize(context, binding, signal);
+    const authorize = (bound: PersonVmBinding, active: AbortSignal) =>
+      this.authorize(context, bound, active);
+    await authorize(binding, signal);
     if (!['gateway', 'entry'].includes(input.participant) || !input.operationId)
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    return this.admitBound(binding, input, signal, authorize);
+  }
+
+  /** Host-only lifetime for traffic already authenticated to the exact VM
+   * proxy. It can never wake a VM or authorize an actor or managed route. */
+  async withPublicEgress(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    transfer: (signal: AbortSignal) => Promise<void>,
+  ) {
+    const personId = binding.personId;
+    await this.recoverJoinedPublicEgress(personId, signal);
+    const permit = await this.admitBound(
+      binding,
+      { participant: 'gateway', operationId: randomUUID() },
+      signal,
+      async (_bound, active) => active.throwIfAborted(),
+      (permitId, owner) =>
+        this.retainPublicEgressRelease(personId, permitId, owner),
+    );
+    let failed: { error: unknown } | undefined;
+    try {
+      if (permit.disposition === 'deferred')
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      await this.activate(permit, transfer, signal);
+    } catch (error) {
+      failed = { error };
+    }
+    try {
+      await this.finish(permit);
+    } catch (cleanup) {
+      const owned = this.owned(permit);
+      if (owned.joined && !owned.unsafe)
+        this.retainPublicEgressRelease(personId, permit.permitId, owned.owner);
+      if (failed)
+        throw new AggregateError(
+          [failed.error, cleanup],
+          'PUBLIC_EGRESS_CLEANUP_INCOMPLETE',
+          {
+            cause: failed.error,
+          },
+        );
+      throw cleanup;
+    }
+    if (failed) throw failed.error;
+  }
+
+  private retainPublicEgressRelease(
+    personId: string,
+    permitId: string,
+    owner: string,
+  ) {
+    const releases = this.publicEgressReleases.get(personId) ?? new Map();
+    releases.set(permitId, owner);
+    this.publicEgressReleases.set(personId, releases);
+  }
+
+  async recoverJoinedPublicEgress(personId: string, signal: AbortSignal) {
+    const releases = this.publicEgressReleases.get(personId);
+    if (!releases) return;
+    for (const [permitId, owner] of [...releases]) {
+      await this.releasePermitRecord(
+        personId,
+        'gateway',
+        permitId,
+        owner,
+        signal,
+      );
+      releases.delete(permitId);
+    }
+    if (!releases.size && this.publicEgressReleases.get(personId) === releases)
+      this.publicEgressReleases.delete(personId);
+  }
+
+  private async admitBound(
+    binding: PersonVmBinding,
+    input: { participant: PersonVmAdmissionParticipant; operationId: string },
+    signal: AbortSignal,
+    authorize: OwnedPermit['authorize'],
+    retainUnknown?: (permitId: string, owner: string) => void,
+  ) {
     const owner = randomUUID(),
       permitId = randomUUID();
+    let inserting = false;
     let issued: {
       disposition: 'queued' | 'deferred';
       source: string;
@@ -622,6 +712,7 @@ export class PersonVmAdmissionHost
             await tx.sql`delete from person_vm_admission_permits where permit_id=${previous.permit_id}`;
           }
           const freeze = frozen ? tx.state.round!.lease : null;
+          inserting = true;
           await tx.sql`insert into person_vm_admission_permits(permit_id,person_id,vm_id,organization_id,instance_id,
         lease_epoch,participant,operation_id,owner_ref,disposition,freeze_id,freeze_version) values(${permitId},${binding.personId},${binding.vmId},
         ${binding.organizationId},${binding.instanceId},${binding.leaseEpoch},${input.participant},${input.operationId},${owner},${disposition},${freeze?.freezeId ?? null},${freeze?.version ?? null})`;
@@ -630,7 +721,8 @@ export class PersonVmAdmissionHost
         },
       );
     } catch (error) {
-      this.unacknowledged.add(owner);
+      if (inserting && retainUnknown) retainUnknown(permitId, owner);
+      else if (!retainUnknown) this.unacknowledged.add(owner);
       throw error;
     }
     const { disposition, source, freeze } = issued;
@@ -646,7 +738,7 @@ export class PersonVmAdmissionHost
       signal: controller.signal,
     });
     this.permits.set(permit, {
-      context,
+      authorize,
       operationId: input.operationId,
       owner,
       source,
@@ -717,7 +809,7 @@ export class PersonVmAdmissionHost
       };
       let entered = false;
       try {
-        await this.authorize(owned.context, permit.binding, operationSignal);
+        await owned.authorize(permit.binding, operationSignal);
         await this.options.shared.transaction(
           permit.binding.personId,
           operationSignal,
@@ -809,15 +901,31 @@ export class PersonVmAdmissionHost
     owned: OwnedPermit,
     signal: AbortSignal,
   ) {
-    await this.options.shared.transaction(
+    return this.releasePermitRecord(
       permit.binding.personId,
+      permit.participant,
+      permit.permitId,
+      owned.owner,
+      signal,
+    );
+  }
+
+  private async releasePermitRecord(
+    personId: string,
+    participant: PersonVmAdmissionParticipant,
+    permitId: string,
+    owner: string,
+    signal: AbortSignal,
+  ) {
+    await this.options.shared.transaction(
+      personId,
       signal,
       async (tx) => {
         const records =
-          await tx.sql`delete from person_vm_admission_permits where permit_id=${permit.permitId}
-          and owner_ref=${owned.owner} returning disposition`;
+          await tx.sql`delete from person_vm_admission_permits where permit_id=${permitId}
+          and owner_ref=${owner} returning disposition`;
         if (records.length)
-          tx.touch(permit.participant, records[0]!.disposition !== 'deferred');
+          tx.touch(participant, records[0]!.disposition !== 'deferred');
       },
       true, // Actual join may finish after an authorized VM tombstone; never admit there.
     );
@@ -1271,6 +1379,7 @@ export class PersonVmAdmissionHost
       !sameBinding(bindingOf(row), binding)
     )
       return undefined;
+    await this.recoverJoinedPublicEgress(binding.personId, signal);
     const observations = await this.options.shared.transaction(
       binding.personId,
       signal,

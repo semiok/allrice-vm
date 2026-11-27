@@ -1120,6 +1120,11 @@ export function createProductionPersonVmHost(input: {
         authority: egressSource.authority,
         policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
+        publicProxy: ['127.0.0.1', '::1'].includes(
+          providers.configuration.egress?.listenAddress ?? '',
+        )
+          ? admission.withPublicEgress.bind(admission)
+          : undefined,
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
@@ -1579,6 +1584,10 @@ export function createProductionPersonVmHost(input: {
             reopen = vm.fenceWorkerStartup();
             await vm.settleRetainedStartupMounts(signal);
             for (const { binding } of ownedVms.values()) {
+              await admission.recoverJoinedPublicEgress(
+                binding.personId,
+                signal,
+              );
               await vm.recoverStoppedEntryWork(binding, signal);
               await vm.assertWorkerShutdownSafe(binding, signal);
             }

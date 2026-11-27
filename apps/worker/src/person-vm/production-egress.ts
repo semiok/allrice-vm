@@ -44,7 +44,11 @@ const code = (error: unknown, value: string) =>
 const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
 const unavailable = () => new EgressError('UNAVAILABLE');
 const accessSchema = z.object({
-  access: z.object({ origin: z.string(), capability: z.string() }),
+  access: z.object({
+    origin: z.string(),
+    capability: z.string(),
+    publicProxyUrl: z.string().optional(),
+  }),
 });
 async function finish<T>(
   file: FileHandle,
@@ -253,7 +257,10 @@ export function createProductionEgressInstallation(
       signal.throwIfAborted();
     },
   };
-  async function readAccess(binding: PersonVmBinding, signal: AbortSignal) {
+  async function readInstalledAccess(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
     check(signal);
     const entry = entries.get(keyOf(binding));
     if (!entry?.ready) throw unavailable();
@@ -293,6 +300,19 @@ export function createProductionEgressInstallation(
           !/^[A-Za-z0-9_-]+$/.test(access.capability)
         )
           throw unavailable();
+        if (access.publicProxyUrl !== undefined) {
+          const proxy = URL.parse(access.publicProxyUrl);
+          if (
+            !proxy ||
+            proxy.origin !== access.origin ||
+            proxy.username !== 'vm-proxy' ||
+            !/^[A-Za-z0-9_-]{43}$/.test(proxy.password) ||
+            proxy.pathname !== '/' ||
+            proxy.search ||
+            proxy.hash
+          )
+            throw unavailable();
+        }
         signal.throwIfAborted();
         if (!entry.ready || entries.get(entry.key) !== entry)
           throw unavailable();
@@ -301,11 +321,15 @@ export function createProductionEgressInstallation(
       entry,
     );
   }
+  async function readAccess(binding: PersonVmBinding, signal: AbortSignal) {
+    const { origin, capability } = await readInstalledAccess(binding, signal);
+    return { origin, capability };
+  }
   const memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'] = async (
     binding,
     signal,
   ) => {
-    const access = await readAccess(binding, signal);
+    const access = await readInstalledAccess(binding, signal);
     const entry = entries.get(keyOf(binding));
     if (!entry?.ready) throw unavailable();
     return own(
@@ -326,11 +350,15 @@ export function createProductionEgressInstallation(
         const hostname = url.hostname.startsWith('[')
           ? url.hostname.slice(1, -1)
           : url.hostname;
-        const contentsByName = {
-          npmrc: `registry=${access.origin}/npm/\n//${url.host}/:_authToken=${access.capability}\n`,
-          netrc: `machine ${hostname} login egress password ${access.capability}\n`,
-          'pip.conf': `[global]\nindex-url=${access.origin}/python/simple/\ntrusted-host=${hostname}\n`,
-        };
+        const contentsByName: Record<string, string> = access.publicProxyUrl
+          ? {
+              'public-proxy.conf': `${access.publicProxyUrl}\n${url.hostname}\n`,
+            }
+          : {
+              npmrc: `registry=${access.origin}/npm/\n//${url.host}/:_authToken=${access.capability}\n`,
+              netrc: `machine ${hostname} login egress password ${access.capability}\n`,
+              'pip.conf': `[global]\nindex-url=${access.origin}/python/simple/\ntrusted-host=${hostname}\n`,
+            };
         const files = Object.entries(contentsByName).map(
           ([name, contents]) => ({
             path: posix.join(directory, name),
@@ -338,11 +366,18 @@ export function createProductionEgressInstallation(
             mode: 0o600,
           }),
         );
-        const env = {
-          npm_config_userconfig: posix.join(directory, 'npmrc'),
-          NETRC: posix.join(directory, 'netrc'),
-          PIP_CONFIG_FILE: posix.join(directory, 'pip.conf'),
-        };
+        const env: Record<string, string> = access.publicProxyUrl
+          ? {
+              ALLRICE_PUBLIC_PROXY_CONFIG: posix.join(
+                directory,
+                'public-proxy.conf',
+              ),
+            }
+          : {
+              npm_config_userconfig: posix.join(directory, 'npmrc'),
+              NETRC: posix.join(directory, 'netrc'),
+              PIP_CONFIG_FILE: posix.join(directory, 'pip.conf'),
+            };
         if (
           files.some((file) =>
             plan.files.some((old) => old.path === file.path),

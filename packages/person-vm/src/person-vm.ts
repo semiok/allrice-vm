@@ -2467,6 +2467,11 @@ export class PersonVmService
     admissionOwned = false,
   ) {
     if (!admissionOwned) {
+      if (lease.row)
+        await this.admissionHost?.recoverJoinedPublicEgress(
+          lease.row.personId,
+          signal,
+        );
       await this.admissionHost?.recoverStoppedEntryPermits(lease, signal);
       await lease.assertAdmissionOpen(true);
     }
@@ -2491,6 +2496,10 @@ export class PersonVmService
   ) {
     const binding = bindingOf(row);
     if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
+    await this.admissionHost?.recoverJoinedPublicEgress(
+      binding.personId,
+      signal,
+    );
     await lease.assertAdmissionOpen(true);
     if (
       !this.admissionShared ||

@@ -643,14 +643,17 @@ export async function setupNativeWebFixture(
     lifetime,
     child,
     observeNativeStartup,
-    async restartRetained() {
-      if (
-        !isolateProfile ||
-        (child.exitCode === null && child.signalCode === null)
-      )
+    async restartRetained(nextModel?: NativeWebModelAdapter) {
+      if (child.exitCode === null && child.signalCode === null)
         throw Error('The original isolated Host must stop before restart');
       const next = launchOnTestHost(
-        await prepareNativeWebLaunch(configuration, binding, profile),
+        await prepareNativeWebLaunch(
+          configuration,
+          binding,
+          profile,
+          undefined,
+          nextModel,
+        ),
       );
       await stage(next);
       const restarted = await openNativeWebOwner({

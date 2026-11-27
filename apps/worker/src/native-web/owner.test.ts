@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { composeEntries } from '@deepseek-ai/dsh-app-boot';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeWebTools from '@deepseek-ai/dsh-tool-web';
+import Tools from '@deepseek-ai/dsh-tools';
+import Web from '@deepseek-ai/dsh-web';
 import {
   NativeWebGuestLaunchUnacknowledged,
   PersonVmError,
@@ -16,6 +22,10 @@ import {
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
+import {
+  nativeSearchToolPatches,
+  nativeWebBundlePatches,
+} from './search-tools.js';
 import { nativeSetupError } from './startup-diagnostic.js';
 import * as webTransport from './transport.js';
 
@@ -224,6 +234,95 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
       ),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
+
+it.each([false, true])(
+  'advertises native Search only with a host provider (%s) and still executes WebFetch',
+  async (webSearchEnabled) => {
+    const layers = nativeWebBundlePatches();
+    const patches = nativeSearchToolPatches(webSearchEnabled);
+    const before = composeEntries(layers);
+    // prepareNativeWebLaunch writes this overlay as JSON in the guest.
+    const composed = composeEntries([
+      ...layers,
+      JSON.parse(JSON.stringify(patches)),
+    ]);
+    const presetIds = ['preset-standard', 'preset-ptc', 'preset-cordis'];
+    expect(patches.map(({ id }) => id)).toEqual(
+      webSearchEnabled ? [] : presetIds,
+    );
+    expect(composed.find(({ id }) => id === 'tool-web')?.disabled).toBe(true);
+    for (const id of presetIds) {
+      const original = before.find((entry) => entry.id === id)?.config;
+      const actual = composed.find((entry) => entry.id === id)?.config;
+      expect(actual).toEqual({
+        ...original,
+        plugins: original.plugins.map(
+          (plugin: { name: string; config?: Record<string, unknown> }) =>
+            !webSearchEnabled && plugin.name === '@deepseek-ai/dsh-tool-web'
+              ? { ...plugin, config: { ...plugin.config, search: false } }
+              : plugin,
+        ),
+      });
+    }
+    const standard = composed.find(
+      ({ id }) => id === 'preset-standard',
+    )?.config;
+    const config = standard.plugins.find(
+      (plugin: { id: string }) => plugin.id === 'tool-web',
+    )?.config;
+    expect(config).toEqual({
+      fetch: true,
+      searchTimeoutMs: 60_000,
+      ...(webSearchEnabled ? {} : { search: false }),
+    });
+
+    const ctx = new Context();
+    try {
+      await ctx.plugin(SystemPrompt);
+      await ctx.plugin(Tools);
+      await ctx.plugin(Web, {
+        searchProvider: 'deepseek-official',
+        fetchProvider: 'http',
+      });
+      if (webSearchEnabled)
+        ctx.web.registerSearchProvider({
+          id: 'deepseek-official',
+          available: () => true,
+          search: async () => ({ sources: [], truncated: false }),
+        });
+      ctx.web.registerFetchProvider({
+        id: 'http',
+        available: () => true,
+        fetch: async ({ url }) => ({
+          url,
+          statusCode: 200,
+          body: { kind: 'text', content: 'fixture fetch' },
+          truncated: false,
+        }),
+      });
+      await ctx.plugin(
+        NativeWebTools,
+        config as Parameters<typeof NativeWebTools.apply>[1],
+      );
+      const assembled = await ctx.systemPrompt.assemble();
+      expect(assembled.tools.map(({ name }) => name).sort()).toEqual(
+        webSearchEnabled ? ['web_fetch', 'web_search'] : ['web_fetch'],
+      );
+      const fetch = await ctx.tools.execute({
+        callId: ToolCallId('fixture-fetch'),
+        name: 'web_fetch',
+        arguments: { url: 'https://example.test/' },
+        signal: new AbortController().signal,
+      });
+      expect(fetch).toMatchObject({
+        isError: false,
+        value: { statusCode: 200 },
+      });
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  },
+);
 
 it('真实Web启动缺有界auth capability时先拒绝，不launch或假ready', async () => {
   const launch = {

@@ -8,6 +8,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../database/src/runtime.fixture.ts';
 import { createPostgresPersonVmScheduledWakeStore } from '../../database/src/capabilities/person-vm-scheduled-wake.ts';
@@ -1713,6 +1714,91 @@ suite(
       ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
       await h.host.participant('gateway').thaw(lease, signal());
       await h.peer.participant('entry').thaw(lease, signal());
+    });
+
+    it('keeps public egress visible to a peer until its transfer joins and refuses new traffic during freeze', async () => {
+      const h = await setup(),
+        entered = latch(),
+        release = latch();
+      const transfer = own(
+        h.host.withPublicEgress(h.binding, signal(), async () => {
+          entered.resolve();
+          await release.promise;
+        }),
+      );
+      await entered.promise;
+      const lease = await frozen(h);
+      expect(
+        await h.peer.participant('gateway').observe(h.binding, signal()),
+      ).toMatchObject({ active: 1, queued: 0, deferred: 0 });
+      const forbidden = vi.fn(async () => {});
+      await expect(
+        h.peer.withPublicEgress(h.binding, signal(), forbidden),
+      ).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+      expect(forbidden).not.toHaveBeenCalled();
+      expect(await counts(h.rc.actor.id)).toEqual([
+        { disposition: 'active', count: 1 },
+      ]);
+      h.states.set(h.binding.vmId, 'stopped');
+      await expect(
+        h.host.stopFrozen(h.rc, lease, signal()),
+      ).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
+      expect(h.log).not.toContain('native:stop');
+      release.resolve();
+      await transfer;
+      expect(await counts(h.rc.actor.id)).toEqual([]);
+      await h.host.participant('gateway').thaw(lease, signal());
+      await h.peer.participant('entry').thaw(lease, signal());
+    });
+
+    it('recovers the exact public permit after a committed admit loses its acknowledgement', async () => {
+      let armed = false;
+      const source = factory('proxy-lost-ack', async () => {
+        if (!armed) return;
+        armed = false;
+        throw Object.assign(new Error('public admit COMMIT reply lost'), {
+          code: 'ECONNRESET',
+        });
+      });
+      const h = await setup(source.open);
+      await h.host.participant('gateway').observe(h.binding, signal());
+      const transfer = vi.fn(async () => {});
+      armed = true;
+      await expect(
+        h.host.withPublicEgress(h.binding, signal(), transfer),
+      ).rejects.toBeDefined();
+      expect(transfer).not.toHaveBeenCalled();
+      const active = [{ disposition: 'queued', count: 1 }];
+      expect(await counts(h.rc.actor.id)).toEqual(active);
+      await h.peer.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual(active);
+      await h.host.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual([]);
+    });
+
+    it('releases a joined public transfer after a temporary finish write failure', async () => {
+      const h = await setup();
+      await db.unsafe(
+        "create function fixture_block_delete() returns trigger language plpgsql as $$ begin raise exception 'fixture release rejected'; end; $$",
+      );
+      await db.unsafe(
+        'create trigger fixture_block_delete before delete on person_vm_admission_permits for each row execute function fixture_block_delete()',
+      );
+      const transfer = vi.fn(async () => {});
+      await expect(
+        h.host.withPublicEgress(h.binding, signal(), transfer),
+      ).rejects.toThrow('fixture release rejected');
+      expect(transfer).toHaveBeenCalledOnce();
+      expect(await counts(h.rc.actor.id)).toEqual([
+        { disposition: 'active', count: 1 },
+      ]);
+      await db.unsafe(
+        'drop trigger fixture_block_delete on person_vm_admission_permits',
+      );
+      await h.host.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual([]);
     });
 
     it('two independent clients linearize ordinary admission against freeze, never lose a queue to deferred', async () => {

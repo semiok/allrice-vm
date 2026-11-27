@@ -4,6 +4,20 @@ export const DSH_SANDBOX_ROOT = '/usr/local/lib/allrice-sandbox';
 // Replace PATH inside the guest, then exec the fixed Node binary in place.
 export const launchDshSandbox = 'PATH="$1"; export PATH; shift; exec "$@"';
 
+// This wrapper runs after the sealed memory launcher and reads data only.
+export const launchDshPublicProxy = String.raw`
+set -eu
+{
+  IFS= read -r proxy_url
+  IFS= read -r proxy_bypass
+} < "$ALLRICE_PUBLIC_PROXY_CONFIG"
+export http_proxy="$proxy_url" HTTP_PROXY="$proxy_url"
+export https_proxy="$proxy_url" HTTPS_PROXY="$proxy_url"
+export no_proxy="localhost,127.0.0.1,[::1],$proxy_bypass"
+export NO_PROXY="$no_proxy"
+exec "$@"
+`;
+
 /** Run inside the VM over the existing managed bootstrap job protocol. */
 export const prepareDshSandbox = String.raw`
 const fs = require('node:fs');

@@ -21,6 +21,7 @@ import {
   type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
+import { nativeSearchToolPatches } from './search-tools.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -56,6 +57,8 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  historicalModels?: readonly LlmResolvedModelInfo[];
+  webSearchEnabled?: boolean;
 }>;
 
 async function managedModelFiles(directory: string, cliPath: string) {
@@ -189,6 +192,13 @@ export async function prepareNativeWebLaunch(
     'utf8',
   );
   const modelOwner = `${directory}/owner-with-model.mjs`;
+  const searchPlugin = `${directory}/allrice-managed-web-search.mjs`;
+  const searchSource = modelAdapter
+    ? await readFile(
+        new URL('../../dsh/allrice-managed-web-search.mjs', import.meta.url),
+        'utf8',
+      )
+    : undefined;
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
@@ -205,14 +215,27 @@ export async function prepareNativeWebLaunch(
               path: modelOwner,
               mode: 0o600,
               contents: `import { applyNativeWebOwner } from './owner.mjs';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+import { apply as applyManagedSearch, observeManagedSearchCalls } from './allrice-managed-web-search.mjs';
 export { inject, name } from './owner.mjs';
 export function apply(ctx, config) {
-  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter);
+  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter, {
+    async applyManagedSearch(scope, settings) {
+      const require = createRequire(settings.cliPath);
+      const { WebError } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-web')).href);
+      return applyManagedSearch(scope, settings, WebError);
+    },
+    observeManagedSearchCalls,
+  });
 }
 `,
             },
           ]
+        : []),
+      ...(searchSource
+        ? [{ path: searchPlugin, contents: searchSource, mode: 0o600 }]
         : []),
       ...modelFiles,
       { path: principalPlugin, contents: principalSource, mode: 0o600 },
@@ -253,6 +276,7 @@ export function apply(ctx, config) {
                         modelAdapter: {
                           ...modelAdapter,
                           id: auth.modelAdapterId,
+                          cliPath: config.cliPath,
                         },
                       }
                     : {}),
@@ -273,6 +297,10 @@ export function apply(ctx, config) {
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },
+                { id: 'web-search-deepseek', disabled: true },
+                ...nativeSearchToolPatches(
+                  modelAdapter.webSearchEnabled === true,
+                ),
                 {
                   id: 'agent-default-model',
                   config: {

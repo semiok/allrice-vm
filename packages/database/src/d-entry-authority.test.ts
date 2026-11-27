@@ -103,6 +103,51 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('fences native page follow synchronously on matching authority and VM hints', async () => {
+    const watcher = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      new AbortController().signal,
+      feed(),
+    );
+    try {
+      const fenced = vi.fn();
+      const detach = watcher.observation!.subscribe(fenced);
+      const client = state.clients[0]!;
+      const hint = (table: string, id: string) =>
+        client.emit('notification', {
+          channel: 'allrice_d_entry_authority',
+          payload: JSON.stringify({
+            schema: 'isolated',
+            table,
+            id,
+            personId: identity.personId,
+            organizationId: identity.organizationId,
+            workspaceId: identity.workspaceId,
+          }),
+        });
+      hint('allrice_sessions', randomUUID());
+      expect(fenced).not.toHaveBeenCalled();
+      const before = state.identity.mock.calls.length;
+      hint('allrice_sessions', context.sessionId);
+      expect(fenced).toHaveBeenCalledOnce();
+      expect(state.identity).toHaveBeenCalledTimes(before);
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      expect(fenced).toHaveBeenCalledTimes(2);
+      detach();
+      hint('allrice_sessions', context.sessionId);
+      expect(fenced).toHaveBeenCalledTimes(2);
+      client.emit('end');
+      expect(watcher.revoked.aborted).toBe(true);
+    } finally {
+      await watcher.close();
+    }
+  });
+
   it('distinguishes the closed original ticket observer from revoked authority during a thread observation', async () => {
     const source = feed();
     const observed = deferred();

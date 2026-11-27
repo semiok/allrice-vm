@@ -12,6 +12,7 @@ import {
   type ResolveProductionDEntrySendRoute,
 } from './production-dentry-source.js';
 import { createProductionEgressAuthority } from './production-egress-authority.js';
+import { createHostSearchProvider } from './production-web-search.js';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
 import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
@@ -46,11 +47,17 @@ export interface ProductionNativeModelExecution {
     input: {
       route: CodexRuntime['route'];
       routeRevoked: AbortSignal;
-      readModelInfo: CodexRuntime['readModelInfo'];
+      readModelMetadata: CodexRuntime['readModelMetadata'];
       assertRouteCurrent: CodexRuntime['assertCurrent'];
       confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
+      webSearch?: {
+        provider: NonNullable<ReturnType<typeof createHostSearchProvider>>;
+        bind: ReturnType<
+          typeof createProductionEgressAuthority
+        >['bindWebSearch'];
+      };
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
@@ -91,15 +98,19 @@ export function createProductionPersonVmSources(
           modelRoute: codex.route,
           lifetime,
         });
+        const provider = createHostSearchProvider(process.env.DEEPSEEK_API_KEY);
         native = await execution.attach(host, {
           route: codex.route,
           routeRevoked: codex.revoked,
-          readModelInfo: codex.readModelInfo,
+          readModelMetadata: codex.readModelMetadata,
           assertRouteCurrent: codex.assertCurrent,
           confirmTransportStopped: codex.confirmTransportStopped,
           bindReference: (call, signal) =>
             egress.bindModelCall(call, signal, 'model-reference'),
           issueCall: calls.issue,
+          ...(provider
+            ? { webSearch: { provider, bind: egress.bindWebSearch } }
+            : {}),
         });
         const owned = native;
         lifetime.throwIfAborted();

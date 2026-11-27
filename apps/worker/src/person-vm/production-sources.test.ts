@@ -68,7 +68,11 @@ function fixture() {
   const lifetime = new AbortController();
   const guest = new AbortController();
   const codex = new AbortController();
-  const issued = { ...modelBinding(), provider: 'openai-codex' as const };
+  const issued = {
+    ...modelBinding(),
+    provider: 'openai-codex' as const,
+    model: 'gpt-6.2-sol' as const,
+  };
   const workspaceId = randomUUID();
   issued.context.workspaceId = workspaceId;
   const candidate = {
@@ -94,10 +98,13 @@ function fixture() {
   io.codex.mockResolvedValue({
     revoked: codex.signal,
     route,
-    readModelInfo: vi.fn(async () => ({
-      id: route.model,
-      name: route.model,
-      provider: route.provider,
+    readModelMetadata: vi.fn(async () => ({
+      modelInfo: {
+        id: route.model,
+        name: route.model,
+        provider: route.provider,
+      },
+      historicalModels: [],
     })),
     scopeStream: undefined,
     transport: {
@@ -120,6 +127,7 @@ function fixture() {
   io.egress.mockReturnValue({
     authority: { context: vi.fn(), allow: vi.fn() },
     bindModelCall,
+    bindWebSearch: vi.fn(),
   });
   const nativeClose = vi.fn(async () => {});
   const authority = {

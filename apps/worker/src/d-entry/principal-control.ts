@@ -4,15 +4,17 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Subagents } from '@deepseek-ai/dsh-subagent/remote';
-import type {
-  RemoteStreamHandle,
-  TypertSchema,
+import {
+  RemoteError,
+  type RemoteStreamHandle,
+  type TypertSchema,
 } from '@deepseek-ai/dsh-typert-protocol';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   DEntryScopeIssueSchema,
   type DEntryPageInput,
   type DEntryPageNativeCall,
+  type DEntryPageNativeEnd,
   type DEntryPageNativeError,
   type DEntryPageNativeItem,
   type DEntryPrincipalActivity,
@@ -26,7 +28,10 @@ import {
 } from '@allrice/d-entry-principal/types';
 
 type StreamFrame =
-  DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError;
+  | DEntryScopedStreamFrame
+  | DEntryPageNativeItem
+  | DEntryPageNativeError
+  | DEntryPageNativeEnd;
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: unknown) => void;
@@ -300,6 +305,7 @@ export function createDEntryPrincipalControl(
         joined: Promise<void> | undefined;
       const children = new Set<Relay<StreamFrame>>();
       const operations = new Set<Promise<unknown>>();
+      const follows = new Map<string, AbortController>();
       let detachRun = () => {};
       let published = false;
       let terminalDispatched = false;
@@ -337,6 +343,19 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'follow-revoked' && published) {
+                  follows.get(frame.followId)?.abort(
+                    new RemoteError(
+                      'remote-access/denied',
+                      'Native session follow unavailable',
+                      {
+                        action: 'session/follow',
+                        reason: 'session-changed',
+                      },
+                    ),
+                  );
+                  return false;
+                }
                 if (frame.type === 'revoked' && published) {
                   revoked.abort(Error('PRINCIPAL_SCOPE_REVOKED'));
                   return false;
@@ -572,17 +591,36 @@ export function createDEntryPrincipalControl(
                 };
               },
               streamPage(call, active) {
-                const child = stream(call, active);
+                const followId = call.followId;
+                const follow = followId ? new AbortController() : undefined;
+                const child = stream(
+                  call,
+                  follow ? AbortSignal.any([active, follow.signal]) : active,
+                );
+                if (followId && follow) follows.set(followId, follow);
                 return {
+                  revoked: follow?.signal,
                   send: child.send,
                   async *[Symbol.asyncIterator]() {
-                    let failure: DEntryPageNativeError['error'] | undefined;
-                    for await (const frame of child) {
-                      if (failure || frame.type === 'item') throw unknown();
-                      if (frame.type === 'page-error') failure = frame.error;
-                      else yield frame;
+                    try {
+                      let failure: DEntryPageNativeError['error'] | undefined;
+                      for await (const frame of child) {
+                        if (failure || frame.type === 'item') throw unknown();
+                        if (frame.type === 'page-end') {
+                          if (!follow) throw unknown();
+                          break;
+                        }
+                        if (frame.type === 'page-error') {
+                          // Iterator close still joins the real child. Keep the
+                          // native failure primary if that join also fails.
+                          if (follow) throw frame.error;
+                          failure = frame.error;
+                        } else yield frame;
+                      }
+                      if (failure) throw failure;
+                    } finally {
+                      if (followId) follows.delete(followId);
                     }
-                    if (failure) throw failure;
                   },
                 };
               },

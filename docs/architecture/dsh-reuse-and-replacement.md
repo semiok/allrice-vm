@@ -12,6 +12,8 @@ DSH 不拥有 SaaS 当前本人/企业、受管VM instance/epoch、员工release
 
 升级须核公开消息/stream/replay词汇、pi-ai HTTP transport及fetch接缝、原生私有consumer close语义、wire终止/usage字段和缓存子集口径。上游若能直接提供host可信身份/逐HTTP attempt/全局person准入合同，可替换相应薄适配；租户授权和实际费用审计不能随替换删除。当前fixture证明loopback HTTP文本/工具往返、失败/取消/重连/8路隔离；数据库、多进程恢复及真实VM/模型验收另列，不把fixture当上线通过。完整owner合同见[model-gateway.md](model-gateway.md)。MET-225待主会话登记同名行。
 
+**个人 VM 的联网搜索。** `allrice-managed-web-search-v1` 复用 rc.2 公开 `ctx.web.registerSearchProvider`、`deepseek-official` 和宿主的原生 DeepSeek provider。原有工具、输出与界面沿用 DSH。宿主通过现有 VM 网关、原生会话和准入接口校验当前人、组织和 VM 代次，随授权撤销终止请求。宿主使用 `DEEPSEEK_API_KEY`，VM 只获现有网关 capability。配额当前为单宿主进程每人每分钟 10 次，进程重启重置。这段接入只提供 Search，个人 VM 的出站规则沿用原配置。
+
 ## MET-221：只用一代 DSH
 
 2026-10-25 起，AllRice 任何时候只依赖一代 DSH（当前 `0.2.1-rc.2` / `687f282`）。升级时 Worker、Web、Bridge、Office 与维护工具一次性换到新一代，不保留旧包、旧补丁或独立的旧版服务。

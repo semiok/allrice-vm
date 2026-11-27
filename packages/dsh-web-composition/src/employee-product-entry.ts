@@ -81,11 +81,16 @@ function boot(
     const identity = readEmployeeDocument(container.dataset);
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
-    installEmployeeDraftStorage(identity);
-    const document = nativeProfileDocument(container, close, (error) => {
-      fail(error);
-      close();
-    });
+    const registerDraft = installEmployeeDraftStorage(identity);
+    const document = nativeProfileDocument(
+      container,
+      close,
+      (error) => {
+        fail(error);
+        close();
+      },
+      registerDraft,
+    );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
     scope.__ALLRICE_D_ENTRY_LIFETIME__ = document.signal;

@@ -9,6 +9,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
+  dEntryRegisteredThreadHeader,
   type DEntryPageOpenedSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
@@ -27,13 +28,19 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it
-  .skipIf(!browserExecutable)
-  .each(['attached', 'unattached', 'stall'] as const)(
+it.skipIf(!browserExecutable).each([
+  'attached',
+  'unattached',
+  'stall',
+  'native-create',
+  // Exercise the Linux web profile on the Mac M5 browser as well as CI.
+  ...(process.platform === 'darwin' ? (['native-create-linux'] as const) : []),
+] as const)(
   'rc.2 workspace/follow and the blank composer (%s)',
   { timeout: 60_000 },
   async (scenario) => {
     const stall = scenario === 'stall';
+    const nativeCreate = scenario.startsWith('native-create');
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -115,10 +122,78 @@ it
     );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       String(row.sessionId) === 'root'
-        ? { ...row, blank: true, cwd: '/work' }
+        ? { ...row, blank: !nativeCreate, cwd: '/work' }
         : row,
     );
-    const life = await open(f);
+    const life = nativeCreate ? undefined : await open(f);
+    const createdThread = randomUUID();
+    const createdNativeId = 'native-created';
+    let documentLoads = 0;
+    let registered = false;
+    const createReplies: unknown[] = [];
+    if (nativeCreate) {
+      const registerFixture = f.registerRoot.getMockImplementation()!;
+      f.registerRoot.mockImplementation(
+        async (context, identity, receipt, active) => {
+          expect(receipt.nativeSessionId).toBe(createdNativeId);
+          const registeredFixture = await registerFixture(
+            context,
+            identity,
+            receipt,
+            active,
+          );
+          const root = {
+            ...registeredFixture,
+            identity: { ...identity, threadId: createdThread },
+            thread: { ...registeredFixture.thread, id: createdThread },
+          };
+          registered = true;
+          f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+            id === createdNativeId ? root : undefined,
+          );
+          const created = f.host.catalog.items.find(
+            ({ sessionId }) => sessionId === createdNativeId,
+          );
+          if (created) Object.assign(created, { cwd: '/work', blank: true });
+          nativeWorkspace.sessionIds.push(createdNativeId);
+          f.host.host.emit('domain/changed', {
+            domain: 'workspace',
+            table: 'workspaces',
+            operation: 'put',
+            key: nativeWorkspace.id,
+            value: {
+              path: nativeWorkspace.path,
+              title: nativeWorkspace.title,
+              sessionIds: [...nativeWorkspace.sessionIds],
+              createdAt: nativeWorkspace.createdAt,
+              updatedAt: nativeWorkspace.updatedAt,
+            },
+          });
+          return root;
+        },
+      );
+    }
+    const shell = nativeCreate
+      ? ((await fromComposition('esbuild').build({
+          stdin: {
+            contents: `import { createRoot } from 'react-dom/client';
+            import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+            createRoot(document.getElementById('shell')).render(<EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+            loader: 'tsx',
+            resolveDir: join(process.cwd(), 'apps/web'),
+          },
+          bundle: true,
+          write: false,
+          outdir: '/employee-entry-native-create',
+          jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+            '.svg': 'dataurl',
+          },
+        })) as { outputFiles: Array<{ path: string; contents: Uint8Array }> })
+      : undefined;
     const unary: string[] = [];
     const startupReplies = new Map<string, unknown>();
     const startupMethods = new Set([
@@ -137,16 +212,49 @@ it
         response
           .writeHead(result.status, {
             'content-type': result.headers.get('content-type')!,
+            ...(result.headers.has(dEntryRegisteredThreadHeader) && {
+              [dEntryRegisteredThreadHeader]: result.headers.get(
+                dEntryRegisteredThreadHeader,
+              )!,
+            }),
           })
           .end(Buffer.from(await result.arrayBuffer()));
       };
       try {
+        if (nativeCreate && url.pathname === '/api/v1/d-entry/native-prewarm')
+          return response.writeHead(204).end();
+        if (nativeCreate && url.pathname === '/api/v1/d-entry/identity')
+          return await copy(Response.json({ identity: f.identity }));
+        if (shell && url.pathname === '/chatflow/4.0')
+          return response
+            .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            .end(
+              '<!doctype html><link rel="stylesheet" href="/shell.css"><div id="shell"></div><script src="/shell.js"></script>',
+            );
+        if (
+          shell &&
+          (url.pathname === '/shell.js' || url.pathname === '/shell.css')
+        ) {
+          const type = extname(url.pathname);
+          return response
+            .writeHead(200, { 'content-type': mime[type]! })
+            .end(
+              shell.outputFiles.find((file) => file.path.endsWith(type))!
+                .contents,
+            );
+        }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(chunk);
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
+          if (nativeCreate && input.endpoint === 'session/create')
+            createReplies.push({
+              status: result.status,
+              ...(await result.clone().json()),
+              thread: result.headers.get(dEntryRegisteredThreadHeader),
+            });
           if (startupMethods.has(input.endpoint))
             startupReplies.set(
               input.endpoint,
@@ -169,7 +277,7 @@ it
           return await copy(
             await f.publish(
               kind,
-              life.scopeId,
+              life?.scopeId ?? url.searchParams.get('scopeId')!,
               Object.fromEntries(url.searchParams),
             ),
           );
@@ -194,10 +302,16 @@ it
             );
           return;
         }
-        if (url.pathname !== '/employee') {
+        if (
+          url.pathname !== '/employee' &&
+          url.pathname !== '/chatflow/4.0/document'
+        ) {
           response.writeHead(404).end();
           return;
         }
+        documentLoads++;
+        const scopeId = life?.scopeId ?? url.searchParams.get('scopeId');
+        if (!scopeId) return response.writeHead(404).end();
         const { identity, selection } = f;
         const version = {
           id: identity.employeeVersionId,
@@ -229,8 +343,8 @@ it
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
-          <script data-scope-id="${life.scopeId}">${initialDocumentLifecycle}</script>
-          <div id="app" data-scope-id="${life.scopeId}" data-thread-id="${selection.threadId}"
+          <script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script>
+          <div id="app" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
@@ -249,6 +363,35 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (nativeCreate) {
+      // rc.2 restores its saved desktop selection before this test's shortcut.
+      await page.addInitScript((linuxProfile) => {
+        if (linuxProfile)
+          Object.defineProperty(navigator, 'platform', {
+            value: 'Linux x86_64',
+          });
+        localStorage.setItem(
+          'dsh.sessions.current',
+          JSON.stringify({ sessionId: 'root' }),
+        );
+        // rc.2 defines this native command on every platform but provides no
+        // default binding for web:linux. Use its own per-profile preferences.
+        localStorage.setItem(
+          'dsh.keybindings.v1',
+          JSON.stringify({
+            schemaVersion: 1,
+            profiles: {
+              'web:linux': {
+                'session.new': {
+                  code: 'Period',
+                  modifiers: ['primary', 'shift'],
+                },
+              },
+            },
+          }),
+        );
+      }, scenario === 'native-create-linux');
+    }
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
     const workspaceBaselines: unknown[] = [];
@@ -295,7 +438,11 @@ it
         });
       });
     }
-    await page.goto(f.origin);
+    await page.goto(
+      nativeCreate
+        ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
+        : f.origin,
+    );
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
       await page.clock.fastForward(30_100);
@@ -358,6 +505,117 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (nativeCreate) {
+      const mark = randomUUID();
+      const frame = page.locator('iframe');
+      await frame.evaluate((node, mark) => {
+        node.dataset.fixtureIdentity = mark;
+      }, mark);
+      await workbench.locator('#app').evaluate((node, mark) => {
+        node.dataset.fixtureDocument = mark;
+      }, mark);
+      const platform = await editor.evaluate(
+        (node) => node.ownerDocument.defaultView!.navigator.platform,
+      );
+      if (scenario === 'native-create-linux')
+        expect(platform).toBe('Linux x86_64');
+      const chord = /darwin|mac|iphone|ipad/iu.test(platform)
+        ? 'Meta+Alt+N'
+        : /win/iu.test(platform)
+          ? 'Control+Alt+N'
+          : 'Control+Shift+Period';
+      try {
+        await editor.press(chord, { timeout: 10_000 });
+        await expect
+          .poll(() => unary.includes('session/create'), { timeout: 15_000 })
+          .toBe(true);
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === createdThread,
+          { timeout: 20_000 },
+        );
+      } catch (error) {
+        throw new Error(
+          JSON.stringify({
+            platform,
+            chord,
+            registered,
+            createReplies,
+            unary,
+            errors,
+            nativeSessions: await workbench
+              .locator('[data-row-key^="session:"]')
+              .evaluateAll((nodes) =>
+                nodes.map((node) => node.getAttribute('data-row-key')),
+              ),
+            text: (
+              await workbench
+                .locator('body')
+                .innerText({ timeout: 1_000 })
+                .catch(() => '')
+            ).slice(0, 450),
+          }),
+          { cause: error },
+        );
+      }
+      const row = workbench.locator(
+        '[data-row-key="session:' + createdThread + '"]',
+      );
+      await row.waitFor({ timeout: 15_000 });
+      await expect
+        .poll(
+          () =>
+            editor.evaluate((node) =>
+              node
+                .closest('[data-conversation-session]')
+                ?.getAttribute('data-conversation-session'),
+            ),
+          { timeout: 10_000 },
+        )
+        .toBe(createdNativeId);
+      const draft = '原生新会话草稿';
+      await editor.fill(draft, { timeout: 15_000 });
+      const draftPrefix =
+        'allrice:d-entry:conversation:v1:' +
+        [
+          f.identity.organizationId,
+          f.identity.personId,
+          f.identity.workspaceId,
+          f.identity.employeeInstanceId,
+        ].join('/') +
+        '/';
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              (key) => localStorage.getItem(key),
+              draftPrefix +
+                createdThread +
+                '/dsh.conversation.' +
+                createdNativeId,
+            ),
+          { timeout: 10_000 },
+        )
+        .toContain(draft);
+      expect(
+        await page.evaluate(
+          (key) => localStorage.getItem(key),
+          draftPrefix +
+            f.selection.threadId +
+            '/dsh.conversation.' +
+            createdNativeId,
+        ),
+      ).toBeNull();
+      expect(await editor.isEditable()).toBe(true);
+      expect(await frame.getAttribute('data-fixture-identity')).toBe(mark);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+      expect(documentLoads).toBe(1);
+      expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      await context.close();
+      return;
+    }
+    if (!life) throw Error('Missing fixture page carrier');
     expect(
       await workbench
         .getByText(/选择一个工作区开始|Choose a workspace to start/)

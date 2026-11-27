@@ -789,6 +789,36 @@ suite(
           });
           await settle(page);
         }
+        const unreadDeliverablesName = '交付成果，5 项新增';
+        const deliverables = native.getByRole('button', {
+          name: unreadDeliverablesName,
+          exact: true,
+        });
+        const unreadDeliveryBadge = deliverables.getByText('5', {
+          exact: true,
+        });
+        await unreadDeliveryBadge.waitFor({ state: 'visible' });
+        const icon = deliverables.locator(':scope > svg');
+        const controlBounds = () =>
+          Promise.all([
+            deliverables.boundingBox(),
+            icon.boundingBox(),
+            unreadDeliveryBadge.boundingBox(),
+          ]);
+        const bounds = await controlBounds();
+        expect(bounds).not.toContain(null);
+        // Stabilize the whole control. A separate layer for only the badge
+        // leaves the adjacent SVG subject to rasterization during reparenting.
+        await native.addStyleTag({
+          content: `button[aria-label=${JSON.stringify(unreadDeliverablesName)}] { will-change: transform; }`,
+        });
+        await settle(native);
+        expect(
+          await deliverables.evaluate(
+            (node) => getComputedStyle(node).willChange,
+          ),
+        ).toBe('transform');
+        expect(await controlBounds()).toEqual(bounds);
         original = await capture(native, 'native-original');
         refStart = await capture(reference, 'reference-start');
         expect(refStart.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
@@ -799,14 +829,8 @@ suite(
           'native-original-repeat-control.json',
           original,
           repeated,
-          'unmodified native repeat',
+          'native repeat with the same deliverables raster control',
         );
-        const unreadDeliveryBadge = native
-          .getByRole('button', {
-            name: '交付成果，5 项新增',
-            exact: true,
-          })
-          .getByText('5', { exact: true });
         fiveUnreadDeliverables = await unreadDeliveryBadge.isVisible();
         expect(fiveUnreadDeliverables).toBe(true);
         const offset = { x: -nativeRoot.x, y: -nativeRoot.y };
@@ -1031,7 +1055,7 @@ suite(
           actualPngs,
           cleanup,
           measuredScope:
-            'One native 1440/light/list/experience panel. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
+            'One native 1440/light/list/experience panel with the deliverables button compositing hint held constant across native captures. Reversible observed pixels under public positioning methods only; discrete sampling, not whole-domain visibility or product repair. Internal compositing/raster cause and full layer diagnostics not assessed. Current baseline required; no historical pixels used.',
           failures: failures.map((error) => ({
             message: String(error),
             stack: error instanceof Error ? error.stack : null,
