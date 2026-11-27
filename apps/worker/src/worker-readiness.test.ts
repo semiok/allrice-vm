@@ -70,6 +70,7 @@ async function host(options: { detail?: string; arrivals?: number } = {}) {
     createServer,
     process,
     makeHealthResponse,
+    personVmDeleteHttp: { handle: async () => false },
     dEntryProfile: { handle: async () => false },
     dEntryPageRpc: { handle: async () => false },
     dEntryHttp: async () => false,

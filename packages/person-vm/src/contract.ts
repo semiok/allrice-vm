@@ -194,6 +194,8 @@ export type PersonVmPrewarmTarget = Readonly<{
   instanceId: string | null;
   leaseEpoch: number;
   restoreRetained?: true;
+  /** Exact fully purged predecessor, only for a fresh VM chosen under lease. */
+  replacesVmId?: string;
 }>;
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
