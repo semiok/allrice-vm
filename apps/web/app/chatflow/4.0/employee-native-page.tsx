@@ -541,7 +541,8 @@ export function EmployeeNativePage({
             selection.employeeInstanceId &&
           selectedEmployee.threadId !== selection.threadId
         ) {
-          const target = (switching = { selection });
+          const target: NonNullable<typeof switching> = { selection };
+          switching = target;
           switchTimer = window.setTimeout(() => {
             if (switching !== target) return;
             switching = undefined;

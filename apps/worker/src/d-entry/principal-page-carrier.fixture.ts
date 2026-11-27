@@ -207,8 +207,8 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     authenticate,
     async watch(_context, selection) {
       const authority = await f.deps.watch();
-      const revoked =
-        selection.threadId && threadRevocations.get(selection.threadId);
+      const { threadId } = DEntrySelectionInputSchema.parse(selection);
+      const revoked = threadId && threadRevocations.get(threadId);
       return revoked
         ? {
             ...authority,

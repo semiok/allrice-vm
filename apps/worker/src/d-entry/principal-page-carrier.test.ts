@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -70,6 +70,102 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   await next.receive();
   await next.receive();
 });
+
+it('replaces the bound root on the same page socket and only the target watch remains live', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  const revoked = f.registerThread(target);
+  const { peer, scopeId, receive } = await open(f);
+  const requestId = randomUUID();
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: {
+      type: 'switch',
+      requestId,
+      threadId: target,
+    },
+  });
+  const switched = await receive('life');
+  expect(switched).toMatchObject({
+    type: 'item',
+    value: {
+      type: 'switched',
+      requestId,
+      threadId: target,
+      nativeSessionId: 'root-' + target,
+    },
+  });
+  const nextScope = switched.value.scopeId as string;
+  expect(nextScope).not.toBe(scopeId);
+  expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+    404,
+  );
+  expect((await f.invokeThread(nextScope, target)).status).toBe(200);
+  expect((await f.invokeThread(nextScope, f.selection.threadId)).status).toBe(
+    404,
+  );
+  const targetClosed = once(peer, 'close');
+  revoked.abort();
+  expect(await receive('life')).toMatchObject({ type: 'error' });
+  await targetClosed;
+  expect((await f.invokeThread(nextScope, target)).status).toBe(404);
+});
+
+it.each(['employee', 'login', 'epoch'] as const)(
+  'refuses native reuse when the %s changes and leaves the exact old scope joinable',
+  async (change) => {
+    const f = await fixture();
+    const target = randomUUID();
+    f.registerThread(target);
+    const { peer, scopeId, receive } = await open(f);
+    if (change === 'employee')
+      f.historyIdentity.mockResolvedValueOnce({
+        ...f.identity,
+        threadId: target,
+        employeeInstanceId: randomUUID(),
+      });
+    if (change === 'login')
+      f.authenticate.mockResolvedValueOnce({
+        ...f.context,
+        sessionId: randomUUID(),
+      });
+    if (change === 'epoch')
+      f.deps.owners.resolve.mockResolvedValueOnce({
+        ...f.owner,
+        receipt: {
+          ...f.owner.receipt,
+          binding: { ...f.binding, leaseEpoch: 2 },
+        },
+      });
+    const requestId = randomUUID();
+    send(peer, {
+      type: 'item',
+      streamId: 'life',
+      value: {
+        type: 'switch',
+        requestId,
+        threadId: target,
+      },
+    });
+    expect(await receive('life')).toMatchObject({
+      type: 'item',
+      value: {
+        type: 'switch-unavailable',
+        requestId,
+      },
+    });
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+      200,
+    );
+    closePage(peer);
+    expect(await receive('life')).toMatchObject({
+      value: { type: 'closed', scopeId },
+    });
+    expect(await receive('life')).toMatchObject({ type: 'end' });
+  },
+);
 
 it('joins shared resource guards before releasing the page admission', async () => {
   const f = await fixture();

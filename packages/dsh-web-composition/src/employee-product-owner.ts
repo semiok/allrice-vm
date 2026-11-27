@@ -126,6 +126,7 @@ export function installEmployeeProductOwner(ctx: Context) {
           | undefined;
         const update = () => {
           if (!pending || signal.aborted) return;
+          const request = pending;
           const generation = native.connection.generation.getSnapshot();
           if (!generation || generation === pending.oldGeneration) return;
           const root = native.sessions.list
@@ -136,6 +137,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             pending.opened = true;
             native.uiWorkspace.openSession(root);
           }
+          if (pending !== request) return;
           if (native.sidebarRight.mounted.getSnapshot() !== root) return;
           const next = pending.scope;
           pending = undefined;
