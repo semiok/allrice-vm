@@ -262,6 +262,11 @@ it('restores a reference in a new authorized document for the same native sessio
   await expect(
     restored.codec.serialize(chip.ref, restored.lifetime.signal),
   ).resolves.toContain(revision.revisionId);
+  restored.bindOwner(restored.lifetime.signal);
+  await expect(
+    restored.codec.serialize(chip.ref, restored.lifetime.signal),
+  ).rejects.toThrow('引用已失效');
+  expect(restored.fetch).toHaveBeenCalledOnce();
   restored.cleanup.forEach((close) => close());
 });
 
