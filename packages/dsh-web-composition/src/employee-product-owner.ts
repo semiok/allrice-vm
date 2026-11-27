@@ -299,6 +299,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             instanceId: selection.employeeInstanceId,
             employeeName: employee.currentVersion.manifest.name,
             headers: requestHeaders,
+            ownerSignal: signal,
             writes: new Map(),
             readSource: personalEmployeeMemorySourceReader(requestHeaders),
           },

@@ -21,6 +21,7 @@ type Props = {
   employeeName?: string;
   refreshKey?: string;
   lifetimeSignal?: AbortSignal;
+  ownerSignal?: AbortSignal;
   assertCurrent?: () => void;
   active?: boolean;
   writes?: MemoryWriteStore;
@@ -157,7 +158,10 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
         await load();
       throw cause;
     }
-    if (!available()) return;
+    // The document owns write receipts across tab visits. A newer tab in the
+    // same document must refresh even after the tab that sent the write closed.
+    if (!available() && (!props.ownerSignal || props.ownerSignal.aborted))
+      return;
     window.dispatchEvent(
       new CustomEvent('allrice:memory-changed', {
         detail: {

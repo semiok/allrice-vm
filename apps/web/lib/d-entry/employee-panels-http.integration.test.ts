@@ -752,24 +752,53 @@ suite(
             .waitFor();
           expect(sourceReads).toBe(1);
           await memoryDialog
-            .getByRole('button', { name: '确认', exact: true })
+            .getByRole('button', { name: '关闭', exact: true })
             .click();
-          await memoryPane
-            .getByRole('region', { name: '生效中' })
-            .getByText(memory.summary, { exact: true })
-            .waitFor();
-          await page
-            .getByRole('button', { name: '关闭记忆', exact: true })
-            .click();
-          await memoryPane.waitFor({ state: 'detached' });
-          expect(await draft.inputValue()).toBe('未发送的原对话草稿');
-          await openMemory.click();
-          await memoryPane
-            .getByRole('region', { name: '生效中' })
-            .getByText(memory.summary, { exact: true })
-            .waitFor();
-          // The native owner returns to the same selected document and form.
-          expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+          const confirmation = `**/api/v1/memories/${memory.id}/promote?*`;
+          let releaseConfirmation!: () => void;
+          const heldConfirmation = new Promise<void>((done) => {
+            releaseConfirmation = done;
+          });
+          await page.route(
+            confirmation,
+            async (route) => {
+              await heldConfirmation;
+              await route.continue();
+            },
+            { times: 1 },
+          );
+          try {
+            await Promise.all([
+              page.waitForRequest((request) =>
+                new URL(request.url()).pathname.endsWith(
+                  `/${memory.id}/promote`,
+                ),
+              ),
+              pending
+                .getByRole('button', { name: '确认', exact: true })
+                .click(),
+            ]);
+            await page
+              .getByRole('button', { name: '关闭记忆', exact: true })
+              .click();
+            await memoryPane.waitFor({ state: 'detached' });
+            expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+            await openMemory.click();
+            await pending.getByText(memory.summary, { exact: true }).waitFor();
+            releaseConfirmation();
+            await memoryPane
+              .getByRole('region', { name: '生效中' })
+              .getByText(memory.summary, { exact: true })
+              .waitFor();
+            // A receipt from the closed tab invalidates the new tab's list.
+            expect(
+              await pending.getByText(memory.summary, { exact: true }).count(),
+            ).toBe(0);
+            expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+          } finally {
+            releaseConfirmation();
+            await page.unroute(confirmation);
+          }
           await page
             .getByRole('button', { name: '交付成果', exact: true })
             .click();
