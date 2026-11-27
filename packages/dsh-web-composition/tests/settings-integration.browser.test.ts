@@ -366,3 +366,146 @@ suite(
     });
   },
 );
+
+suite('production settings owner in the installed rc.2 workbench', () => {
+  let host: Awaited<ReturnType<typeof startInstalledProfile>>;
+  let browser: Browser;
+  let artifacts: string;
+  const id = (index: number) =>
+    '10000000-0000-4000-8000-' + String(index).padStart(12, '0');
+  const loginSessionId = id(6);
+
+  beforeAll(async () => {
+    artifacts = await createBrowserArtifacts();
+    host = await startInstalledProfile();
+    browser = await chromium.launch({
+      headless: true,
+      ...(process.env.ALLRICE_BROWSER_EXECUTABLE
+        ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
+        : {}),
+    });
+  }, 90_000);
+  afterAll(async () => {
+    try {
+      await browser?.close();
+    } finally {
+      await host?.close();
+    }
+  });
+
+  it('opens the two approved settings entries, calls native General and sends account actions for the exact login', async () => {
+    const context = await browser.newContext({ reducedMotion: 'reduce' });
+    try {
+      const page = await context.newPage();
+      const authenticated = await context.request.get(host.authUrl);
+      expect(authenticated.ok()).toBe(true);
+      const employee = createSidebarFixtureData().employees[1]!;
+      const roster = {
+        organizationId: id(1),
+        workspaceId: id(2),
+        viewerId: id(3),
+        employees: [{ ...employee, id: id(4), employeeId: id(4) }],
+        sessions: [
+          {
+            ...createSidebarFixtureData().sessions[1],
+            id: id(5),
+            ownerId: id(3),
+            employeeInstanceId: id(4),
+            employeeAssignmentId: id(4),
+            executionGeneration: '4.0',
+          },
+        ],
+      };
+      const documentOwner = `<script>const documentLifetime = new AbortController(); window.__ALLRICE_D_ENTRY_LIFETIME__ = documentLifetime.signal; window.revokeTestDocument = () => documentLifetime.abort();</script>
+        <div hidden id="app" data-organization-id="${id(1)}" data-workspace-id="${id(2)}" data-viewer-id="${id(3)}" data-employee-instance-id="${id(4)}" data-thread-id="${id(5)}" data-login-session-id="${loginSessionId}" data-scope-id="${id(7)}" data-native-session-id="session-00000000-0000-4000-8000-000000000036"></div>
+        <script id="allrice-employee-directory" type="application/json">${JSON.stringify(roster).replaceAll('<', '\\u003c')}</script>`;
+      await page.route(host.origin + '/', async (route) => {
+        const upstream = await route.fetch();
+        const html = await upstream.text();
+        expect(html).toContain('</body>');
+        await route.fulfill({
+          response: upstream,
+          body: html.replace('</body>', documentOwner + '</body>'),
+        });
+      });
+      await page.route('**/api/v1/d-entry/panels/**', (route) =>
+        route.fulfill({ status: 403, json: {} }),
+      );
+      await page.route('**/api/v1/auth/password', (route) => {
+        expect(route.request().method()).toBe('POST');
+        expect(route.request().headers()['x-allrice-expected-session-id']).toBe(
+          loginSessionId,
+        );
+        return route.fulfill({ status: 401 });
+      });
+      await page.route('**/api/v1/auth/logout', (route) => {
+        expect(route.request().method()).toBe('POST');
+        expect(route.request().headers()['x-allrice-expected-session-id']).toBe(
+          loginSessionId,
+        );
+        return route.fulfill({ status: 204 });
+      });
+      await page.route(host.origin + '/login', (route) =>
+        route.fulfill({ body: 'synthetic sign-in landing' }),
+      );
+      await page.goto(host.origin);
+      const trigger = page.locator('#chat-sidebar').getByRole('button', {
+        name: '设置',
+        exact: true,
+      });
+      await trigger.click();
+      const pane = page.getByRole('region', { name: '设置', exact: true });
+      await pane.waitFor();
+      expect(await pane.getByRole('button').allTextContents()).toEqual([
+        'AllRice 账号',
+        '通用设置 ↗',
+      ]);
+      await page.screenshot({
+        path: join(artifacts, 'production-settings-1440.png'),
+      });
+      await pane
+        .getByRole('button', { name: '通用设置 ↗', exact: true })
+        .click();
+      const native = page.locator('[data-shortcut-modal="settings"]');
+      await native.waitFor({ state: 'visible' });
+      expect(
+        await native
+          .getByRole('button', { name: '通用设置', exact: true })
+          .count(),
+      ).toBe(1);
+      for (const name of ['我的电脑', '工作方式', '已链接应用'])
+        expect(
+          await native.getByRole('button', { name, exact: true }).count(),
+        ).toBe(0);
+      await page.keyboard.press('Escape');
+      await native.waitFor({ state: 'hidden' });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await pane.waitFor();
+      await page.screenshot({
+        path: join(artifacts, 'production-settings-390.png'),
+      });
+      await pane
+        .getByRole('button', { name: 'AllRice 账号', exact: true })
+        .click();
+      await pane.getByText('修改登录密码', { exact: true }).click();
+      await pane
+        .getByLabel('当前密码', { exact: true })
+        .fill('old-test-password');
+      await pane
+        .getByLabel('新密码', { exact: true })
+        .fill('new-test-password');
+      await pane
+        .getByLabel('确认新密码', { exact: true })
+        .fill('new-test-password');
+      await pane.getByRole('button', { name: '修改密码并重新登录' }).click();
+      await pane
+        .getByRole('alert')
+        .getByText('当前密码不正确，或登录已过期。')
+        .waitFor();
+      await pane.getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.waitForURL(host.origin + '/login');
+    } finally {
+      await context.close();
+    }
+  }, 45_000);
+});

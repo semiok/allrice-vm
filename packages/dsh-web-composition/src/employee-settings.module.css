@@ -36,3 +36,24 @@
     flex-direction: column;
   }
 }
+
+.pane {
+  padding: var(--ar-space-5);
+  display: grid;
+  align-content: start;
+  gap: var(--ar-space-2);
+  color: var(--ar-text);
+  font: var(--ar-font-body);
+}
+
+.paneHeading {
+  margin: 0 0 var(--ar-space-2);
+  padding-bottom: var(--ar-space-3);
+  border-bottom: 1px solid var(--ar-border);
+  font: var(--ar-font-heading);
+}
+
+.pane .paneEntry {
+  justify-content: flex-start;
+  min-height: 48px;
+}

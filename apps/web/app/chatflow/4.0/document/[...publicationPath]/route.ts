@@ -67,6 +67,7 @@ export async function GET(request: Request, { params }: Params) {
       ['employee-instance-id', selection.employeeInstanceId],
       ['thread-id', selection.threadId ?? ''],
       ['viewer-id', input.context.actor.id],
+      ['login-session-id', input.context.sessionId],
       ['native-session-id', address.nativeSessionId],
       ...(released
         ? [
