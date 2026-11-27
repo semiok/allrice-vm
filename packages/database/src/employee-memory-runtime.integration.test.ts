@@ -434,7 +434,11 @@ suite(
               throw Error('fixture_actual_execution_denied');
             const execution = observations[selector.nativeRequestRef];
             if (!execution) throw Error('fixture_actual_request_unknown');
-            return { ...execution, moduleConfigRevisionRef: row.config_ref };
+            // The restored producer returns the original adopted revision,
+            // even when the current application configuration has changed.
+            return row.restore_expected
+              ? execution
+              : { ...execution, moduleConfigRevisionRef: row.config_ref };
           },
           stored: async (selector) => {
             const row = await read();
@@ -998,12 +1002,14 @@ suite(
         },
         live(),
       );
-      await f.change({
-        config_ref: 'fixture-config-2',
-        restore_expected: true,
-      });
       const restore = () =>
         f.port.issueContext(f.context, f.target(), live(), 'restore');
+      await f.change({ config_ref: 'fixture-config-2' });
+      await expect(restore()).rejects.toHaveProperty(
+        'code',
+        'MEMORY_CONTEXT_UNAVAILABLE',
+      );
+      await f.change({ restore_expected: true });
       expect(await restore()).toBe(document);
       expect((await f.state())!.state).toEqual(spent.state);
       expect((await f.state())!.module_config_revision_ref).toBe(

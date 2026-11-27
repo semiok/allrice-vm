@@ -2,6 +2,8 @@
  * The fixture is NOT a 271/273 producer, public transaction participation port,
  * or native root/child/source acceptance. No fixture enters production code. */
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import postgres from 'postgres';
 import type { TransactionSql } from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -25,7 +27,7 @@ import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
 import {
   issueMemoryContextStorage,
   readMemoryContextStorageOrdinal,
-  restoreMemoryContextStorage,
+  type restoreMemoryContextStorage,
   type MemoryContextStorageDraft,
   type MemoryContextStorageKey,
 } from './memory-context-store.ts';
@@ -266,7 +268,7 @@ suite(
       return f;
     }
 
-    async function openIsolatedMemoryConnection() {
+    async function isolatedMemoryDatabaseUrl() {
       const value = process.env.ALLRICE_TEST_DATABASE_URL;
       if (!value) throw Error('Dedicated ALLRICE_TEST_DATABASE_URL required');
       const url = new URL(value);
@@ -274,13 +276,61 @@ suite(
       const [row] = await database.db<{ schema: string }[]>`
         select current_schema() schema`;
       url.searchParams.set('options', `-csearch_path=${row!.schema}`);
-      return postgres(url.toString(), {
+      return url.toString();
+    }
+
+    async function openIsolatedMemoryConnection() {
+      return postgres(await isolatedMemoryDatabaseUrl(), {
         max: 1,
         onnotice: () => {},
         connection: {
           application_name: `memory-context-recovery:${randomUUID()}`,
         },
       });
+    }
+
+    async function restoreInFreshProcess(key: MemoryContextStorageKey) {
+      const { stdout } = await promisify(execFile)(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--input-type=module',
+          '--eval',
+          `
+          import postgres from 'postgres';
+          import { restoreMemoryContextStorage } from './src/memory-context-store.ts';
+          const sql = postgres(process.env.MEMORY_FIXTURE_URL, { max: 1, onnotice() {} });
+          try {
+            const [connection] = await sql\`select pg_backend_pid() pid\`;
+            const signal = AbortSignal.timeout(5000);
+            let outcome;
+            try {
+              outcome = { restored: await sql.begin(tx => restoreMemoryContextStorage(tx, JSON.parse(process.env.MEMORY_FIXTURE_KEY), signal)) };
+            } catch (error) {
+              if (error?.code !== 'MEMORY_CONTEXT_UNAVAILABLE') throw error;
+              outcome = { code: error.code };
+            }
+            console.log(JSON.stringify({ processId: process.pid, backendPid: connection.pid, ...outcome }));
+          } finally { await sql.end({ timeout: 2 }); }
+        `,
+        ],
+        {
+          cwd: new URL('../', import.meta.url),
+          timeout: 15000,
+          env: {
+            ...process.env,
+            MEMORY_FIXTURE_URL: await isolatedMemoryDatabaseUrl(),
+            MEMORY_FIXTURE_KEY: JSON.stringify(key),
+          },
+        },
+      );
+      return JSON.parse(stdout) as {
+        processId: number;
+        backendPid: number;
+        restored?: Awaited<ReturnType<typeof restoreMemoryContextStorage>>;
+        code?: string;
+      };
     }
 
     it('stores original builtin app provenance in the existing JSON field and never repins an existing B', async () => {
@@ -531,9 +581,12 @@ suite(
           { pid: number }[]
         >`select pg_backend_pid() pid`;
         expect(session!.pid).not.toBe(before.pid);
-        const restored = await sql.begin((tx) =>
-          restoreMemoryContextStorage(tx, key, live()),
-        );
+        const child = await restoreInFreshProcess(key);
+        expect(child.processId).not.toBe(process.pid);
+        expect(child.backendPid).not.toBe(before.pid);
+        const restored = child.restored;
+        if (!restored)
+          throw Error('Fresh process did not restore the existing snapshot');
         expect(restored.id).toBe(before.issued.id);
         expect(restored.document).toBe(before.issued.document);
         expect(restored.state).toEqual(before.state);
@@ -556,9 +609,7 @@ suite(
           where id=${restored.id} and organization_id=${key.organizationId}
             and budget_ref=${key.budgetRef} returning id`;
         expect(removed).toHaveLength(1);
-        await expect(
-          sql.begin((tx) => restoreMemoryContextStorage(tx, key, live())),
-        ).rejects.toMatchObject(refused);
+        expect(await restoreInFreshProcess(key)).toMatchObject(refused);
         await expect(
           sql.begin((tx) =>
             readMemoryContextStorageOrdinal(tx, key, { number: 1 }, live()),
