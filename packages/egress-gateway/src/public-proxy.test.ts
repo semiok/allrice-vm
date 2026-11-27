@@ -114,7 +114,12 @@ const setup = async (rejectHint?: ServerResponse['writeEarlyHints']) => {
   };
 };
 
-async function get(port: number, path: string, authorization?: string) {
+async function get(
+  port: number,
+  path: string,
+  authorization?: string,
+  information?: number[],
+) {
   return new Promise<{ status: number; body: string }>((resolve, reject) => {
     const req = request(
       {
@@ -134,6 +139,7 @@ async function get(port: number, path: string, authorization?: string) {
         response.once('error', reject);
       },
     );
+    req.on('information', (message) => information?.push(message.statusCode));
     req.once('error', reject);
     req.end();
   });
@@ -209,6 +215,7 @@ it('challenges before DNS and forwards plain HTTP once to the pinned answer with
     host: '1.1.1.1',
     port: upstreamPort,
     family: 4,
+    allowHalfOpen: false,
   });
 });
 
@@ -219,15 +226,29 @@ it('keeps the final HTTP response when the early-hints writer rejects a hint', a
   const vm = await setup(rejectHint);
   const port = await listen(
     createServer((_req, res) => {
-      res.writeEarlyHints({ link: '</fixture.css>; rel=preload; as=style' });
+      res.writeProcessing();
+      res.writeEarlyHints({
+        link: '</fixture.css>; rel=preload; as=style',
+        'x-fixture-hint': 'kept',
+      });
       res.end('final response');
     }),
   );
   network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const information: number[] = [];
   await expect(
-    get(vm.port, `http://public.example:${port}/`, vm.authorization),
+    get(
+      vm.port,
+      `http://public.example:${port}/`,
+      vm.authorization,
+      information,
+    ),
   ).resolves.toEqual({ status: 200, body: 'final response' });
-  expect(rejectHint).toHaveBeenCalledOnce();
+  expect(information).toEqual([102]);
+  expect(rejectHint).toHaveBeenCalledExactlyOnceWith({
+    link: '</fixture.css>; rel=preload; as=style',
+    'x-fixture-hint': 'kept',
+  });
 });
 
 it('denies a mixed DNS answer, private redirect target and a retired epoch before dialing', async () => {
@@ -400,7 +421,7 @@ it('streams a validated HTTPS response through multiple TLS records and preserve
   }
 });
 
-it('discards non-TLS bytes after accepting a native ClientHello', async () => {
+async function nativeClientHello() {
   const hello = deferred<Buffer>();
   const capture = createTcpServer((socket) => {
     let buffer = Buffer.alloc(0);
@@ -421,6 +442,110 @@ it('discards non-TLS bytes after accepting a native ClientHello', async () => {
   generator.on('error', () => {});
   const initial = await hello.promise;
   generator.destroy();
+  return initial;
+}
+
+it('joins the epoch after an upstream TLS alert and FIN precede the guest FIN', async () => {
+  const initial = await nativeClientHello();
+  const upstream = deferred<Net.Socket>();
+  const peerClosed = deferred<void>();
+  const port = await listen(
+    createTcpServer({ allowHalfOpen: true }, (socket) => {
+      socket.once('close', () => peerClosed.resolve());
+      socket.once('data', () => {
+        socket.end(Buffer.from([21, 3, 3, 0, 2, 2, 40]));
+        upstream.resolve(socket);
+      });
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  tunnel.allowHalfOpen = true;
+  const ended = once(tunnel, 'end');
+  const clientClosed = once(tunnel, 'close');
+  tunnel.resume();
+  tunnel.write(initial);
+  try {
+    await ended;
+    expect((await upstream.promise).readableEnded).toBe(false);
+    tunnel.end();
+    await Promise.all([clientClosed, peerClosed.promise]);
+    vm.stop.abort();
+    await vm.drain();
+  } finally {
+    tunnel.destroy();
+  }
+});
+
+it.each(['coalesced', 'split'] as const)(
+  'relays %s early TLS records before the first server flight',
+  async (transport) => {
+    // Synthetic ClientHello and opaque records exercise framing only.
+    const name = Buffer.from('public.example');
+    const wireHello = Buffer.concat([
+      Buffer.from([22, 3, 1, 0, 0, 1, 0, 0, 0, 3, 3]),
+      Buffer.alloc(32),
+      Buffer.from([0, 0, 2, 0x13, 1, 1, 0, 0, 0]),
+      Buffer.from([
+        0,
+        0,
+        0,
+        name.length + 5,
+        0,
+        name.length + 3,
+        0,
+        0,
+        name.length,
+      ]),
+      name,
+      Buffer.from([0, 42, 0, 0, 0, 41, 0, 0]),
+    ]);
+    wireHello.writeUInt16BE(wireHello.length - 5, 3);
+    wireHello.writeUIntBE(wireHello.length - 9, 6, 3);
+    wireHello.writeUInt16BE(wireHello.length - 52, 50);
+    const early = Buffer.from([23, 3, 3, 0, 3, 11, 12, 13]);
+    const helloReceived = deferred<void>();
+    const received = deferred<Buffer>();
+    const port = await listen(
+      createTcpServer((socket) => {
+        let data = Buffer.alloc(0);
+        socket.on('data', (chunk) => {
+          data = Buffer.concat([data, chunk]);
+          if (data.length >= wireHello.length) helloReceived.resolve();
+          if (data.length >= wireHello.length + early.length) {
+            received.resolve(data);
+            socket.end(Buffer.from([21, 3, 3, 0, 2, 2, 40]));
+          }
+        });
+      }),
+    );
+    const vm = await setup();
+    network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+    const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+    expect(response.statusCode).toBe(200);
+    const clientClosed = once(tunnel, 'close');
+    tunnel.resume();
+    if (transport === 'coalesced')
+      tunnel.write(Buffer.concat([wireHello, early]));
+    else {
+      tunnel.write(wireHello);
+      await helloReceived.promise;
+      tunnel.write(early);
+    }
+    try {
+      expect(await received.promise).toEqual(Buffer.concat([wireHello, early]));
+      await clientClosed;
+      await vm.drain();
+    } finally {
+      tunnel.destroy();
+    }
+  },
+);
+
+it('discards non-TLS bytes after accepting a native ClientHello', async () => {
+  const initial = await nativeClientHello();
   const crossed: Buffer[] = [];
   const forwarded = deferred<void>();
   const remoteClosed = deferred<void>();

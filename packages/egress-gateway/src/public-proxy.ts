@@ -10,11 +10,11 @@ import { addAbortListener } from 'node:events';
 import { BlockList, connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import type { Duplex } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
+import { finished, pipeline } from 'node:stream/promises';
 import {
   resolvePublicAddresses,
   sandboxPublicAddress,
-  sandboxTlsClientHello,
+  sandboxPublicTlsClientHello,
 } from '@allrice/project-runtime';
 import { EgressError } from './contract.js';
 
@@ -108,10 +108,11 @@ async function openPinned(
   port: number,
   signal: AbortSignal,
   setup: AbortSignal,
+  allowHalfOpen: boolean,
 ) {
   setup.throwIfAborted();
   if (!publicProxyAddress(address)) throw denied();
-  const socket = connect({ host: address, port, family });
+  const socket = connect({ host: address, port, family, allowHalfOpen });
   const joined = closed(socket);
   const abort = addAbortListener(signal, () => socket.destroy());
   const release = async () => {
@@ -146,12 +147,13 @@ async function open(
   addresses: Awaited<ReturnType<typeof resolveTarget>>,
   port: number,
   signal: AbortSignal,
+  allowHalfOpen = false,
 ) {
   const overall = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
   for (const address of addresses) {
     const attempt = AbortSignal.any([overall, AbortSignal.timeout(2_500)]);
     try {
-      return await openPinned(address, port, signal, attempt);
+      return await openPinned(address, port, signal, attempt, allowHalfOpen);
     } catch (error) {
       overall.throwIfAborted();
       if (error instanceof EgressError && error.code === 'DENIED') throw error;
@@ -178,8 +180,8 @@ function forwarded(headers: IncomingHttpHeaders) {
     [];
   const dropped = new Set([...hopByHop, ...connection]);
   return Object.fromEntries(
-    Object.entries(headers).filter(
-      ([key, value]) => value !== undefined && !dropped.has(key),
+    Object.entries(headers).flatMap(([key, value]) =>
+      value !== undefined && !dropped.has(key) ? [[key, value] as const] : [],
     ),
   );
 }
@@ -220,10 +222,10 @@ async function relayHttp(
       signal,
     });
     out.on('information', (message) => {
-      const hint = forwarded(message.headers).link;
-      if (message.statusCode !== 103 || !hint) return;
       try {
-        res.writeEarlyHints({ link: hint });
+        if (message.statusCode === 102) res.writeProcessing();
+        if (message.statusCode === 103)
+          res.writeEarlyHints(forwarded(message.headers));
       } catch {
         // Optional hints must not interrupt the final response or escape this handler.
       }
@@ -251,25 +253,27 @@ async function firstBytes(
   hostname: string,
   signal: AbortSignal,
 ) {
+  type Initial = {
+    bytes: Buffer;
+    hello: ReturnType<typeof sandboxPublicTlsClientHello>;
+  };
   let bytes = Buffer.from(head);
   let complete = false;
-  let ready!: (bytes: Buffer) => void;
+  let ready!: (initial: Initial) => void;
   let invalid!: (error: unknown) => void;
-  const request = new Promise<Buffer>((resolve, reject) => {
+  const request = new Promise<Initial>((resolve, reject) => {
     ready = resolve;
     invalid = reject;
   });
   function inspect() {
     if (!bytes.length) return;
     try {
-      if (
-        bytes[0] === 22 &&
-        sandboxTlsClientHello(bytes, hostname, true) === 'pending'
-      )
-        return;
+      const tls = bytes[0] === 22;
+      const hello = tls ? sandboxPublicTlsClientHello(bytes, hostname) : null;
+      if (tls && !hello) return;
       complete = true;
       socket.pause();
-      ready(bytes);
+      ready({ bytes, hello });
     } catch {
       complete = true;
       socket.pause();
@@ -295,7 +299,7 @@ async function firstBytes(
  * wire framing only; the client still validates certificates and ciphertext. */
 async function* tlsRecords(
   source: AsyncIterable<Buffer>,
-  beforeFirst: (record: Buffer) => Promise<void> | void,
+  inspect: (record: Buffer, first: boolean) => Promise<void> | void,
 ) {
   let pending = Buffer.alloc(0);
   let first = true;
@@ -316,44 +320,73 @@ async function* tlsRecords(
       if (pending.length < length + 5) break;
       const record = pending.subarray(0, length + 5);
       pending = pending.subarray(length + 5);
-      if (first) {
-        first = false;
-        await beforeFirst(record);
-      }
+      const decision = inspect(record, first);
+      if (decision) await decision;
+      first = false;
       yield record;
     }
   }
   if (pending.length) throw denied();
 }
 
-async function relayTls(client: Duplex, peer: Duplex, signal: AbortSignal) {
+function finishTlsWrite(destination: Duplex, signal: AbortSignal) {
+  const flushed = finished(destination, {
+    readable: false,
+    cleanup: true,
+    signal,
+  });
+  destination.end();
+  return flushed;
+}
+
+async function relayTls(
+  client: Duplex,
+  peer: Duplex,
+  earlyData: boolean,
+  signal: AbortSignal,
+) {
   const close = new AbortController();
   const active = AbortSignal.any([signal, close.signal]);
   const handshake = AbortSignal.any([active, AbortSignal.timeout(10_000)]);
+  let serverHello: boolean | undefined;
   let serverFlight!: (serverHello: boolean) => void;
   const serverReady = new Promise<boolean>((resolve) => {
     serverFlight = resolve;
   });
+  // Each pump owns its destination's FIN. Ending it in pipeline can await a
+  // finish notification that was already consumed by a half-closing socket.
   const ingress = pipeline(
     peer,
     (source) =>
-      tlsRecords(source, (record) => {
+      tlsRecords(source, (record, first) => {
+        if (!first) return;
         const hello = record[0] === 22 && record[5] === 2;
         if (!hello && record[0] !== 21) throw denied();
+        serverHello = hello;
         serverFlight(hello);
       }),
     client,
-    { signal: active },
-  );
+    { signal: active, end: false },
+  ).then(() => finishTlsWrite(client, active));
   const egress = pipeline(
     client,
     (source) =>
-      tlsRecords(source, async () => {
-        if (!(await waitFor(serverReady, handshake))) throw denied();
+      tlsRecords(source, (record) => {
+        if (serverHello === true) return;
+        // A TLS 1.3 client can send framed early data before ServerHello.
+        if (
+          serverHello === undefined &&
+          earlyData &&
+          (record[0] === 20 || record[0] === 23)
+        )
+          return;
+        return waitFor(serverReady, handshake).then((hello) => {
+          if (!hello) throw denied();
+        });
       }),
     peer,
-    { signal: active },
-  );
+    { signal: active, end: false },
+  ).then(() => finishTlsWrite(peer, active));
   try {
     await Promise.all([ingress, egress]);
   } finally {
@@ -513,15 +546,24 @@ export function createVmPublicProxy(
         const initial = await firstBytes(client, head, target.hostname, budget);
         assertActive();
         counts.connect++;
-        if (initial[0] !== 22) {
-          await httpInsideTunnel(client, initial, target, addresses, signal);
+        if (!initial.hello) {
+          await httpInsideTunnel(
+            client,
+            initial.bytes,
+            target,
+            addresses,
+            signal,
+          );
           return;
         }
-        upstream = await open(addresses, target.port, signal);
+        upstream = await open(addresses, target.port, signal, true);
         assertActive();
         signal.throwIfAborted();
-        upstream.socket.write(initial);
-        await relayTls(client, upstream.socket, signal);
+        const { end, earlyData } = initial.hello;
+        upstream.socket.write(initial.bytes.subarray(0, end));
+        if (end < initial.bytes.length)
+          client.unshift(initial.bytes.subarray(end));
+        await relayTls(client, upstream.socket, earlyData, signal);
       } catch (error) {
         const status = responseCode(error);
         counts[status === 403 ? 'denied' : 'unavailable']++;
