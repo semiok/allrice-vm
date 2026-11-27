@@ -33,7 +33,9 @@ class ConversationFixture extends LlmAdapter {
     ]);
   }
 
-  async *stream({ messages, signal, tools }) {
+  async *stream({ messages, model, signal, tools }) {
+    if (model !== 'fixture-nova')
+      throw new Error('The native selection did not reach the adapter');
     const read = 'read';
     const hasRead = messages.some(
       (message) =>

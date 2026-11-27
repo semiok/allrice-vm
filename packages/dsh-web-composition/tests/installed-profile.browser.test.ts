@@ -233,80 +233,91 @@ suite('installed AllRice native Web composition', () => {
     }
   }, 60_000);
   it('renders native controls and live work from a real rc.2 turn', async () => {
-    await page.evaluate(
-      (id) => window.__allriceCompositionTest!.openSession(id),
-      processSession,
-    );
-    await writeFile(
-      join(host.root, 'workspace', 'visible-tool-witness.txt'),
-      'R2 工具在这次测试中读取了原生工作区。',
-    );
-    const permission = page.getByRole('button', { name: /访问模式，当前/ });
-    const model = page.getByRole('button', { name: /Fixture Sol/ });
-    await permission.waitFor();
-    await model.waitFor();
-    await permission.click();
-    await page.getByText('只读', { exact: true }).waitFor();
-    await page.keyboard.press('Escape');
-    await model.click();
-    await page.getByText('Fixture Nova', { exact: true }).waitFor();
-    await page.keyboard.press('Escape');
+    try {
+      await page.evaluate(
+        (id) => window.__allriceCompositionTest!.openSession(id),
+        processSession,
+      );
+      await writeFile(
+        join(host.root, 'workspace', 'visible-tool-witness.txt'),
+        'R2 工具在这次测试中读取了原生工作区。',
+      );
+      const permission = page.getByRole('button', { name: /访问模式，当前/ });
+      const model = page.getByRole('button', {
+        name: /^请?选择模型/,
+      });
+      await permission.waitFor();
+      await model.waitFor();
+      await permission.click();
+      await page.getByText('只读', { exact: true }).waitFor();
+      await page.keyboard.press('Escape');
+      await model.click();
+      await page.getByRole('menuitem', { name: /^模型/ }).click();
+      await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
+      await page.getByRole('button', { name: /当前 Fixture Nova/ }).waitFor();
 
-    const composer = page
-      .locator('textarea:visible,[contenteditable=true]:visible')
-      .first();
-    await composer.fill('请读取当前工作区的测试文件。');
-    await composer.press('Enter');
-    const running = page.getByText(/深度求索中.*用时/);
-    await running.waitFor();
-    await writeFile(join(host.root, 'fixture-plugin', 'issue-tool'), '');
-    const tool = page
-      .getByRole('button', { name: /读取文件|读取了文件/ })
-      .last();
-    await tool.waitFor();
-    if ((await tool.getAttribute('aria-expanded')) === 'false')
-      await tool.click();
-    await page
-      .getByText('visible-tool-witness.txt', { exact: false })
-      .last()
-      .waitFor();
-    expect(await running.isVisible()).toBe(true);
-    await writeFile(join(host.root, 'fixture-plugin', 'finish-turn'), '');
-    await page
-      .getByText('R2 浏览器收到原生回合结果。', { exact: true })
-      .waitFor();
-    await running.waitFor({ state: 'hidden' });
+      const composer = page
+        .locator('textarea:visible,[contenteditable=true]:visible')
+        .first();
+      await composer.fill('请读取当前工作区的测试文件。');
+      await composer.press('Enter');
+      const running = page.getByText(/深度求索中.*用时/);
+      await running.waitFor();
+      await writeFile(join(host.root, 'fixture-plugin', 'issue-tool'), '');
+      const tool = page
+        .getByRole('button', { name: /读取文件|读取了文件/ })
+        .last();
+      await tool.waitFor();
+      if ((await tool.getAttribute('aria-expanded')) === 'false')
+        await tool.click();
+      await page
+        .getByText('visible-tool-witness.txt', { exact: false })
+        .last()
+        .waitFor();
+      expect(await running.isVisible()).toBe(true);
+      await writeFile(join(host.root, 'fixture-plugin', 'finish-turn'), '');
+      await page
+        .getByText('R2 浏览器收到原生回合结果。', { exact: true })
+        .waitFor();
+      await running.waitFor({ state: 'hidden' });
 
-    const activity = page
-      .getByRole('button', { name: /\d+ 轮 \d+ 步.*tok\/s/ })
-      .last();
-    const usage = page.getByRole('button', { name: /tok.*缓存命中/ }).last();
-    for (const width of [1440, 390])
-      for (const theme of ['light', 'dark'] as const) {
-        await page.setViewportSize({ width, height: 1000 });
-        await page.evaluate(
-          (mode) => window.__allriceCompositionTest!.setTheme(mode),
-          theme,
-        );
-        await permission.waitFor();
-        await model.waitFor();
-        await activity.waitFor();
-        await usage.waitFor();
-        expect(
-          await page.evaluate(() => document.documentElement.scrollWidth),
-        ).toBeLessThanOrEqual(width);
-        if (process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) {
-          const target = resolve(
-            process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
+      const activity = page
+        .getByRole('button', { name: /\d+ 轮 \d+ 步.*tok\/s/ })
+        .last();
+      const usage = page.getByRole('button', { name: /tok.*缓存命中/ }).last();
+      for (const width of [1440, 390])
+        for (const theme of ['light', 'dark'] as const) {
+          await page.setViewportSize({ width, height: 1000 });
+          await page.evaluate(
+            (mode) => window.__allriceCompositionTest!.setTheme(mode),
+            theme,
           );
-          await mkdir(target, { recursive: true });
-          await page.screenshot({
-            path: join(target, `controls-${width}-${theme}.png`),
-            fullPage: true,
-            animations: 'disabled',
-          });
+          await permission.waitFor();
+          await model.waitFor();
+          await activity.waitFor();
+          await usage.waitFor();
+          expect(
+            await page.evaluate(() => document.documentElement.scrollWidth),
+          ).toBeLessThanOrEqual(width);
+          if (process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) {
+            const target = resolve(
+              process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
+            );
+            await mkdir(target, { recursive: true });
+            await page.screenshot({
+              path: join(target, `controls-${width}-${theme}.png`),
+              fullPage: true,
+              animations: 'disabled',
+            });
+          }
         }
-      }
-    expect(errors).toEqual([]);
+      expect(errors).toEqual([]);
+    } catch (error) {
+      console.info(
+        'R2 isolated conversation browser state:\n' +
+          (await page.locator('body').ariaSnapshot()).slice(0, 10000),
+      );
+      throw error;
+    }
   }, 60_000);
 });
