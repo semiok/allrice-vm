@@ -196,7 +196,7 @@ export interface EmployeeSkillsHostProps {
   active?: boolean;
   activeEntry?: 'sidebar' | 'employee';
   backLabel?: string;
-  readOnly?: boolean;
+  readOnlyCatalog?: (signal: AbortSignal) => Promise<EmployeeSkillCatalog>;
   scopeSignal?: AbortSignal;
   lifetimeSignal?: AbortSignal;
   /** The caller reports confirmed access loss through this reader's callback. */
@@ -276,7 +276,7 @@ export function EmployeeSkillsHost(props: EmployeeSkillsHostProps) {
     props.scope.workspaceId,
     props.scope.instanceId,
     Object.entries(props.scope.headers).sort(),
-    props.readOnly === true,
+    props.readOnlyCatalog !== undefined,
   ]);
   const projectionScope = useMemo(() => ({ key, ownerView }), [key, ownerView]);
   const currentScope = useRef(projectionScope);
@@ -401,7 +401,7 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
   active,
   activeEntry,
   backLabel,
-  readOnly,
+  readOnlyCatalog,
   lifetimeSignal,
   onStart,
   onNotice,
@@ -412,6 +412,7 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
 > & {
   onView: (view: EmployeeSkillsHostView) => void;
 }) {
+  const readOnly = readOnlyCatalog !== undefined;
   const [view, setView] = useState<EmployeeSkillsView>({
     status: 'loading',
     label: copy.loading,
@@ -456,7 +457,9 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
       ? AbortSignal.any([signal, lifetimeSignal])
       : signal;
     requestSignal.throwIfAborted();
-    const result = await readEmployeeSkills(scope, requestSignal);
+    const result = await (readOnlyCatalog
+      ? readOnlyCatalog(requestSignal)
+      : readEmployeeSkills(scope, requestSignal));
     if (requestSignal.aborted || !mounted.current) return null;
     catalog.current = result;
     setView({ status: 'ready', catalog: result });

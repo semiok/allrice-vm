@@ -167,7 +167,8 @@ it.skipIf(!browserExecutable)(
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
-    const skillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
+    const skillsPath = `/api/v1/d-entry/panels/${f.identity.employeeInstanceId}/skills`;
+    const legacySkillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
     const catalog = skillTestCatalog(
       f.identity.employeeInstanceId,
       f.identity.workspaceId,
@@ -175,7 +176,10 @@ it.skipIf(!browserExecutable)(
     const late = deferred();
     const reads: unknown[] = [];
     await page.route(
-      (url) => url.origin === f.origin && url.pathname.startsWith(skillsPath),
+      (url) =>
+        url.origin === f.origin &&
+        (url.pathname.startsWith(skillsPath) ||
+          url.pathname.startsWith(legacySkillsPath)),
       async (route) => {
         const request = route.request();
         const url = new URL(request.url());
@@ -183,6 +187,8 @@ it.skipIf(!browserExecutable)(
           method: request.method(),
           path: url.pathname,
           workspace: url.searchParams.get('workspaceId'),
+          thread: url.searchParams.get('threadId'),
+          expectedViewer: request.headers()['x-allrice-expected-viewer-id'],
           organization: request.headers()['x-allrice-organization-id'],
           workspaceHeader: request.headers()['x-allrice-workspace-id'],
         });
@@ -363,6 +369,8 @@ it.skipIf(!browserExecutable)(
           method: 'GET',
           path: skillsPath,
           workspace: f.identity.workspaceId,
+          thread: f.selection.threadId,
+          expectedViewer: f.identity.personId,
           organization: f.identity.organizationId,
           workspaceHeader: f.identity.workspaceId,
         })),

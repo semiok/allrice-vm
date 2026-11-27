@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import { employeeSkillHostCopy } from '../../../apps/web/app/chatflow/employee-skill-host-copy';
+import { readDEntryEmployeeSkills } from '../../../apps/web/app/chatflow/employee-skills-api';
 import type { EmployeeSkillWriteStore } from '../../../apps/web/app/chatflow/employee-skills-host';
 import {
   employeeChoice,
@@ -257,6 +258,12 @@ export function installEmployeeProductOwner(ctx: Context) {
         headers: requestHeaders,
       };
       const skillWrites: EmployeeSkillWriteStore = new Map();
+      const readSkills = (signal: AbortSignal) =>
+        readDEntryEmployeeSkills(
+          skillScope,
+          { threadId, expectedViewerId: viewerId },
+          signal,
+        );
       const employeeName = employee.currentVersion.manifest.name;
       const initial: EmployeePanelsSnapshot = {
         scopeKey: ownerKey,
@@ -281,7 +288,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             copy: employeeSkillHostCopy,
             backLabel: '返回能力列表',
             // Configuration is available independently of the Guest registry.
-            readOnly: true,
+            readOnlyCatalog: readSkills,
             scopeSignal: signal,
             lifetimeSignal: tabSignal,
           },
