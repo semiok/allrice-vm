@@ -86,6 +86,39 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       ).resolves.toBe('released');
     },
   );
+  it('rechecks admitted authority after inspecting a cold disk without a pool', async () => {
+    const h = harness();
+    const rc = context();
+    let current = true;
+    const inspect = h.disk.inspect.bind(h.disk);
+    vi.spyOn(h.disk, 'inspect').mockImplementationOnce(async (...args) => {
+      const inspection = await inspect(...args);
+      current = false;
+      return inspection;
+    });
+    const revoked = Object.assign(Error('ticket grant changed'), {
+      code: 'authorization_denied',
+    });
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!current) throw revoked;
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED', cause: revoked });
+    expect(h.log).toEqual([]);
+    expect(h.disks.size).toBe(0);
+  });
   it.each(['native create', 'readiness'] as const)(
     'rechecks the admitted revision after %s before proceeding and joins startup cleanup',
     async (boundary) => {

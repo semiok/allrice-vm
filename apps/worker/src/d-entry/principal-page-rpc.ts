@@ -123,26 +123,40 @@ export function createDEntryPageRpc(
             input.scopeId,
             signal,
             async (page, active) => {
-              const authorize = () =>
-                authorizeDEntryNativeInvocation(
-                  page.authorize,
-                  input.endpoint,
-                  input.payload,
-                  'http',
-                  active,
-                );
+              const authorize = async () =>
+                input.endpoint === 'session/list'
+                  ? undefined
+                  : authorizeDEntryNativeInvocation(
+                      page.authorize,
+                      input.endpoint,
+                      input.payload,
+                      'http',
+                      active,
+                    );
               const invocation = await authorize();
-              const call = {
-                scopeId: input.scopeId,
-                endpoint: invocation.endpoint,
-                args: invocation.payload.args,
-              } as DEntryScopedUnaryCall; // Exact unary selector and its generated input codec above.
+              const call: DEntryScopedUnaryCall = invocation
+                ? ({
+                    scopeId: input.scopeId,
+                    endpoint: invocation.endpoint,
+                    args: invocation.payload.args,
+                  } as DEntryScopedUnaryCall) // Exact unary selector and its generated input codec above.
+                : {
+                    scopeId: input.scopeId,
+                    endpoint: 'session/list',
+                    args: TYPERT_REMOTE.methods['session/list']
+                      .input({ strict: true })
+                      .create()
+                      .parse(input.payload.args),
+                  };
               let native: Response;
+              let sessionIds: string[] | undefined;
               try {
-                native = encodeResult(
-                  rpcId,
-                  await page.scope.invoke(call, active),
-                );
+                const result = await page.scope.invoke(call, active);
+                if (result.endpoint === 'session/list')
+                  sessionIds = result.value.items.map((row) =>
+                    String(row.sessionId),
+                  );
+                native = encodeResult(rpcId, result);
               } catch (error) {
                 const failure = pageRemoteFailure(error);
                 if (
@@ -166,10 +180,11 @@ export function createDEntryPageRpc(
                     })
                     .end(bytes),
                 async () => {
-                  await page.assertCurrent(active);
+                  await page.assertCurrent(active, sessionIds);
+                  if (!invocation) return;
                   const next = await authorize();
                   if (
-                    next.resource.bindingRef !==
+                    next?.resource.bindingRef !==
                       invocation.resource.bindingRef ||
                     next.resource.parentNativeSessionId !==
                       invocation.resource.parentNativeSessionId

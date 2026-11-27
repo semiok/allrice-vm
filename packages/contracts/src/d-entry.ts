@@ -152,6 +152,7 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   scopeId: UuidSchema.optional(),
 });
 export const DEntryPageUnarySchema = z.enum([
+  'session/list',
   'session/attachment',
   'session/page',
   'session/projections',

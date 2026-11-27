@@ -25,6 +25,8 @@ export {
 export * from './admission-boundary.ts';
 export { PersonVmAdmissionHost } from './admission-host.ts';
 export { PersonVmService, sameVmBinding } from './person-vm.ts';
+export { PersonVmDiskPool, type PersonVmDiskPoolOptions } from './disk-pool.ts';
+export { MacosPersonVmDiskPool } from './disk-pool-macos.ts';
 export {
   PostgresPersonVmStore,
   type PersonVmStore,

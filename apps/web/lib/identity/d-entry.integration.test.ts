@@ -74,6 +74,7 @@ import { resolveDEntryIdentity } from '../d-entry/identity';
 import {
   dEntryReleasePolicyKey,
   readDEntryReleasePolicy,
+  readPersonVmDiskPreparationTarget,
   getDEntryReleasePolicy,
   updateDEntryReleasePolicy,
   requireCurrentPlatformAdmin,
@@ -1893,6 +1894,7 @@ suite(
     it('creates from an empty personal roster and opens a 4.0 thread without changing existing writers', async () => {
       const f = await setup();
       const ownerId = randomUUID();
+      const signal = new AbortController().signal;
       await fixture.db`insert into allrice_users(id,email,display_name,password_hash)
         values(${ownerId},${ownerId + '@example.test'},'New employee owner','synthetic')`;
       await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
@@ -1960,6 +1962,9 @@ suite(
         expect(await ensureDefaultEmployee(owner)).toBeNull();
         expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
         expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
+        expect(
+          await readPersonVmDiskPreparationTarget(ownerId, signal),
+        ).toBeNull();
 
         const vmId = randomUUID();
         await fixture.db`insert into person_virtual_machines
@@ -2064,6 +2069,16 @@ suite(
           await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
         ).toEqual([{ id: instance.id }]);
         await fixture.db`delete from person_virtual_machines where vm_id=${vmId}`;
+        expect(
+          await readPersonVmDiskPreparationTarget(ownerId, signal),
+        ).toMatchObject({
+          personId: ownerId,
+          organizationId: f.org,
+          workspaceId: f.workspace,
+          employeeInstanceId: instance.id,
+          employeeVersionId: instance.source.employeeVersionId,
+          platformRevisionId: null,
+        });
         expect(instance).toMatchObject({
           kind: 'custom',
           workspaceId: f.workspace,
@@ -2148,7 +2163,6 @@ suite(
             native.threadId,
           ),
         ).toBe('4.0');
-        const signal = new AbortController().signal;
         // A business thread is durable before its native root exists. The
         // document directory opens only after the trusted host pins that root.
         await expect(
