@@ -29,6 +29,7 @@ export async function confirmPersonalSkillSource(
   instanceIdInput: string,
   raw: unknown,
   signal?: AbortSignal,
+  requireCurrentAccess?: Parameters<typeof confirmPersonalSkillBrowser>[2],
 ) {
   const input = PersonalSkillConfirmRequestSchema.parse(raw),
     instanceId = UuidSchema.parse(instanceIdInput);
@@ -88,6 +89,7 @@ export async function confirmPersonalSkillSource(
   const completed = await preparePersonalSkillBrowserConfirmation(
     context,
     confirmation,
+    requireCurrentAccess,
   );
   if (completed) return PersonalSkillConfirmResponseSchema.parse(completed);
   const storage = getStorageAdapter();
@@ -107,7 +109,11 @@ export async function confirmPersonalSkillSource(
     await storage.put(pending.object, new Blob([bytes]).stream());
     bounded.throwIfAborted();
     return PersonalSkillConfirmResponseSchema.parse(
-      await confirmPersonalSkillBrowser(context, confirmation),
+      await confirmPersonalSkillBrowser(
+        context,
+        confirmation,
+        requireCurrentAccess,
+      ),
     );
   } finally {
     // Completed immutable objects are never claimed here. Pending duplicates,

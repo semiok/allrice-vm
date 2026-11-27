@@ -1,4 +1,5 @@
 import { assertOrdinarySkillSceneName } from './personal-scene-names.ts';
+import type { PersonalSkillWriteAuthority } from './personal-skill-browser.ts';
 import { randomUUID } from 'node:crypto';
 import {
   PersonalSkillDefinitionSchema,
@@ -810,9 +811,15 @@ async function assertBindingCapacity(
 export async function managePersonalSkill(
   contextInput: RequestContext,
   raw: unknown,
+  requireCurrentAccess?: PersonalSkillWriteAuthority,
 ) {
   const args = PersonalSkillManageRequestSchema.parse(raw);
+  if (requireCurrentAccess && args.operation !== 'disable')
+    throw new DataAccessError('authorization_denied');
   const context = { ...contextInput, workspaceId: args.workspaceId };
+  const requestInput = requireCurrentAccess
+    ? { ...args, purpose: 'd-entry-browser-skill-disable-v1' }
+    : args;
   return employeeAccessTransaction(getDatabase(), async (tx) => {
     if (!(await readContentPrincipal(context, tx, true))?.writable)
       throw new DataAccessError('authorization_denied');
@@ -823,8 +830,9 @@ export async function managePersonalSkill(
       await tx`select id from allrice_employee_assignments where id=${instance.assignmentId} for share`;
       await tx`select id from allrice_employee_instances where id=${instance.id} for share`;
       await getEmployeeInstance(context, args.instanceId, tx);
+      await requireCurrentAccess?.(context, args.instanceId, tx);
     }
-    const prior = await priorReceipt(tx, context, args.requestId, args);
+    const prior = await priorReceipt(tx, context, args.requestId, requestInput);
     if (prior) return prior;
     const [row] = await tx`select * from allrice_personal_skill_installations
       where id=${args.installationId} and organization_id=${context.organizationId} and owner_id=${owner(context)} for update`;
@@ -854,7 +862,7 @@ export async function managePersonalSkill(
     await tx`update allrice_personal_skill_installations set state=${args.operation === 'uninstall' ? 'uninstalled' : 'installed'},
       revoked_at=case when ${args.operation === 'uninstall'} then clock_timestamp() else revoked_at end,
       revision=revision+1,updated_at=clock_timestamp() where id=${row.id}`;
-    return receipt(tx, context, args.requestId, args, row.id);
+    return receipt(tx, context, args.requestId, requestInput, row.id);
   });
 }
 

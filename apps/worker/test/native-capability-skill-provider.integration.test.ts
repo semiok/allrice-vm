@@ -1,10 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { PersonalSkillDefinition } from '@allrice/contracts';
+import {
+  PersonalSkillConfirmResponseSchema,
+  PersonalSkillRemoveResponseSchema,
+  type PersonalSkillDefinition,
+  type RequestContext,
+} from '@allrice/contracts';
 import {
   createBuiltinSkillSourcesPort,
   createPostgresPersonalSkillPackageSource,
+  requireEmployeePanelsAccess,
   runtimePolicyDigest,
 } from '@allrice/database';
+import { createFileArchive } from '@allrice/file-archives';
 import { Context } from '@deepseek-ai/cordis';
 import SkillRegistry from '@deepseek-ai/dsh-skill';
 import {
@@ -18,13 +25,19 @@ import {
   vi,
 } from 'vitest';
 import type * as DatabaseClient from '../../../packages/database/src/core/client.ts';
-import { createRuntimeFixtureDatabase } from '../../../packages/database/src/runtime.fixture.ts';
+import {
+  createRuntimeFixtureDatabase,
+  runtimeFixtureStorage,
+} from '../../../packages/database/src/runtime.fixture.ts';
 import { createEmployeeAdministrationFixture } from '../../../packages/database/src/employee-administration.fixture.ts';
 import {
   authenticateSession,
   createSession,
 } from '../../../packages/database/src/identity.ts';
-import { getEmployeeWorkspace } from '../../../packages/database/src/workspace/service.ts';
+import {
+  createChatSession,
+  getEmployeeWorkspace,
+} from '../../../packages/database/src/workspace/service.ts';
 import { createEmployeeInstance } from '../../../packages/database/src/employees/employee-instances.ts';
 import {
   registerNativeCapabilitySkillProvider,
@@ -33,6 +46,7 @@ import {
 
 const client: {
   db?: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>['db'];
+  context?: RequestContext;
 } = vi.hoisted(() => ({}));
 vi.mock('../../../packages/database/src/core/client.ts', async (original) => ({
   ...(await original<typeof DatabaseClient>()),
@@ -41,6 +55,15 @@ vi.mock('../../../packages/database/src/core/client.ts', async (original) => ({
     return client.db;
   },
 }));
+vi.mock('../../web/lib/storage/runtime', () => ({
+  getStorageAdapter: () => {
+    if (!client.db) throw Error('isolated native Skill database required');
+    return runtimeFixtureStorage(client.db);
+  },
+}));
+vi.mock('../../web/lib/identity/session', () => ({
+  getRequestContext: async () => client.context ?? null,
+}));
 const hash = (text: string) =>
   'sha256:' + createHash('sha256').update(text).digest('hex');
 const suite =
@@ -48,7 +71,7 @@ const suite =
     ? describe.sequential
     : describe.skip;
 suite(
-  'real PG sources → real DSH registry; current/config are contract substitutes',
+  'real PG sources and real DSH registry; no production Guest configuration is mounted',
   () => {
     let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
     let host: Awaited<ReturnType<typeof setup>>;
@@ -100,6 +123,7 @@ suite(
       where organization_id=${host.context.organizationId} and owner_id=${host.context.actor.id}`;
     });
     afterEach(async () => {
+      client.context = undefined;
       for (const ctx of contexts.splice(0)) await ctx.fiber.dispose();
     });
     afterAll(async () => {
@@ -181,6 +205,147 @@ suite(
         },
       };
     }
+
+    it('loads the published browser package in DSH and refuses its exact pin after an employee disable', async () => {
+      const abort = new AbortController();
+      const { context } = host;
+      const selection = {
+        workspaceId: host.scope.workspaceId,
+        employeeInstanceId: host.scope.instanceId,
+      };
+      const thread = await createChatSession(context, selection, {
+        executionGeneration: '4.0',
+      });
+      const target = { ...selection, threadId: thread.id };
+      const policy = {
+        revision: randomUUID(),
+        defaultGeneration: '3.x',
+        selections: [
+          {
+            organizationId: context.organizationId,
+            personId: context.actor.id,
+          },
+        ],
+      };
+      await f.db`insert into allrice_settings(scope_type,key,value)
+        values ('system','d_entry_rollout_policy',${f.db.json(policy)})
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+      host.requireCurrent.mockImplementation(async (signal) => {
+        signal.throwIfAborted();
+        await requireEmployeePanelsAccess(context, target);
+        signal.throwIfAborted();
+      });
+      const { previewPersonalSkillSource } =
+        await import('../../web/lib/skills/personal-skill-preview');
+      const { POST } =
+        await import('../../web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/confirm/route');
+      const { DELETE } =
+        await import('../../web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/[installationId]/route');
+      const name = 'r3-weekly-summary';
+      const content = 'Keep the source report scoped to this employee.';
+      const originalText = [
+        '---',
+        'name: ' + name,
+        'description: Prepare a weekly summary.',
+        '---',
+        content,
+        '',
+      ].join('\n');
+      const archive = await createFileArchive([
+        { path: 'SKILL.md', bytes: Buffer.from(originalText) },
+      ]);
+      const preview = await previewPersonalSkillSource(
+        context,
+        selection.employeeInstanceId,
+        {
+          workspaceId: selection.workspaceId,
+          target: { operation: 'install' },
+          source: { kind: 'zip', fileName: 'weekly.zip' },
+        },
+        archive,
+        abort.signal,
+      );
+      const owned = await mount();
+      expect(await owned.ctx.skills.get(name)).toBeUndefined();
+      client.context = context;
+      const routeBase = 'https://allrice.test';
+      const params = { panelEmployeeInstanceId: selection.employeeInstanceId };
+      const query = new URLSearchParams({
+        workspaceId: target.workspaceId,
+        threadId: target.threadId,
+      });
+      const request = (path: string, method: string, body: object) =>
+        new Request(
+          `${routeBase}/api/v1/d-entry/panels/${params.panelEmployeeInstanceId}/skills${path}?${query}`,
+          {
+            method,
+            headers: {
+              origin: routeBase,
+              'content-type': 'application/json',
+              'x-allrice-expected-viewer-id': context.actor.id,
+            },
+            body: JSON.stringify(body),
+            signal: abort.signal,
+          },
+        );
+      const applied = await POST(
+        request('/confirm', 'POST', {
+          workspaceId: target.workspaceId,
+          requestId: randomUUID(),
+          previewId: preview.previewId,
+          digest: preview.digest,
+        }),
+        { params: Promise.resolve(params) },
+      );
+      const appliedBody: unknown = await applied.json();
+      expect(applied.status, JSON.stringify(appliedBody)).toBe(200);
+      const publication = PersonalSkillConfirmResponseSchema.parse(appliedBody);
+      // This is the public rc.2 receiver exercised distinct from any live VM
+      // notification route. The test explicitly delivers both invalidations.
+      owned.mounted.invalidate();
+      expect(
+        (await owned.ctx.skills.list()).map((skill) => skill.name),
+      ).toContain(name);
+      expect(await owned.ctx.skills.get(name)).toMatchObject({
+        name,
+        content: expect.stringContaining(content),
+      });
+      const [pin] = await owned.personal.listPackagePins(abort.signal);
+      expect(pin).toMatchObject({
+        installationId: publication.skill.id,
+        versionId: publication.skill.versionId,
+      });
+      const revoked = await DELETE(
+        request('/' + publication.skill.id, 'DELETE', {
+          workspaceId: target.workspaceId,
+          expectedRevision: publication.skill.revision,
+          requestId: randomUUID(),
+        }),
+        {
+          params: Promise.resolve({
+            ...params,
+            installationId: publication.skill.id,
+          }),
+        },
+      );
+      const revokedBody: unknown = await revoked.json();
+      expect(revoked.status, JSON.stringify(revokedBody)).toBe(200);
+      expect(
+        PersonalSkillRemoveResponseSchema.parse(revokedBody).receipt.binding,
+      ).toMatchObject({
+        enabled: false,
+        epoch: pin!.bindingEpoch + 1,
+      });
+      // Even if a previous catalog is cached, the exact body source denies.
+      await expect(owned.ctx.skills.get(name)).rejects.toThrow(
+        'personal_skill_unavailable',
+      );
+      owned.mounted.invalidate();
+      expect(
+        (await owned.ctx.skills.list()).map((skill) => skill.name),
+      ).not.toContain(name);
+      expect(await owned.ctx.skills.get(name)).toBeUndefined();
+    }, 20000);
 
     it('用户要用本人安装的周报Skill：actual list→exact body, update pin, epoch revocation', async () => {
       const installed = await install();

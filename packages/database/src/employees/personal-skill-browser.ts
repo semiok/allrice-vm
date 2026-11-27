@@ -17,6 +17,7 @@ import { readContentPrincipal } from '../content-maintenance.ts';
 import { runtimePolicyDigest } from '../runtime-policy.ts';
 import { skillBytesChecksum } from '../skill-bundles.ts';
 import { employeeAccessTransaction } from './employee-access-cancellation.ts';
+import type { ContentTx } from './employee-content-model.ts';
 import { getEmployeeInstance } from './employee-instances.ts';
 import { readCurrentEmployeeBaseSkills } from './employee-current-skills.ts';
 import { assertOrdinarySkillSceneName } from './personal-scene-names.ts';
@@ -59,6 +60,13 @@ type BrowserInput = {
   resourceManifest: PersonalSkillPackage;
 };
 
+/** Server-owned panel authority, evaluated inside the Skill writer. */
+export type PersonalSkillWriteAuthority = (
+  context: RequestContext,
+  instanceId: string,
+  tx: ContentTx,
+) => Promise<void>;
+
 export async function authorizePersonalSkillBrowser(
   context: RequestContext,
   instanceId: string,
@@ -96,8 +104,9 @@ export async function previewPersonalSkillInstallTarget(
 export async function confirmPersonalSkillBrowser(
   context: RequestContext,
   input: BrowserInput,
+  requireCurrentAccess?: PersonalSkillWriteAuthority,
 ) {
-  return browserOperation(context, input, false);
+  return browserOperation(context, input, false, requireCurrentAccess);
 }
 
 /** Complete a replay or an existing-version operation without allocating a
@@ -106,14 +115,16 @@ export async function confirmPersonalSkillBrowser(
 export async function preparePersonalSkillBrowserConfirmation(
   context: RequestContext,
   input: BrowserInput,
+  requireCurrentAccess?: PersonalSkillWriteAuthority,
 ) {
-  return browserOperation(context, input, true);
+  return browserOperation(context, input, true, requireCurrentAccess);
 }
 
 async function browserOperation(
   context: RequestContext,
   input: BrowserInput,
   withoutArchive: boolean,
+  requireCurrentAccess?: PersonalSkillWriteAuthority,
 ) {
   const instanceId = UuidSchema.parse(input.instanceId);
   const requestId = UuidSchema.parse(input.requestId);
@@ -135,7 +146,9 @@ async function browserOperation(
   )
     throw new PersonalSkillError('source_invalid');
   const requestInput = {
-    purpose: 'browser-skill-confirm-v1',
+    purpose: requireCurrentAccess
+      ? 'd-entry-browser-skill-confirm-v1'
+      : 'browser-skill-confirm-v1',
     workspaceId: context.workspaceId,
     instanceId,
     attestationDigest,
@@ -149,6 +162,22 @@ async function browserOperation(
     await tx`select id from allrice_employee_assignments where id=${instance.assignmentId} for share`;
     await tx`select id from allrice_employee_instances where id=${instance.id} for share`;
     instance = await getEmployeeInstance(context, instanceId, tx);
+    // D Entry locks the thread and release after the existing principal,
+    // organization content gate, assignment and instance locks.
+    await requireCurrentAccess?.(context, instanceId, tx);
+    const updateImpact = async (id: string) => {
+      const impact = await personalSkillUpdateImpact(tx, context, id);
+      if (
+        requireCurrentAccess &&
+        impact.some(
+          (binding) =>
+            binding.instanceId !== instanceId ||
+            binding.workspaceId !== context.workspaceId,
+        )
+      )
+        throw new DataAccessError('authorization_denied');
+      return impact;
+    };
     const [prior] = await tx`
       select response,request_input=${tx.json(requestInput)}::jsonb matches
       from allrice_personal_skill_receipts where organization_id=${context.organizationId}
@@ -172,9 +201,8 @@ async function browserOperation(
         throw new PersonalSkillError('conflict');
       if (
         input.target.operation === 'update' &&
-        runtimePolicyDigest(
-          await personalSkillUpdateImpact(tx, context, old.id),
-        ) !== runtimePolicyDigest(result.affectedBindings)
+        runtimePolicyDigest(await updateImpact(old.id)) !==
+          runtimePolicyDigest(result.affectedBindings)
       )
         throw new PersonalSkillError('conflict');
       return result;
@@ -201,7 +229,7 @@ async function browserOperation(
         throw new PersonalSkillError('conflict');
       if (row.name !== definition.name)
         throw new PersonalSkillError('name_conflict');
-      affectedBindings = await personalSkillUpdateImpact(tx, context, row.id);
+      affectedBindings = await updateImpact(row.id);
       if (
         runtimePolicyDigest(affectedBindings) !== target.bindingsDigest ||
         !affectedBindings.some((b) => b.instanceId === instanceId && b.enabled)
