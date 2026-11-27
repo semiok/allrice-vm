@@ -191,6 +191,16 @@ export const reviewedUnresolvedCalls: readonly {
     reason: `The personal Web callback resolves D-entry history with only the workspace and employee instance IDs. Current instance and assignment checks use plain SELECT with lock=false. The callback then checks the built-in module policy. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
   },
   {
+    target: 'packages/database/src/employee-memory-port.ts detail',
+    reason:
+      'The personal memory detail GET checks the current employee module before and after getPersonalEmployeeMemory. That owner read is repeatable read, read only, with employeeMemoryScope(write=false). The existing session last_seen_at update belongs to authentication. Review again if the bound callback or owner read changes.',
+  },
+  {
+    target: 'packages/database/src/employee-memory-port.ts list',
+    reason:
+      'The personal memory management GET checks the current employee module before and after listPersonalEmployeeMemories. That owner read is repeatable read, read only, with employeeMemoryScope(write=false). The existing session last_seen_at update belongs to authentication. Review again if the bound callback or owner read changes.',
+  },
+  {
     target: 'packages/database/src/employee-memory-port.ts source',
     reason: `The port selects getPersonalEmployeeMemorySource or getAdminEmployeeMemorySource based on the parsed organizationId. The personal branch checks current access before and after the owner read, whose scope uses the default write=false. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
   },

@@ -295,6 +295,10 @@ suite(
       const [rejected] =
         await fixture.db`select egress_receipt from person_virtual_machines where vm_id=${vmId}`;
       expect(rejected?.egress_receipt).toEqual(receipt);
+      const releasedCapacity = () =>
+        fixture.db`select lease_epoch::integer as lease_epoch from person_vm_audit
+          where vm_id=${vmId} and action='capacity.release' and result='succeeded'`;
+      expect(await releasedCapacity()).toEqual([]);
       await fixture.db`update person_virtual_machines set egress_receipt=null where vm_id=${vmId}`;
       revokeBeforeErase = revoke;
       try {
@@ -306,6 +310,9 @@ suite(
       } finally {
         revokeBeforeErase = undefined;
       }
+      // Even with no configured budget, preserve proof of the physical join.
+      // The later erasure authorization cannot replace that host fact.
+      expect(await releasedCapacity()).toEqual([{ lease_epoch: 1 }]);
       const second = await post(token, review);
       failDetach = true;
       try {
@@ -317,6 +324,7 @@ suite(
       } finally {
         failDetach = false;
       }
+      expect(await releasedCapacity()).toEqual([{ lease_epoch: 1 }]);
       expect(
         (
           await post(token, {

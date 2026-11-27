@@ -8,6 +8,7 @@ import { EmployeeMemoryWriteResponseSchema } from '@allrice/contracts';
 import { getRequestContext } from '../../../../lib/identity/session';
 import { sameOriginBrowserWrite } from '../../../../lib/identity/request-origin';
 import { storageErrorResponse } from '../../../../lib/storage/responses';
+import { requireEmployeeMemoryModule } from '../../../../lib/memory/employee-memory-personal-source';
 
 export const runtime = 'nodejs';
 
@@ -53,6 +54,7 @@ export async function POST(request: Request) {
     const context = await getRequestContext(request);
     if (!context) throw new DataAccessError('authentication_required');
     const input = await request.json();
+    await requireEmployeeMemoryModule(request.signal);
     const { counts, ...memory } = await createManagedEmployeeMemory(
       context,
       input,
@@ -69,6 +71,8 @@ export async function POST(request: Request) {
       },
     );
   } catch (error) {
-    return storageErrorResponse(error);
+    const response = storageErrorResponse(error);
+    response.headers.set('cache-control', 'private, no-store');
+    return response;
   }
 }

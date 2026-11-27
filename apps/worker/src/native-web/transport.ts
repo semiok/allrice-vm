@@ -14,6 +14,21 @@ import type {
 import { PersonVmError } from '@allrice/person-vm';
 
 export const nativeIndexByteLimit = 1024 * 1024;
+// rc.2 includes retained projection previews in both session reads.
+const nativeActivityHistoryByteLimit = 8 * 1024 * 1024;
+const nativeUnaryByteLimits: Partial<Record<NativeOwnedUnary, number>> = {
+  'session/create': 16 * 1024,
+  'session/list': nativeActivityHistoryByteLimit,
+  'session/projections': nativeActivityHistoryByteLimit,
+};
+
+export type NativeOwnedUnary =
+  | 'session/create'
+  | 'session/modelCatalog'
+  | 'session/list'
+  | 'session/projections'
+  | 'goals/get'
+  | 'schedule/catalog';
 
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(
@@ -348,6 +363,7 @@ export function nativeWebTransport(
       caller: AbortSignal,
       image = false,
       onChunk?: (chunk: Buffer) => void,
+      streamBytes?: number,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
@@ -356,7 +372,7 @@ export function nativeWebTransport(
         {
           maxBytes: image
             ? Math.ceil((20 * 1024 * 1024 * 4) / 3) + 16_384
-            : 24 * 1024,
+            : (streamBytes ?? 24 * 1024),
           credential: 'api',
           body,
           onChunk,
@@ -369,17 +385,17 @@ export function nativeWebTransport(
       );
       return data.length ? data.toString('utf8') : null;
     },
-    async readSessionReply(
-      endpoint: 'create' | 'modelCatalog',
+    async readUnaryReply(
+      method: NativeOwnedUnary,
       body: string,
       caller: AbortSignal,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
-        new URL('api/session/' + endpoint, origin),
+        new URL('api/' + method, origin),
         caller,
         {
-          maxBytes: endpoint === 'create' ? 16 * 1024 : nativeIndexByteLimit,
+          maxBytes: nativeUnaryByteLimits[method] ?? nativeIndexByteLimit,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>

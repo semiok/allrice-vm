@@ -12,6 +12,11 @@ import {
   type MemoryWriteStore,
 } from './employee-memory-client';
 
+import {
+  createEmployeeMemoryPageWrites,
+  readEmployeeMemoryPageWrites,
+} from './employee-memory-page-writes';
+
 const id = (n: number) =>
   `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const target = {
@@ -77,6 +82,217 @@ const conflict = (reason: string, message = 'not a UI discriminator') =>
     { status: 409 },
   );
 afterEach(() => vi.unstubAllGlobals());
+
+it('treats an archived employee as lost access without treating other 409 errors as revoked', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      Response.json(
+        {
+          error: {
+            code: 'EMPLOYEE_INSTANCE_ARCHIVED',
+            message: 'archived',
+            retryable: false,
+            requestId: id(99),
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const client = employeeMemoryClient(target, new Map());
+  await expect(client.list()).rejects.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.detail(record)).rejects.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.save(pair, record)).rejects.toBeInstanceOf(
+    MemoryAccessLost,
+  );
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => conflict('cas_conflict')),
+  );
+  await expect(client.list()).rejects.not.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.save(pair, record)).rejects.toMatchObject({
+    reason: 'cas_conflict',
+  });
+});
+
+describe('native memory across chat navigation', () => {
+  const employee = {
+    organizationId: id(101),
+    personId: id(102),
+    workspaceId: target.workspaceId,
+    employeeInstanceId: target.instanceId,
+  };
+
+  it('retries an uncertain edit with its original key and CAS after a replacement document', async () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const first = bind(host, 'first-chat', employee);
+    const sent: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit) => {
+        sent.push(JSON.parse(String(init.body)));
+        if (sent.length === 1) throw Error('receipt lost');
+        return ack();
+      }),
+    );
+    const save = (scopeId: string, row: EmployeeMemoryRecord) =>
+      readEmployeeMemoryPageWrites(host, scopeId, employee)!.mutate(
+        { action: 'save', row, pair },
+        () => {},
+        {},
+      );
+    await expect(save('first-chat', record)).rejects.toThrow();
+    first();
+    bind(host, 'second-chat', employee);
+    expect(
+      readEmployeeMemoryPageWrites(host, 'first-chat', employee),
+    ).toBeUndefined();
+    await save('second-chat', {
+      ...record,
+      revision: 8,
+      pairDigest: 'sha256:' + 'b'.repeat(64),
+    });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+  });
+
+  it('isolates the bridge by issued document and full employee scope', () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const first = bind(host, 'first-chat', employee);
+    const owned = readEmployeeMemoryPageWrites(host, 'first-chat', employee);
+    for (const field of [
+      'organizationId',
+      'workspaceId',
+      'personId',
+      'employeeInstanceId',
+    ] as const) {
+      expect(
+        readEmployeeMemoryPageWrites(host, 'first-chat', {
+          ...employee,
+          [field]: id(98),
+        }),
+      ).toBeUndefined();
+    }
+    const other = { ...employee, employeeInstanceId: id(42) };
+    const second = bind(host, 'second-chat', other);
+    first();
+    const replacement = readEmployeeMemoryPageWrites(
+      host,
+      'second-chat',
+      other,
+    );
+    expect(replacement).toBeDefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second-chat', employee),
+    ).toBeUndefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'first-chat', employee),
+    ).toBeUndefined();
+    expect(owned).toBeDefined();
+    second();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second-chat', other),
+    ).toBeUndefined();
+  });
+
+  it('notifies a new same-employee document when a retired document commits', async () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const retire = bind(host, 'first-chat', employee);
+    const before = readEmployeeMemoryPageWrites(host, 'first-chat', employee)!;
+    const oldPane = vi.fn();
+    before.subscribe(oldPane);
+    const source = {};
+    let sent!: () => void;
+    let respond!: (response: Response) => void;
+    const dispatched = new Promise<void>((resolve) => {
+      sent = resolve;
+    });
+    const receipt = new Promise<Response>((resolve) => {
+      respond = resolve;
+    });
+    const fetcher = vi.fn(() => {
+      sent();
+      return receipt;
+    });
+    vi.stubGlobal('fetch', fetcher);
+
+    const write = before.mutate(
+      { action: 'confirm', row: record },
+      () => {},
+      source,
+    );
+    await dispatched;
+    retire();
+    bind(host, 'second-chat', employee);
+    const after = readEmployeeMemoryPageWrites(host, 'second-chat', employee)!;
+    const newPane = vi.fn();
+    const unsubscribe = after.subscribe(newPane);
+    expect(newPane).not.toHaveBeenCalled();
+    respond(ack());
+    await write;
+    expect(newPane).toHaveBeenCalledExactlyOnceWith(source);
+    expect(oldPane).not.toHaveBeenCalled();
+    await expect(
+      before.mutate({ action: 'confirm', row: record }, () => {}, source),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    unsubscribe();
+  });
+});
+
+describe('native memory tab lifetime', () => {
+  it('sends no write or operation key if the tab closes before dispatch', async () => {
+    const lifetime = new AbortController();
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    const writes: MemoryWriteStore = new Map();
+    const client = employeeMemoryClient(target, writes, {
+      lifetimeSignal: lifetime.signal,
+    });
+    const attempt = client.save(pair, null);
+    const closed = Error('native tab closed');
+    lifetime.abort(closed);
+    await expect(attempt).rejects.toBe(closed);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(writes.size).toBe(0);
+  });
+
+  it('joins the original write receipt while canceling reads on a retired tab', async () => {
+    const lifetime = new AbortController();
+    let sent!: () => void;
+    const dispatch = new Promise<void>((done) => {
+      sent = done;
+    });
+    let reply!: (response: Response) => void;
+    const pending = new Promise<Response>((done) => {
+      reply = done;
+    });
+    const fetcher = vi.fn(async () => {
+      sent();
+      return pending;
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const writes: MemoryWriteStore = new Map();
+    const client = employeeMemoryClient(target, writes, {
+      lifetimeSignal: lifetime.signal,
+    });
+    const attempt = client.save(pair, null);
+    await dispatch;
+    const closed = Error('native tab closed');
+    lifetime.abort(closed);
+    await expect(client.detail(record)).rejects.toBe(closed);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(writes.size).toBe(1);
+    reply(ack({ ...record, state: 'active', revision: 1 }, 201));
+    await expect(attempt).resolves.toMatchObject({ memory: { id: record.id } });
+    expect(writes.size).toBe(0);
+  });
+});
 
 describe('employee memory v2 consumer operation identity', () => {
   it('keeps a lost creation key through GET and later denial while allowing an explicitly different addition', async () => {

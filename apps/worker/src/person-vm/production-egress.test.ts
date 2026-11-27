@@ -128,7 +128,25 @@ async function readHttp() {
   expect(await response.json()).toEqual({ ok: true });
 }
 
-it('uses actual bind0 origin in receipt, real private readback and public memory plan', async () => {
+it.each([2048, 3072])('stages bind0 and %i MiB', async (memoryMiB) => {
+  const { configuration, platform } = f.loaded;
+  const platformPhysicalBytes = memoryMiB * 1024 ** 2;
+  const memory = {
+    ...configuration.memory,
+    policy: {
+      ...configuration.memory.policy,
+      physicalBytes: platformPhysicalBytes,
+    },
+  };
+  await installation.close();
+  installation = createProductionEgressInstallation(
+    {
+      ...f.loaded,
+      configuration: { ...configuration, memory },
+      platform: { ...platform, memoryMiB },
+    },
+    lifetime.signal,
+  );
   const { receipt } = await prepare();
   expect(receipt.gatewayPorts[0]).toBeGreaterThan(0);
   const path = await installedFile(),
@@ -145,7 +163,8 @@ it('uses actual bind0 origin in receipt, real private readback and public memory
   ).toBe(0o700);
   const plan = await installation.memoryGuestPlan(binding, signal());
   const original = await createVmMemoryGuestPlan({
-    ...f.loaded.configuration.memory,
+    ...memory,
+    platformPhysicalBytes,
     dshCommandMemory:
       f.loaded.configuration.native.readonlyCommandMemoryDirectory,
   });

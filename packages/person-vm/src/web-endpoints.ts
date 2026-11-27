@@ -30,15 +30,19 @@ export type NativeWebSetupFailure = Readonly<{
   httpStatus?: number;
   target?: string;
 }>;
-/** Startup metadata from the service's authenticated caller, never guest JSON. */
-export type PersonVmWebStartup = Readonly<{
-  context: RequestContext;
-  receipt: PersonVmWebEndpointReceipt;
-  recordNativeFailure?(
-    failure: NativeWebSetupFailure,
-    signal: AbortSignal,
-  ): Promise<void>;
-}>;
+/** Host-owned startup metadata, from the authenticated caller or system wake. */
+export type PersonVmWebStartup = Readonly<
+  {
+    receipt: PersonVmWebEndpointReceipt;
+    recordNativeFailure?(
+      failure: NativeWebSetupFailure,
+      signal: AbortSignal,
+    ): Promise<void>;
+  } & (
+    | { context: RequestContext; purpose?: never }
+    | { context?: never; purpose: 'scheduled-wake' }
+  )
+>;
 export interface PersonVmWebRosterPort {
   prepare(
     context: RequestContext,

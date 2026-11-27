@@ -12,6 +12,8 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
+import { readEmployeeMemoryPageWrites } from '../../../apps/web/lib/memory/employee-memory-page-writes';
+import { personalEmployeeMemorySourceReader } from '../../../apps/web/lib/memory/employee-memory-client';
 import {
   bindEmployeeSidebar,
   type EmployeeSidebarSnapshot,
@@ -50,6 +52,12 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
+  const pageWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
+    organizationId,
+    personId: viewerId,
+    workspaceId: selection.workspaceId,
+    employeeInstanceId: selection.employeeInstanceId,
+  });
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -327,6 +335,23 @@ export function installEmployeeProductOwner(ctx: Context) {
             });
           },
         },
+        experience:
+          pageWrites || parent === window
+            ? {
+                management: {
+                  scopeId: ownerKey,
+                  workspaceId: selection.workspaceId,
+                  instanceId: selection.employeeInstanceId,
+                  employeeName: employee.currentVersion.manifest.name,
+                  headers: requestHeaders,
+                  ownerSignal: signal,
+                  pageWrites,
+                  writes: pageWrites ? undefined : new Map(),
+                  readSource:
+                    personalEmployeeMemorySourceReader(requestHeaders),
+                },
+              }
+            : undefined,
       };
       panels.update(initial);
       await bindEmployeePanelsHttp(

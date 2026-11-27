@@ -424,6 +424,62 @@ it('holds the bootstrap scope through editor proof and exposes only proved emplo
     await f.service.close();
   }
 });
+
+it('scheduled bootstrap starts the native scheduler and obtains editor proof only from a later real caller', async () => {
+  const f = fixture();
+  const route = new AbortController();
+  const readScheduleCatalog = vi.fn<NativeWebOwner['readScheduleCatalog']>(
+    async (guard, signal) => {
+      await guard(signal);
+      return [];
+    },
+  );
+  const prove = vi.fn(async () => route.signal);
+  const verifyStartingEditor = vi.fn<NativeWebOwner['verifyStartingEditor']>();
+  open.mockResolvedValue({
+    ...catalogOwner(),
+    readScheduleCatalog,
+    verifyStartingEditor,
+    verifyRunningEditor: vi.fn<NativeWebOwner['verifyRunningEditor']>(
+      async (context, active, verify) => {
+        expect(context).toBe(f.web.context);
+        return verify(
+          {
+            revoked: active,
+            readImmutableGraph: vi.fn(),
+            readImmutableBundle: vi.fn(),
+          },
+          vi.fn(),
+          active,
+        );
+      },
+    ),
+  });
+  const uninstall = f.service.installStartingEditorProof(prove);
+  const scheduled = {
+    purpose: 'scheduled-wake' as const,
+    receipt: f.web.receipt,
+  };
+  try {
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, scheduled);
+    await f.service.start(f.binding, f.scope.signal, f.scope, scheduled);
+    expect(readScheduleCatalog).toHaveBeenCalledTimes(2);
+    expect(
+      open.mock.calls.every(([input]) => input.context === undefined),
+    ).toBe(true);
+    expect(verifyStartingEditor).not.toHaveBeenCalled();
+    expect(prove).not.toHaveBeenCalled();
+    expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow();
+    await f.service.prepareForegroundEditor(f.binding, f.web.context, signal());
+    expect(prove).toHaveBeenCalledTimes(2);
+    expect(f.service.assertVerifiedEditor(f.binding, signal())).toBe(
+      route.signal,
+    );
+  } finally {
+    uninstall();
+    await f.service.close();
+  }
+});
 it('launches each employee with an authenticated Web entry locator on the sealed origin', async () => {
   const origin = 'https://employees.example.test';
   const f = fixture(undefined, origin);

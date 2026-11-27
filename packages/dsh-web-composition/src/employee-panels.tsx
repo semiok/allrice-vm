@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
 import { EnterpriseMaterialsPanel } from '../../../apps/web/app/chatflow/enterprise-materials-panel';
 import { WorkbenchFilesPanel } from '../../../apps/web/app/chatflow/workbench-files-panel';
 import { EmployeeMemorySidebar } from '../../../apps/web/app/chatflow/employee-memory-sidebar';
+import { EmployeeMemoryManager } from '../../../apps/web/app/chatflow/employee-memory-manager';
 import { EmployeeCapabilitiesPanel } from '../../../apps/web/app/chatflow/employee-capabilities-panel';
 import {
   WorkbenchEntries,
@@ -109,6 +110,17 @@ type PublicationActions = {
 /** Exported render seam uses the real components. */
 export function EmployeePanelContent(props: EmployeePanelContentProps) {
   const { kind, snapshot } = props;
+  if (
+    kind === 'experience' &&
+    snapshot.experience &&
+    'management' in snapshot.experience
+  )
+    return (
+      <EmployeePersonalMemoryPanel
+        {...props}
+        management={snapshot.experience.management}
+      />
+    );
   if (kind === 'materials' || kind === 'files') {
     const data = snapshot[kind];
     if (snapshot.publicationManagement && data.viewerId && data.dataClient)
@@ -126,6 +138,30 @@ export function EmployeePanelContent(props: EmployeePanelContentProps) {
       );
   }
   return employeePanelView(props);
+}
+
+function EmployeePersonalMemoryPanel({
+  ctx,
+  binding,
+  sessionId,
+  snapshot: { scopeKey },
+  signal,
+  management,
+}: EmployeePanelContentProps & {
+  management: React.ComponentProps<typeof EmployeeMemoryManager>;
+}) {
+  const assertCurrent = useCallback(() => {
+    assertEmployeePanelSession(ctx, sessionId);
+    assertEmployeePanelsCurrent(binding, sessionId, { scopeKey }, signal);
+  }, [ctx, binding, sessionId, scopeKey, signal]);
+  return (
+    <EmployeeMemoryManager
+      {...management}
+      active
+      lifetimeSignal={signal}
+      assertCurrent={assertCurrent}
+    />
+  );
 }
 
 function EmployeePublicationPanel({
@@ -296,7 +332,8 @@ function employeePanelView(
       );
     }
     case 'experience':
-      if (!snapshot.experience) return null;
+      if (!snapshot.experience || 'management' in snapshot.experience)
+        return null;
       return (
         <EmployeeMemorySidebar
           {...guardEmployeePanelProps(snapshot.experience, current)}

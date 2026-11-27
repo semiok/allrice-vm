@@ -6,6 +6,7 @@ import type {
 import * as client from './core/client.ts';
 import { createEmployeeMemoryPort } from './employee-memory-port.ts';
 import {
+  issueNativeEmployeeMemoryContext,
   NativeMemoryTargetSchema,
   nativeMemoryOperationKey,
 } from './employee-memory-runtime.ts';
@@ -83,6 +84,28 @@ const live = () => new AbortController().signal;
 afterEach(() => vi.restoreAllMocks());
 
 describe('native memory business boundary, with no production assembly', () => {
+  it('requires an explicit Host mode and does not treat an attempt selector as an original B', async () => {
+    const sql = vi.spyOn(client, 'getDatabase').mockImplementation(() => {
+      throw Error('business SQL must not open');
+    });
+    await expect(
+      Reflect.apply(issueNativeEmployeeMemoryContext, undefined, [
+        context,
+        target,
+        live(),
+      ]),
+    ).rejects.toMatchObject({ code: 'authorization_denied' });
+    await expect(
+      Reflect.apply(issueNativeEmployeeMemoryContext, undefined, [
+        context,
+        target,
+        live(),
+        'restore',
+      ]),
+    ).rejects.toMatchObject({ name: 'ZodError' });
+    expect(sql).not.toHaveBeenCalled();
+  });
+
   it('has a null private production binding and rejects each native path before opening business SQL', async () => {
     expect(readMemoryRuntimeAssembly()).toBeNull();
     const sql = vi.spyOn(client, 'getDatabase').mockImplementation(() => {
@@ -101,6 +124,18 @@ describe('native memory business boundary, with no production assembly', () => {
     };
     for (const action of [
       () => port.issueContext(context, target, live()),
+      () =>
+        port.restoreContext(
+          context,
+          {
+            workspaceId: target.workspaceId,
+            employeeInstanceId: target.employeeInstanceId,
+            threadId: target.threadId,
+            module: target.module,
+            b: stored.b,
+          },
+          live(),
+        ),
       () => port.readOrdinal(context, target, { number: 1 }, live()),
       () =>
         port.remember(

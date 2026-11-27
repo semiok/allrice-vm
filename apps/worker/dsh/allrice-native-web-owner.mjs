@@ -4,11 +4,14 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { isIP } from 'node:net';
 import { dirname } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
-import { TextEncoder } from 'node:util';
-import { createNativeRunTerminalAttestations } from './allrice-native-run-journal.mjs';
+import { isDeepStrictEqual, TextEncoder } from 'node:util';
+import {
+  createNativeRunTerminalAttestations,
+  isNativeForkHeader,
+} from './allrice-native-run-journal.mjs';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -218,13 +221,48 @@ function nativeOriginInput(source) {
   return ['user', 'agent-message', 'subagent-settled'].includes(source?.kind);
 }
 
-function nativePromptId(source) {
-  return source?.kind === 'user' && typeof source.rpcId === 'string'
-    ? source.rpcId
-    : null;
+function isNativeOrdinaryRoot(header) {
+  return (
+    isNativeForkHeader(header) ||
+    (!header.parentSession && !header.isSeeded && header.origin === undefined)
+  );
 }
 
-// The controller's follow window is for display. Read admitted input from the
+function isNativeRpcPrompt(source) {
+  return source?.kind === 'user' && typeof source.rpcId === 'string';
+}
+
+export function nativePromptOccurrence(session, message, turn) {
+  const { source } = message;
+  const parentSessionId =
+    session.header.origin === 'subagent'
+      ? session.header.parentSession
+      : undefined;
+  if (
+    (!isNativeOrdinaryRoot(session.header) && !parentSessionId) ||
+    !isNativeRpcPrompt(source) ||
+    source.principal?.kind !== 'allrice-d-entry' ||
+    typeof source.principal.scopeId !== 'string' ||
+    typeof message.id !== 'string' ||
+    !Number.isSafeInteger(turn) ||
+    turn < 1
+  )
+    return null;
+  return {
+    sessionId: session.id,
+    ...(parentSessionId && { parentSessionId }),
+    scopeId: source.principal.scopeId,
+    requestId: source.rpcId,
+    messageId: message.id,
+    turn,
+  };
+}
+
+function collectPrompt(occurrences, occurrence) {
+  occurrences.set(JSON.stringify(occurrence), occurrence);
+}
+
+// The controller's follow window is for display. Read adopted input from the
 // live journal at the exact cursor of the authenticated attempt.
 export function readPromptOrigins(
   events,
@@ -233,12 +271,9 @@ export function readPromptOrigins(
   purpose,
   readDelegated = () => null,
   ownFrom = 0,
+  readDirect = () => null,
 ) {
-  const addPrompt = (event, ids) => {
-    if (event?.type !== 'user/message') return;
-    const id = nativePromptId(event.data.source);
-    if (id !== null) ids.add(id);
-  };
+  const prompts = new Map();
   if (purpose === 'session-title') {
     const request = events[cursor];
     if (request?.type !== 'session/title-llm-request') return null;
@@ -246,24 +281,37 @@ export function readPromptOrigins(
     if (
       !Array.isArray(messageSeqs) ||
       messageSeqs.some(
-        (seq) => !Number.isSafeInteger(seq) || seq < 0 || seq >= cursor,
+        (seq) => !Number.isSafeInteger(seq) || seq < ownFrom || seq >= cursor,
       )
     )
       return null;
-    const ids = new Set();
     let sourceTurn = null;
     for (const seq of messageSeqs) {
-      const previousSize = ids.size;
-      addPrompt(events[seq], ids);
-      if (ids.size !== previousSize && sourceTurn === null)
-        sourceTurn =
-          events.findLast(
-            (event) => event.seq < seq && event.type === 'turn/start',
-          )?.data.turn ?? null;
+      const message = events[seq];
+      if (
+        message?.type !== 'user/message' ||
+        !isNativeRpcPrompt(message.data.source)
+      )
+        return null;
+      const start = events.findLast(
+        (event) =>
+          event.seq >= ownFrom &&
+          event.seq < seq &&
+          event.type === 'turn/start',
+      );
+      const occurrence = readDirect(message, start?.data.turn);
+      if (!occurrence) return null;
+      collectPrompt(prompts, occurrence);
+      sourceTurn ??= occurrence.turn;
     }
     return sourceTurn === null
       ? null
-      : { turn: sourceTurn, ids: [...ids], delegated: false, inherited: [] };
+      : {
+          turn: sourceTurn,
+          prompts: [...prompts.values()],
+          delegated: false,
+          inherited: [],
+        };
   }
   const start = events.findLast(
     (event) =>
@@ -273,28 +321,33 @@ export function readPromptOrigins(
       event.data.turn === turn,
   );
   if (!start) return null;
-  const ids = new Set();
-  const inherited = new Set();
+  const inherited = new Map();
   let delegated = false;
   for (let seq = start.seq + 1; seq <= cursor; seq++) {
     const event = events[seq];
     if (event.type === 'turn/end' || event.type === 'turn/start') return null;
     if (event.type !== 'user/message' || !nativeOriginInput(event.data.source))
       continue;
-    const id = nativePromptId(event.data.source);
-    if (id !== null) {
-      ids.add(id);
+    if (isNativeRpcPrompt(event.data.source)) {
+      const occurrence = readDirect(event, turn);
+      if (!occurrence) return null;
+      collectPrompt(prompts, occurrence);
       continue;
     }
     const source = readDelegated(event, turn);
     if (!source?.length) return null;
-    if (!ids.size) delegated = true;
-    for (const promptId of source) {
-      inherited.add(promptId);
-      ids.add(promptId);
+    if (!prompts.size) delegated = true;
+    for (const occurrence of source) {
+      collectPrompt(inherited, occurrence);
+      collectPrompt(prompts, occurrence);
     }
   }
-  return { turn, ids: [...ids], delegated, inherited: [...inherited] };
+  return {
+    turn,
+    prompts: [...prompts.values()],
+    delegated,
+    inherited: [...inherited.values()],
+  };
 }
 
 async function observePromptOrigins(
@@ -314,7 +367,7 @@ async function observePromptOrigins(
     return null;
   const { id, header } = live;
   const root = delegations.root(live);
-  if (!root || (header.parentSession && purpose === 'session-title'))
+  if (!root || (!isNativeOrdinaryRoot(header) && purpose === 'session-title'))
     return null;
   const observed = await scope.sessionQuery.observeSession(id, {
     signal,
@@ -335,14 +388,20 @@ async function observePromptOrigins(
       turn,
       purpose,
       (event, sourceTurn) =>
-        delegations.claimed(live, event.data, sourceTurn)?.ids,
+        delegations.claimed(live, event.data, sourceTurn)?.prompts,
       observed.inheritedEventCount,
+      (event, sourceTurn) =>
+        nativePromptOccurrence(live, event.data, sourceTurn),
     );
-    return origin?.ids.length > 0 && origin.ids.length <= 64
+    return origin?.prompts.length > 0 && origin.prompts.length <= 64
       ? {
           ...origin,
           rootSessionId: root.id,
-          delegated: !!header.parentSession || origin.delegated,
+          delegated: !isNativeOrdinaryRoot(header) || origin.delegated,
+          request:
+            purpose === 'assistant'
+              ? observeOriginalRequest(observed, cursor, turn, origin)
+              : null,
         }
       : null;
   } finally {
@@ -350,32 +409,231 @@ async function observePromptOrigins(
   }
 }
 
+// Version 1 covers ordered, exact text blocks only. No content or tool
+// arguments cross the owner carrier. An unsupported block has no proof.
+const nativeToolBodyClaims = new Map();
+const witnessedNativeTools = new WeakSet();
+const publishedMemoryTools = new WeakMap();
+
+// Only the exact, sealed registration may opt in. A successful around-dispatch
+// result, on its own, cannot mark entry into the registered implementation.
+export function withNativeToolEvidence(tool, version) {
+  if (typeof version !== 'string' || !version || version.length > 256)
+    throw Error('Native tool evidence requires a sealed version');
+  const wrapped = {
+    ...tool,
+    execute(args, exec) {
+      exec.signal.throwIfAborted();
+      if (!nativeToolBodyClaims.get(exec.token)?.(wrapped, version))
+        throw Error('Native tool invocation proof is unavailable');
+      return tool.execute(args, exec);
+    },
+  };
+  witnessedNativeTools.add(wrapped);
+  return wrapped;
+}
+
+// The future sealed memory registration must use this wrapper around the
+// actual implementation. Merely returning from a waterfall cannot authorize it.
+export function withNativeMemoryToolPublication(tool, version) {
+  if (
+    !['mcp__allrice__memory_read', 'mcp__allrice__memory_remember'].includes(
+      tool.name,
+    ) ||
+    typeof version !== 'string' ||
+    !version ||
+    version.length > 256
+  )
+    throw Error('Invalid native memory tool registration');
+  const execute = tool.execute.bind(tool);
+  const wrapped = {
+    ...tool,
+    async execute(args, exec) {
+      exec.signal.throwIfAborted();
+      const ref = await nativeToolBodyClaims.get(exec.token)?.(
+        wrapped,
+        version,
+      );
+      exec.signal.throwIfAborted();
+      if (typeof ref !== 'string')
+        throw Error('Native memory call unavailable');
+      return execute(args, exec, ref);
+    },
+  };
+  witnessedNativeTools.add(wrapped);
+  publishedMemoryTools.set(wrapped, version);
+  return wrapped;
+}
+
+function readMemoryToolVersions(scope, session, toolSchemas, selected) {
+  const agent = scope.agents.get(session.id);
+  if (!agent || original(agent.session) !== original(session) || !toolSchemas)
+    return null;
+  const version = (toolId) => {
+    const name = 'mcp__allrice__' + toolId;
+    const found = toolSchemas.filter((schema) => schema.name === name);
+    const tool = original(scope.tools.get(name, agent));
+    const registered = tool && publishedMemoryTools.get(tool);
+    return registered &&
+      tool === selected?.[toolId] &&
+      found.length === 1 &&
+      found[0].description === tool.description &&
+      (found[0].deferLoading === true) === (tool.deferLoading === true) &&
+      isDeepStrictEqual(found[0].parameters, tool.parameters)
+      ? registered
+      : null;
+  };
+  return {
+    memory_read: version('memory_read'),
+    memory_remember: version('memory_remember'),
+  };
+}
+
+function adoptedTextDigest(message) {
+  const blocks = message.content;
+  if (
+    !Array.isArray(blocks) ||
+    !blocks.length ||
+    blocks.some(
+      (block) => block.type !== 'text' || typeof block.text !== 'string',
+    )
+  )
+    return null;
+  return (
+    'sha256:' +
+    createHash('sha256')
+      .update(JSON.stringify(blocks.map(({ text }) => text)))
+      .digest('hex')
+  );
+}
+
+export function observeOriginalRequest(observed, cursor, turn, origin) {
+  const { events, inheritedEventCount } = observed;
+  const config = events.findLast(
+    (event) => event.seq <= cursor && event.type === 'request/header',
+  )?.data.header;
+  const request = config && {
+    provider: config.config.provider,
+    model: config.config.model,
+    digest:
+      'sha256:' +
+      createHash('sha256')
+        .update(JSON.stringify([config.config, config.adapterDefaults ?? null]))
+        .digest('hex'),
+  };
+  const empty = {
+    request: request ?? null,
+    human: null,
+    ...(Array.isArray(config?.tools) && {
+      toolSchemas: config.tools,
+    }),
+  };
+  if (origin.delegated || !origin.prompts.length) return empty;
+  const start = events.findLast(
+    (event) =>
+      event.seq >= inheritedEventCount &&
+      event.seq <= cursor &&
+      event.type === 'turn/start' &&
+      event.data.turn === turn,
+  );
+  if (!start) return empty;
+  const currentTurn = events.slice(start.seq + 1, cursor + 1);
+  const occurrences = new Map(
+    origin.prompts.map((prompt) => [prompt.messageId, prompt]),
+  );
+  let group = [];
+  let originalGroup;
+  let latestGroup;
+  for (const event of currentTurn) {
+    if (event.type === 'step/start') {
+      if (group.length) {
+        originalGroup ??= group;
+        latestGroup = group;
+        group = [];
+      }
+    }
+    if (event.type !== 'user/message' || !nativeOriginInput(event.data.source))
+      continue;
+    const occurrence = occurrences.get(event.data.id);
+    const digest = occurrence && adoptedTextDigest(event.data);
+    group.push(digest ? { occurrence, sequence: event.seq, digest } : null);
+    if (occurrence) occurrences.delete(event.data.id);
+  }
+  if (occurrences.size) return empty;
+  if (group.length) {
+    originalGroup ??= group;
+    latestGroup = group;
+  }
+  const originalHuman = originalGroup?.length === 1 ? originalGroup[0] : null;
+  const human = latestGroup?.length === 1 ? latestGroup[0] : null;
+  return {
+    ...empty,
+    human,
+    originalHuman,
+    firstMemoryAttempt:
+      !!originalHuman &&
+      originalGroup === latestGroup &&
+      !currentTurn.some(
+        ({ type }) =>
+          type === 'assistant/message' || type === 'assistant/attempt',
+      ),
+  };
+}
+
 /** Carry only the inbox facts for an exact scoped prompt through the existing
  * authenticated owner transport. A waiter is registered before dispatch. */
-export function observeNativePrompts(scope, lifetime) {
+export function observeNativePrompts(scope, lifetime, capture) {
   const observers = new Map();
   const sources = new Map();
   const turns = new WeakMap();
+  const attempts = new WeakMap();
+  const memoryAssemblies = new WeakMap();
+  const beforeMemoryAssembly = new Map();
+  const memoryTool = (agent, id) =>
+    original(scope.tools.get('mcp__allrice__' + id, agent));
+  const currentMemoryTools = (witness) =>
+    witness &&
+    !witness.changed &&
+    original(scope.agents.get(witness.agent.session.id)) ===
+      original(witness.agent) &&
+    witness.tools.memory_read === memoryTool(witness.agent, 'memory_read') &&
+    witness.tools.memory_remember ===
+      memoryTool(witness.agent, 'memory_remember');
+  const inboxClaims = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
     'content-type': 'text/plain; charset=utf-8',
   };
   const encoder = new TextEncoder();
-  const sourceKey = (root, principal, requestId) =>
-    JSON.stringify([root, principal, requestId]);
+  const sourceKey = (sessionId, parentSessionId, principal, requestId) =>
+    JSON.stringify([sessionId, parentSessionId, principal, requestId]);
   const pending = (agent) => [...agent.inbox.nextTurn, ...agent.inbox.nextStep];
   function messageKey(agent, message) {
     const { source } = message;
     const session = agent.session;
     if (
-      session.header.parentSession ||
-      session.header.isSeeded ||
       source?.kind !== 'user' ||
       typeof source.rpcId !== 'string' ||
       source.principal?.kind !== 'allrice-d-entry'
     )
       return undefined;
-    return sourceKey(session.id, source.principal.scopeId, source.rpcId);
+    const parentSessionId =
+      session.header.origin === 'subagent'
+        ? session.header.parentSession
+        : undefined;
+    if (!isNativeOrdinaryRoot(session.header)) {
+      // Cold resume owns the inbox before it announces subagent/start.
+      const parent =
+        parentSessionId && original(scope.agents.get(parentSessionId));
+      if (!parent || !scope.agents.isOwnedBy(session.id, parent))
+        return undefined;
+    }
+    return sourceKey(
+      session.id,
+      parentSessionId,
+      source.principal.scopeId,
+      source.rpcId,
+    );
   }
   const matches = (agent, message) =>
     sources.get(messageKey(agent, message)) ?? [];
@@ -383,9 +641,29 @@ export function observeNativePrompts(scope, lifetime) {
     'agent/inbox/inserted',
     ({ agent, message }) => {
       for (const observer of matches(agent, message)) {
-        if (observer.existing.has(message.id) || observer.itemId) continue;
+        if (
+          observer.existing.has(message.id) ||
+          (observer.itemId && observer.itemId !== message.id) ||
+          observer.turn !== undefined
+        )
+          continue;
+        if (capture?.()) {
+          const inTurn = agent.inbox.nextTurn.some(
+            ({ id }) => id === message.id,
+          );
+          const inStep = agent.inbox.nextStep.some(
+            ({ id }) => id === message.id,
+          );
+          observer.humanKind =
+            inTurn === inStep
+              ? null
+              : inTurn
+                ? 'ordinary-human-message'
+                : 'adopted-steering';
+        }
+        if (observer.itemId) continue;
         observer.itemId = message.id;
-        observer.send('inserted');
+        observer.send('inserted ' + JSON.stringify({ messageId: message.id }));
       }
     },
     { global: true },
@@ -393,11 +671,22 @@ export function observeNativePrompts(scope, lifetime) {
   scope.on(
     'agent/inbox/claimed',
     ({ agent, message, turn }) => {
+      const session = original(agent.session);
+      if (capture?.()) {
+        const previous = inboxClaims.get(session);
+        inboxClaims.set(session, {
+          turn,
+          pending: true,
+          // Claims are synchronous before the committed step/start event.
+          messageId:
+            previous?.turn === turn && previous.pending ? null : message.id,
+        });
+      }
       for (const observer of matches(agent, message)) {
         if (observer.itemId !== message.id || observer.turn !== undefined)
           continue;
         observer.turn = turn;
-        const session = original(agent.session);
+        if (capture?.()) observer.contentDigest = adoptedTextDigest(message);
         let active = turns.get(session);
         if (!active) turns.set(session, (active = new Map()));
         let claimed = active.get(turn);
@@ -407,7 +696,9 @@ export function observeNativePrompts(scope, lifetime) {
           claimed.delete(observer);
           if (claimed.size === 0) active.delete(turn);
         };
-        observer.send('claimed');
+        observer.send(
+          'claimed ' + JSON.stringify({ messageId: message.id, turn }),
+        );
       }
     },
     { global: true },
@@ -436,7 +727,14 @@ export function observeNativePrompts(scope, lifetime) {
   scope.on(
     'session/event',
     (session, event) => {
+      const native = original(session);
+      if (event.type === 'step/start') {
+        const claim = inboxClaims.get(native);
+        if (claim?.turn === event.data.turn) claim.pending = false;
+      }
       if (event.type !== 'turn/end') return;
+      if (inboxClaims.get(native)?.turn === event.data.turn)
+        inboxClaims.delete(native);
       for (const observer of turns
         .get(original(session))
         ?.get(event.data.turn) ?? [])
@@ -444,24 +742,370 @@ export function observeNativePrompts(scope, lifetime) {
     },
     { global: true },
   );
-  return (value, request) => {
+  if (capture) {
+    lifetime.addEventListener('abort', () => beforeMemoryAssembly.clear(), {
+      once: true,
+    });
+    scope.on(
+      'agent/disposed',
+      ({ agent }) => {
+        beforeMemoryAssembly.delete(original(agent.session));
+      },
+      { global: true },
+    );
+    scope.on(
+      'tools/change',
+      () => {
+        // rc.2 broadcasts registry changes without a scope. Check only the
+        // two definitions visible to each active memory-capable attempt.
+        for (const witness of beforeMemoryAssembly.values()) {
+          if (!currentMemoryTools(witness)) witness.changed = true;
+        }
+      },
+      { global: true, prepend: true },
+    );
+    scope.on(
+      'system-prompt/assemble',
+      (assembly, context, next) => {
+        const agent = context.agent;
+        if (
+          capture() &&
+          agent &&
+          original(scope.agents.get(agent.session.id)) === original(agent)
+        ) {
+          const session = original(agent.session);
+          const before = beforeMemoryAssembly.get(session);
+          const tool = (id) => {
+            const name = 'mcp__allrice__' + id;
+            if (!assembly.tools.some((schema) => schema.name === name))
+              return null;
+            const definition = before?.tools[id];
+            return currentMemoryTools(before) &&
+              publishedMemoryTools.has(definition)
+              ? definition
+              : null;
+          };
+          // One assembly per step. An unrelated/re-entrant assembly is not an
+          // authority for this stream, even if it used the same wire schema.
+          if (memoryAssemblies.has(session))
+            memoryAssemblies.set(session, null);
+          else
+            memoryAssemblies.set(session, {
+              memory_read: tool('memory_read'),
+              memory_remember: tool('memory_remember'),
+            });
+        }
+        return next();
+      },
+      { global: true, prepend: true },
+    );
+    scope.on(
+      'agent/assistant-stream',
+      ({ agent, frame }) => {
+        const session = original(agent.session);
+        if (frame.type === 'start') {
+          attempts.set(session, {
+            id: frame.attemptId,
+            turn: frame.turn,
+            step: frame.step,
+            cursor: session.seq - 1,
+            memoryTools: memoryAssemblies.get(session),
+            memoryToolWitness: beforeMemoryAssembly.get(session),
+            calls: new Map(),
+            dispatched: new Set(),
+          });
+        } else if (frame.type === 'end') {
+          const attempt = attempts.get(session);
+          if (attempt?.id !== frame.attemptId || !attempt.human) return;
+          if (
+            frame.outcome.kind === 'committed' &&
+            frame.outcome.eventType === 'assistant/message' &&
+            attempt.assistant?.seq === frame.outcome.seq
+          ) {
+            attempt.assistantSeq = frame.outcome.seq;
+          } else {
+            attempts.delete(session);
+          }
+        }
+      },
+      { global: true },
+    );
+    scope.on(
+      'session/event',
+      (subject, event) => {
+        const session = original(subject);
+        if (event.type === 'turn/start' || event.type === 'step/end') {
+          beforeMemoryAssembly.delete(session);
+          const agent = scope.agents.get(session.id);
+          if (
+            agent &&
+            original(agent.session) === session &&
+            capture() &&
+            !lifetime.aborted
+          ) {
+            const tools = {
+              memory_read: memoryTool(agent, 'memory_read'),
+              memory_remember: memoryTool(agent, 'memory_remember'),
+            };
+            if (
+              publishedMemoryTools.has(tools.memory_read) ||
+              publishedMemoryTools.has(tools.memory_remember)
+            )
+              beforeMemoryAssembly.set(session, {
+                agent,
+                tools,
+                changed: false,
+              });
+          }
+        }
+        if (event.type === 'turn/end') beforeMemoryAssembly.delete(session);
+        if (event.type === 'step/end' || event.type === 'turn/end') {
+          attempts.delete(session);
+          memoryAssemblies.delete(session);
+        }
+        const attempt = attempts.get(session);
+        if (!attempt?.human) return;
+        if (
+          event.type === 'assistant/message' &&
+          event.data.turn === attempt.turn &&
+          event.data.step === attempt.step
+        ) {
+          attempt.assistant = event;
+        }
+        if (event.type !== 'tool/call') return;
+        const { turn, step, callId, name } = event.data;
+        if (
+          attempt.assistantSeq === undefined ||
+          attempt.assistantSeq >= event.seq ||
+          turn !== attempt.turn ||
+          step !== attempt.step
+        )
+          return;
+        const blocks = attempt.assistant.data.message.content.filter(
+          (block) => block.type === 'tool-call' && block.id === callId,
+        );
+        if (
+          blocks.length !== 1 ||
+          blocks[0].name !== name ||
+          attempt.dispatched.has(callId)
+        )
+          return;
+        const agent = scope.agents.get(session.id);
+        const definition = agent && original(scope.tools.get(name, agent));
+        // Unregistered names never occupy a pending witness slot. Ordinary
+        // result samples do not consume the opt-in tools' pending budget.
+        if (
+          !definition ||
+          (attempt.calls.size >= 64 && !witnessedNativeTools.has(definition))
+        )
+          return;
+        attempt.calls.set(
+          callId,
+          attempt.calls.has(callId)
+            ? null
+            : {
+                callId,
+                name,
+                sequence: event.seq,
+              },
+        );
+      },
+      { global: true },
+    );
+    scope.on('tools/execute', async (exec, next) => {
+      if (
+        !capture() ||
+        lifetime.aborted ||
+        exec.signal.aborted ||
+        exec.parent !== undefined ||
+        !exec.agent
+      )
+        return next();
+      const session = original(exec.agent.session);
+      const attempt = attempts.get(session);
+      const call = attempt?.calls.get(exec.callId);
+      const observer = attempt?.observer;
+      const definition = original(scope.tools.get(exec.name, exec.agent));
+      if (
+        !definition ||
+        call?.name !== exec.name ||
+        !observer ||
+        original(scope.agents.get(session.id)) !== original(exec.agent) ||
+        !observers.has(observer.id) ||
+        (observer.registryResult && !witnessedNativeTools.has(definition))
+      )
+        return next();
+      attempt.calls.delete(exec.callId);
+      attempt.dispatched.add(exec.callId);
+      let sealedVersion;
+      if (nativeToolBodyClaims.has(exec.token)) return next();
+      nativeToolBodyClaims.set(exec.token, (wrapped, version) => {
+        if (
+          wrapped !== definition ||
+          sealedVersion ||
+          exec.signal.aborted ||
+          !capture() ||
+          !observers.has(observer.id) ||
+          (!publishedMemoryTools.has(wrapped) && observer.handlerRecords >= 7)
+        )
+          return false;
+        sealedVersion = version;
+        if (publishedMemoryTools.has(wrapped)) {
+          const toolId = wrapped.name.slice('mcp__allrice__'.length);
+          if (
+            !currentMemoryTools(attempt.memoryToolWitness) ||
+            attempt.memoryTools?.[toolId] !== wrapped
+          )
+            return false;
+          const claimed = inboxClaims.get(session);
+          if (
+            claimed?.turn !== attempt.turn ||
+            claimed.messageId !== attempt.human.occurrence.messageId
+          )
+            return false;
+          return observer
+            .publishMemoryCall(
+              {
+                attemptId: attempt.id,
+                assistantSequence: attempt.assistantSeq,
+                ...call,
+                human: attempt.human,
+                executionSessionRef: session.id,
+                executionParentRef:
+                  session.header.origin === 'subagent'
+                    ? session.header.parentSession
+                    : null,
+                dispatch: { kind: 'sealed-handler', version },
+              },
+              exec.signal,
+            )
+            .then((ref) => {
+              if (
+                capture() &&
+                observers.has(observer.id) &&
+                attempts.get(session) === attempt &&
+                inboxClaims.get(session) === claimed &&
+                currentMemoryTools(attempt.memoryToolWitness)
+              )
+                return ref;
+              return null;
+            });
+        }
+        observer.handlerRecords++;
+        return true;
+      });
+      let result;
+      try {
+        result = await next();
+      } finally {
+        nativeToolBodyClaims.delete(exec.token);
+      }
+      const claimed = inboxClaims.get(session);
+      // rc.2 also sends unregistered names and short-circuited failures
+      // through the waterfall. Retain only a successful, still-registered call.
+      if (
+        !publishedMemoryTools.has(definition) &&
+        !result.isError &&
+        !exec.signal.aborted &&
+        capture() &&
+        claimed?.turn === attempt.turn &&
+        claimed.messageId === attempt.human.occurrence.messageId &&
+        definition === original(scope.tools.get(exec.name, exec.agent)) &&
+        observers.has(observer.id) &&
+        (sealedVersion || !observer.registryResult)
+      ) {
+        const fact = JSON.stringify({
+          attemptId: attempt.id,
+          assistantSequence: attempt.assistantSeq,
+          ...call,
+          human: attempt.human,
+          dispatch: sealedVersion
+            ? { kind: 'sealed-handler', version: sealedVersion }
+            : { kind: 'registry-result' },
+        });
+        if (Buffer.byteLength(fact) <= 2400) {
+          try {
+            observer.send('tool ' + fact);
+            if (!sealedVersion) observer.registryResult = true;
+          } catch {
+            // Losing collection cannot turn into a failed native tool.
+          }
+        }
+      }
+      return result;
+    });
+  }
+  function attest(session, id, cursor, turn, human) {
+    if (!human) return { human: null, proofState: 'no-unique-text' };
+    const attempt = attempts.get(original(session));
+    if (
+      !attempt ||
+      attempt.id !== id ||
+      attempt.cursor !== cursor ||
+      attempt.turn !== turn ||
+      human.occurrence.parentSessionId
+    )
+      return { human: null, proofState: 'no-matching-attempt' };
+    const { occurrence } = human;
+    const allClaims = inboxClaims.get(original(session));
+    if (
+      allClaims?.turn !== turn ||
+      allClaims.messageId !== occurrence.messageId
+    )
+      return { human: null, proofState: 'competing-inbox-input' };
+    const key = sourceKey(
+      occurrence.sessionId,
+      undefined,
+      occurrence.scopeId,
+      occurrence.requestId,
+    );
+    const claims = [...(sources.get(key) ?? [])].filter(
+      (observer) =>
+        observer.turn === turn &&
+        observer.itemId === occurrence.messageId &&
+        observer.contentDigest === human.digest &&
+        observer.humanKind,
+    );
+    if (claims.length !== 1)
+      return { human: null, proofState: 'no-matching-claim' };
+    attempt.human = { ...human, kind: claims[0].humanKind };
+    attempt.observer = claims[0];
+    return { human: attempt.human, proofState: 'adopted' };
+  }
+  const read = (value, request) => {
     const notFound = () => new globalThis.Response(null, { status: 404 });
     if (
       typeof value?.id !== 'string' ||
       value.id.length !== 36 ||
       typeof value.sessionId !== 'string' ||
+      (value.parentSessionId !== undefined &&
+        (typeof value.parentSessionId !== 'string' ||
+          !value.parentSessionId ||
+          value.parentSessionId === value.sessionId)) ||
       typeof value.scopeId !== 'string' ||
       value.scopeId.length !== 36 ||
       typeof value.requestId !== 'string'
     )
       return notFound();
-    const { id, sessionId, scopeId, requestId } = value;
-    const key = sourceKey(sessionId, scopeId, requestId);
+    const { id, sessionId, parentSessionId, scopeId, requestId } = value;
+    const key = sourceKey(sessionId, parentSessionId, scopeId, requestId);
+    if (value.action === 'memory-call-result') {
+      const observer = observers.get(id);
+      const ref = value.nativeRequestRef;
+      if (
+        observer?.key !== key ||
+        (ref !== null &&
+          (typeof ref !== 'string' || !ref || ref.length > 256)) ||
+        !observer.memoryReplies.get(value.ticket)?.(ref)
+      )
+        return notFound();
+      return globalThis.Response.json({ accepted: true });
+    }
     if (value.action === 'prompt-outcome') {
       const observer = observers.get(id);
       return observer?.key === key
         ? globalThis.Response.json(
-            { inserted: observer.itemId !== undefined },
+            { messageId: observer.itemId ?? null },
             { headers: { 'cache-control': 'no-store' } },
           )
         : notFound();
@@ -489,6 +1133,7 @@ export function observeNativePrompts(scope, lifetime) {
         close = () => {
           if (!observers.delete(id)) return false;
           signal.removeEventListener('abort', abort);
+          for (const finish of observer.memoryReplies.values()) finish(null);
           group.delete(observer);
           if (group.size === 0) sources.delete(key);
           observer.unclaim?.();
@@ -501,6 +1146,42 @@ export function observeNativePrompts(scope, lifetime) {
           id,
           key,
           existing,
+          handlerRecords: 0,
+          registryResult: false,
+          memoryReplies: new Map(),
+          async publishMemoryCall(fact, nativeSignal) {
+            if (value.memoryCalls !== true) return null;
+            const ticket = randomUUID();
+            const frame = JSON.stringify({ ticket, fact });
+            if (Buffer.byteLength(frame) > 2500) return null;
+            const active = globalThis.AbortSignal.any([
+              nativeSignal,
+              signal,
+              globalThis.AbortSignal.timeout(30_000),
+            ]);
+            active.throwIfAborted();
+            return new Promise((resolve, reject) => {
+              const finish = (ref) => {
+                if (!observer.memoryReplies.delete(ticket)) return false;
+                active.removeEventListener('abort', cancel);
+                resolve(ref);
+                return true;
+              };
+              const cancel = () => {
+                if (finish(null) && observers.has(id) && !signal.aborted)
+                  send('memory-call-cancel ' + ticket);
+              };
+              observer.memoryReplies.set(ticket, finish);
+              active.addEventListener('abort', cancel, { once: true });
+              try {
+                send('memory-call ' + frame);
+              } catch (error) {
+                observer.memoryReplies.delete(ticket);
+                active.removeEventListener('abort', cancel);
+                reject(error);
+              }
+            });
+          },
           send,
           finish(type) {
             if (!close()) return;
@@ -519,6 +1200,21 @@ export function observeNativePrompts(scope, lifetime) {
     });
     return new globalThis.Response(body, { headers });
   };
+  return Object.assign(read, {
+    attest,
+    memoryToolVersions(session, attemptId, toolSchemas) {
+      const attempt = attempts.get(original(session));
+      return readMemoryToolVersions(
+        scope,
+        session,
+        toolSchemas,
+        attempt?.id === attemptId &&
+          currentMemoryTools(attempt.memoryToolWitness)
+          ? attempt.memoryTools
+          : null,
+      );
+    },
+  });
 }
 
 // Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
@@ -539,7 +1235,7 @@ export function observeDelegatedInputs(scope) {
     const seen = new Set();
     let agent = liveAgent(session.id);
     if (original(agent?.session) !== original(session)) return null;
-    while (agent.session.header.parentSession) {
+    while (!isNativeOrdinaryRoot(agent.session.header)) {
       if (seen.has(agent)) return null;
       seen.add(agent);
       const activation = activations.get(agent.id);
@@ -550,18 +1246,18 @@ export function observeDelegatedInputs(scope) {
         return null;
       agent = activation.parent;
     }
-    return agent.session.header.isSeeded ? null : original(agent.session);
+    return original(agent.session);
   }
 
   function collect(session, inputs) {
     const owner = root(session);
     if (!owner || !inputs?.length) return null;
-    const ids = new Set();
+    const prompts = new Map();
     for (const input of inputs) {
       if (input?.root !== owner) return null;
-      for (const id of input.ids) ids.add(id);
+      for (const prompt of input.prompts) collectPrompt(prompts, prompt);
     }
-    return { root: owner, ids: [...ids] };
+    return { root: owner, prompts: [...prompts.values()] };
   }
 
   function currentOrigin(session) {
@@ -596,9 +1292,11 @@ export function observeDelegatedInputs(scope) {
       [...state.claimed.values()].map(({ origin }) => origin),
     );
     if (!origin || state.unprovenClaim) return { kind: 'unproven' };
-    const promptIds = [...new Set([...origin.ids, ...state.directClaims])];
-    return promptIds.length && promptIds.length <= 64
-      ? { kind: 'delegated', turn: state.turn, promptIds }
+    const prompts = new Map();
+    for (const prompt of [...origin.prompts, ...state.directClaims.values()])
+      collectPrompt(prompts, prompt);
+    return prompts.size && prompts.size <= 64
+      ? { kind: 'delegated', turn: state.turn, prompts: [...prompts.values()] }
       : { kind: 'unproven' };
   }
 
@@ -692,10 +1390,13 @@ export function observeDelegatedInputs(scope) {
       const state = turns.get(session);
       if (state?.turn !== turn) return;
       if (record) state.claimed.set(message.id, record);
-      if (!session.header.parentSession && nativeOriginInput(message.source)) {
-        const id = nativePromptId(message.source);
-        state.firstInput ??= id === null ? 'delegated' : 'prompt';
-        if (id !== null) state.directClaims.add(id);
+      if (
+        isNativeOrdinaryRoot(session.header) &&
+        nativeOriginInput(message.source)
+      ) {
+        const direct = nativePromptOccurrence(session, message, turn);
+        state.firstInput ??= direct === null ? 'delegated' : 'prompt';
+        if (direct) collectPrompt(state.directClaims, direct);
         else if (!record) state.unprovenClaim = true;
       }
     },
@@ -719,7 +1420,7 @@ export function observeDelegatedInputs(scope) {
           turn: event.data.turn,
           claimed: new Map(),
           inputs: [],
-          directClaims: new Set(),
+          directClaims: new Map(),
         });
         return;
       }
@@ -752,11 +1453,10 @@ export function observeDelegatedInputs(scope) {
         !nativeOriginInput(event.data.source)
       )
         return;
-      const id = nativePromptId(event.data.source);
-      const origin =
-        id === null
-          ? claimed(session, event.data, state.turn)
-          : { root: root(session), ids: [id] };
+      const direct = nativePromptOccurrence(session, event.data, state.turn);
+      const origin = direct
+        ? { root: root(session), prompts: [direct] }
+        : claimed(session, event.data, state.turn);
       state.inputs.push(origin);
       const activation = activations.get(agent.id);
       if (activation?.child === agent) activation.inputs.push(origin);
@@ -956,12 +1656,13 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
+          'tools',
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
           const delegations = observeDelegatedInputs(scope);
-          const promptFacts = observeNativePrompts(scope, signal);
+          const promptFacts = observeNativePrompts(scope, signal, current);
           const terminalAttestations = createNativeRunTerminalAttestations();
           const currentSession = (sessionId) =>
             original(scope.sessions.get(sessionId));
@@ -1014,7 +1715,8 @@ export function applyNativeWebOwner(
               if (
                 value?.adapterId === id &&
                 (value.action === 'observe-prompt' ||
-                  value.action === 'prompt-outcome')
+                  value.action === 'prompt-outcome' ||
+                  value.action === 'memory-call-result')
               )
                 return promptFacts(value, request);
               if (
@@ -1062,17 +1764,41 @@ export function applyNativeWebOwner(
                   delegations,
                   globalThis.AbortSignal.any([found.signal, request.signal]),
                 );
-                if (!origin)
+                if (!origin || !current())
                   return new globalThis.Response(null, { status: 404 });
+                const inherited = new Set(
+                  origin.inherited.map((prompt) => JSON.stringify(prompt)),
+                );
                 return globalThis.Response.json(
                   {
                     id: found.id,
                     recipient: found.recipient,
                     rootSessionId: origin.rootSessionId,
                     sourceTurn: origin.turn,
-                    promptIds: origin.ids,
+                    prompts: origin.prompts,
                     delegated: origin.delegated,
-                    delegatedPromptIds: origin.inherited,
+                    observation: origin.request && {
+                      request: origin.request.request,
+                      ...promptFacts.attest(
+                        found.session,
+                        value.nativeAttemptId,
+                        value.cursor,
+                        value.turn,
+                        origin.request.human,
+                      ),
+                      firstMemoryAttempt:
+                        origin.request.firstMemoryAttempt === true,
+                      originalHuman: origin.request.originalHuman ?? null,
+                      memoryToolVersions: promptFacts.memoryToolVersions(
+                        found.session,
+                        value.nativeAttemptId,
+                        origin.request.toolSchemas,
+                      ),
+                    },
+                    inheritedPromptIndexes: origin.prompts.flatMap(
+                      (prompt, index) =>
+                        inherited.has(JSON.stringify(prompt)) ? [index] : [],
+                    ),
                   },
                   { headers },
                 );

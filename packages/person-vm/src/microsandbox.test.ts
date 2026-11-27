@@ -26,7 +26,11 @@ import {
   verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
-import { PersonVmError, PERSON_VM_MEMORY_MIB } from './contract.ts';
+import {
+  PersonVmError,
+  PERSON_VM_MEMORY_MIB,
+  type PersonVmBinding,
+} from './contract.ts';
 import { runCommand } from './process.ts';
 import { context, currentReceipt, harness, signal } from './test-support.ts';
 import { PersonVmService } from './person-vm.ts';
@@ -107,7 +111,8 @@ else if(a[0]==='inspect'){
  }
  const ports=v.ports??[],active=(mode.startsWith('web-inspect')||(v.retained&&mode==='retained-web-drift'))?[]:ports;
  const mounts=v.mounts??[],activeMounts=(mode==='artifact-inspect-drift'||(v.retained&&mode==='retained-mount-drift'))?mounts.map(m=>({...m,options:{...m.options,readonly:false}})):mounts;
- console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports},mounts},active_config:{network:{ports:active},mounts:activeMounts},pending_changes:[]}));
+ const resources={memory_mib:2048,max_memory_mib:2048};
+ console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports},mounts,resources},active_config:v.status==='Running'?{network:{ports:active},mounts:activeMounts,resources}:null,pending_changes:[]}));
 }
 else if(a[0]==='start'){v.retained=true;v.status='Running';}
 else if(a[0]==='stop'){if(!['lost-id-unknown-stop','workdir-lost-id-unknown-stop','auth-unknown-stop','web-inspect-unknown-stop'].includes(mode))v.status='Stopped';}
@@ -361,6 +366,16 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     await f.service.start(f.rc, signal());
     const binding = await f.service.resolve(f.rc, signal());
     const fresh = f.reloadNative();
+    const config = join(f.mount, 'msb-config.json');
+    const saved = await readFile(config);
+    const statusStart = (await f.calls()).length;
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('running');
+    expect((await f.calls()).slice(statusStart)).toEqual([
+      ['list', '--format', 'json'],
+    ]);
+    expect(await readFile(config)).toEqual(saved);
     const guard = vi.fn(async () => undefined);
     const current = { binding, signal: signal(), assertCurrent: guard };
     const spec = { executable: 'node', args: ['journal-read-fixture'] };
@@ -381,6 +396,10 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(reads[2]).toContain('10s');
 
     await f.native.stop(binding, signal());
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('stopped');
+    expect(await readFile(config)).toEqual(saved);
     const stopped = (await f.calls()).length;
     await expect(
       fresh.readAttachedProbe(current, f.mount, spec),
@@ -1686,6 +1705,7 @@ if(a[0]==='--version')console.log('microsandbox 0.7.16');
 else if(a[0]==='list')console.log(JSON.stringify(v.name?[{name:v.name,status:v.status}]:[]));
 else if(a[0]==='pull')v.image=a[1];
 else if(a[0]==='create'){if(v.image!==a[1])process.exit(27);v.name=a[a.indexOf('--name')+1];v.status='Running';}
+else if(a[0]==='inspect')console.log(JSON.stringify({name:v.name,status:v.status,config:{resources:{memory_mib:2048,max_memory_mib:2048}},active_config:null}));
 else if(a[0]==='stop')v.status='Stopped';
 else if(a[0]==='start')v.status='Running';
 else if(a[0]==='ping'){if(v.status!=='Running')process.exit(29);}
@@ -1837,6 +1857,483 @@ fs.writeFileSync(f,JSON.stringify(v));
       expect(runner).not.toHaveBeenCalled();
     },
   );
+  describe('retained start with a host memory reservation (mock CLI)', () => {
+    const resources = (memory: number) => ({
+      memory_mib: memory,
+      max_memory_mib: memory,
+    });
+
+    async function fixture(
+      memoryMiB = 3072,
+      mode:
+        'reserved' | 'missing-reservation' | 'legacy' | 'default' = 'reserved',
+    ) {
+      const binding = {
+        vmId: randomUUID(),
+        personId: randomUUID(),
+        organizationId: randomUUID(),
+        instanceId: randomUUID(),
+        leaseEpoch: 3,
+      };
+      const name = 'allrice-' + binding.vmId;
+      const owner = new AbortController();
+      const ports = [
+        {
+          host_bind: '127.0.0.1',
+          host_port: 38990,
+          guest_port: 39000,
+          protocol: 'tcp',
+        },
+      ];
+      const state = {
+        status: 'Stopped',
+        saved: resources(2048),
+        active: undefined as ReturnType<typeof resources> | undefined,
+        activeAfterCrash: false,
+        activePorts: ports,
+        persist: true,
+        applied: true,
+        settleModify: async () => {},
+      };
+      const assertCurrent = vi.fn(
+        async (
+          request: Readonly<{ binding: PersonVmBinding; memoryMiB: number }>,
+          active: AbortSignal,
+        ) => {
+          expect(request).toEqual({ binding, memoryMiB });
+          active.throwIfAborted();
+        },
+      );
+      const commitRunning = vi.fn(
+        async (
+          request: Readonly<{ binding: PersonVmBinding; memoryMiB: number }>,
+          active: AbortSignal,
+        ) => {
+          expect(request).toEqual({ binding, memoryMiB });
+          active.throwIfAborted();
+        },
+      );
+      const reserve = vi.fn(async () => ({
+        signal: owner.signal,
+        assertCurrent,
+        commitRunning,
+      }));
+      const runner = vi.fn(
+        async ({ args }: Parameters<typeof runCommand>[0]) => {
+          switch (args[0]) {
+            case '--version':
+              return 'microsandbox 0.7.16';
+            case 'list':
+              return JSON.stringify([{ name, status: state.status }]);
+            case 'stop':
+              state.status = 'Stopped';
+              return '';
+            case 'inspect':
+              return JSON.stringify({
+                name,
+                status: state.status,
+                config: { resources: state.saved, network: { ports } },
+                active_config:
+                  state.status === 'Running' || state.activeAfterCrash
+                    ? {
+                        resources: state.active ?? state.saved,
+                        network: { ports: state.activePorts },
+                      }
+                    : null,
+              });
+            case 'modify':
+              if (state.persist)
+                state.saved = {
+                  memory_mib: Number(args[3]?.slice(0, -1)),
+                  max_memory_mib: Number(args[5]?.slice(0, -1)),
+                };
+              await state.settleModify();
+              return JSON.stringify({
+                sandbox: name,
+                status: state.status.toLowerCase(),
+                policy: 'next_start',
+                applied: state.applied,
+                conflicts: [],
+              });
+            case 'start':
+              state.status = 'Running';
+              return '';
+            default:
+              throw Error('Unexpected mock CLI command');
+          }
+        },
+      );
+      const provider = new MicrosandboxPersonVm({
+        binary: '/fixture/msb',
+        libkrunfw: '/fixture/fw',
+        agentd: '/fixture/agentd',
+        image: 'registry/node@sha256:' + 'a'.repeat(64),
+        rootDiskGiB: 20,
+        socketRoot: await socketDirectory(),
+        ...(mode === 'legacy' || mode === 'default'
+          ? { memoryMiB: mode === 'legacy' ? memoryMiB : undefined }
+          : {
+              restartMemory: {
+                memoryMiB,
+                reserve: mode === 'reserved' ? reserve : undefined,
+              },
+            }),
+        runner,
+      });
+      await provider.prepare(binding, await directory(), signal());
+      runner.mockClear();
+      return {
+        joinStopped: () =>
+          provider.stop(binding, signal(), { requireStopped: true }),
+        stopIdle: (
+          assertCurrent: () => Promise<void>,
+          dispatch?: Parameters<typeof provider.stopIdle>[3],
+        ) => provider.stopIdle(binding, signal(), assertCurrent, dispatch),
+        assertStopped: () => provider.assertStopped(binding, signal()),
+        start: () => provider.start(binding, signal()),
+        startWithWeb: () =>
+          provider.startWithWebEndpoints(
+            {
+              binding,
+              rosterDigest: 'a'.repeat(64),
+              endpoints: [
+                {
+                  workspaceId: randomUUID(),
+                  employeeInstanceId: randomUUID(),
+                  employeeRevision: 1,
+                  employeeVersionId: randomUUID(),
+                  hostPort: 38990,
+                  guestPort: 39000,
+                },
+              ],
+            },
+            signal(),
+          ),
+        commands: () => runner.mock.calls.map(([{ args }]) => args),
+        name,
+        binding,
+        reserve,
+        assertCurrent,
+        commitRunning,
+        state,
+        owner,
+      };
+    }
+
+    it.each(['Running', 'Unknown', 'Stopped'])(
+      'joins a stopped VM for deletion without stopping a running or unknown VM (%s)',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        if (status === 'Stopped') {
+          await f.joinStopped();
+          expect(f.commands().map(([command]) => command)).toEqual([
+            'list',
+            'stop',
+            'list',
+          ]);
+        } else {
+          await expect(f.joinStopped()).rejects.toMatchObject({
+            code: 'ACTIVITY_UNKNOWN',
+          });
+          expect(f.commands().map(([command]) => command)).toEqual(['list']);
+          expect(f.state.status).toBe(status);
+        }
+      },
+    );
+
+    it('runs the last idle guard after the native state read and before dispatch', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      await expect(
+        f.stopIdle(async () => {
+          expect(f.commands().map(([command]) => command)).toEqual(['list']);
+          throw new PersonVmError('VM_ACTIVE');
+        }),
+      ).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+      expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      expect(f.state.status).toBe('Running');
+    });
+
+    it('joins the stop and reads the exact terminal state after authority close fails', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const connectionLost = Error('injected authority close failure');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async (active, stop) => {
+            await stop(active);
+            expect(f.commands().map(([command]) => command)).toEqual([
+              'list',
+              'stop',
+            ]);
+            throw connectionLost;
+          },
+        ),
+      ).resolves.toBeUndefined();
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'list',
+        'stop',
+        'list',
+      ]);
+      expect(f.state.status).toBe('Stopped');
+    });
+
+    it('preserves a failed authority gate before native stop', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const denied = new PersonVmError('AUTHORIZATION_DENIED');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async () => {
+            throw denied;
+          },
+        ),
+      ).rejects.toBe(denied);
+      expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      expect(f.state.status).toBe('Running');
+    });
+
+    it.each(['Running', 'Created', 'Crashed', 'Stopped'])(
+      'only accepts exact raw native Stopped as read-only recovery evidence: %s',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        if (status === 'Stopped') await f.assertStopped();
+        else {
+          await expect(f.assertStopped()).rejects.toMatchObject({
+            code: 'ACTIVITY_UNKNOWN',
+          });
+        }
+        expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      },
+    );
+
+    it.each([
+      [1024, 'start'],
+      [4096, 'startWithWeb'],
+    ] as const)(
+      'persists %i MiB through %s and reads both saved and running fields',
+      async (memoryMiB, operation) => {
+        const f = await fixture(memoryMiB);
+        const capacity = await f[operation]();
+        expect(f.reserve).toHaveBeenCalledOnce();
+        expect(f.reserve).toHaveBeenCalledWith(
+          { binding: f.binding, memoryMiB },
+          expect.any(AbortSignal),
+        );
+        const inspect = ['inspect', f.name, '--format', 'json'];
+        expect(f.commands()).toEqual([
+          inspect,
+          inspect,
+          [
+            'modify',
+            f.name,
+            '--memory',
+            `${memoryMiB}M`,
+            '--max-memory',
+            `${memoryMiB}M`,
+            '--next-start',
+            '--format',
+            'json',
+          ],
+          inspect,
+          ['start', f.name],
+          inspect,
+        ]);
+        expect(f.state.saved).toEqual(resources(memoryMiB));
+        expect(f.state.status).toBe('Running');
+        expect(f.commitRunning).not.toHaveBeenCalled();
+        await capacity!.commitRunning();
+        expect(f.commitRunning).toHaveBeenCalledExactlyOnceWith(
+          { binding: f.binding, memoryMiB },
+          capacity!.signal,
+        );
+      },
+    );
+
+    it.each(['Running', 'Created', 'Starting', 'Unknown'])(
+      'rejects raw %s before making a reservation or mutating the sandbox',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.reserve).not.toHaveBeenCalled();
+        expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      },
+    );
+
+    it('recovers a terminal crashed VM only with current capacity and no active config', async () => {
+      const f = await fixture(4096);
+      f.state.status = 'Crashed';
+      f.state.activeAfterCrash = true;
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.reserve).not.toHaveBeenCalled();
+      f.state.activeAfterCrash = false;
+      const capacity = await f.start();
+      expect(f.reserve).toHaveBeenCalledOnce();
+      expect(f.state.status).toBe('Running');
+      expect(f.state.saved).toEqual(resources(4096));
+      const lost = new PersonVmError('LEASE_LOST');
+      f.owner.abort(lost);
+      expect(capacity?.signal.reason).toBe(lost);
+      await expect(capacity?.assertCurrent()).rejects.toBe(lost);
+    });
+
+    it('rechecks the raw stopped state after obtaining capacity', async () => {
+      const f = await fixture();
+      f.reserve.mockImplementationOnce(async () => {
+        f.state.status = 'Running';
+        return {
+          signal: f.owner.signal,
+          assertCurrent: f.assertCurrent,
+          commitRunning: f.commitRunning,
+        };
+      });
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+      ]);
+    });
+
+    it.each([1023, 4097, 1024.5, Infinity])(
+      'rejects a requested %s MiB cap before reservation or native operations',
+      async (memoryMiB) => {
+        const f = await fixture(memoryMiB);
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.reserve).not.toHaveBeenCalled();
+        expect(f.commands()).toEqual([]);
+      },
+    );
+
+    it('rejects an explicit restart policy with no capacity source', async () => {
+      const f = await fixture(3072, 'missing-reservation');
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands()).toEqual([]);
+    });
+
+    it('keeps an explicit legacy start only when its saved cap matches', async () => {
+      const f = await fixture(3072, 'legacy');
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      f.state.saved = resources(3072);
+      await f.start();
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'start',
+      ]);
+      expect(f.reserve).not.toHaveBeenCalled();
+    });
+
+    it('rejects a persisted 4096 MiB cap when the caller omits memory options', async () => {
+      const f = await fixture(2048, 'default');
+      f.state.saved = resources(4096);
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().map(([command]) => command)).toEqual(['inspect']);
+      f.state.saved = resources(2048);
+      await f.start();
+      expect(f.state.status).toBe('Running');
+    });
+
+    it('rejects a reservation that no longer covers the current request', async () => {
+      const f = await fixture();
+      const lost = Error('fixture stale reservation');
+      f.assertCurrent.mockRejectedValueOnce(lost);
+      await expect(f.start()).rejects.toBe(lost);
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+    });
+
+    it('requires a new reservation even when the target is already persisted', async () => {
+      const f = await fixture();
+      f.state.saved = resources(3072);
+      const full = Error('fixture capacity exhausted');
+      f.reserve.mockRejectedValueOnce(full);
+      await expect(f.start()).rejects.toBe(full);
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      await f.start();
+      expect(f.reserve).toHaveBeenCalledTimes(2);
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'inspect',
+        'start',
+        'inspect',
+      ]);
+    });
+
+    it.each(['plan', 'saved', 'active'] as const)(
+      'rejects incomplete %s evidence',
+      async (evidence) => {
+        const f = await fixture();
+        if (evidence === 'plan') f.state.applied = false;
+        if (evidence === 'saved') f.state.persist = false;
+        if (evidence === 'active')
+          f.state.active = { memory_mib: 3072, max_memory_mib: 4096 };
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.commands().some(([command]) => command === 'start')).toBe(
+          evidence === 'active',
+        );
+      },
+    );
+
+    it('rejects mismatched Web endpoints after starting with the expected memory', async () => {
+      const f = await fixture();
+      f.state.activePorts = [];
+      await expect(f.startWithWeb()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().slice(-2)).toEqual([
+        ['start', f.name],
+        ['inspect', f.name, '--format', 'json'],
+      ]);
+    });
+
+    it('joins a late modify before returning cancelled and never starts the sandbox', async () => {
+      const f = await fixture();
+      const dispatched = pendingRead<void>();
+      const result = pendingRead<void>();
+      f.state.settleModify = async () => {
+        dispatched.resolve(undefined);
+        await result.promise;
+      };
+      const settled = vi.fn();
+      const starting = f.start().catch(settled);
+      await dispatched.promise;
+      const revoked = Error('fixture reservation revoked');
+      f.owner.abort(revoked);
+      expect(settled).not.toHaveBeenCalled();
+      result.resolve(undefined);
+      await starting;
+      expect(settled).toHaveBeenCalledOnce();
+      expect(settled).toHaveBeenCalledWith(revoked);
+      expect(f.state.saved).toEqual(resources(3072));
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'modify',
+      ]);
+    });
+  });
   it('不接可变镜像tag或不固定的运行版本', async () => {
     expect(
       () =>

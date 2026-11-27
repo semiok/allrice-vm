@@ -26,6 +26,7 @@ const prompt = z
     adapterId: z.string().min(1),
     loginSessionId: UuidSchema,
     nativeRequestId: z.string().min(1),
+    forkedFromNativeSessionId: z.string().min(1).optional(),
   })
   .strict();
 const attempt = z
@@ -84,6 +85,8 @@ export async function readDEntryNativeExecution(
   if (
     root.vmId !== before.prompt.vmId ||
     root.rootNativeSessionId !== before.prompt.rootSessionId ||
+    root.forkedFromNativeSessionId !==
+      before.prompt.forkedFromNativeSessionId ||
     root.identity.employeeVersionId !== before.prompt.employeeRelease
   )
     throw new DataAccessError('authorization_denied');
@@ -499,6 +502,7 @@ async function checkCurrentRunJournal(
       and t.organization_id=v.organization_id and t.owner_id=v.person_id
     where ${currentJournalScope(sql, owner, leaseOwner)}
       and t.d_entry_native_root->>'nativeSessionId'=${prompt.rootSessionId}
+      and (t.d_entry_native_root->>'forkedFromNativeSessionId') is not distinct from ${prompt.forkedFromNativeSessionId ?? null}::text
       ${lock ? sql`for share of v,t` : sql``}
   `;
   signal.throwIfAborted();

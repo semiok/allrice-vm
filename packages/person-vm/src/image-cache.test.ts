@@ -487,6 +487,13 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
           calls.push([...args]);
           if (args[0] === '--version') return 'microsandbox 0.7.16';
           if (args[0] === 'list') return '[]';
+          if (args[0] === 'inspect')
+            return JSON.stringify({
+              name: args[1],
+              status: 'Stopped',
+              config: { resources: { memory_mib: 2048, max_memory_mib: 2048 } },
+              active_config: null,
+            });
           if (args[0] === 'create' && (mode === 'seeded' || mode === 'warm'))
             expect(await readFile(join(person.cache, blobPath), 'utf8')).toBe(
               blob,
@@ -529,6 +536,7 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
         expect(calls.map(([command]) => command)).toEqual([
           '--version',
           'list',
+          'inspect',
           'start',
         ]);
         return;

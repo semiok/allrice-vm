@@ -85,6 +85,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding;
       receipt: PersonVmWebEndpointReceipt;
       bindingRef: string;
+      scheduledWake?: boolean;
       revoked: AbortController;
       ready: boolean;
       verifiedBy?: StartingEditorProof;
@@ -122,9 +123,10 @@ export function createAssignedNativeWebStartup(input: {
       closing ||
       !web ||
       !sameVmBinding(web.receipt.binding, binding) ||
-      web.context.actor.type !== 'user' ||
-      web.context.actor.id !== binding.personId ||
-      web.context.organizationId !== binding.organizationId
+      (web.purpose !== 'scheduled-wake' &&
+        (web.context.actor.type !== 'user' ||
+          web.context.actor.id !== binding.personId ||
+          web.context.organizationId !== binding.organizationId))
     )
       throw new PersonVmError('LEASE_LOST');
     return web;
@@ -267,6 +269,7 @@ export function createAssignedNativeWebStartup(input: {
           binding,
           receipt,
           bindingRef: randomUUID(),
+          scheduledWake: web.purpose === 'scheduled-wake',
           revoked: new AbortController(),
           ready: false,
           verifiedEmployees: new Map(),
@@ -322,7 +325,8 @@ export function createAssignedNativeWebStartup(input: {
             });
             const endpoint = receipt.endpoints[index]!;
             group.owners.set(endpoint.employeeInstanceId, owner);
-            if (prove) {
+            const context = web.context;
+            if (context && prove) {
               const proof = await owner.verifyStartingEditor(
                 scope,
                 signal,
@@ -331,7 +335,7 @@ export function createAssignedNativeWebStartup(input: {
                     {
                       binding: receipt.binding,
                       endpoint,
-                      context: web.context,
+                      context,
                       modelAdapterId,
                       profile,
                       readModels,
@@ -343,6 +347,11 @@ export function createAssignedNativeWebStartup(input: {
                 proof.throwIfAborted();
                 group.verifiedEmployees.set(endpoint.employeeInstanceId, proof);
               }
+            } else if (group.scheduledWake) {
+              await owner.readScheduleCatalog(
+                () => scope.assertCurrent(),
+                signal,
+              );
             }
             current(binding, web);
             signal.throwIfAborted();
@@ -353,7 +362,7 @@ export function createAssignedNativeWebStartup(input: {
           if (
             group.retiring ||
             editorProof !== prove ||
-            (prove && !group.verifiedEmployees.size) ||
+            (prove && !group.scheduledWake && !group.verifiedEmployees.size) ||
             [...group.owners.values()].some(
               (owner) => owner.revoked.aborted || !owner.controlReady(),
             )
@@ -471,6 +480,36 @@ export function createAssignedNativeWebStartup(input: {
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
     },
+    async prepareForegroundEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      signal: AbortSignal,
+    ) {
+      const group = running.get(binding.vmId);
+      if (
+        !group?.scheduledWake ||
+        [...group.verifiedEmployees.values()].some((proof) => !proof.aborted)
+      )
+        return;
+      const results = await Promise.allSettled(
+        group.receipt.endpoints
+          .filter(
+            (entry) =>
+              !context.workspaceId || context.workspaceId === entry.workspaceId,
+          )
+          .map(({ employeeInstanceId }) =>
+            this.ensureVerifiedEditor(
+              context,
+              binding,
+              employeeInstanceId,
+              signal,
+            ),
+          ),
+      );
+      if (!results.some((result) => result.status === 'fulfilled'))
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      signal.throwIfAborted();
+    },
     ensureVerifiedEditor(
       context: RequestContext,
       binding: PersonVmBinding,
@@ -559,6 +598,15 @@ export function createAssignedNativeWebStartup(input: {
         owner,
       });
     },
+    activityCatalogs(binding: PersonVmBinding, signal: AbortSignal) {
+      this.assertAuthenticatedGroup(binding, signal);
+      const group = running.get(binding.vmId)!;
+      if (group.owners.size !== group.receipt.endpoints.length)
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      return group.receipt.endpoints.map(({ employeeInstanceId }) =>
+        this.catalog(binding, employeeInstanceId),
+      );
+    },
     /** Authenticated owners already present in this Worker. Ledger reads
      * separately verify the durable scope and never start a profile. */
     runJournalOwners(): AssignedNativeWebCatalog[] {
@@ -624,10 +672,19 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       signal: AbortSignal,
     ): AbortSignal;
+    prepareForegroundEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      signal: AbortSignal,
+    ): Promise<void>;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,
     ): AssignedNativeWebCatalog;
+    activityCatalogs(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): readonly AssignedNativeWebCatalog[];
     runJournalOwners(): AssignedNativeWebCatalog[];
     hasLocalOwner(binding: PersonVmBinding): boolean;
     owner(

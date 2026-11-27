@@ -254,13 +254,15 @@ export function createDEntryProfile(
                 throw error;
               });
             }
-            async function verify(nativeSessionIds?: readonly string[]) {
+            async function verify() {
               await verifyRelease();
-              await page.assertCurrent(active, nativeSessionIds);
+              await page.assertCurrent(active);
             }
             await verifyRelease();
             if (operation === 'bootstrap') {
               if (mode === 'document') {
+                if (!page.root) throw new DEntryNativeUnavailable();
+                const nativeSessionId = page.root.rootNativeSessionId;
                 await json(
                   active,
                   {
@@ -269,10 +271,13 @@ export function createDEntryProfile(
                       graphRev: release.graph.rev,
                       manifestSha256: release.manifestSha256,
                     }),
-                    nativeSessionId: page.root.rootNativeSessionId,
+                    nativeSessionId,
                   },
                   200,
-                  verify,
+                  async () => {
+                    await verify();
+                    await page.authorize(nativeSessionId, 'read', active);
+                  },
                 );
                 return;
               }
@@ -353,14 +358,7 @@ export function createDEntryProfile(
                       },
                     });
                     const baseline = await readBaseline(latestAccess);
-                    const nativeSessionIds = baseline.grants.map(
-                      ({ resource }) => {
-                        if (resource.kind !== 'session')
-                          throw new DEntryNativeUnavailable();
-                        return String(resource.id);
-                      },
-                    );
-                    await verify(nativeSessionIds);
+                    await verify();
                     body = JSON.stringify(
                       DEntryProfileBootstrapSchema.parse({
                         version: 1,

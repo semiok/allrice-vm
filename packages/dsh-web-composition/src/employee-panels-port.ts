@@ -4,6 +4,7 @@ import type { SessionIdOf } from '@deepseek-ai/dsh-client-ui-slots';
 import type { EnterpriseMaterialsPanel } from '../../../apps/web/app/chatflow/enterprise-materials-panel';
 import type { WorkbenchFilesPanel } from '../../../apps/web/app/chatflow/workbench-files-panel';
 import type { EmployeeMemorySidebar } from '../../../apps/web/app/chatflow/employee-memory-sidebar';
+import type { EmployeeMemoryManager } from '../../../apps/web/app/chatflow/employee-memory-manager';
 import type { EmployeeCapabilitiesPanel } from '../../../apps/web/app/chatflow/employee-capabilities-panel';
 
 import type { ReferencePublicationScope } from '../../../apps/web/app/chatflow/reference-publication-dialog';
@@ -45,7 +46,14 @@ export interface EmployeePanelsSnapshot {
   readonly materials: Omit<Materials, 'active' | 'onUse'>;
   readonly files: Omit<Files, 'active' | 'onUse'>;
   readonly filePreview?: { readonly objectId: string; close(): void };
-  readonly experience?: Omit<Memory, 'active'>;
+  readonly experience?:
+    | Omit<Memory, 'active'>
+    | {
+        management: Omit<
+          ComponentProps<typeof EmployeeMemoryManager>,
+          'active' | 'lifetimeSignal' | 'assertCurrent'
+        >;
+      };
   /** Pure props composition. Existing controllers/providers remain in the
    * authenticated owner; do not create hooks or a second catalog here. */
   readonly workflow?: (

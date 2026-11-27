@@ -14,6 +14,7 @@ import {
   type PersonVmBinding,
   type PersonVmEgressReceipt,
 } from './contract.ts';
+import type { PersonVmIdleStopDispatch } from './admission-contract.ts';
 import { privateDirectory } from './encrypted-disk.ts';
 import {
   checkedPublicImageCache,
@@ -66,6 +67,55 @@ const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
 const GUEST_WORK_DIRECTORY = '/work';
 type NativePaths = { home: string; config: string; userHome: string };
+type RestartMemoryRequest = Readonly<{
+  binding: PersonVmBinding;
+  memoryMiB: number;
+}>;
+type RestartMemoryReservation = Readonly<{
+  signal: AbortSignal;
+  assertCurrent(
+    request: RestartMemoryRequest,
+    signal: AbortSignal,
+  ): Promise<void>;
+  /** The capacity owner atomically rejects a revoked reservation or converts
+   * it into a running charge for this exact binding. A committed charge
+   * survives reservation expiry and cancellation until physical release. */
+  commitRunning(
+    request: RestartMemoryRequest,
+    signal: AbortSignal,
+  ): Promise<void>;
+}>;
+type NativeStartFence = Readonly<{
+  signal: AbortSignal;
+  assertCurrent(): Promise<void>;
+  commitRunning(): Promise<void>;
+}>;
+type NativeMemoryInspection = {
+  name?: unknown;
+  status?: unknown;
+  config?: unknown;
+  active_config?: unknown;
+};
+
+function matchesNativeMemory(config: unknown, memoryMiB: number) {
+  const { memory_mib: memory, max_memory_mib: max } =
+    (
+      config as {
+        resources?: { memory_mib?: unknown; max_memory_mib?: unknown };
+      } | null
+    )?.resources ?? {};
+  if (
+    typeof memory !== 'number' ||
+    typeof max !== 'number' ||
+    !Number.isInteger(memory) ||
+    !Number.isInteger(max) ||
+    memory <= 0 ||
+    memory > max ||
+    max > 0xffffffff
+  )
+    throw new PersonVmError('PROVIDER_FAILED');
+  return memory === memoryMiB && max === memoryMiB;
+}
 
 function assertSocketHome(home: string) {
   const controlSocket = join(
@@ -89,6 +139,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<'absent' | 'stopped' | 'running' | 'unknown'>;
+  readAttachedStatus?(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ): ReturnType<PersonVmNativePort['status']>;
   create(
     binding: PersonVmBinding,
     receipt: PersonVmEgressReceipt,
@@ -120,14 +175,29 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
       'binding' | 'probes' | 'native' | 'cleanupSignal'
     >,
   ): ReturnType<typeof createPersonVmCommandMemoryObserver>;
-  start(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  start(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<NativeStartFence | void>;
   /** Optional retained-start operation. It must verify both the artifact and
    * Web endpoints against the same fresh, post-start native inspection. */
   startWithWebEndpoints?(
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
+  ): Promise<NativeStartFence | void>;
+  stop(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    options?: Readonly<{ requireStopped: true }>,
   ): Promise<void>;
-  stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  /** Optional Host-only retirement operations. */
+  stopIdle?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    assertCurrent: () => Promise<void>,
+    dispatch?: PersonVmIdleStopDispatch,
+  ): Promise<void>;
+  assertStopped?(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   releaseDiskHome?(
     vmId: string,
     mount: string,
@@ -163,12 +233,25 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
       memoryMiB?: number;
+      /** Reserve against the physical binding. The capacity owner must keep
+       * charging until it can confirm that binding is stopped or absent,
+       * even if the signal aborts or the native start fails without an ACK. */
+      restartMemory?: Readonly<{
+        memoryMiB: number;
+        reserve?(
+          request: RestartMemoryRequest,
+          signal: AbortSignal,
+        ): Promise<RestartMemoryReservation>;
+      }>;
       runner?: CommandRunner;
       jobCleanupTimeoutMs?: number;
     },
   ) {
     this.options = {
       ...options,
+      ...(options.restartMemory
+        ? { restartMemory: Object.freeze({ ...options.restartMemory }) }
+        : {}),
       ...(options.readonlyDshDirectory
         ? {
             readonlyDshDirectory: checkedReadonlyDshDirectory(
@@ -409,8 +492,22 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     running = true,
     web?: PersonVmWebEndpointReceipt,
   ) {
+    if (!this.options.readonlyDshDirectory && !web) return;
+    const [artifact] = await this.inspectAndAssertArtifact(
+      binding,
+      signal,
+      running,
+      web,
+    );
+    return artifact;
+  }
+  private async inspectAndAssertArtifact(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    running: boolean,
+    web?: PersonVmWebEndpointReceipt,
+  ) {
     const c = this.options.readonlyDshDirectory;
-    if (!c && !web) return;
     const [artifact, inspection] = await this.inspectWithArtifact(
       binding,
       signal,
@@ -434,7 +531,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         web,
         true,
       );
-    return artifact.value;
+    return [artifact.value, inspection.value] as const;
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
     // Both reads can overlap under the same owner. Join the native CLI even
@@ -503,15 +600,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (!/\b0\.7\.16\b/.test(version))
       throw new PersonVmError('PROVIDER_FAILED');
   }
-  /** For a fixed Host-authored read command, inside a physical lease that has
-   * independently verified this already attached disk. Reopen the original
-   * configuration without populating launch ownership or preparing the disk. */
-  async readAttachedProbe(
-    scope: PersonVmStartingScope,
+  /** Read the verified attached disk without changing the saved CLI config. */
+  private async readAttachedPaths(
+    binding: PersonVmBinding,
     mount: string,
-    commandSpec: PersonVmGuestCommand,
+    signal: AbortSignal,
   ) {
-    const { binding, signal } = scope;
     const home = join(this.options.socketRoot, binding.vmId);
     const target = join(mount, 'microsandbox');
     const paths = {
@@ -520,7 +614,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       config: join(mount, 'msb-config.json'),
     };
     assertSocketHome(home);
-    await scope.assertCurrent();
     signal.throwIfAborted();
     for (const directory of [this.options.socketRoot, target, paths.userHome]) {
       const stat = await lstat(directory);
@@ -549,8 +642,33 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     } finally {
       await config.close();
     }
+    signal.throwIfAborted();
+    return paths;
+  }
+  async readAttachedStatus(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+  ) {
+    const paths = await this.readAttachedPaths(binding, mount, signal);
+    const output = await this.runWithPaths(
+      paths,
+      ['list', '--format', 'json'],
+      signal,
+    );
+    return this.lifecycleState(this.parseStatus(binding, output));
+  }
+  /** Fixed Host-authored read inside an independently verified physical lease. */
+  async readAttachedProbe(
+    scope: PersonVmStartingScope,
+    mount: string,
+    commandSpec: PersonVmGuestCommand,
+  ) {
+    const { binding, signal } = scope;
+    await scope.assertCurrent();
+    const paths = await this.readAttachedPaths(binding, mount, signal);
     const directory = this.options.readonlyDshDirectory;
-    const artifact = await this.artifact(binding, signal, false, home);
+    const artifact = await this.artifact(binding, signal, false, paths.home);
     if (!directory || !artifact) throw new PersonVmError('PROVIDER_FAILED');
     const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
       this.runWithPaths(paths, args, active, nonzero);
@@ -593,10 +711,14 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       throw error;
     }
   }
-  async status(binding: PersonVmBinding, signal: AbortSignal) {
-    const rows: unknown = JSON.parse(
+  private async rawStatus(binding: PersonVmBinding, signal: AbortSignal) {
+    return this.parseStatus(
+      binding,
       await this.command(binding, ['list', '--format', 'json'], signal),
     );
+  }
+  private parseStatus(binding: PersonVmBinding, output: string) {
+    const rows: unknown = JSON.parse(output);
     if (!Array.isArray(rows)) throw new PersonVmError('PROVIDER_FAILED');
     const matches = rows.filter(
       (value: unknown) =>
@@ -605,9 +727,15 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         'name' in value &&
         value.name === this.name(binding),
     );
-    if (matches.length === 0) return 'absent' as const;
+    if (matches.length === 0) return undefined;
     if (matches.length !== 1) throw new PersonVmError('PROVIDER_FAILED');
-    const status = (matches[0] as { status?: string }).status;
+    return (matches[0] as { status?: string }).status ?? 'Unknown';
+  }
+  async status(binding: PersonVmBinding, signal: AbortSignal) {
+    return this.lifecycleState(await this.rawStatus(binding, signal));
+  }
+  private lifecycleState(status: string | undefined) {
+    if (status === undefined) return 'absent' as const;
     if (status === 'Running') return 'running' as const;
     if (status === 'Stopped' || status === 'Created' || status === 'Crashed')
       return 'stopped' as const;
@@ -821,28 +949,199 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       true,
     );
   }
-  private async startNative(binding: PersonVmBinding, signal: AbortSignal) {
-    await this.assertArtifact(binding, signal, false);
-    await this.command(binding, ['start', this.name(binding)], signal);
+  private async startNative(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    web?: PersonVmWebEndpointReceipt,
+  ): Promise<NativeStartFence | void> {
+    const policy = this.options.restartMemory;
+    if (policy === undefined) {
+      // The default cap is also a cap: a cancelled modify may have persisted
+      // a higher setting that only a start with new capacity may consume.
+      const [, raw] = await this.inspectAndAssertArtifact(
+        binding,
+        signal,
+        false,
+      );
+      const saved = raw as NativeMemoryInspection | null;
+      if (
+        saved?.name !== this.name(binding) ||
+        typeof saved.status !== 'string' ||
+        !['Stopped', 'Created', 'Crashed'].includes(saved.status) ||
+        saved.active_config !== null ||
+        !matchesNativeMemory(saved.config, this.memoryMiB)
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+      await this.command(binding, ['start', this.name(binding)], signal);
+      await this.assertArtifact(binding, signal, true, web);
+      return;
+    }
+
+    const { memoryMiB, reserve } = policy;
+    if (
+      !Number.isInteger(memoryMiB) ||
+      memoryMiB < 1024 ||
+      memoryMiB > 4096 ||
+      typeof reserve !== 'function'
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+
+    const request = Object.freeze({
+      binding: Object.freeze({ ...binding }),
+      memoryMiB,
+    });
+    const name = this.name(request.binding);
+    const inspect = async (active: AbortSignal, running: boolean) => {
+      active.throwIfAborted();
+      const [, raw] = await this.inspectAndAssertArtifact(
+        request.binding,
+        active,
+        running,
+        running ? web : undefined,
+      );
+      const value = raw as NativeMemoryInspection | null;
+      const currentStatus = value?.status;
+      if (
+        value?.name !== name ||
+        (running
+          ? currentStatus !== 'Running'
+          : (currentStatus !== 'Stopped' && currentStatus !== 'Crashed') ||
+            value.active_config !== null)
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+      return value;
+    };
+    await inspect(signal, false);
+    const reservation = await reserve(request, signal);
+    if (typeof reservation.commitRunning !== 'function')
+      throw new PersonVmError('PROVIDER_FAILED');
+    const active = AbortSignal.any([signal, reservation.signal]);
+    const assertCapacity = async () => {
+      active.throwIfAborted();
+      await reservation.assertCurrent(request, active);
+      active.throwIfAborted();
+    };
+
+    await assertCapacity();
+    const stopped = await inspect(active, false);
+    if (!matchesNativeMemory(stopped.config, memoryMiB)) {
+      await assertCapacity();
+      const result = await this.command(
+        request.binding,
+        [
+          'modify',
+          name,
+          '--memory',
+          `${memoryMiB}M`,
+          '--max-memory',
+          `${memoryMiB}M`,
+          '--next-start',
+          '--format',
+          'json',
+        ],
+        active,
+      );
+      active.throwIfAborted();
+      const plan: {
+        sandbox?: unknown;
+        status?: unknown;
+        policy?: unknown;
+        applied?: unknown;
+        conflicts?: unknown;
+      } | null = JSON.parse(result);
+      if (
+        plan?.sandbox !== name ||
+        plan.status !==
+          (stopped.status === 'Crashed' ? 'crashed' : 'stopped') ||
+        plan.policy !== 'next_start' ||
+        plan.applied !== true ||
+        !Array.isArray(plan.conflicts) ||
+        plan.conflicts.length !== 0
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+      await assertCapacity();
+      const saved = await inspect(active, false);
+      if (!matchesNativeMemory(saved.config, memoryMiB))
+        throw new PersonVmError('PROVIDER_FAILED');
+    }
+    await assertCapacity();
+    await this.command(request.binding, ['start', name], active);
+    await assertCapacity();
+    const started = await inspect(active, true);
+    if (
+      !matchesNativeMemory(started.config, memoryMiB) ||
+      !matchesNativeMemory(started.active_config, memoryMiB)
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+    await assertCapacity();
+    return Object.freeze({
+      signal: active,
+      assertCurrent: assertCapacity,
+      commitRunning: async () => {
+        active.throwIfAborted();
+        await reservation.commitRunning(request, active);
+      },
+    });
   }
   async start(binding: PersonVmBinding, signal: AbortSignal) {
-    await this.startNative(binding, signal);
-    await this.assertArtifact(binding, signal);
+    return this.startNative(binding, signal);
   }
   async startWithWebEndpoints(
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
   ) {
-    await this.startNative(receipt.binding, signal);
-    await this.assertArtifact(receipt.binding, signal, true, receipt);
+    return this.startNative(receipt.binding, signal, receipt);
   }
-  async stop(binding: PersonVmBinding, signal: AbortSignal) {
+  async stop(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    options?: Readonly<{ requireStopped: true }>,
+  ) {
     const state = await this.status(binding, signal);
-    if (state === 'absent' || state === 'stopped') return;
+    if (state === 'absent') return;
+    if (options?.requireStopped && state !== 'stopped')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+    // An exiting runtime can publish Stopped before releasing ownership.
+    // The native stop operation joins the known runtime before we detach.
     await this.command(binding, ['stop', this.name(binding)], signal);
     const after = await this.status(binding, signal);
     if (after !== 'stopped' && after !== 'absent')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
+  }
+  async stopIdle(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    assertCurrent: () => Promise<void>,
+    dispatch?: PersonVmIdleStopDispatch,
+  ) {
+    if ((await this.rawStatus(binding, signal)) !== 'Running')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+    await assertCurrent();
+    signal.throwIfAborted();
+    let commandJoined = false;
+    const stop = async (active: AbortSignal) => {
+      await this.command(binding, ['stop', this.name(binding)], active);
+      commandJoined = true;
+    };
+    if (dispatch) {
+      try {
+        await dispatch(signal, stop);
+      } catch (error) {
+        // Closing the read-only authority transaction may fail after the
+        // command joined. The physical lease still owns terminal readback.
+        if (!commandJoined) throw error;
+      }
+      if (!commandJoined) throw new PersonVmError('ACTIVITY_UNKNOWN');
+    } else await stop(signal);
+    if ((await this.rawStatus(binding, signal)) !== 'Stopped')
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+  }
+  async assertStopped(binding: PersonVmBinding, signal: AbortSignal) {
+    // Caller must already have proof that the native stop joined. This read
+    // only verifies that the same stopped instance is still current.
+    if ((await this.rawStatus(binding, signal)) !== 'Stopped')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+    signal.throwIfAborted();
   }
   async releaseDiskHome(vmId: string, mount: string, signal: AbortSignal) {
     const home = join(this.options.socketRoot, vmId);
