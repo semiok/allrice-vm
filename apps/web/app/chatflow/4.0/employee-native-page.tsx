@@ -775,12 +775,34 @@ function EmployeeNativePane({
         frameSelection.current = selection;
         selectedQuery = query;
         nextQuery.current = displayedQuery.current = query;
-        commitRoute(query, restored ? undefined : true);
-        if (restored && restoredQuery !== undefined && restoredQuery !== query)
-          queueMicrotask(() => {
-            if (!detached && restoredQuery !== undefined)
-              restore(restoredQuery);
-          });
+        if (!restored) {
+          commitRoute(query, true);
+        } else {
+          const historyQuery = restoredQuery;
+          const historySelection =
+            historyQuery && restoredSelection(historyQuery);
+          if (
+            historyQuery &&
+            historySelection &&
+            stillSelected(historySelection)
+          ) {
+            // The leaf may have become visible again while its history
+            // handoff was pending. Replace that entry with the confirmed thread.
+            nextQuery.current =
+              displayedQuery.current =
+              selectedQuery =
+                historyQuery;
+            commitRoute(historyQuery, false);
+          } else {
+            // Keep the confirmed thread in this leaf while draining the
+            // newer history selection.
+            commitRoute(query);
+            queueMicrotask(() => {
+              if (!detached && restoredQuery !== undefined)
+                restore(restoredQuery);
+            });
+          }
+        }
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
