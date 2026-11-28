@@ -439,7 +439,7 @@ integration('MET-288 live administration HTTP contract', () => {
     const toolRecord = {
       source: 'tool_broker',
       name: 'PRIVATE_TOOL_NAME',
-      toolCallId: 'PRIVATE_TOOL_CALL'.padEnd(240, 'X'),
+      toolCallId: 'PRIVATE_TOOL_CALL'.padEnd(300, 'X'),
       summary: 'PRIVATE_TOOL_OUTPUT',
     };
     const next = Number(seq!.next) + 1;

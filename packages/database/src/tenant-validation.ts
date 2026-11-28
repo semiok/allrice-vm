@@ -163,7 +163,9 @@ export async function inspectTenantRun(
     from allrice_task_resource_waits w where w.run_id=${runId} and w.organization_id=${organizationId} and w.workspace_id=${workspaceId}
     order by w.queued_at desc,w.id limit 101`;
   const diagnostics =
-    await db`select occurred_at,reason,metadata from allrice_audit_events
+    await db`select occurred_at,reason,metadata->'attemptId' as attempt_id,
+      metadata->'reason' as diagnostic_reason,metadata->'errorCode' as error_code
+    from allrice_audit_events
     where organization_id=${organizationId} and workspace_id=${workspaceId} and resource_id=${runId} and action='execution.diagnostic'
     order by occurred_at desc,id desc limit 201`;
   const [pending] =
@@ -211,16 +213,12 @@ export async function inspectTenantRun(
           .map((e) => ({
             at: e.occurred_at.toISOString(),
             stage: e.reason,
-            attemptId:
-              typeof e.metadata.attemptId === 'string'
-                ? e.metadata.attemptId
-                : null,
+            attemptId: typeof e.attempt_id === 'string' ? e.attempt_id : null,
             reason:
-              typeof e.metadata.reason === 'string' ? e.metadata.reason : null,
-            errorCode:
-              typeof e.metadata.errorCode === 'string'
-                ? e.metadata.errorCode
+              typeof e.diagnostic_reason === 'string'
+                ? e.diagnostic_reason
                 : null,
+            errorCode: typeof e.error_code === 'string' ? e.error_code : null,
           })),
         truncated: waits.length > 100 || diagnostics.length > 200,
       }

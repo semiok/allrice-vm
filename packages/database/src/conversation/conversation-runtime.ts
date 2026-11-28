@@ -641,7 +641,6 @@ export async function listDshRuntimeEventTimeline(
           'status',event.payload->>'status',
           'compactionEnded',event.payload->>'sourceEventType'='compaction/end',
           'toolKey',case when jsonb_typeof(diagnostic.call_id)='string'
-                       and length(diagnostic.call_id #>> '{}') between 1 and 240
                        and btrim(diagnostic.call_id #>> '{}') <> ''
             then encode(sha256(convert_to(jsonb_build_array(
               employee_run.run_id,event.payload->>'source',diagnostic.call_id
