@@ -20,7 +20,6 @@ import {
   pageMuxAttach,
   pageNavigate,
   pageSwitchReady,
-  pageThreadScope,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
   pageThreadSwitchPrepared,
@@ -593,10 +592,6 @@ export function EmployeeNativePage({
             return;
           }
           target.scopeId = issued.scopeId;
-          frame.current?.contentWindow?.postMessage(
-            { type: pageThreadScope, scopeId, issued },
-            location.origin,
-          );
         })
         .catch((error: unknown) => {
           if (switching !== target) return;

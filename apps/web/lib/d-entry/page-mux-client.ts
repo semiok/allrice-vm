@@ -16,6 +16,7 @@ export function borrowPageMux(
   resourceScopeId = scopeId,
   canSendInput: () => boolean = () => true,
   currentScope: () => string = () => resourceScopeId,
+  applyScope?: (issued: unknown) => void,
 ): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
@@ -29,6 +30,8 @@ export function borrowPageMux(
   port1.onmessage = ({ data }) => {
     if (data?.type === 'close') {
       finish();
+    } else if (data?.type === 'scope' && readyState === WebSocket.OPEN) {
+      applyScope?.(data.issued);
     } else if (data?.type === 'open' && readyState === WebSocket.CONNECTING) {
       readyState = WebSocket.OPEN;
       events.dispatchEvent(new Event('open'));

@@ -187,6 +187,8 @@ export function openNativePageCarrier(
             if (value.type === 'switched') {
               scopeId = value.scopeId;
               carrierSelection = { ...selection, threadId: value.threadId };
+              // Use the same FIFO as native snapshots and stream terminals.
+              nativeMux?.postMessage({ type: 'scope', issued: value });
             }
             result.resolve(value.type === 'switched' ? value : undefined);
             return;
