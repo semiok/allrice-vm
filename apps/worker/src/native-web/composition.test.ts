@@ -285,6 +285,71 @@ it.each(['proved', 'unproved'] as const)(
     }
   },
 );
+it('proves the exact scoped thread during starting without using running-only or threadless proof', async () => {
+  const f = fixture();
+  const employee = { ...f.web.receipt.endpoints[0]!, ...f.binding };
+  const editor = { employee, threadId: randomUUID() };
+  const web = {
+    ...f.web,
+    selectedEmployee: employee,
+    editorThreadId: editor.threadId,
+  };
+  const proof = new AbortController();
+  const model = {
+    provider: 'openai-codex',
+    model: 'gpt-6.2-sol',
+    modelInfo: { provider: 'openai-codex', id: 'gpt-6.2-sol', name: 'Fixture' },
+  };
+  f.service.installModelAdapter(async () => ({
+    ...model,
+    origin: 'http://192.0.2.5:34100',
+    capability: 'synthetic-model-capability',
+    scoped: { rules: [], models: [model] },
+  }));
+  const verify = vi.fn(async () => proof.signal);
+  f.service.installStartingEditorProof(verify);
+  const owner = {
+    ...catalogOwner(),
+    verifyStartingEditor: vi.fn<NativeWebOwner['verifyStartingEditor']>(
+      async (_scope, active, check) =>
+        check(
+          {
+            revoked: active,
+            readImmutableGraph: vi.fn(),
+            readImmutableBundle: vi.fn(),
+          },
+          vi.fn(),
+          active,
+        ),
+    ),
+    verifyRunningEditor: vi.fn(),
+  };
+  open.mockResolvedValue(owner);
+  try {
+    await f.service.memoryGuestPlan(f.binding, signal(), web);
+    await f.service.start(f.binding, signal(), f.scope, web);
+    expect(verify).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ threadId: editor.threadId }),
+      expect.any(AbortSignal),
+    );
+    await expect(
+      f.service.assertStartingEditor(f.binding, web.context, editor, signal()),
+    ).resolves.toBe(proof.signal);
+    expect(owner.verifyRunningEditor).not.toHaveBeenCalled();
+    expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow();
+    await expect(
+      f.service.assertStartingEditor(
+        f.binding,
+        web.context,
+        { ...editor, threadId: randomUUID() },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+  } finally {
+    await f.service.close();
+  }
+});
+
 it('starts only the selected employee on a fresh five-profile disk and keeps all five usable after stop and restore', async () => {
   const f = capacityFixture(
     createProductionEmployeeRuntime({}, { readAttachedProbe: vi.fn() }, 20)!,

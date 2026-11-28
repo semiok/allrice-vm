@@ -1021,7 +1021,9 @@ export class PersonVmService
           binding,
           signal,
           context,
-          ...(editor ? [editor] : []),
+          ...(editor
+            ? [{ ...editor, starting: row.phase === 'starting' }]
+            : []),
         )
       : await this.options.runtime.readiness(binding, signal);
     if (

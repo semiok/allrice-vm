@@ -160,7 +160,7 @@ export interface PersonVmRuntimePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     context?: RequestContext,
-    editor?: PersonVmEditorSelection,
+    editor?: PersonVmEditorSelection & Readonly<{ starting: boolean }>,
   ): Promise<{
     binding: PersonVmBinding;
     authenticated: boolean;

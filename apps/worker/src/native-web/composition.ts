@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import type {
   PersonVmBinding,
   PersonVmBootstrapScope,
+  PersonVmEditorSelection,
   PersonVmGuestBootstrapPort,
   PersonVmPort,
   PersonVmRuntimePort,
@@ -169,6 +170,13 @@ export function createAssignedNativeWebStartup(input: {
       ready: boolean;
       verifiedBy?: StartingEditorProof;
       verifiedEmployees: Map<string, AbortSignal>;
+      startingEditor?: {
+        threadId: string;
+        sessionId: string;
+        endpoint: Endpoint;
+        proof: AbortSignal;
+        assertCurrent(): Promise<void>;
+      };
       owners: Map<string, NativeWebOwner>;
       added: Map<string, PersonVmWebEndpointReceipt>;
       startingEmployees: Set<string>;
@@ -686,8 +694,16 @@ export function createAssignedNativeWebStartup(input: {
               );
               if (proof) {
                 proof.throwIfAborted();
-                if (selected && plan.selectedThreadId) selectedProof = proof;
-                else group.verifiedEmployees.set(employeeId, proof);
+                if (selected && plan.selectedThreadId) {
+                  selectedProof = proof;
+                  group.startingEditor = {
+                    threadId: plan.selectedThreadId,
+                    sessionId: context.sessionId,
+                    endpoint,
+                    proof,
+                    assertCurrent: () => scope.assertCurrent(),
+                  };
+                } else group.verifiedEmployees.set(employeeId, proof);
               }
             } else if (group.scheduledWake) {
               await owner.readScheduleCatalog(
@@ -886,6 +902,35 @@ export function createAssignedNativeWebStartup(input: {
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
+    },
+    async assertStartingEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      editor: PersonVmEditorSelection,
+      signal: AbortSignal,
+    ) {
+      const group = running.get(binding.vmId);
+      const started = group?.startingEditor;
+      this.assertAuthenticatedGroup(binding, signal);
+      if (
+        !started ||
+        started.sessionId !== context.sessionId ||
+        started.threadId !== editor.threadId ||
+        !sameEmployee(started.endpoint, editor.employee) ||
+        context.actor.type !== 'user' ||
+        context.actor.id !== binding.personId ||
+        context.organizationId !== binding.organizationId
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      await started.assertCurrent();
+      const catalog = this.catalog(
+        binding,
+        started.endpoint.employeeInstanceId,
+      );
+      catalog.revoked.throwIfAborted();
+      signal.throwIfAborted();
+      started.proof.throwIfAborted();
+      return started.proof;
     },
     async prepareForegroundEditor(
       binding: PersonVmBinding,
@@ -1305,6 +1350,12 @@ export function createAssignedNativeWebStartup(input: {
       signal: AbortSignal,
       employeeInstanceId?: string,
     ): AbortSignal;
+    assertStartingEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      editor: PersonVmEditorSelection,
+      signal: AbortSignal,
+    ): Promise<AbortSignal>;
     needsEmployee(
       context: RequestContext,
       binding: PersonVmBinding,

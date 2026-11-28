@@ -196,13 +196,20 @@ export function createProductionPersonVmSources(
             async readiness(binding, signal, context, editor) {
               if (context && editor) {
                 if (routing.applies(binding)) {
-                  const proof = await startup.ensureVerifiedEditor(
-                    context,
-                    binding,
-                    editor.employee.employeeInstanceId,
-                    signal,
-                    editor.threadId,
-                  );
+                  const proof = editor.starting
+                    ? await startup.assertStartingEditor(
+                        binding,
+                        context,
+                        editor,
+                        signal,
+                      )
+                    : await startup.ensureVerifiedEditor(
+                        context,
+                        binding,
+                        editor.employee.employeeInstanceId,
+                        signal,
+                        editor.threadId,
+                      );
                   signal.throwIfAborted();
                   proof.throwIfAborted();
                   return {

@@ -149,7 +149,11 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
           startup?.receipt.binding,
           expect.any(AbortSignal),
           rc,
-          { employee: selectedEmployee, threadId: editorThreadId },
+          {
+            employee: selectedEmployee,
+            threadId: editorThreadId,
+            starting: true,
+          },
         );
       expect(startup?.unusedEmployeeHomes).toBe(
         state === 'fresh disk and attach' ? true : undefined,
