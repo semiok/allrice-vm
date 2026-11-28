@@ -97,8 +97,12 @@ it.each([
       store,
       async readTrustedContext(_binding, _signal, phase) {
         phases.push(phase);
-        if (archived) throw new ModelGatewayError('AUTHORIZATION_DENIED');
         return index;
+      },
+      async withTrustedContext(_binding, _signal, _route, dispatch) {
+        phases.push('dispatch');
+        if (archived) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+        dispatch(index);
       },
     });
     cleanup.push(() => f.close());
@@ -106,8 +110,58 @@ it.each([
     expect(phases).toEqual(['seal', 'dispatch']);
     expect(store.calls.size).toBe(1);
     expect(upstream.requests).toHaveLength(0);
+    expect([...store.rows.values()]).toMatchObject([
+      { dispatchObserved: false, outcome: 'failed', httpStatus: null },
+    ]);
   },
 );
+it('does not send the sealed index if the selected route is revoked while waiting on recovery', async () => {
+  const upstream = await upstreamFixture();
+  cleanup.push(() => upstream.close());
+  const native = await nativeProviderFixture(upstream.url);
+  cleanup.push(() => native.close());
+  const entered = deferred();
+  const released = deferred();
+  const index = 'confirmed memory only';
+  let ready = true;
+  const store = new FixtureStore();
+  const f = await gatewayFixture({
+    store,
+    provider: {
+      ...native.provider,
+      async assertDispatchCurrent() {
+        expect(ready).toBe(true);
+        return {
+          assertCurrent() {
+            if (!ready) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+          },
+        };
+      },
+    },
+    async readTrustedContext() {
+      return index;
+    },
+    async withTrustedContext(_binding, _signal, _route, dispatch) {
+      entered.resolve();
+      await released.promise;
+      dispatch(index);
+    },
+  });
+  cleanup.push(() => f.close());
+  const result = f.collect();
+  try {
+    await entered.promise;
+    ready = false;
+  } finally {
+    released.resolve();
+  }
+  await result;
+  expect(upstream.requests).toHaveLength(0);
+  expect([...store.rows.values()]).toMatchObject([
+    { dispatchObserved: false, outcome: 'failed', httpStatus: null },
+  ]);
+  expect(store.slots.get(f.binding.vm.personId)?.size).toBe(0);
+});
 it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
   const f = await setup();
   const status = await new Promise<number | undefined>((resolve, reject) => {

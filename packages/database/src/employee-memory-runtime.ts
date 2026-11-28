@@ -552,6 +552,10 @@ async function restoreNativeEmployeeMemoryContext(
   input: NativeMemoryRestoreTarget,
   signal: AbortSignal,
   assembly?: MemoryRuntimeAssembly,
+  dispatch?: {
+    codex?: NativeMemoryCodexRoute;
+    start(document: string): void;
+  },
 ) {
   const target = NativeMemoryRestoreTargetSchema.parse(input);
   const { module, ...selector } = target;
@@ -575,6 +579,12 @@ async function restoreNativeEmployeeMemoryContext(
         qualifier(bound, signal, context),
       );
       requireOriginalContextOrigin(saved.origin, execution);
+      if (dispatch) {
+        if (dispatch.codex)
+          await lockNativeMemoryCodexDispatch(bound.tx, dispatch.codex);
+        signal.throwIfAborted();
+        dispatch.start(saved.document);
+      }
       return saved.document;
     },
     'read',
@@ -582,6 +592,34 @@ async function restoreNativeEmployeeMemoryContext(
   );
   signal.throwIfAborted();
   return document;
+}
+
+type NativeMemoryCodexRoute = Readonly<{
+  connectionId: string;
+  slot: 1 | 2;
+  revision: string;
+}>;
+
+async function lockNativeMemoryCodexDispatch(
+  tx: Sql,
+  route: NativeMemoryCodexRoute,
+) {
+  // Lock the exact ready generation after every awaited memory read. A
+  // concurrent administrative write must win or fail the send, never queue
+  // behind a lock waiter keeping the memory pin and foreground order held.
+  const [selected] = await tx<{ allowed: boolean }[]>`
+    select true as allowed
+    from allrice_codex_subscriptions s
+    join allrice_model_connections c on c.id=${route.connectionId}
+    join allrice_model_providers p on p.id=c.provider_id
+    where s.slot=${route.slot} and s.enabled
+      and extract(epoch from s.updated_at)::text=${route.revision}
+      and c.scope='platform' and c.status='ready'
+      and c.credential_reference='deployment:codex-default' and c.base_url is null
+      and p.enabled and p.provider_key in ('codex','openai-codex')
+      and p.auth_mode='chatgpt_subscription'
+    for share of s,c,p nowait`;
+  if (!selected?.allowed) return denied();
 }
 
 export async function readNativeEmployeeMemoryOrdinal(
@@ -743,6 +781,36 @@ export function createNativeEmployeeMemoryHost() {
             : denied();
       signal.throwIfAborted();
       return { executionRef: runId, memoryIndexDocument };
+    },
+    async dispatchRoot(
+      context: RequestContext,
+      input: Extract<NativeMemoryRootObservation, { mode: 'restore' }>,
+      signal: AbortSignal,
+      codex: NativeMemoryCodexRoute | undefined,
+      start: (root: {
+        executionRef: string;
+        memoryIndexDocument: string;
+      }) => void,
+    ) {
+      const { workspaceId, employeeInstanceId, threadId } = input;
+      const runId = UuidSchema.parse(input.runId);
+      await restoreNativeEmployeeMemoryContext(
+        context,
+        {
+          workspaceId,
+          employeeInstanceId,
+          threadId,
+          module: nativeMemoryModule,
+          b: runId,
+        },
+        signal,
+        workflowMemoryRuntime({ root: input }),
+        {
+          codex,
+          start: (memoryIndexDocument) =>
+            start({ executionRef: runId, memoryIndexDocument }),
+        },
+      );
     },
     async call(
       context: RequestContext,

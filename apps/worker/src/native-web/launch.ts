@@ -24,6 +24,7 @@ import {
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import { nativeSearchToolPatches } from './search-tools.js';
+import { productionNativeMemoryToolDefinitions } from '../person-vm/production-native-memory.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -37,6 +38,7 @@ export type NativeWebConfiguration = Readonly<{
   cliPath: string;
   startupTimeoutMs: number;
   terminalEnabled?: boolean;
+  nativeMemoryEnabled?: boolean;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -134,6 +136,8 @@ export async function prepareNativeWebLaunch(
   modelAdapter?: NativeWebModelAdapter,
 ): Promise<NativeWebLaunchPlan> {
   let origin: URL, publicUrl: URL;
+  if (config.nativeMemoryEnabled && !modelAdapter)
+    throw new PersonVmError('PROVIDER_FAILED');
   try {
     origin = new URL(config.origin);
     publicUrl = new URL(config.publicUrl);
@@ -293,6 +297,10 @@ export function apply(ctx, config) {
                           ...modelAdapter,
                           id: auth.modelAdapterId,
                           cliPath: config.cliPath,
+                          ...(config.nativeMemoryEnabled && {
+                            memoryTools:
+                              productionNativeMemoryToolDefinitions(),
+                          }),
                         },
                       }
                     : {}),

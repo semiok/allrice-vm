@@ -13,6 +13,7 @@ export type {
   ModelGatewayAdmission,
   GatewayModelInput,
   GatewayProvider,
+  ModelDispatchAuthority,
   GatewayFetchClassification,
   ModelAttemptStart,
   ModelAttemptReceipt,

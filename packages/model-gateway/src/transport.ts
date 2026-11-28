@@ -10,6 +10,7 @@ import type {
   ModelCallBinding,
   ModelGatewayStore,
   GatewayProvider,
+  ModelDispatchAuthority,
   ModelAttemptReceipt,
 } from './contract.ts';
 import { unknownUsage, WireUsageObserver } from './usage.ts';
@@ -161,7 +162,11 @@ export function createMeteredTransport(options: {
   provider: GatewayProvider;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
-  assertContextCurrent?(signal: AbortSignal): Promise<void>;
+  withContextCurrent?(
+    signal: AbortSignal,
+    authority: ModelDispatchAuthority | void,
+    dispatch: () => void,
+  ): Promise<void>;
   activate(): Promise<void>;
 }) {
   const controller = new AbortController();
@@ -211,12 +216,19 @@ export function createMeteredTransport(options: {
         init?.signal ?? (input instanceof Request ? input.signal : undefined);
       // pi-ai supplies its own independent 15s timeout after refresh starts.
       // Never merge model/client/revocation/close cancellation into it.
-      const requestSignal = refreshing
+      const callerSignal = refreshing
         ? (incoming ??
           AbortSignal.abort(new ModelGatewayError('AUTH_TRANSACTION_REQUIRED')))
         : incoming
           ? AbortSignal.any([signal, incoming])
           : signal;
+      const contextStop =
+        !refreshing && options.withContextCurrent
+          ? new AbortController()
+          : undefined;
+      const requestSignal = contextStop
+        ? AbortSignal.any([callerSignal, contextStop.signal])
+        : callerSignal;
       const method = (
         init?.method ?? (input instanceof Request ? input.method : 'GET')
       ).toUpperCase();
@@ -351,20 +363,48 @@ export function createMeteredTransport(options: {
             }),
           duplex: 'half',
         };
-        // The memory check, when installed, runs after the selected-generation
-        // read and all other async gates. Refresh has no memory input.
-        await options.provider.assertDispatchCurrent?.(requestSignal);
-        if (classification.kind === 'model' && options.assertContextCurrent)
-          await options.assertContextCurrent(requestSignal);
-        requestSignal.throwIfAborted();
-        dispatched = true;
-        // Redirects are disabled in request; hidden 421 replay is disabled by
-        // the one-shot body. Each later SDK fetch gets its own durable attempt.
-        const response = await nativeClose.run(() =>
-          options.provider.fetchOwned
-            ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
-            : nativeFetch(request, dispatchInit),
-        );
+        const authority =
+          await options.provider.assertDispatchCurrent?.(requestSignal);
+        let sending: Promise<Response> | undefined;
+        let authorizationOpen = true;
+        const dispatch = () => {
+          if (!authorizationOpen || dispatched)
+            throw new ModelGatewayError('AUTHORIZATION_DENIED');
+          requestSignal.throwIfAborted();
+          authority?.assertCurrent();
+          dispatched = true;
+          // Disable redirects and hidden 421 replay. Each later SDK fetch
+          // gets its own durable attempt.
+          sending = nativeClose.run(() =>
+            options.provider.fetchOwned
+              ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
+              : nativeFetch(request, dispatchInit),
+          );
+          void sending.catch(() => {});
+        };
+        if (contextStop && options.withContextCurrent) {
+          try {
+            // Start the native fetch while both authorities are still held.
+            // Release the DB transaction before waiting for the response.
+            await options.withContextCurrent(
+              requestSignal,
+              authority,
+              dispatch,
+            );
+          } catch (error) {
+            if (sending) {
+              contextStop.abort(error);
+              await sending
+                .then((value) => value.body?.cancel(error))
+                .catch(() => {});
+            }
+            throw error;
+          } finally {
+            authorizationOpen = false;
+          }
+        } else dispatch();
+        if (!sending) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+        const response = await sending;
         status = response.status;
         if (!response.body) {
           if (

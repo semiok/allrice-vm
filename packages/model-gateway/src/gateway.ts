@@ -13,6 +13,7 @@ import type {
   ModelGatewayStore,
   GatewayModelInput,
   GatewayProvider,
+  ModelDispatchAuthority,
 } from './contract.ts';
 import type {
   PersonVmAdmissionPermit,
@@ -226,6 +227,12 @@ export function createModelGateway(options: {
     signal: AbortSignal,
     phase: 'seal' | 'dispatch',
   ): Promise<string | undefined>;
+  withTrustedContext?(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+    authority: ModelDispatchAuthority | void,
+    dispatch: (document: string) => void,
+  ): Promise<void>;
   confirmTransportStopped?(
     ownerId: string,
     signal: AbortSignal,
@@ -447,19 +454,24 @@ export function createModelGateway(options: {
                 signal,
                 assertCurrent,
                 activate,
-                assertContextCurrent:
+                withContextCurrent:
                   trustedContext === undefined
                     ? undefined
-                    : async (active) => {
-                        if (
-                          trustedContext !==
-                          (await options.readTrustedContext?.(
-                            binding,
-                            active,
-                            'dispatch',
-                          ))
-                        )
+                    : async (active, authority, dispatch) => {
+                        if (!options.withTrustedContext)
                           throw new ModelGatewayError('AUTHORIZATION_DENIED');
+                        await options.withTrustedContext(
+                          binding,
+                          active,
+                          authority,
+                          (document) => {
+                            if (document !== trustedContext)
+                              throw new ModelGatewayError(
+                                'AUTHORIZATION_DENIED',
+                              );
+                            dispatch();
+                          },
+                        );
                       },
               });
               iterator = transport.run(() => {

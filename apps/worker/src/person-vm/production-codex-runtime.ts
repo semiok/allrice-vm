@@ -208,6 +208,7 @@ async function openCodexGeneration(
     await assertCurrent(revoked);
     return {
       revoked,
+      selection,
       retain,
       close,
       modelMetadata: { modelInfo, historicalModels },
@@ -460,8 +461,12 @@ export async function createProductionCodexRuntime(
       fetchOwned: (...args: Parameters<typeof transport.fetchOwned>) =>
         (args[1].url === oauthEndpoint ? oauth : transport).fetchOwned(...args),
       async beforeDispatch(signal: AbortSignal) {
-        await current(signal);
+        const selected = await current(signal);
         signal.throwIfAborted();
+        return {
+          codex: { connectionId, ...selected.selection },
+          assertCurrent: () => selected.revoked.throwIfAborted(),
+        };
       },
     },
     confirmTransportStopped: stoppedEvidence,

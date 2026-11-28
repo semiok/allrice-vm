@@ -523,6 +523,18 @@ describe('private production Host configuration', () => {
     const disabled = await readProductionHostConfiguration(signal());
     expect(disabled.configuration.web.terminalEnabled).toBe(false);
   });
+  it('enables native employee memory only with the sealed web opt-in', async () => {
+    const config = value();
+    await seal(config);
+    const defaults = await readProductionHostConfiguration(signal());
+    expect(defaults.configuration.web.nativeMemoryEnabled).toBe(false);
+    await seal({
+      ...config,
+      web: { ...config.web, nativeMemoryEnabled: true },
+    });
+    const enabled = await readProductionHostConfiguration(signal());
+    expect(enabled.configuration.web.nativeMemoryEnabled).toBe(true);
+  });
   it.each([
     { label: 'missing', patch: null },
     {
