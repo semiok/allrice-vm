@@ -409,7 +409,7 @@ async function observePromptOrigins(
 
 /** Carry only the inbox facts for an exact scoped prompt through the existing
  * authenticated owner transport. A waiter is registered before dispatch. */
-export function observeNativePrompts(scope, lifetime) {
+export function observeNativePrompts(scope, lifetime, beforeObserve) {
   const observers = new Map();
   const sources = new Map();
   const turns = new WeakMap();
@@ -547,54 +547,71 @@ export function observeNativePrompts(scope, lifetime) {
     const signal = globalThis.AbortSignal.any([request.signal, lifetime]);
     signal.throwIfAborted();
     const agent = scope.agents.get(sessionId);
-    const existing = new Set(
-      agent
-        ? pending(agent)
-            .filter((message) => messageKey(agent, message) === key)
-            .map(({ id }) => id)
-        : [],
-    );
-    for (const observer of sources.get(key) ?? []) {
-      if (observer.itemId) existing.add(observer.itemId);
+    function register() {
+      signal.throwIfAborted();
+      if (observers.has(id)) return notFound();
+      const existing = new Set(
+        agent
+          ? pending(agent)
+              .filter((message) => messageKey(agent, message) === key)
+              .map(({ id }) => id)
+          : [],
+      );
+      for (const observer of sources.get(key) ?? []) {
+        if (observer.itemId) existing.add(observer.itemId);
+      }
+      let close;
+      const body = new ReadableStream({
+        start(controller) {
+          const send = (type) =>
+            controller.enqueue(encoder.encode(`${type}\n`));
+          let group = sources.get(key);
+          if (!group) sources.set(key, (group = new Set()));
+          close = () => {
+            if (!observers.delete(id)) return false;
+            signal.removeEventListener('abort', abort);
+            group.delete(observer);
+            if (group.size === 0) sources.delete(key);
+            observer.unclaim?.();
+            return true;
+          };
+          const abort = () => {
+            if (close()) controller.close();
+          };
+          const observer = {
+            id,
+            key,
+            existing,
+            send,
+            finish(type) {
+              if (!close()) return;
+              if (type) send(type);
+              controller.close();
+            },
+          };
+          observers.set(id, observer);
+          group.add(observer);
+          signal.addEventListener('abort', abort, { once: true });
+          send('ready');
+        },
+        cancel() {
+          close?.();
+        },
+      });
+      return new globalThis.Response(body, { headers });
     }
-    let close;
-    const body = new ReadableStream({
-      start(controller) {
-        const send = (type) => controller.enqueue(encoder.encode(`${type}\n`));
-        let group = sources.get(key);
-        if (!group) sources.set(key, (group = new Set()));
-        close = () => {
-          if (!observers.delete(id)) return false;
-          signal.removeEventListener('abort', abort);
-          group.delete(observer);
-          if (group.size === 0) sources.delete(key);
-          observer.unclaim?.();
-          return true;
-        };
-        const abort = () => {
-          if (close()) controller.close();
-        };
-        const observer = {
-          id,
-          key,
-          existing,
-          send,
-          finish(type) {
-            if (!close()) return;
-            if (type) send(type);
-            controller.close();
-          },
-        };
-        observers.set(id, observer);
-        group.add(observer);
-        signal.addEventListener('abort', abort, { once: true });
-        send('ready');
-      },
-      cancel() {
-        close?.();
-      },
-    });
-    return new globalThis.Response(body, { headers });
+    if (beforeObserve && agent) {
+      const session = agent.session;
+      const owner = parentSessionId && scope.agents.get(parentSessionId);
+      if (
+        parentSessionId
+          ? !owner || !scope.agents.isOwnedBy(session.id, owner)
+          : !isNativeOrdinaryRoot(session.header)
+      )
+        return notFound();
+      return beforeObserve(agent, signal).then(register);
+    }
+    return register();
   }
   observe.claimed = (session, message, turn) => {
     const agent = scope.agents.get(session.id);
@@ -896,29 +913,59 @@ export function observeDelegatedInputs(scope, observedClaim = () => false) {
   return { root, claimed, rootWake, searchOrigin };
 }
 
+function managedModelRoute(select, rules, fallback, session) {
+  return select(
+    rules,
+    {
+      sessionId: session.id,
+      parentSessionId:
+        session.header.origin === 'subagent'
+          ? (session.header.parentSession ?? null)
+          : null,
+      attemptKind: 'assistant',
+    },
+    fallback,
+  );
+}
+
 export function managedModelRequest(select, rules, fallback, lifetime) {
   return async ({ agent, signal }, next) => {
     const config = await next();
     signal.throwIfAborted();
     lifetime.throwIfAborted();
-    const { session } = agent;
-    const route = select(
-      rules,
-      {
-        sessionId: session.id,
-        parentSessionId:
-          session.header.origin === 'subagent'
-            ? (session.header.parentSession ?? null)
-            : null,
-        attemptKind: 'assistant',
-      },
-      fallback,
-    );
+    const route = managedModelRoute(select, rules, fallback, agent.session);
     // Controls chosen for an unrelated model are not portable.
     return config.provider === route.provider && config.model === route.model
       ? config
       : route;
   };
+}
+
+export function alignManagedAgentModel(
+  scope,
+  select,
+  rules,
+  fallback,
+  lifetime,
+) {
+  return (agent, signal = lifetime) =>
+    scope.agents.serializeImageAdmission(agent, async () => {
+      signal.throwIfAborted();
+      lifetime.throwIfAborted();
+      const route = managedModelRoute(select, rules, fallback, agent.session);
+      const { current } = scope.agents.selectionFor(agent);
+      if (current.provider === route.provider && current.model === route.model)
+        return;
+      const { provider, model, reasoningEffort } =
+        await scope.llm.resolveCallConfig(route, signal);
+      signal.throwIfAborted();
+      lifetime.throwIfAborted();
+      scope.agents.selectForNextRequest(agent, {
+        provider,
+        model,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      });
+    });
 }
 
 export function apply(ctx, config) {
@@ -1140,7 +1187,19 @@ export function applyNativeWebOwner(
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
-          const promptFacts = observeNativePrompts(scope, signal);
+          const select = managedSearch?.selectScopedModel;
+          if (scoped && typeof select !== 'function')
+            throw Error('Native managed model policy is unavailable');
+          const align =
+            scoped &&
+            alignManagedAgentModel(
+              scope,
+              select,
+              scoped.rules,
+              { provider, model },
+              signal,
+            );
+          const promptFacts = observeNativePrompts(scope, signal, align);
           const delegations = observeDelegatedInputs(
             scope,
             modelAdapter.webSearchEnabled ? promptFacts.claimed : undefined,
@@ -1407,18 +1466,44 @@ export function applyNativeWebOwner(
               throw Error('Native managed model was not registered');
           }
           if (scoped) {
-            if (typeof managedSearch?.selectScopedModel !== 'function')
-              throw Error('Native managed model policy is unavailable');
+            const outer = { global: true, prepend: true };
             disposers.push(
+              scope.on(
+                'agent/created',
+                async ({ agent, signal: starting }) => {
+                  await align(agent, starting);
+                },
+                outer,
+              ),
+              scope.on(
+                'system-prompt/assemble',
+                async (_assembly, context, next) => {
+                  const prompt = await next();
+                  context.signal?.throwIfAborted();
+                  signal.throwIfAborted();
+                  if (!context.agent) return prompt;
+                  const route = managedModelRoute(
+                    select,
+                    scoped.rules,
+                    { provider, model },
+                    context.agent.session,
+                  );
+                  return {
+                    ...prompt,
+                    variables: { ...prompt.variables, ...route },
+                  };
+                },
+                outer,
+              ),
               scope.on(
                 'agent/request',
                 managedModelRequest(
-                  managedSearch.selectScopedModel,
+                  select,
                   scoped.rules,
                   { provider, model },
                   signal,
                 ),
-                { global: true, prepend: true },
+                outer,
               ),
             );
           }

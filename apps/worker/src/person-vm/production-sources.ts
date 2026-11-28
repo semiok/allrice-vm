@@ -144,23 +144,29 @@ export function createProductionPersonVmSources(
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, modelLifetime, signal]);
-            const configured = routing.applies(input.binding);
-            const generation = configured
-              ? modelLifetime
-              : await modelRuntime.assertCurrent(active);
+            const startupRoute = routing.freshRootRoute(input.binding);
+            const generation = await routing.assertFreshRootCurrent(
+              input.binding,
+              active,
+            );
             const guest = await owned.resolveSendRoute(input, active);
-            if (!configured) await modelRuntime.assertCurrent(active);
+            await routing.assertFreshRootCurrent(input.binding, active);
             active.throwIfAborted();
             generation.throwIfAborted();
             guest.revoked.throwIfAborted();
-            if (
-              guest.provider !== modelRuntime.route.provider ||
-              guest.model !== modelRuntime.route.model
-            )
+            if (!sameModelRoute(guest, modelRuntime.route))
               throw new ModelGatewayError('BINDING_INVALID');
             return {
-              provider: guest.provider,
-              model: guest.model,
+              provider: startupRoute.provider,
+              model: startupRoute.model,
+              ...(sameModelRoute(startupRoute, modelRuntime.route)
+                ? {}
+                : {
+                    catalogDefault: {
+                      provider: modelRuntime.route.provider,
+                      model: modelRuntime.route.model,
+                    },
+                  }),
               revoked: AbortSignal.any([guest.revoked, generation, lifetime]),
             };
           },

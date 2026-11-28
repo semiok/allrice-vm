@@ -86,6 +86,7 @@ function rejectCredentialText(value: string) {
   const hostKeys = [
     process.env.ALLRICE_OPENAI_API_KEY,
     process.env.ALLRICE_DEEPSEEK_API_KEY,
+    process.env.DEEPSEEK_API_KEY,
   ];
   if (
     hostKeys.some((raw) => {
@@ -325,27 +326,44 @@ export async function createProductionModelRouting(
           ] as const,
       ),
     );
+    function authorisedRuntime(route: ModelRouteKey) {
+      const runtime = runtimeFor(route);
+      if (retired.has(runtime))
+        throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      return runtime;
+    }
+    function freshRootRoute(binding: VmOwner) {
+      // A new conversation has no known native ID. Exact-session rules can
+      // authorize their existing conversations, not an arbitrary future root.
+      return selectScopedModel(
+        rulesFor(binding),
+        {
+          sessionId: '',
+          parentSessionId: null,
+          attemptKind: 'assistant',
+        },
+        fallback.route,
+      );
+    }
     return {
       fallback,
       close,
       scoped: config !== undefined,
       select,
+      freshRootRoute,
+      assertFreshRootCurrent(binding: VmOwner, signal: AbortSignal) {
+        return authorisedRuntime(freshRootRoute(binding)).assertCurrent(signal);
+      },
       applies: (binding: VmOwner) => rulesFor(binding).length > 0,
       provider(call: ModelCallBinding) {
         if (!sameModelRoute(select(call.vm, call.native), call))
           throw new ModelGatewayError('BINDING_INVALID');
-        const runtime = runtimeFor(call);
-        if (retired.has(runtime))
-          throw new ModelGatewayError('AUTHORIZATION_DENIED');
-        return providers.get(runtime.route)!;
+        return providers.get(authorisedRuntime(call).route)!;
       },
       async assertCurrent(call: ModelCallBinding, signal: AbortSignal) {
         if (!sameModelRoute(select(call.vm, call.native), call))
           throw new ModelGatewayError('BINDING_INVALID');
-        const runtime = runtimeFor(call);
-        if (retired.has(runtime))
-          throw new ModelGatewayError('AUTHORIZATION_DENIED');
-        return runtime.assertCurrent(signal);
+        return authorisedRuntime(call).assertCurrent(signal);
       },
       async guestCatalog(binding: VmOwner, signal: AbortSignal) {
         const rules = rulesFor(binding);

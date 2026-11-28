@@ -5,6 +5,7 @@ import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
   PlatformModelConfigurationSchema,
+  UpdatePlatformModelSettingsSchema,
   type PlatformModelConfiguration,
 } from '@allrice/contracts';
 import { getDatabase, readPlatformModelSettings } from '@allrice/database';
@@ -23,6 +24,7 @@ import { codexSubscriptionHome } from '../codex-subscription-home.js';
 
 const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
+const oauthEndpoint = 'https://auth.openai.com/oauth/token';
 
 async function readSelectedSubscription(connectionId: string) {
   const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
@@ -61,17 +63,6 @@ export function managedCodexModel(model: string) {
   };
 }
 
-class MeteredCodexCredentials extends LocalCredentials {
-  override modifyRecord(
-    ...args: Parameters<LocalCredentials['modifyRecord']>
-  ): ReturnType<LocalCredentials['modifyRecord']> {
-    if (args[0] !== credential)
-      return Promise.reject(new ModelGatewayError('AUTHORIZATION_DENIED'));
-    // Join the original DSH operation, including writer lock and persistence.
-    return withGatewayAuthTransaction(() => super.modifyRecord(...args));
-  }
-}
-
 function classify(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -83,7 +74,7 @@ function classify(
     return null;
   if (url.href === 'https://chatgpt.com/backend-api/codex/responses')
     return { kind: 'model', protocol: 'openai-responses' };
-  if (url.href === 'https://auth.openai.com/oauth/token')
+  if (url.href === oauthEndpoint)
     return { kind: 'auth-refresh', protocol: 'opaque' };
   return null;
 }
@@ -119,6 +110,20 @@ async function openCodexGeneration(
       release();
     };
   }
+  class MeteredCodexCredentials extends LocalCredentials {
+    override modifyRecord(
+      ...args: Parameters<LocalCredentials['modifyRecord']>
+    ): ReturnType<LocalCredentials['modifyRecord']> {
+      if (args[0] !== credential)
+        return Promise.reject(new ModelGatewayError('AUTHORIZATION_DENIED'));
+      // Join the original DSH operation, including writer lock and persistence.
+      const release = retain();
+      return withGatewayAuthTransaction(() =>
+        super.modifyRecord(...args),
+      ).finally(release);
+    }
+  }
+
   let closing: Promise<void> | undefined;
   function close() {
     if (closing) return closing;
@@ -198,9 +203,14 @@ export async function createProductionCodexRuntime(
     configuration: { connectionId, workModel, reasoningEffort },
   } = await readPlatformModelSettings();
   lifetime.throwIfAborted();
-  const model = PlatformModelConfigurationSchema.shape.workModel.parse(
-    approvedModel ?? workModel,
-  );
+  const configured =
+    approvedModel === undefined
+      ? { success: true as const, data: workModel }
+      : UpdatePlatformModelSettingsSchema.shape.configuration.shape.workModel.safeParse(
+          approvedModel,
+        );
+  if (!configured.success) throw new ModelGatewayError('BINDING_INVALID');
+  const model = configured.data;
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const route: DshGatewayRoute = Object.freeze({
@@ -213,6 +223,9 @@ export async function createProductionCodexRuntime(
     ? createProductionModelImages(readModelImage)
     : undefined;
   const transport = createOwnedModelTransport(ownerId);
+  // A route may stop its model sockets without interrupting a rotating OAuth
+  // grant that another route sharing this slot will subsequently need.
+  const oauth = createOwnedModelTransport(ownerId + ':auth');
   let generation: Awaited<ReturnType<typeof openCodexGeneration>> | undefined;
   let operations = Promise.resolve();
   const retiring = new Set<Promise<void>>();
@@ -342,6 +355,41 @@ export async function createProductionCodexRuntime(
       };
     },
   };
+  async function stoppedEvidence(candidate: string, signal: AbortSignal) {
+    const [modelEvidence, oauthEvidence] = await Promise.all([
+      transport.stoppedEvidence(candidate, signal),
+      oauth.stoppedEvidence(candidate + ':auth', signal),
+    ]);
+    signal.throwIfAborted();
+    return modelEvidence + '|' + oauthEvidence;
+  }
+  function close() {
+    if (closing) return closing;
+    stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
+    return (closing = Promise.allSettled([
+      transport.close(),
+      catalog,
+      operations.then(async () => {
+        if (generation) retire(generation);
+        await Promise.allSettled([...retiring]);
+        try {
+          if (retirementFailures.length)
+            throw new AggregateError(
+              retirementFailures,
+              'CODEX_GENERATION_CLOSE_UNKNOWN',
+            );
+        } finally {
+          await oauth.close();
+        }
+      }),
+    ]).then((results) => {
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length)
+        throw new AggregateError(failures, 'CODEX_RUNTIME_CLOSE_UNKNOWN');
+    }));
+  }
   return Object.freeze({
     llm,
     route,
@@ -359,34 +407,16 @@ export async function createProductionCodexRuntime(
     },
     transport: {
       ...transport,
+      close,
+      stoppedEvidence,
+      fetchOwned: (...args: Parameters<typeof transport.fetchOwned>) =>
+        (args[1].url === oauthEndpoint ? oauth : transport).fetchOwned(...args),
       async beforeDispatch(signal: AbortSignal) {
         await current(signal);
         signal.throwIfAborted();
       },
     },
-    confirmTransportStopped: transport.stoppedEvidence,
-    close() {
-      if (closing) return closing;
-      stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
-      return (closing = Promise.allSettled([
-        transport.close(),
-        catalog,
-        operations.then(async () => {
-          if (generation) retire(generation);
-          await Promise.allSettled([...retiring]);
-          if (retirementFailures.length)
-            throw new AggregateError(
-              retirementFailures,
-              'CODEX_GENERATION_CLOSE_UNKNOWN',
-            );
-        }),
-      ]).then((results) => {
-        const failures = results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        );
-        if (failures.length)
-          throw new AggregateError(failures, 'CODEX_RUNTIME_CLOSE_UNKNOWN');
-      }));
-    },
+    confirmTransportStopped: stoppedEvidence,
+    close,
   });
 }

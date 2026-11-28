@@ -72,7 +72,11 @@ export async function createProductionOpenAiRuntime(
     provider === 'openai'
       ? 'ALLRICE_OPENAI_API_KEY'
       : 'ALLRICE_DEEPSEEK_API_KEY';
-  const key = process.env[keyName];
+  const readKey = () =>
+    provider === 'openai'
+      ? process.env.ALLRICE_OPENAI_API_KEY
+      : process.env.ALLRICE_DEEPSEEK_API_KEY;
+  const key = readKey();
   const credential = key && key.trim() === key ? key : undefined;
   const requireCredentialAtBoot = !configured && !allowUnavailable;
   if (requireCredentialAtBoot && !credential)
@@ -122,7 +126,7 @@ export async function createProductionOpenAiRuntime(
   }
   async function assertCurrent(signal?: AbortSignal) {
     signal?.throwIfAborted();
-    if (!credential || process.env[keyName] !== credential)
+    if (!credential || readKey() !== credential)
       stop.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
     revoked.throwIfAborted();
     return revoked;

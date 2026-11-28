@@ -60,7 +60,12 @@ export type ResolveProductionDEntrySendRoute = (
   }>,
   signal: AbortSignal,
 ) => Promise<
-  Readonly<{ provider: string; model: string; revoked: AbortSignal }>
+  Readonly<{
+    provider: string;
+    model: string;
+    catalogDefault?: Readonly<{ provider: string; model: string }>;
+    revoked: AbortSignal;
+  }>
 >;
 
 function denied(): never {
@@ -566,8 +571,10 @@ export function installProductionDEntrySource(input: {
                 // Route revocation may only be observed on a current read.
                 const currentRoute = await resolveRoute();
                 if (
-                  models.value.default.provider !== currentRoute.provider ||
-                  models.value.default.model !== currentRoute.model ||
+                  models.value.default.provider !==
+                    (currentRoute.catalogDefault ?? currentRoute).provider ||
+                  models.value.default.model !==
+                    (currentRoute.catalogDefault ?? currentRoute).model ||
                   !models.value.routableProviders.includes(
                     currentRoute.provider,
                   ) ||

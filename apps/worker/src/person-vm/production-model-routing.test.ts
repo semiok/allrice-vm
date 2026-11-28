@@ -229,10 +229,12 @@ it('inherited maintenance follows the Host session route, with fallback only for
 it('refuses a configured Host key pasted into any Guest model or session selector', async () => {
   routeFixture();
   const config = JSON.parse(process.env.ALLRICE_DSH_MODEL_ROUTES!);
+  vi.stubEnv('DEEPSEEK_API_KEY', 'synthetic-r2-search-key');
   function mutate(field: 'model' | 'sessionId' | 'parentSessionId') {
     const copy = structuredClone(config);
     const row = field === 'model' ? copy.routes[0] : copy.rules[0];
-    row[field] = deepSeekKey;
+    row[field] =
+      field === 'parentSessionId' ? 'synthetic-r2-search-key' : deepSeekKey;
     vi.stubEnv('ALLRICE_DSH_MODEL_ROUTES', JSON.stringify(copy));
     return createProductionModelRouting(
       new AbortController().signal,
@@ -246,6 +248,49 @@ it('refuses a configured Host key pasted into any Guest model or session selecto
     await expect(mutate(field)).rejects.toMatchObject({
       code: 'BINDING_INVALID',
     });
+});
+
+it('proves a fresh root independently of a maintenance-only rule or an exact prior session', async () => {
+  const { root, base } = routeFixture();
+  vi.stubEnv('ALLRICE_DSH_MODEL_PROVIDER', 'openai');
+  vi.stubEnv('ALLRICE_DSH_OPENAI_MODEL', 'gpt-6.2-astra');
+  vi.stubEnv('ALLRICE_OPENAI_API_KEY', undefined);
+  const config = JSON.parse(process.env.ALLRICE_DSH_MODEL_ROUTES!);
+  const signal = new AbortController().signal;
+  const images = async () => {
+    throw Error('fixture does not read images');
+  };
+  const unready = await createProductionModelRouting(
+    signal,
+    'fixture-unready',
+    images,
+  );
+  cleanups.push(unready.close);
+  expect(unready.freshRootRoute(root.vm)).toMatchObject({
+    provider: 'openai',
+    model: 'gpt-6.2-astra',
+  });
+  await expect(
+    unready.assertFreshRootCurrent(base.vm, signal),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  config.rules.push({
+    organizationId: root.vm.organizationId,
+    personId: root.vm.personId,
+    scope: 'root',
+    attempt: 'assistant',
+    route: 'chat',
+  });
+  vi.stubEnv('ALLRICE_DSH_MODEL_ROUTES', JSON.stringify(config));
+  const routed = await createProductionModelRouting(
+    signal,
+    'fixture-routed',
+    images,
+  );
+  cleanups.push(routed.close);
+  expect(routed.freshRootRoute(root.vm)).toEqual(modelRoutes.chat);
+  await expect(
+    routed.assertFreshRootCurrent(root.vm, signal),
+  ).resolves.toMatchObject({ aborted: false });
 });
 
 it('does not confuse a short credential placeholder with part of an approved model ID', async () => {

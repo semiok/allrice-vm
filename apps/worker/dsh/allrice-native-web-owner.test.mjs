@@ -5,6 +5,7 @@ import { TextDecoder } from 'node:util';
 import { selectScopedModel } from '@allrice/model-gateway';
 import {
   managedModelRequest,
+  alignManagedAgentModel,
   nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
@@ -720,4 +721,45 @@ it('routes through the DSH agent/request payload with an opaque scoped receiver 
   await expect(
     waterfall.call(scopeCarrier, payload, next),
   ).rejects.toMatchObject({ name: 'AbortError' });
+});
+
+it('aligns a cold resumed selection before native image admission without changing history', async () => {
+  const lifetime = new globalThis.AbortController();
+  const root = { provider: 'openai', model: 'vision-fixture' };
+  const prior = { provider: 'deepseek', model: 'old-text-fixture' };
+  const history = Object.freeze([{ config: prior }]);
+  const agent = { session: { id: 'retained', header: {}, history } };
+  let selected = prior;
+  let insideImageAdmission = false;
+  const scope = {
+    agents: {
+      async serializeImageAdmission(subject, operation) {
+        expect(subject).toBe(agent);
+        insideImageAdmission = true;
+        try {
+          await operation();
+        } finally {
+          insideImageAdmission = false;
+        }
+      },
+      selectionFor: () => ({ current: selected }),
+      selectForNextRequest(subject, value) {
+        expect(subject).toBe(agent);
+        expect(insideImageAdmission).toBe(true);
+        selected = value;
+      },
+    },
+    llm: { resolveCallConfig: async (route) => route },
+  };
+  const align = alignManagedAgentModel(
+    scope,
+    selectScopedModel,
+    [],
+    root,
+    lifetime.signal,
+  );
+  await align(agent);
+  expect(selected).toEqual(root);
+  expect(agent.session.history).toBe(history);
+  expect(agent.session.history[0].config).toEqual(prior);
 });

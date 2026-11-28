@@ -237,7 +237,8 @@ export function createMeteredTransport(options: {
       const nativeClose = observeNativeClose();
       const confirmedClose = async () =>
         (await nativeClose.confirmed()) ||
-        (await options.provider.confirmTransportClosed?.()) === true;
+        (!refreshing &&
+          (await options.provider.confirmTransportClosed?.()) === true);
       let started = false;
       let dispatched = false;
       let transportJoined = false;
