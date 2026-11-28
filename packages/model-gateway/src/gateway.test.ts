@@ -10,6 +10,7 @@ import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { ModelGatewayError } from './contract.ts';
 import type { GatewayProvider } from './contract.ts';
 import { withGatewayAuthTransaction } from './transport.ts';
+import { createOwnedModelTransport } from './owned-transport.ts';
 import {
   closeServer,
   deferred,
@@ -38,6 +39,13 @@ async function setup(
   const gateway = await gatewayFixture({ provider: native.provider, store });
   cleanup.push(() => gateway.close());
   return { upstream, native, ...gateway };
+}
+async function memoryProvider(endpoint: string) {
+  const native = await nativeProviderFixture(endpoint);
+  cleanup.push(() => native.close());
+  const owner = createOwnedModelTransport('memory-dispatch-fixture');
+  cleanup.push(() => owner.close());
+  return { ...native.provider, fetchOwned: owner.fetchOwned };
 }
 it('hashes the same trusted context that reaches the provider, and refuses stale context before claiming', async () => {
   const sent = vi.fn();
@@ -80,8 +88,7 @@ it.each([
   async (gate, index) => {
     const upstream = await upstreamFixture();
     cleanup.push(() => upstream.close());
-    const native = await nativeProviderFixture(upstream.url);
-    cleanup.push(() => native.close());
+    const provider = await memoryProvider(upstream.url);
     const store = new FixtureStore();
     const routeEntered = deferred();
     const routeReleased = deferred();
@@ -92,7 +99,7 @@ it.each([
     const phases: string[] = [];
     const f = await gatewayFixture({
       provider: {
-        ...native.provider,
+        ...provider,
         async assertDispatchCurrent() {
           if (gate === 'route') {
             routeEntered.resolve();
@@ -133,8 +140,7 @@ it.each([
 it('does not send the sealed index if the selected route is revoked while waiting on recovery', async () => {
   const upstream = await upstreamFixture();
   cleanup.push(() => upstream.close());
-  const native = await nativeProviderFixture(upstream.url);
-  cleanup.push(() => native.close());
+  const provider = await memoryProvider(upstream.url);
   const entered = deferred();
   const released = deferred();
   const index = 'confirmed memory only';
@@ -143,7 +149,7 @@ it('does not send the sealed index if the selected route is revoked while waitin
   const f = await gatewayFixture({
     store,
     provider: {
-      ...native.provider,
+      ...provider,
       async assertDispatchCurrent() {
         expect(ready).toBe(true);
         return {
@@ -250,12 +256,11 @@ it('defers memory authorization until a queued real connection can write HTTP', 
 it('releases the memory guard after a confirmed body write while upstream response is held', async () => {
   const upstream = await upstreamFixture({ hold: true });
   cleanup.push(() => upstream.close());
-  const native = await nativeProviderFixture(upstream.url);
-  cleanup.push(() => native.close());
+  const provider = await memoryProvider(upstream.url);
   const authorized = deferred();
   const index = 'confirmed memory only';
   const f = await gatewayFixture({
-    provider: native.provider,
+    provider,
     readTrustedContext: async () => index,
     async withTrustedContext(_binding, _signal, _route, dispatch) {
       await dispatch(index);

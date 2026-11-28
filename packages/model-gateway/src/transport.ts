@@ -400,7 +400,9 @@ export function createMeteredTransport(options: {
           );
         let response: Response;
         if (contextStop && options.withContextCurrent) {
-          if (!request.body)
+          // Memory dispatch requires the dedicated HTTP/1 Undici dispatcher.
+          // Node's implicit dispatcher does not provide first-chunk proof.
+          if (!options.provider.fetchOwned || !request.body)
             throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
           const source = request.body.getReader();
           let releaseBody!: () => void;
@@ -416,6 +418,7 @@ export function createMeteredTransport(options: {
                 const chunk = await source.read();
                 requestSignal.throwIfAborted();
                 if (chunk.done) {
+                  source.releaseLock();
                   if (!receivedBody)
                     throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
                   controller.close();
@@ -424,7 +427,13 @@ export function createMeteredTransport(options: {
                   controller.enqueue(chunk.value);
                 }
               },
-              cancel: (reason) => source.cancel(reason),
+              async cancel(reason) {
+                try {
+                  await source.cancel(reason);
+                } finally {
+                  source.releaseLock();
+                }
+              },
             },
             { highWaterMark: 0 },
           );
