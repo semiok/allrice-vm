@@ -2526,7 +2526,7 @@ suite(
     it('selects only authenticated current 4.0 threads across the private directory cursor', async () => {
       const p = await person();
       const legacy = await seedLegacyThread(p);
-      await release(p);
+      await release();
       const copies = [];
       for (const name of ['调查', '整理', '已归档']) {
         copies.push(
@@ -2539,6 +2539,7 @@ suite(
         );
       }
       await f.db`update allrice_employee_instances set archived_at=now() where id=${copies[2]!.id}`;
+      await release(p);
       const create = () =>
         createChatSession(p.context, p.selection, {
           executionGeneration: '4.0',
