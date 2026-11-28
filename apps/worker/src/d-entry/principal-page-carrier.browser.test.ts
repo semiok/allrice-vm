@@ -115,7 +115,8 @@ it
     let projectionSeq = 0;
     let nativeTitle: string | undefined;
     let forkTitle: string | undefined;
-    let failNextTitle = false;
+    let titleAfterLockTimeout: string | undefined;
+    const titleReads: (string | undefined)[] = [];
     const projectedTitles: string[] = [];
     const projectedThreads: (string | null)[] = [];
     const titleRead = deferred();
@@ -179,12 +180,15 @@ it
           });
           expect(binding).toMatchObject(f.binding);
           const title = await read(signal);
+          titleReads.push(title);
           if (!reopening && !projectedTitles.length) {
             titleRead.resolve();
             await allowTitleWrite.promise;
           }
-          if (failNextTitle) {
-            failNextTitle = false;
+          if (titleAfterLockTimeout) {
+            nativeTitle = titleAfterLockTimeout;
+            titleAfterLockTimeout = undefined;
+            projectionSeq++;
             throw Object.assign(Error('fixture title lock timeout'), {
               code: '55P03',
             });
@@ -1541,8 +1545,11 @@ it
         f.selection.threadId,
         f.selection.threadId,
       ]);
-      failNextTitle = true;
-      nativeTitle = '一次写入超时后重读的标题';
+      const observedTitle = '写入遇到锁超时的标题';
+      const currentTitle = '一次写入超时后重读的标题';
+      const readsBeforeTimeout = titleReads.length;
+      titleAfterLockTimeout = currentTitle;
+      nativeTitle = observedTitle;
       titleChanges.emit('projection', {
         type: 'projection',
         sessionId: 'root',
@@ -1550,10 +1557,14 @@ it
         value: nativeTitle,
         seq: ++projectionSeq,
       });
-      await row.getByText(nativeTitle, { exact: true }).waitFor();
+      await row.getByText(observedTitle, { exact: true }).waitFor();
       await vi.waitFor(() =>
-        expect(projectedTitles).toEqual([...titles, nativeTitle]),
+        expect(projectedTitles).toEqual([...titles, currentTitle]),
       );
+      expect(titleReads.slice(readsBeforeTimeout)).toEqual([
+        observedTitle,
+        currentTitle,
+      ]);
       await context.close();
       return;
     }
