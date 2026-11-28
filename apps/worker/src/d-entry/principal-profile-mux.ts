@@ -26,6 +26,7 @@ import {
   type DEntryPageInput,
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError, EmployeeInstanceError } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import { controlTitleTargets, snapshotTitleTarget } from './native-title.js';
 import {
@@ -183,7 +184,8 @@ async function runOwner(
             (status === 401 ||
               status === 404 ||
               (error instanceof EmployeeInstanceError &&
-                error.code === 'instance_archived'))
+                error.code === 'instance_archived') ||
+              (error instanceof PersonVmError && error.code === 'LEASE_LOST'))
           ) {
             revokedPage = { generation, scopeId, reason: error };
             if (!requestedClose) withdrawal.abort();
