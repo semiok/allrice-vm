@@ -882,6 +882,7 @@ export function EmployeeNativePage({
       });
     const setup = async () => {
       const entry = await parsedEntry;
+      const { params } = entry;
       let selection = entry.selection;
       let identity: DEntryIdentity | undefined;
       let opened: Awaited<ReturnType<typeof connect>['ready']> | undefined;
@@ -896,6 +897,7 @@ export function EmployeeNativePage({
         warm.employeeInstanceId === selection.employeeInstanceId
       ) {
         await waitForVisibleEntry(lifetime.signal);
+        selectedQuery = params.toString();
         opening();
         const attempt = (carrier = connect(warm, selection));
         try {
@@ -923,6 +925,9 @@ export function EmployeeNativePage({
               prewarming,
             )
           : entry.selection;
+        if (selection.threadId && !entry.selection.threadId)
+          params.set('threadId', selection.threadId);
+        if (prepare && selection.threadId) selectedQuery = params.toString();
         identity =
           warmup?.readIdentity() ??
           (await readEmployeeEntryIdentity(selection, lifetime.signal));
@@ -930,10 +935,6 @@ export function EmployeeNativePage({
         carrier = connect(identity, selection);
         opened = await carrier.ready;
       }
-      const { params } = entry;
-      if (selection.threadId && !entry.selection.threadId)
-        params.set('threadId', selection.threadId);
-      if (prepare && selection.threadId) selectedQuery = params.toString();
       const issued = opened.scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
