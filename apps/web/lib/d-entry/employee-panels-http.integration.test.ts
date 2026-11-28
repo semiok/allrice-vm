@@ -61,6 +61,7 @@ import {
   EmployeePanelsWriteRejectedError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
+import { GET as listSessions } from '../../app/api/v1/sessions/route';
 import { GET as manageMemory } from '../../app/api/v1/memories/manage/route';
 import { GET as readMemory } from '../../app/api/v1/memories/[id]/route';
 import { GET as readMemorySource } from '../../app/api/v1/memories/[id]/source/route';
@@ -2580,6 +2581,62 @@ suite(
         readDEntryEmployeeDirectory(p.context, selection, signal()),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       expect(await rows()).toEqual(before);
+    });
+    it('lists only pinned private 4.0 archives and their counts for the current Cookie owner', async () => {
+      const owner = await person();
+      const other = await person();
+      await release(owner, other);
+      const seed = async (
+        p: typeof owner,
+        archived: boolean,
+        pinned = true,
+      ) => {
+        const session = await createChatSession(p.context, p.selection, {
+          executionGeneration: '4.0',
+        });
+        if (pinned) await bindDirectoryThread(p, session.id);
+        if (archived)
+          await f.db`update allrice_chat_sessions set archived_at=now() where id=${session.id}`;
+        return session.id;
+      };
+      const visible = await seed(owner, true);
+      const legacy = await seedLegacyThread(owner);
+      await f.db`update allrice_chat_sessions set archived_at=now() where id=${legacy}`;
+      await seed(owner, false);
+      await seed(owner, true, false);
+      await seed(other, true);
+      const query = new URLSearchParams({
+        entry: '4.0',
+        workspaceId: owner.selection.workspaceId,
+        archived: 'only',
+      });
+      const request = () => new Request(base + '/api/v1/sessions?' + query);
+      const list = (p: typeof owner) =>
+        cookieScope.run('allrice_session=' + p.login.token, () =>
+          listSessions(request()),
+        );
+      const result = await list(owner);
+      expect(result.status).toBe(200);
+      expect(result.headers.get('cache-control')).toBe('private, no-store');
+      expect(await result.json()).toMatchObject({
+        sessions: [{ id: visible }],
+        employeeGroups: [
+          {
+            employeeInstanceId: owner.selection.employeeInstanceId,
+            count: 1,
+          },
+        ],
+        nextCursor: null,
+      });
+      query.set('employeeInstanceId', other.selection.employeeInstanceId);
+      expect(await (await list(owner)).json()).toEqual({
+        sessions: [],
+        nextCursor: null,
+      });
+      expect([403, 404]).toContain((await list(other)).status);
+      expect((await listSessions(request())).status).toBe(401);
+      await release(other);
+      expect((await list(owner)).status).toBe(403);
     });
     it('requires real Cookie, same-origin writes and matching viewer without changing stored files', async () => {
       const p = await person();

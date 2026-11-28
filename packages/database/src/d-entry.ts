@@ -1,6 +1,7 @@
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
+  UuidSchema,
   hasDEntryPersonRelease,
   sameDEntryIdentity,
   selectDEntryGeneration,
@@ -23,6 +24,7 @@ import {
 import { requireCurrentWorkspaceWriteAuthority } from './identity.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { getDatabase } from './core/client.ts';
+import { readContentPrincipal } from './content-maintenance.ts';
 
 const identityServices = {
   authorizeSessionHistoryOwner,
@@ -110,6 +112,54 @@ export async function requireDEntryNativeIdentity(
   )
     throw new DataAccessError('authorization_denied');
   return identity;
+}
+
+/** Read pinned 4.0 history independently of a live page or guest. Archived
+ * employees retain owner history; neither the list nor its cursor grants execution. */
+export function readDEntrySessionArchivePage(
+  context: RequestContext,
+  workspaceIdInput: string,
+  options: {
+    cursor?: string;
+    employeeInstanceId?: string;
+    includeArchived?: boolean;
+    archivedOnly?: boolean;
+  },
+) {
+  const workspaceId = UuidSchema.parse(workspaceIdInput);
+  if (
+    context.actor.type !== 'user' ||
+    (context.workspaceId !== null && context.workspaceId !== workspaceId)
+  )
+    throw new DataAccessError('authorization_denied');
+  const personId = context.actor.id;
+  const scope = { ...context, workspaceId };
+  return getDatabase().begin(
+    'isolation level repeatable read read only',
+    async (sql) => {
+      if (
+        !(await readContentPrincipal(scope, sql)) ||
+        !hasDEntryPersonRelease(await readDEntryReleasePolicy(sql), {
+          organizationId: scope.organizationId,
+          personId,
+        })
+      )
+        throw new DataAccessError('authorization_denied');
+      return readDEntrySidebarSessionPage(
+        scope,
+        workspaceId,
+        undefined,
+        options.cursor,
+        sql,
+        {
+          employeeInstanceId: options.employeeInstanceId,
+          includeArchived: options.includeArchived,
+          archivedOnly: options.archivedOnly,
+          includeEmployeeGroups: !options.employeeInstanceId,
+        },
+      );
+    },
+  );
 }
 
 /** The authenticated D document owns this directory. The cursor is internal,
