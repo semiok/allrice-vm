@@ -1144,6 +1144,8 @@ it
     let socketCount = 0;
     let lastScopeId: string | undefined;
     const firstItems: string[] = [];
+    const followed = new Set<string>();
+    const followAddresses = new Map<string, string>();
     const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -1162,6 +1164,13 @@ it
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
         if (frame.type === 'open' && frame.endpoint === '$events')
           nativeEventOpens++;
+        if (frame.type === 'open' && frame.endpoint === 'session/follow') {
+          const address = frame.payload.args.request.address;
+          followAddresses.set(
+            frame.streamId,
+            address.sessionId ?? address.childSessionId,
+          );
+        }
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
@@ -1172,6 +1181,13 @@ it
           ['baseline', 'snapshot'].includes(frame.value.type)
         )
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
+        const followedSession = followAddresses.get(frame.streamId);
+        if (
+          frame.type === 'item' &&
+          frame.value.type === 'snapshot' &&
+          followedSession
+        )
+          followed.add(followedSession);
         if (
           frame.type === 'item' &&
           frame.value.type === 'baseline' &&
@@ -1889,6 +1905,7 @@ it
           { timeout: 10_000 },
         )
         .toBe(createdNativeId);
+      await expect.poll(() => followed.has(createdNativeId)).toBe(true);
       const draft = '原生新会话草稿';
       await editor.fill(draft, { timeout: 15_000 });
       const draftPrefix =
