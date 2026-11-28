@@ -295,6 +295,58 @@ it
       f.host.catalog.allocateSessionId = () =>
         summary(expectedNativeId ?? randomUUID()).sessionId;
     }
+    if (crossRetain) {
+      const root = f.host.catalog.items.find((row) => row.sessionId === 'root');
+      Object.assign(root!, { blank: false });
+      const events: Omit<SessionHistoryRecord['event'], 'seq' | 'time'>[] = [];
+      for (let turn = 1; turn <= 14; turn++) {
+        events.push(
+          { type: 'turn/start', data: { turn } },
+          {
+            type: 'user/message',
+            surfaceOp: 'append',
+            data: {
+              role: 'user',
+              id: randomUUID(),
+              source: { kind: 'user', rpcId: randomUUID() },
+              content: [
+                { type: 'text', text: '隔离回放的第' + turn + '个问题' },
+              ],
+            },
+          },
+          { type: 'step/start', data: { turn, step: 1 } },
+          {
+            type: 'assistant/message',
+            surfaceOp: 'append',
+            data: {
+              turn,
+              step: 1,
+              message: {
+                role: 'assistant',
+                id: randomUUID(),
+                source: {
+                  kind: 'model',
+                  provider: 'fixture',
+                  model: 'fixture',
+                },
+                content: [
+                  { type: 'text', text: '供滚动验收的第' + turn + '个回答' },
+                ],
+              },
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              stream: [],
+            },
+          },
+          { type: 'step/end', data: { turn, step: 1 } },
+          { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } },
+        );
+      }
+      const records: SessionHistoryRecord[] = events.map((event, index) => ({
+        type: 'event',
+        event: { ...event, seq: index + 1, time: Date.now() },
+      }));
+      f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
+    }
     const nativeIdsByThread = new Map<string, string>();
     let registered = false;
     const createReplies: unknown[] = [];
@@ -1372,21 +1424,24 @@ it
       const scope = async () => (await app.getAttribute('data-scope-id'))!;
       const firstScope = await scope();
       const scroll = workbench.locator('[data-conversation-scroll]');
-      const readingTop = await scroll.evaluate((node) => {
-        // Make the real native scrollport scrollable without generating model work.
-        Object.assign(node.style, {
-          maxHeight: '400px',
-          overflowY: 'auto',
-          scrollBehavior: 'auto',
-        });
-        const filler = document.createElement('div');
-        filler.style.height = '1800px';
-        filler.style.flexShrink = '0';
-        node.append(filler);
-        node.scrollTop = 173;
-        return node.scrollTop;
-      });
-      expect(readingTop).toBe(173);
+      await workbench.getByText('供滚动验收的第14个回答').waitFor();
+      const readScroll = () =>
+        scroll.evaluate((node) => ({
+          top: node.scrollTop,
+          limit: node.scrollHeight - node.clientHeight,
+        }));
+      await expect
+        .poll(async () => (await readScroll()).limit)
+        .toBeGreaterThan(200);
+      await scroll.hover();
+      await page.mouse.wheel(0, -173);
+      await expect
+        .poll(async () => {
+          const { top, limit } = await readScroll();
+          return top > 0 && top < limit - 20;
+        })
+        .toBe(true);
+      const readingTop = (await readScroll()).top;
       await app.evaluate((node) => {
         node.dataset.testOriginalDocument = 'first';
       });
