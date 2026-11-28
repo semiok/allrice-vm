@@ -17,6 +17,8 @@ import {
   DEntryPageMuxQuerySchema,
   DEntryPageRpcRequestSchema,
   DEntryPageUnarySchema,
+  DEntryPageSwitchSchema,
+  type DEntrySelectionInput,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import {
@@ -30,6 +32,7 @@ import {
   DEntryNativeUnavailable,
 } from './native-owner.js';
 import {
+  DEntryPageSwitchUnavailable,
   type DEntryPageHandle,
   type createDEntryPageRequests,
 } from './principal-requests.js';
@@ -102,30 +105,31 @@ function openPeer(
   });
 }
 
+type OwnedPage = {
+  setup: AbortController;
+  stop: AbortController;
+  page?: DEntryPageHandle;
+  resources?: ReturnType<typeof pageStreams>;
+  operation: Promise<void>;
+};
+
 async function runOwner(
   pages: ReturnType<typeof createDEntryPageRequests>,
   token: string,
   input: {
     organizationId: string;
-    selection: {
-      workspaceId: string;
-      employeeInstanceId: string;
-      threadId?: string;
-    };
+    selection: DEntrySelectionInput;
   },
   peer: WebSocket,
   connected: AbortSignal,
 ) {
-  const setup = new AbortController(),
-    stop = new AbortController();
-  const signal = AbortSignal.any([connected, setup.signal]);
   const send = sendTo(peer);
   let streamId: string | undefined;
-  let scopeId: string | undefined;
-  let operation: Promise<void> | undefined;
+  let current: OwnedPage | undefined;
+  let staged: OwnedPage | undefined;
+  let handoff: Promise<void> | undefined;
   let terminal: Promise<void> | undefined;
-  let requestedClose = false,
-    uplinkEnded = false;
+  let requestedClose = false;
   const notify = (error: unknown) => {
     if (!streamId || terminal || connected.aborted) return;
     terminal = send({
@@ -135,10 +139,152 @@ async function runOwner(
     });
     return terminal;
   };
-  function endPage(reason: unknown) {
-    stop.abort(reason);
-    if (!scopeId) setup.abort(reason);
+  const fail = (error: unknown) => {
+    void notify(error)
+      ?.finally(() => peer.close())
+      .catch(() => peer.terminate());
+  };
+
+  function begin(
+    selection: DEntrySelectionInput,
+    publish: (generation: OwnedPage, page: DEntryPageHandle) => Promise<void>,
+    previous?: DEntryPageHandle,
+  ) {
+    const setup = new AbortController();
+    const stop = new AbortController();
+    const signal = AbortSignal.any([connected, setup.signal]);
+    const generation: OwnedPage = {
+      setup,
+      stop,
+      operation: pages.own(
+        token,
+        { organizationId: input.organizationId, selection },
+        signal,
+        stop.signal,
+        async (page) => {
+          stop.signal.throwIfAborted();
+          page.signal.throwIfAborted();
+          generation.page = page;
+          await publish(generation, page);
+        },
+        (error) => {
+          if (!requestedClose && !stop.signal.aborted) fail(error);
+        },
+        previous,
+      ),
+    };
+    return generation;
   }
+
+  function endPage(generation: OwnedPage | undefined, reason?: unknown) {
+    generation?.stop.abort(reason);
+    if (!generation?.page) generation?.setup.abort(reason);
+  }
+
+  async function join(generation: OwnedPage | undefined) {
+    if (!generation) return;
+    const [streams, scope] = await Promise.allSettled([
+      generation.resources?.close(),
+      generation.operation,
+    ]);
+    if (streams.status === 'rejected') throw streams.reason;
+    if (scope.status === 'rejected') {
+      const intentional =
+        (generation.setup.signal.aborted &&
+          scope.reason === generation.setup.signal.reason) ||
+        (generation.stop.signal.aborted &&
+          scope.reason === generation.stop.signal.reason);
+      if (!intentional) throw scope.reason;
+    }
+  }
+
+  function mount(generation: OwnedPage, page: DEntryPageHandle) {
+    generation.resources = pageStreams(
+      page,
+      send,
+      AbortSignal.any([connected, generation.stop.signal, page.signal]),
+    );
+    current = generation;
+  }
+
+  function switchThread(
+    command: ReturnType<typeof DEntryPageSwitchSchema.parse>,
+    id: string,
+  ) {
+    const previous = current;
+    const previousPage = previous?.page;
+    if (!previousPage || staged || requestedClose) throw denied();
+    previousPage.signal.throwIfAborted();
+    const decline = () =>
+      send({
+        type: 'item',
+        streamId: id,
+        value: { type: 'switch-unavailable', requestId: command.requestId },
+      });
+    if (command.threadId === previousPage.identity.threadId) return decline();
+    const reserved = previousPage.reserveThreadSwitch(
+      command.requestId,
+      command.threadId,
+    );
+    if (!reserved) return decline();
+    staged = begin(
+      { ...input.selection, threadId: command.threadId },
+      async (generation, page) => {
+        const root = page.root;
+        if (!root) throw denied();
+        // A normal handoff must not abort a native create/fork after dispatch.
+        await reserved.drained;
+        // New authority is watching before the old registration is fenced.
+        // No stream or unary from the old document can use this new scope ID.
+        await previousPage.assertCurrent(
+          AbortSignal.any([connected, generation.stop.signal]),
+        );
+        generation.stop.signal.throwIfAborted();
+        page.signal.throwIfAborted();
+        endPage(previous);
+        await join(previous);
+        generation.stop.signal.throwIfAborted();
+        await page.assertCurrent(page.signal);
+        page.signal.throwIfAborted();
+        generation.stop.signal.throwIfAborted();
+        connected.throwIfAborted();
+        mount(generation, page);
+        staged = undefined;
+        await send({
+          type: 'item',
+          streamId: id,
+          value: {
+            type: 'switched',
+            requestId: command.requestId,
+            threadId: command.threadId,
+            scopeId: page.scope.opened.scopeId,
+            nativeSessionId: root.rootNativeSessionId,
+          },
+        });
+      },
+      previousPage,
+    );
+    // Wait only for publication. The stage operation itself stays owned until
+    // its authorization is revoked or the next generation joins it.
+    const generation = staged;
+    handoff = generation.operation
+      .catch(async (error: unknown) => {
+        if (requestedClose || connected.aborted) return;
+        if (
+          error instanceof DEntryPageSwitchUnavailable &&
+          staged === generation
+        ) {
+          staged = undefined;
+          handoff = undefined;
+          await decline();
+        } else if (!generation.stop.signal.aborted) fail(error);
+      })
+      .finally(reserved.release);
+    void handoff.catch(fail);
+    // Publication marks completion below at the mount; handoff owns a
+    // rejection listener until the generation itself terminates.
+  }
+
   try {
     for await (const [message, binary] of on(peer, 'message', {
       signal: connected,
@@ -155,55 +301,45 @@ async function runOwner(
       ) {
         emptyPayload.parse(frame.payload);
         const id = (streamId = frame.streamId);
-        operation = pages.own(
-          token,
-          input,
-          signal,
-          stop.signal,
-          async (page) => {
-            stop.signal.throwIfAborted();
-            scopeId = page.scope.opened.scopeId;
-            await send({
-              type: 'item',
-              streamId: id,
-              value: {
-                type: 'opened',
-                scopeReference: { scopeId },
-                bindingRef: page.bindingRef,
-              },
-            });
-          },
-          (error) => {
-            void notify(error)
-              ?.finally(() => peer.close())
-              .catch(() => peer.terminate());
-          },
-        );
-        void operation.catch((error) => {
-          if (!requestedClose) {
-            void notify(error)
-              ?.finally(() => peer.close())
-              .catch(() => peer.terminate());
-          }
+        current = begin(input.selection, async (generation, page) => {
+          mount(generation, page);
+          await send({
+            type: 'item',
+            streamId: id,
+            value: {
+              type: 'opened',
+              scopeReference: { scopeId: page.scope.opened.scopeId },
+              bindingRef: page.bindingRef,
+            },
+          });
+        });
+        void current.operation.catch((error) => {
+          if (!requestedClose) fail(error);
         });
       } else if (frame.streamId !== streamId) {
-        throw denied();
+        if (!current?.resources || requestedClose) throw denied();
+        if (!current.stop.signal.aborted) current.resources.accept(frame);
       } else if (
         frame.type === 'item' &&
         frame.value === 'close' &&
-        !requestedClose &&
-        !uplinkEnded
+        !requestedClose
       ) {
         requestedClose = true;
-        endPage(new DOMException('Page closed', 'AbortError'));
-      } else if (frame.type === 'end' && !uplinkEnded) {
-        uplinkEnded = true;
-        if (!requestedClose) {
-          endPage(new DOMException('Page abandoned', 'AbortError'));
-          break;
-        }
+        const reason = new DOMException('Page closed', 'AbortError');
+        endPage(current, reason);
+        endPage(staged, reason);
+      } else if (frame.type === 'item' && !requestedClose) {
+        await switchThread(
+          DEntryPageSwitchSchema.parse(frame.value),
+          frame.streamId,
+        );
+      } else if (frame.type === 'end') {
+        if (!requestedClose) break;
+        const scopeId = current?.page?.scope.opened.scopeId;
         try {
-          await operation;
+          const joins = await Promise.allSettled([join(staged), join(current)]);
+          for (const result of joins)
+            if (result.status === 'rejected') throw result.reason;
           connected.throwIfAborted();
           if (!scopeId) {
             await send({
@@ -224,47 +360,27 @@ async function runOwner(
             await send({ type: 'end', streamId: frame.streamId });
           }
         } catch (error) {
-          if (
-            signal.aborted &&
-            requestedClose &&
-            !scopeId &&
-            error === signal.reason &&
-            !connected.aborted
-          )
-            await send({
-              type: 'error',
-              streamId: frame.streamId,
-              error: {
-                code: 'gateway/cancelled',
-                message: 'Page closed during setup',
-                details: {},
-              },
-            });
-          else await notify(error);
+          await notify(error);
         }
         break;
       } else if (frame.type === 'cancel') {
-        endPage(new DOMException('Page abandoned', 'AbortError'));
         break;
       } else {
         throw denied();
       }
     }
   } catch (error) {
-    endPage(error);
+    endPage(current, error);
+    endPage(staged, error);
     await notify(error);
   } finally {
-    endPage(connected.reason);
-    await Promise.allSettled([operation, terminal]);
+    endPage(current, connected.reason);
+    endPage(staged, connected.reason);
+    await Promise.allSettled([join(current), join(staged), handoff, terminal]);
   }
 }
 
-async function runStreams(
-  page: DEntryPageHandle,
-  peer: WebSocket,
-  signal: AbortSignal,
-) {
-  const send = sendTo(peer);
+function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
   const streams = new Map<
     string,
     {
@@ -300,7 +416,7 @@ async function runStreams(
       });
       void inputError.catch((error: unknown) => stop.abort(error));
     }
-    const source = (async () => {
+    const source = page.use(child, async (child) => {
       if (frame.endpoint === 'session/follow')
         follow = await page.watchFollow(child);
       if (follow) {
@@ -337,9 +453,10 @@ async function runStreams(
         },
         follow?.signal ?? child,
       );
-    })();
-    const work = source
-      .then(async (stream) => {
+    });
+    const work = page
+      .use(child, async (child) => {
+        const stream = await source;
         for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
@@ -423,15 +540,10 @@ async function runStreams(
     });
     void work.catch((error) => stop.abort(error));
   }
-  try {
-    for await (const [message, binary] of on(peer, 'message', {
-      signal: active,
-      close: ['close'],
-      highWaterMark: 1,
-      lowWaterMark: 1,
-    })) {
-      if (binary) throw denied();
-      const frame = parseRemoteStreamClientMessage(String(message));
+  return {
+    signal: active,
+    accept(frame: Frame) {
+      active.throwIfAborted();
       const prior = streams.get(frame.streamId);
       if (frame.type === 'open') {
         if (prior) throw denied();
@@ -448,10 +560,32 @@ async function runStreams(
           value: frame.value as JsonValue | undefined,
         });
       }
+    },
+    async close() {
+      stop.abort();
+      await Promise.allSettled([...streams.values()].map(({ work }) => work));
+    },
+  };
+}
+
+async function runStreams(
+  page: DEntryPageHandle,
+  peer: WebSocket,
+  signal: AbortSignal,
+) {
+  const resources = pageStreams(page, sendTo(peer), signal);
+  try {
+    for await (const [message, binary] of on(peer, 'message', {
+      signal: resources.signal,
+      close: ['close'],
+      highWaterMark: 1,
+      lowWaterMark: 1,
+    })) {
+      if (binary) throw denied();
+      resources.accept(parseRemoteStreamClientMessage(String(message)));
     }
   } finally {
-    stop.abort();
-    await Promise.allSettled([...streams.values()].map(({ work }) => work));
+    await resources.close();
   }
 }
 

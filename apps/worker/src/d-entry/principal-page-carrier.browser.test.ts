@@ -1,8 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
@@ -11,40 +13,56 @@ import { expect, it, vi } from 'vitest';
 import {
   dEntryRegisteredThreadHeader,
   type DEntryPageOpenedSchema,
+  DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
-import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
+import {
+  initialDocumentLifecycle,
+  publicStartupBundleUrls,
+} from '../../../web/lib/d-entry/initial-document.js';
 import {
   fixture,
   buildProfileFixture,
   closes,
-  closePage,
-  open,
   sessionToken,
+  otherToken,
 } from './principal-page-carrier.fixture.js';
 
 const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable).each([
-  'attached',
-  'unattached',
-  'stall',
-  'native-create',
-  // Exercise the Linux web profile on the Mac M5 browser as well as CI.
-  ...(process.platform === 'darwin' ? (['native-create-linux'] as const) : []),
-] as const)(
-  'rc.2 workspace/follow and the blank composer (%s)',
-  { timeout: 60_000 },
+it
+  .skipIf(!browserExecutable)
+  .each([
+    'refresh',
+    'stall',
+    'switch',
+    'baseline',
+    'attached',
+    'unattached',
+    'native-create',
+    ...(process.platform === 'darwin'
+      ? (['native-create-linux'] as const)
+      : []),
+  ] as const)(
+  'rc.2 workbench composer (%s)',
+  { timeout: 120_000 },
   async (scenario) => {
     const stall = scenario === 'stall';
+    const switching = scenario === 'switch' || scenario === 'baseline';
     const nativeCreate = scenario.startsWith('native-create');
+    const createAfterSwitch =
+      scenario === 'native-create-linux' ||
+      (nativeCreate && process.platform !== 'darwin');
+    const realShell = switching || nativeCreate;
     const release = await buildProfileFixture();
-    const manifest: { files: { path: string }[] } = JSON.parse(
-      await readFile(join(release.directory, 'artifact.json'), 'utf8'),
-    );
+    const sealed = await readFile(join(release.directory, 'artifact.json'));
+    const manifest: {
+      files: { path: string }[];
+      profile: { files: { reference: string; sha256: string }[] };
+    } = JSON.parse(sealed.toString());
     const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
     const mime: Record<string, string> = {
       '.js': 'text/javascript',
@@ -52,6 +70,13 @@ it.skipIf(!browserExecutable).each([
       '.wasm': 'application/wasm',
     };
     const f = await fixture(release);
+    const otherThread = randomUUID();
+    const revokeOther =
+      switching || createAfterSwitch
+        ? f.registerThread(otherThread)
+        : undefined;
+    const cross =
+      scenario === 'switch' ? await f.registerOtherEmployee() : undefined;
     const fromComposition = createRequire(
       new URL(
         '../../../../packages/dsh-web-composition/package.json',
@@ -79,7 +104,15 @@ it.skipIf(!browserExecutable).each([
       id: randomUUID(),
       path: '/work',
       title: 'Fixture work',
-      sessionIds: scenario === 'unattached' ? [] : ['root'],
+      sessionIds:
+        scenario === 'unattached'
+          ? []
+          : [
+              'root',
+              ...(switching || createAfterSwitch
+                ? ['root-' + otherThread]
+                : []),
+            ],
       archivedSessionIds: [],
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
@@ -121,16 +154,56 @@ it.skipIf(!browserExecutable).each([
       blockedHandlers.forEach((handler) => handler.mockRestore()),
     );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
-      String(row.sessionId) === 'root'
+      ['root', 'root-' + otherThread].includes(String(row.sessionId))
         ? { ...row, blank: !nativeCreate, cwd: '/work' }
         : row,
     );
-    const life = nativeCreate ? undefined : await open(f);
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const parentModule: { outputFiles: { text: string }[] } =
+      await require('esbuild').build({
+        entryPoints: ['apps/web/lib/d-entry/page-carrier.ts'],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        globalName: 'DEntryCarrier',
+        write: false,
+      });
+    const realParent:
+      { outputFiles: { path: string; text: string }[] } | undefined = realShell
+      ? await require('esbuild').build({
+          stdin: {
+            contents: `import { createRoot } from 'react-dom/client';
+              import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+              createRoot(document.getElementById('root')).render(
+                <EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+            loader: 'tsx',
+            resolveDir: join(process.cwd(), 'apps/web'),
+          },
+          bundle: true,
+          write: false,
+          outdir: '/fixture-dsh-switch',
+          jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+            '.svg': 'dataurl',
+          },
+        })
+      : undefined;
     const createdThread = randomUUID();
     const createdNativeId = 'native-created';
-    let documentLoads = 0;
     let registered = false;
     const createReplies: unknown[] = [];
+    const createdResponse = deferred();
+    const deliverCreatedResponse = deferred();
+    let holdCreatedResponse = false;
+    let switchProofRequests = 0;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
       f.registerRoot.mockImplementation(
@@ -148,6 +221,7 @@ it.skipIf(!browserExecutable).each([
             thread: { ...registeredFixture.thread, id: createdThread },
           };
           registered = true;
+          f.rememberRoot(root);
           f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
             id === createdNativeId ? root : undefined,
           );
@@ -173,27 +247,6 @@ it.skipIf(!browserExecutable).each([
         },
       );
     }
-    const shell = nativeCreate
-      ? ((await fromComposition('esbuild').build({
-          stdin: {
-            contents: `import { createRoot } from 'react-dom/client';
-            import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
-            createRoot(document.getElementById('shell')).render(<EmployeeNativePage prepare query={location.search.slice(1)} />);`,
-            loader: 'tsx',
-            resolveDir: join(process.cwd(), 'apps/web'),
-          },
-          bundle: true,
-          write: false,
-          outdir: '/employee-entry-native-create',
-          jsx: 'automatic',
-          loader: {
-            '.woff': 'dataurl',
-            '.woff2': 'dataurl',
-            '.ttf': 'dataurl',
-            '.svg': 'dataurl',
-          },
-        })) as { outputFiles: Array<{ path: string; contents: Uint8Array }> })
-      : undefined;
     const unary: string[] = [];
     const startupReplies = new Map<string, unknown>();
     const startupMethods = new Set([
@@ -205,7 +258,34 @@ it.skipIf(!browserExecutable).each([
     const application = graph.batches.find(
       ({ phase }) => phase === 'application',
     )!;
+    const publicRoot =
+      '/_next/static/dsh-profile/' +
+      createHash('sha256').update(sealed).digest('hex') +
+      '/';
+    const bundles = graph.batches.map((batch) => ({
+      reference: batch.url,
+      revision: batch.rev,
+      sha256: manifest.profile.files.find(
+        (file) => file.reference === batch.url,
+      )!.sha256,
+      phase: batch.phase,
+    }));
+    const publicBundles = new Map(
+      bundles.map((bundle) => [
+        publicRoot + 'bundles/' + bundle.sha256 + '.js',
+        bundle,
+      ]),
+    );
+    let earlyUrls: string[] = [];
+    const seenEarly = new Set<string>();
+    const earlyBootstrapSeen = deferred<void>();
+    const traffic: { kind: string; start: number; end?: number }[] = [];
+    let started = 0;
+    let firstRpc: number | undefined;
     let applicationReads = 0;
+    let browserBootstrapReads = 0;
+    let scopedBundleReads = 0;
+    let documentLoads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -221,29 +301,60 @@ it.skipIf(!browserExecutable).each([
           .end(Buffer.from(await result.arrayBuffer()));
       };
       try {
-        if (nativeCreate && url.pathname === '/api/v1/d-entry/native-prewarm')
-          return response.writeHead(204).end();
-        if (nativeCreate && url.pathname === '/api/v1/d-entry/identity')
-          return await copy(Response.json({ identity: f.identity }));
-        if (shell && url.pathname === '/chatflow/4.0')
-          return response
-            .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-            .end(
-              '<!doctype html><link rel="stylesheet" href="/shell.css"><div id="shell"></div><script src="/shell.js"></script>',
+        const scopeId = url.searchParams.get('scopeId');
+        if (realShell) {
+          if (url.pathname === '/api/v1/d-entry/identity') {
+            return await copy(
+              Response.json({
+                identity: f.selectionIdentity(
+                  Object.fromEntries(url.searchParams),
+                ),
+              }),
             );
-        if (
-          shell &&
-          (url.pathname === '/shell.js' || url.pathname === '/shell.css')
-        ) {
-          const type = extname(url.pathname);
-          return response
-            .writeHead(200, { 'content-type': mime[type]! })
-            .end(
-              shell.outputFiles.find((file) => file.path.endsWith(type))!
-                .contents,
+          }
+          if (url.pathname === '/api/v1/d-entry/native-prewarm') {
+            request.resume();
+            return response.writeHead(204).end();
+          }
+          if (url.pathname === '/chatflow/4.0') {
+            return response
+              .writeHead(200, { 'content-type': 'text/html' })
+              .end(
+                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
+              );
+          }
+          if (url.pathname === '/outer.js' || url.pathname === '/outer.css') {
+            const css = url.pathname.endsWith('.css');
+            const asset = realParent!.outputFiles.find(({ path }) =>
+              path.endsWith(css ? '.css' : '.js'),
             );
+            return response
+              .writeHead(200, {
+                'content-type': css ? 'text/css' : 'text/javascript',
+                'cache-control': 'public, max-age=31536000, immutable',
+              })
+              .end(asset!.text);
+          }
+        }
+        if (url.pathname === '/api/v1/d-entry/profile/switch') {
+          switchProofRequests++;
+          const cookie =
+            request.headers.cookie
+              ?.split('; ')
+              .find((part) => part.startsWith('allrice_session='))
+              ?.slice('allrice_session='.length) ?? '';
+          return await copy(
+            await f.proveSwitch(
+              scopeId!,
+              url.searchParams.get('targetThreadId')!,
+              url.searchParams.get('requestId')!,
+              cookie,
+              Object.fromEntries(url.searchParams),
+            ),
+          );
         }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
+          firstRpc ??= performance.now();
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(chunk);
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -255,6 +366,11 @@ it.skipIf(!browserExecutable).each([
               ...(await result.clone().json()),
               thread: result.headers.get(dEntryRegisteredThreadHeader),
             });
+          if (holdCreatedResponse && input.endpoint === 'session/create') {
+            holdCreatedResponse = false;
+            createdResponse.resolve();
+            await deliverCreatedResponse.promise;
+          }
           if (startupMethods.has(input.endpoint))
             startupReplies.set(
               input.endpoint,
@@ -264,6 +380,8 @@ it.skipIf(!browserExecutable).each([
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
           if (url.pathname !== '/api/v1/d-entry/profile/' + kind) continue;
+          if (kind === 'bootstrap') browserBootstrapReads++;
+          else scopedBundleReads++;
           if (
             stall &&
             kind === 'assets' &&
@@ -274,15 +392,59 @@ it.skipIf(!browserExecutable).each([
             response.write('/* deliberately incomplete application');
             return;
           }
-          return await copy(
+          const timing = { kind, start: performance.now(), end: 0 };
+          traffic.push(timing);
+          await copy(
             await f.publish(
               kind,
-              life?.scopeId ?? url.searchParams.get('scopeId')!,
+              scopeId!,
               Object.fromEntries(url.searchParams),
             ),
           );
+          timing.end = performance.now();
+          return;
+        }
+        const publicBundle = !stall && publicBundles.get(url.pathname);
+        if (publicBundle) {
+          if (earlyUrls.includes(url.pathname)) {
+            seenEarly.add(url.pathname);
+            if (seenEarly.size === earlyUrls.length)
+              earlyBootstrapSeen.resolve();
+          }
+          const timing = {
+            kind: 'public-' + publicBundle.phase,
+            start: performance.now(),
+            end: 0,
+          };
+          traffic.push(timing);
+          expect(request.headers.cookie).toBeUndefined();
+          const bytes = await release.read(
+            publicBundle.reference,
+            new AbortController().signal,
+          );
+          // Match the production Next asset delivery. Chromium's cache limits
+          // apply to the encoded HTTP response, not the decoded bundle.
+          expect(request.headers['accept-encoding']).toContain('gzip');
+          const encoded = gzipSync(bytes);
+          await delay(180);
+          timing.end = performance.now();
+          response
+            .writeHead(200, {
+              'content-type': 'text/javascript',
+              'cache-control': 'public, max-age=31536000, immutable',
+              'content-encoding': 'gzip',
+              'content-length': encoded.length,
+              vary: 'accept-encoding',
+            })
+            .end(encoded);
+          return;
         }
         if (staticFiles.has(url.pathname)) {
+          if (
+            earlyUrls.length &&
+            url.pathname === '/managed/employee-web-entry.js'
+          )
+            await earlyBootstrapSeen.promise;
           const asset = await readFile(
             join(release.directory, url.pathname.slice(1)),
           );
@@ -298,7 +460,32 @@ it.skipIf(!browserExecutable).each([
           response
             .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
             .end(
-              '<!doctype html><iframe src="/employee" style="width:100%;height:100vh"></iframe>',
+              `<!doctype html><iframe data-page-mux="v1" style="width:100%;height:100vh"></iframe>
+                <script>${parentModule.outputFiles[0]!.text}</script>
+                <script>
+                  const frame = document.querySelector('iframe');
+                  const carrier = DEntryCarrier.openNativePageCarrier(
+                    ${JSON.stringify(f.identity)}, ${JSON.stringify(f.selection)}, () => {}
+                  );
+                  carrier.ready.then(({scopeReference}) => {
+                    const scopeId = scopeReference.scopeId;
+                    function send(type, state) {
+                      frame.contentWindow.postMessage({ type, scopeId, state }, location.origin);
+                    }
+                    const finish = () => carrier.close().then(
+                      () => send('allrice:d-entry:completion','closed'),
+                      () => send('allrice:d-entry:completion','unknown')
+                    );
+                    window.finishCarrier = finish;
+                    window.addEventListener('message', (event) => {
+                      if (event.origin !== location.origin || event.source !== frame.contentWindow ||
+                        event.data?.scopeId !== scopeId) return;
+                      if (event.data.type === 'allrice:d-entry:mux-attach') carrier.attachMux(event.ports[0]);
+                      if (event.data.type === 'allrice:d-entry:close') void finish();
+                    });
+                    frame.src = '/employee?scopeId=' + encodeURIComponent(scopeId);
+                  });
+                </script>`,
             );
           return;
         }
@@ -310,9 +497,16 @@ it.skipIf(!browserExecutable).each([
           return;
         }
         documentLoads++;
-        const scopeId = life?.scopeId ?? url.searchParams.get('scopeId');
-        if (!scopeId) return response.writeHead(404).end();
-        const { identity, selection } = f;
+        const selection = {
+          ...f.selection,
+          employeeInstanceId:
+            url.searchParams.get('employeeInstanceId') ??
+            f.selection.employeeInstanceId,
+          threadId: url.searchParams.get('threadId') ?? f.selection.threadId,
+        };
+        const identity = f.selectionIdentity(selection);
+        const nativeId =
+          selection.threadId === otherThread ? 'root-' + otherThread : 'root';
         const version = {
           id: identity.employeeVersionId,
           manifest: { name: 'Fixture employee' },
@@ -321,34 +515,61 @@ it.skipIf(!browserExecutable).each([
           ...identity,
           viewerId: identity.personId,
           employees: [
-            {
-              id: identity.employeeInstanceId,
-              employeeId: identity.employeeInstanceId,
-              isDefault: true,
-              currentVersion: version,
-              versions: [version],
-            },
-          ],
-          sessions: [
-            {
-              id: selection.threadId,
-              employeeInstanceId: identity.employeeInstanceId,
-              ownerId: identity.personId,
-              updatedAt: '2026-01-01T00:00:00.000Z',
-              createdAt: '2026-01-01T00:00:00.000Z',
-              title: 'Fixture thread',
-            },
-          ],
+            f.selection.employeeInstanceId,
+            ...(cross ? [cross.identity.employeeInstanceId] : []),
+          ].map((id) => ({
+            id,
+            employeeId: id,
+            isDefault: id === f.selection.employeeInstanceId,
+            currentVersion: version,
+            versions: [version],
+          })),
+          sessions: (switching || createAfterSwitch
+            ? [
+                f.selection.threadId,
+                otherThread,
+                ...(cross ? [cross.identity.threadId!] : []),
+              ]
+            : [selection.threadId]
+          ).map((id) => ({
+            id,
+            employeeInstanceId:
+              id === cross?.identity.threadId
+                ? cross.identity.employeeInstanceId
+                : f.selection.employeeInstanceId,
+            ownerId: identity.personId,
+            updatedAt: '2026-01-01T00:00:00.000Z',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            title: id === otherThread ? '第二条已存在对话' : '第一条已存在对话',
+          })),
         };
+        if (!scopeId) return response.writeHead(404).end();
+        const bootstrap = await f.publish('bootstrap', scopeId, {
+          threadId: selection.threadId,
+          employeeInstanceId: selection.employeeInstanceId,
+        });
+        if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
+        const published = DEntryProfileBootstrapSchema.parse(
+          await bootstrap.json(),
+        );
+        earlyUrls = stall
+          ? []
+          : publicStartupBundleUrls(published, {
+              root: publicRoot,
+              bundles,
+            });
+        const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
-          <script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script>
-          <div id="app" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
+          <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
+          <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
-            data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
+            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${graph.rev}"
+            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
+          <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
       } catch {
         response.writeHead(500).end();
@@ -393,6 +614,8 @@ it.skipIf(!browserExecutable).each([
       }, scenario === 'native-create-linux');
     }
     const streams = new Map<string, string>();
+    let socketCount = 0;
+    let lastScopeId: string | undefined;
     const firstItems: string[] = [];
     const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
@@ -406,12 +629,15 @@ it.skipIf(!browserExecutable).each([
         errors.push(`${response.status()} ${new URL(response.url()).pathname}`);
     });
     page.on('websocket', (socket) => {
+      socketCount++;
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
+        if (frame.type === 'item' && frame.value.type === 'opened')
+          lastScopeId = frame.value.scopeReference.scopeId;
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
@@ -438,8 +664,18 @@ it.skipIf(!browserExecutable).each([
         });
       });
     }
+    if (scenario === 'baseline') {
+      await page.addInitScript(() => {
+        if (window !== top) return;
+        window.addEventListener('message', (event) => {
+          if (event.data?.type === 'allrice:d-entry:switch-ready')
+            event.stopImmediatePropagation();
+        });
+      });
+    }
+    started = performance.now();
     await page.goto(
-      nativeCreate
+      realShell
         ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
         : f.origin,
     );
@@ -450,6 +686,8 @@ it.skipIf(!browserExecutable).each([
       await page.clock.fastForward(30_100);
       await page.locator('html[data-asset-timeout="asset-timeout"]').waitFor();
       expect(applicationReads).toBe(2);
+      expect(browserBootstrapReads).toBe(0);
+      expect(socketCount).toBe(1);
       expect(unary).not.toContain('session/list');
       await context.close();
       return;
@@ -469,7 +707,15 @@ it.skipIf(!browserExecutable).each([
           items: [
             {
               workspaceId: nativeWorkspace.id,
-              sessionIds: scenario === 'unattached' ? [] : ['root'],
+              sessionIds:
+                scenario === 'unattached'
+                  ? []
+                  : [
+                      'root',
+                      ...(switching || createAfterSwitch
+                        ? ['root-' + otherThread]
+                        : []),
+                    ],
             },
           ],
         },
@@ -505,15 +751,221 @@ it.skipIf(!browserExecutable).each([
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (switching) {
+      const frame = page.locator('iframe');
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((node, value) => {
+        node.dataset.fixtureDocument = value;
+      }, mark);
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false,
+        latency: 200,
+        downloadThroughput: 1_250_000,
+        uploadThroughput: 1_250_000,
+      });
+      const samples: number[] = [];
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const other = attempt % 2 === 0;
+        const target = other ? otherThread : f.selection.threadId;
+        const nativeId = other ? 'root-' + otherThread : 'root';
+        const row = workbench.locator(
+          '[data-row-key="session:' + target + '"]',
+        );
+        const start = performance.now();
+        await row.press('Enter');
+        try {
+          await page.waitForURL(
+            (url) => url.searchParams.get('threadId') === target,
+            { timeout: 8_000, waitUntil: 'commit' },
+          );
+          await workbench
+            .locator(
+              '[data-conversation-session="' +
+                nativeId +
+                '"] [data-composer-input][contenteditable="true"]',
+            )
+            .waitFor({ timeout: 8_000 });
+        } catch (cause) {
+          throw Error(
+            JSON.stringify({
+              attempt,
+              scenario,
+              socketCount,
+              documentLoads,
+              unary,
+              errors,
+            }),
+            { cause },
+          );
+        }
+        samples.push(Math.round(performance.now() - start));
+        expect(await row.getAttribute('aria-selected')).toBe('true');
+        if (scenario === 'switch') {
+          expect(
+            await workbench
+              .locator('#app')
+              .getAttribute('data-fixture-document'),
+          ).toBe(mark);
+          expect(documentLoads).toBe(1);
+          expect(socketCount).toBe(1);
+        }
+        if (attempt === 0) await editor.fill('另一条会话的原生草稿');
+      }
+      expect(await editor.innerText()).toBe('未发送的原生草稿');
+      expect(await frame.count()).toBe(1);
+      if (scenario === 'baseline') {
+        expect(documentLoads).toBe(7);
+        expect(socketCount).toBe(7);
+      } else {
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+      }
+      console.info(
+        'NATIVE_THREAD_SWITCH_BENCHMARK ' +
+          JSON.stringify({
+            scenario,
+            browser: browser.version(),
+            samples,
+            documentLoads,
+            socketCount,
+          }),
+      );
+      if (cross) {
+        const before = { documentLoads, socketCount };
+        const original = [...f.pageSignals].find(
+          ([, signal]) => !signal.aborted,
+        )?.[0];
+        expect(original).toBeDefined();
+        const next = {
+          workspaceId: cross.identity.workspaceId,
+          employeeInstanceId: cross.identity.employeeInstanceId,
+          threadId: cross.identity.threadId,
+        };
+        await workbench.locator('#app').evaluate((node, selection) => {
+          parent.postMessage(
+            {
+              type: 'allrice:d-entry:navigate',
+              scopeId: node.dataset.scopeId,
+              selection,
+            },
+            location.origin,
+          );
+        }, next);
+        await page.waitForURL(
+          (url) =>
+            url.searchParams.get('employeeInstanceId') ===
+            next.employeeInstanceId,
+        );
+        await editor.waitFor();
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-employee-instance-id'),
+        ).toBe(next.employeeInstanceId);
+        expect(
+          await workbench.locator('#app').getAttribute('data-scope-id'),
+        ).not.toBe(original);
+        expect(await editor.innerText()).not.toContain('未发送的原生草稿');
+        expect(documentLoads).toBe(before.documentLoads + 1);
+        expect(socketCount).toBe(before.socketCount + 1);
+        expect((await f.invokeThread(original!, otherThread)).status).toBe(404);
+        console.info(
+          'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
+        );
+        await page.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        await editor.waitFor();
+        const originalLoginScope = await workbench
+          .locator('#app')
+          .getAttribute('data-scope-id');
+        await context.addCookies([
+          { name: 'allrice_session', value: otherToken, url: f.origin },
+        ]);
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page
+          .getByRole('heading', { name: '暂时打不开这条对话' })
+          .waitFor();
+        await expect.poll(() => page.locator('iframe').count()).toBe(0);
+        expect(f.pageSignals.get(originalLoginScope!)?.aborted).toBe(true);
+        await context.addCookies([
+          { name: 'allrice_session', value: sessionToken, url: f.origin },
+        ]);
+        await page.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        await editor.waitFor();
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        revokeOther!.abort();
+        await expect.poll(() => page.locator('iframe:visible').count()).toBe(0);
+      }
+      await cdp.detach();
+      await context.close();
+      return;
+    }
+    expect(browserBootstrapReads).toBe(0);
+    expect(socketCount).toBe(1);
+    const bootstrapDownload = traffic.find(
+      ({ kind }) => kind === 'public-bootstrap',
+    );
+    const applicationDownload = traffic.find(
+      ({ kind }) => kind === 'public-application',
+    );
+    expect(earlyUrls).toHaveLength(2);
+    expect(applicationDownload?.start).toBeLessThan(bootstrapDownload!.end!);
+    expect(
+      traffic.filter(({ kind }) => kind === 'public-bootstrap'),
+    ).toHaveLength(1);
+    expect(
+      traffic.filter(({ kind }) => kind === 'public-application'),
+    ).toHaveLength(1);
+    console.info(
+      'HOT_NATIVE_BENCHMARK ' +
+        JSON.stringify({
+          browser: browser.version(),
+          publicDelayMs: 180,
+          firstRpcMs: Math.round(firstRpc! - started),
+          editableMs: Math.round(performance.now() - started),
+          traffic: traffic.map(({ kind, start, end }) => ({
+            kind,
+            startMs: Math.round(start - started),
+            endMs: typeof end === 'number' ? Math.round(end - started) : null,
+          })),
+        }),
+    );
     if (nativeCreate) {
       const mark = randomUUID();
       const frame = page.locator('iframe');
+      const initialSockets = socketCount;
       await frame.evaluate((node, mark) => {
         node.dataset.fixtureIdentity = mark;
       }, mark);
       await workbench.locator('#app').evaluate((node, mark) => {
         node.dataset.fixtureDocument = mark;
       }, mark);
+      if (createAfterSwitch) {
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        await editor.fill('切换后保留的草稿', { timeout: 15_000 });
+      }
       const platform = await editor.evaluate(
         (node) => node.ownerDocument.defaultView!.navigator.platform,
       );
@@ -525,7 +977,40 @@ it.skipIf(!browserExecutable).each([
           ? 'Control+Alt+N'
           : 'Control+Shift+Period';
       try {
+        if (createAfterSwitch) {
+          await workbench.locator('#app').evaluate((node) => {
+            window.addEventListener('message', (event) => {
+              if (
+                event.source === parent &&
+                event.data?.type === 'allrice:d-entry:thread-switch-prepare'
+              )
+                node.dataset.fixturePreparing = 'yes';
+            });
+          });
+          holdCreatedResponse = true;
+        }
         await editor.press(chord, { timeout: 10_000 });
+        if (createAfterSwitch) {
+          try {
+            await createdResponse.promise;
+            const before = switchProofRequests;
+            await workbench
+              .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+              .click();
+            await workbench
+              .locator('#app[data-fixture-preparing="yes"]')
+              .waitFor();
+            expect(switchProofRequests).toBe(before);
+          } finally {
+            deliverCreatedResponse.resolve();
+          }
+          await page.waitForURL(
+            (url) => url.searchParams.get('threadId') === f.selection.threadId,
+          );
+          await workbench
+            .locator('[data-row-key="session:' + createdThread + '"]')
+            .click();
+        }
         await expect
           .poll(() => unary.includes('session/create'), { timeout: 15_000 })
           .toBe(true);
@@ -534,6 +1019,7 @@ it.skipIf(!browserExecutable).each([
           { timeout: 20_000 },
         );
       } catch (error) {
+        deliverCreatedResponse.resolve();
         throw new Error(
           JSON.stringify({
             platform,
@@ -611,16 +1097,31 @@ it.skipIf(!browserExecutable).each([
         await workbench.locator('#app').getAttribute('data-fixture-document'),
       ).toBe(mark);
       expect(documentLoads).toBe(1);
+      expect(socketCount).toBe(initialSockets);
+      if (createAfterSwitch) {
+        await workbench
+          .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await workbench
+          .locator('[data-row-key="session:' + createdThread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === createdThread,
+        );
+        await expect.poll(() => editor.textContent()).toBe(draft);
+        expect(documentLoads).toBe(1);
+        expect(socketCount).toBe(initialSockets);
+        expect(
+          await workbench.locator('#app').getAttribute('data-fixture-document'),
+        ).toBe(mark);
+      }
       expect(f.registerRoot).toHaveBeenCalledTimes(1);
       await context.close();
       return;
     }
-    if (!life) throw Error('Missing fixture page carrier');
-    expect(
-      await workbench
-        .getByText(/选择一个工作区开始|Choose a workspace to start/)
-        .count(),
-    ).toBe(0);
     await expect
       .poll(() => firstItems)
       .toEqual(
@@ -671,6 +1172,7 @@ it.skipIf(!browserExecutable).each([
       resolveRequestRun: { requestId: 'fixture-request', resolution: refused },
       settleUserRun: { agentId: 'other', pluginId, resolution: refused },
     };
+    if (!lastScopeId) throw Error('Missing fixture page carrier');
     for (const method of blockedMethods) {
       const endpoint = `dynamicCordisRunner/${method}`;
       const response = await page.request.post(
@@ -678,7 +1180,7 @@ it.skipIf(!browserExecutable).each([
         {
           data: {
             selection: f.selection,
-            scopeId: life.scopeId,
+            scopeId: lastScopeId,
             rpcId: randomUUID(),
             endpoint,
             payload: { args: blockedArgs[method] },
@@ -699,8 +1201,44 @@ it.skipIf(!browserExecutable).each([
     for (const handler of blockedHandlers)
       expect(handler).not.toHaveBeenCalled();
     expect(unary).not.toContain('session/prompt');
-    closePage(life.peer);
-    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    await page.evaluate(async () => {
+      const finish: unknown = Reflect.get(window, 'finishCarrier');
+      if (typeof finish !== 'function')
+        throw Error('Fixture carrier unavailable');
+      await finish();
+    });
+
+    const downloaded = () =>
+      traffic.filter(({ kind }) => kind.startsWith('public-'));
+    expect(downloaded()).toHaveLength(2);
+    expect(scopedBundleReads).toBe(0);
+    const refreshedAt = performance.now();
+    await page.reload();
+    await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
+    expect(
+      downloaded()
+        .map(({ kind }) => kind)
+        .sort(),
+    ).toEqual(['public-application', 'public-bootstrap']);
+    expect(scopedBundleReads).toBe(0);
+    expect(browserBootstrapReads).toBe(0);
+    expect(socketCount).toBe(2);
+    console.info(
+      'SEALED_PROFILE_REFRESH ' +
+        JSON.stringify({
+          browser: browser.version(),
+          sealedBundleRequests: downloaded().length - 2,
+          scopedBundleRequests: scopedBundleReads,
+          editableMs: Math.round(performance.now() - refreshedAt),
+        }),
+    );
+    await page.evaluate(async () => {
+      const finish: unknown = Reflect.get(window, 'finishCarrier');
+      if (typeof finish !== 'function')
+        throw Error('Fixture carrier unavailable');
+      await finish();
+    });
+
     await context.close();
   },
 );
@@ -857,6 +1395,14 @@ it.skipIf(!browserExecutable)(
     let firstStyle = deferred<ServerResponse>();
     let initialScriptClose = deferred<void>();
     let initialStyleClose = deferred<void>();
+    let earlyTransfer = deferred<ServerResponse>();
+    let earlyClose = deferred<void>();
+    const heldPublicUrl =
+      '/_next/static/dsh-profile/' +
+      '1'.repeat(64) +
+      '/bundles/' +
+      '2'.repeat(64) +
+      '.js';
     let startup:
       | 'style'
       | 'entry'
@@ -892,6 +1438,14 @@ it.skipIf(!browserExecutable)(
         return send('application/javascript', outer);
       if (url.pathname === '/child.js')
         return send('application/javascript', child);
+      if (url.pathname === heldPublicUrl) {
+        expect(request.headers.cookie).toBeUndefined();
+        response.once('close', () => earlyClose.resolve());
+        response.writeHead(200, { 'content-type': 'text/javascript' });
+        response.write('/* suspended early bootstrap */');
+        earlyTransfer.resolve(response);
+        return;
+      }
       if (url.pathname === '/first.js') {
         if (startup === 'entry') return response.writeHead(503).end();
         response.once('close', () => initialScriptClose.resolve());
@@ -951,7 +1505,7 @@ it.skipIf(!browserExecutable)(
           .join(' ');
         return send(
           'text/html',
-          `<!doctype html><head><script data-scope-id="${scope}">${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : mode === 'draft-storage' ? '<script>Object.defineProperty(Storage.prototype,"getItem",{value:Storage.prototype.getItem,writable:false,configurable:false})</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
+          `<!doctype html><head><script data-scope-id="${scope}"${mode === 'pending-elements' ? ` data-public-startup-bundles='["${heldPublicUrl}"]'` : ''}>${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : mode === 'draft-storage' ? '<script>Object.defineProperty(Storage.prototype,"getItem",{value:Storage.prototype.getItem,writable:false,configurable:false})</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
         );
       }
       if (url.pathname.startsWith('/chatflow/4.0/document/'))
@@ -1157,6 +1711,8 @@ it.skipIf(!browserExecutable)(
       firstStyle = deferred<ServerResponse>();
       initialScriptClose = deferred();
       initialStyleClose = deferred();
+      earlyTransfer = deferred();
+      earlyClose = deferred();
       const page = await context.newPage();
       try {
         await page.goto(start, { waitUntil: 'commit' });
@@ -1173,7 +1729,12 @@ it.skipIf(!browserExecutable)(
           ]);
           expect(script.writableFinished).toBe(false);
           if (phase === 'style') style.writeHead(503).end();
-          else await select(page, next);
+          else {
+            const early = await earlyTransfer.promise;
+            await select(page, next);
+            await earlyClose.promise;
+            expect(early.writableFinished).toBe(false);
+          }
           await initialScriptClose.promise;
           expect(script.writableFinished).toBe(false);
           if (phase === 'pending-elements') {

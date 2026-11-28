@@ -1,4 +1,5 @@
 import { applyIndexInjections } from '@deepseek-ai/dsh-client-web';
+import type { EarlyProfileBundles } from '../../../apps/web/lib/d-entry/initial-document';
 import {
   EmployeeProfileBundleTimeout,
   nativeProfileDocument,
@@ -12,6 +13,7 @@ import {
 import {
   pageEditorMounted,
   pageStartupFailed,
+  pageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
 
 const container = document.getElementById('app');
@@ -21,6 +23,7 @@ const scope = globalThis as typeof globalThis & {
   __ALLRICE_EMPLOYEE_DOCUMENT__?: {
     scopeId: string;
     signal: AbortSignal;
+    earlyBundles?: EarlyProfileBundles;
     claim(): boolean;
     finish(state: 'closed' | 'unknown'): void;
   };
@@ -81,7 +84,7 @@ function boot(
     const identity = readEmployeeDocument(container.dataset);
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
-    const registerDraft = installEmployeeDraftStorage(identity);
+    const drafts = installEmployeeDraftStorage(identity);
     const document = nativeProfileDocument(
       container,
       close,
@@ -89,7 +92,14 @@ function boot(
         fail(error);
         close();
       },
-      registerDraft,
+      documentOwner.earlyBundles,
+      (next) => {
+        drafts.registerScope(next.nativeSessionId, next.threadId);
+        container.ownerDocument.dispatchEvent(
+          new CustomEvent(pageThreadScope, { detail: next }),
+        );
+      },
+      drafts.registerDraft,
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;

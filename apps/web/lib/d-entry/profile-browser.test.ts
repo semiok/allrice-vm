@@ -78,6 +78,8 @@ it('falls back through the authenticated no-store path when the public body is i
   expect(request).toHaveBeenNthCalledWith(1, direct, {
     signal: expect.any(AbortSignal),
     credentials: 'omit',
+    cache: 'force-cache',
+    redirect: 'error',
   });
   expect(request).toHaveBeenNthCalledWith(2, scoped, {
     signal: expect.any(AbortSignal),
@@ -101,6 +103,31 @@ it('does not fall back after the scoped page is revoked', async () => {
     ),
   ).rejects.toMatchObject({ name: 'AbortError' });
   expect(request).toHaveBeenCalledTimes(1);
+});
+
+it('consumes fetched public bytes once and keeps fallback scoped if preloading fails', async () => {
+  const scoped = new URL('https://allrice.test/scoped');
+  const direct = '/_next/static/dsh-profile/example.js';
+  const signal = new AbortController().signal;
+  const request = vi.fn().mockResolvedValue(new Response('scoped'));
+  vi.stubGlobal('fetch', request);
+  const bytes = new TextEncoder().encode('public').buffer;
+  await expect(
+    readProfileBundle(scoped, signal, direct, Promise.resolve(bytes)),
+  ).resolves.toBe(bytes);
+  expect(request).not.toHaveBeenCalled();
+  const fallback = await readProfileBundle(
+    scoped,
+    signal,
+    direct,
+    Promise.reject(Error('preload unavailable')),
+  );
+  expect(new TextDecoder().decode(fallback)).toBe('scoped');
+  expect(request).toHaveBeenCalledExactlyOnceWith(scoped, {
+    signal: expect.any(AbortSignal),
+    credentials: 'same-origin',
+    cache: 'no-store',
+  });
 });
 
 it('aborts an incomplete bundle body and retries the authorized request once', async () => {
