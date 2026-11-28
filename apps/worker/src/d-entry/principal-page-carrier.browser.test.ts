@@ -79,6 +79,8 @@ it
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const warmRefresh = scenario === 'refresh';
+    const refreshBenchmark =
+      warmRefresh && process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL === '1';
     const usePublicFiles = coldAssets || warmRefresh;
     const realShell = switching || nativeCreate || coldAssets || warmRefresh;
     const release = await buildProfileFixture();
@@ -236,7 +238,7 @@ it
           write: false,
           outdir: '/fixture-dsh-switch',
           jsx: 'automatic',
-          minify: coldAssets,
+          minify: coldAssets || refreshBenchmark,
           loader: {
             '.woff': 'dataurl',
             '.woff2': 'dataurl',
@@ -738,12 +740,20 @@ it
             const asset = realParent!.outputFiles.find(({ path }) =>
               path.endsWith(css ? '.css' : '.js'),
             );
+            const encoded = refreshBenchmark
+              ? gzipSync(asset!.text)
+              : undefined;
             return response
               .writeHead(200, {
                 'content-type': css ? 'text/css' : 'text/javascript',
                 'cache-control': 'public, max-age=31536000, immutable',
+                ...(encoded && {
+                  'content-encoding': 'gzip',
+                  'content-length': encoded.byteLength,
+                  vary: 'accept-encoding',
+                }),
               })
-              .end(asset!.text);
+              .end(encoded ?? asset!.text);
           }
         }
         if (url.pathname === '/api/v1/d-entry/profile/switch') {
@@ -2352,7 +2362,7 @@ it
           ([path]) => path === '/api/v1/d-entry/native-prewarm',
         ),
       ).toHaveLength(1);
-      if (process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL === '1') {
+      if (refreshBenchmark) {
         await refreshCdp.detach();
         for (let sample = 1; sample <= 3; sample++) {
           for (const cache of ['cold', 'warm'] as const) {
