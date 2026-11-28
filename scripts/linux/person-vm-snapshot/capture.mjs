@@ -12,7 +12,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { release } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { source as publicOci } from '../../person-vm-image/verify.mjs';
 import { inventoryFile, readSmallFile } from './build.mjs';
@@ -20,6 +20,7 @@ import {
   checkCaptureReceipt,
   checkHostPreflight,
   hashPattern,
+  matches,
   payloads,
   requireCapture,
   sha256,
@@ -29,7 +30,10 @@ const exec = promisify(execFile);
 const vm = 'allrice-public-template';
 const group = vm;
 const snapshot = group + ':baseline';
+const runtimeVolume = 'allrice-public-dsh';
 const cleanEnv = { PATH: '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC' };
+const preflightSha256 =
+  'a3a66dbf99e09dbee605b2fefa1cfbe81c1f96f02b4a854fafe4ce8316b67d50';
 
 async function command(program, args, { env, cwd, signal, phase }) {
   try {
@@ -100,7 +104,7 @@ export function cpuAbi(cpuinfo) {
 }
 
 export function captureCreateArgs({
-  runtimeDisk,
+  runtimeSizeMiB,
   dsh,
   controlsHost,
   controls,
@@ -131,8 +135,8 @@ export function captureCreateArgs({
     'root',
     '--mount-dir',
     work + ':/work',
-    '--mount-disk',
-    runtimeDisk + ':' + dsh + ':format=raw,fstype=ext4,ro',
+    '--mount-named',
+    runtimeVolume + ':' + dsh + ':kind=disk,size=' + runtimeSizeMiB + 'M,ro',
     '--mount-dir',
     controlsHost + ':' + controls + ':ro',
   ];
@@ -151,13 +155,20 @@ async function exactPath(path) {
 
 async function sealedInput(path, digest, signal) {
   await exactPath(path);
+  requireCapture(matches(hashPattern, digest), 'expected pinned input digest');
   const info = await lstat(path);
+  const parent = await lstat(dirname(path));
   requireCapture(
-    info.isFile() && (info.mode & 0o7222) === 0,
+    info.isFile() &&
+      (info.mode & 0o7222) === 0 &&
+      info.nlink === 1 &&
+      [0, process.getuid()].includes(info.uid) &&
+      (parent.mode & 0o7022) === 0 &&
+      [0, process.getuid()].includes(parent.uid),
     'unprotected capture input',
   );
   requireCapture(
-    (await inventoryFile(path, signal)).sha256 === digest,
+    (await inventoryFile(path, signal, undefined, info.uid)).sha256 === digest,
     'capture input digest mismatch',
   );
   return path;
@@ -195,7 +206,7 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
       geometry.memory_mib === 2048 &&
       geometry.max_memory_mib === 2048 &&
       Array.isArray(checkpoint.disks) &&
-      checkpoint.disks.length === 1 &&
+      checkpoint.disks.length === 2 &&
       (checkpoint.owned_volumes === undefined ||
         (Array.isArray(checkpoint.owned_volumes) &&
           checkpoint.owned_volumes.length === 0)) &&
@@ -212,7 +223,21 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
           device_id,
           device_type,
         })),
-        resources: checkpoint.resources,
+        // Per-boot grants and network identities stay bound by the raw
+        // checkpoint hash. Only stable device layout enters the profile pin.
+        resources: checkpoint.resources.map(({ binding, ...resource }) => ({
+          ...resource,
+          binding: Object.fromEntries(
+            Object.entries(binding).filter(
+              ([key]) =>
+                ![
+                  'source_binding_token',
+                  'guest_network',
+                  'gateway_mac',
+                ].includes(key),
+            ),
+          ),
+        })),
         geometry,
       }),
     ),
@@ -246,9 +271,56 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
   }
   const execution = await object(checkpoint.execution_state);
   const memoryPath = await object(checkpoint.memory);
-  const rootDisk = await object(checkpoint.disks[0]);
+  const disks = await Promise.all(
+    checkpoint.disks.map(async (id) => {
+      const path = await object(id);
+      return { path, manifest: JSON.parse(await readSmallFile(path)) };
+    }),
+  );
+  const dshGuestPath = '/opt/allrice/dsh/' + publicOci.artifactSha256;
+  const runtimeResource = checkpoint.resources.find(
+    ({ binding }) =>
+      binding.guest_path === dshGuestPath && binding.managed_disk === 'true',
+  );
+  const runtimeDevice = runtimeResource?.binding.device_id;
+  const runtime = disks.find(
+    ({ manifest }) => manifest.device_id === runtimeDevice,
+  );
+  const root = disks.find(({ manifest }) =>
+    [undefined, 'vda', 'vdb'].includes(manifest.device_id),
+  );
+  requireCapture(
+    runtimeDevice &&
+      runtime &&
+      root &&
+      runtime !== root &&
+      runtimeResource.binding.fstype === 'ext4' &&
+      JSON.parse(runtimeResource.binding.mount_options).readonly === true,
+    'native public runtime disk binding mismatch',
+  );
+  const [runtimeLayer] = runtime.manifest.layers;
+  requireCapture(
+    runtime.manifest.layers.length === 1 &&
+      runtimeLayer?.format === 'raw' &&
+      /^[a-zA-Z0-9_-]+$/.test(runtimeLayer.layer_id) &&
+      runtime.manifest.pause_generation === checkpoint.pause_generation,
+    'native public runtime disk generation mismatch',
+  );
+  const runtimeLayerPath = join(
+    checkpointDirectory,
+    'layers',
+    runtimeLayer.layer_id + '.raw',
+  );
+  await exactPath(runtimeLayerPath);
+  const runtimeBytes = await inventoryFile(runtimeLayerPath, signal);
+  requireCapture(
+    runtimeBytes.sha256 === expected.inputs.dshRuntimeDiskSha256 &&
+      runtimeBytes.sizeBytes === runtimeLayer.file_size,
+    'native public runtime disk bytes mismatch',
+  );
+  const rootDisk = root.path;
   const memory = JSON.parse(await readSmallFile(memoryPath, 16 * 1024 * 1024));
-  const disk = JSON.parse(await readSmallFile(rootDisk));
+  const disk = root.manifest;
   requireCapture(
     memory.schema === 'microsandbox.memory/1' &&
       memory.architecture === 'aarch64' &&
@@ -259,7 +331,13 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
       disk.layers.length > 0,
     'native memory or disk generation mismatch',
   );
-  return { execution, memoryPath, rootDisk, topology };
+  return {
+    execution,
+    memoryPath,
+    rootDisk,
+    topology,
+    checkpointRoot: descriptor.state.checkpoint_root,
+  };
 }
 
 /** Capture under a dedicated non-root UID in an operator-created disconnected
@@ -269,6 +347,7 @@ export async function captureTemplate({
   output,
   preflightScript,
   hostNode,
+  hostNodeSha256,
   native,
   controls,
   publicImageCache,
@@ -325,7 +404,7 @@ export async function captureTemplate({
     await command(
       '/usr/bin/python3',
       [
-        await exactPath(preflightScript),
+        await sealedInput(preflightScript, preflightSha256, signal),
         'check-runtime',
         '--scratch-mount',
         scratchMount,
@@ -336,7 +415,7 @@ export async function captureTemplate({
         '--scratch-luks-uuid',
         scratchLuksUuid,
         '--node',
-        await exactPath(hostNode),
+        await sealedInput(hostNode, hostNodeSha256, signal),
         '--msb',
         binary,
       ],
@@ -367,6 +446,12 @@ export async function captureTemplate({
     inputs.dshRuntimeDiskSha256,
     signal,
   );
+  const runtimeSize = (await lstat(runtimeDisk)).size;
+  const runtimeSizeMiB = runtimeSize / 1024 ** 2;
+  requireCapture(
+    Number.isSafeInteger(runtimeSizeMiB) && runtimeSizeMiB > 0,
+    'runtime must have a whole-MiB volume size',
+  );
   requireCapture(
     controls.sha256 === inputs.commandMemorySha256,
     'command memory digest mismatch',
@@ -380,36 +465,83 @@ export async function captureTemplate({
   const controlsHost = await exactPath(controls.hostDirectory);
   const dsh = '/opt/allrice/dsh/' + publicOci.artifactSha256;
 
-  const scratch = await mkdtemp(join(scratchMount, 's-'));
   const capture = await mkdtemp(join(output, '.capture-'));
+  let scratch;
+  try {
+    scratch = await mkdtemp(join(scratchMount, 's-'));
+  } catch (error) {
+    await rm(capture, { recursive: true, force: true });
+    throw error;
+  }
   const home = join(scratch, 'm');
   const work = join(scratch, 'w');
   const config = join(scratch, 'msb.json');
   const snapshots = join(home, 'snapshots');
-  const env = {
-    ...cleanEnv,
-    HOME: scratch,
-    MSB_HOME: home,
-    MSB_CONFIG_PATH: config,
-  };
-  const msb = (args, phase, active = signal) =>
-    command(binary, args, { env, cwd: scratch, signal: active, phase });
+  const volumes = join(home, 'volumes');
+  async function configureMsb(home, config) {
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(
+      config,
+      JSON.stringify({
+        version: 1,
+        home,
+        allowed_backends: ['local'],
+        paths: {
+          msb: binary,
+          libkrunfw: firmware,
+          agentd,
+          snapshots: join(home, 'snapshots'),
+          volumes: join(home, 'volumes'),
+        },
+      }),
+      { mode: 0o600, flag: 'wx' },
+    );
+    const env = {
+      ...cleanEnv,
+      HOME: home,
+      MSB_HOME: home,
+      MSB_CONFIG_PATH: config,
+    };
+    return (args, phase, active = signal) =>
+      command(binary, args, { env, cwd: home, signal: active, phase });
+  }
+  let msb;
   let dispatch = false;
   let stoppedAndRemoved = false;
+  async function listSandboxes(active) {
+    const rows = JSON.parse(
+      await msb(['ls', '--format', 'json'], 'sandbox inventory', active),
+    );
+    requireCapture(Array.isArray(rows), 'sandbox inventory unavailable');
+    return rows;
+  }
+  async function stopAndRemove() {
+    const active = globalThis.AbortSignal.timeout(60000);
+    const rows = await listSandboxes(active);
+    requireCapture(
+      rows.length === 1 && rows[0].name === vm,
+      'capture owner missing',
+    );
+    if (rows[0].status !== 'Stopped')
+      await msb(['stop', '-t', '30', vm], 'stop', active);
+    const stopped = await listSandboxes(active);
+    requireCapture(
+      stopped.length === 1 &&
+        stopped[0].name === vm &&
+        stopped[0].status === 'Stopped',
+      'stop not confirmed',
+    );
+    await msb(['rm', vm], 'remove', active);
+    requireCapture(
+      (await listSandboxes(active)).length === 0,
+      'sandbox removal not confirmed',
+    );
+    stoppedAndRemoved = true;
+  }
   try {
     try {
       await mkdir(work, { mode: 0o700 });
-      await mkdir(home, { mode: 0o700 });
-      await writeFile(
-        config,
-        JSON.stringify({
-          version: 1,
-          home,
-          allowed_backends: ['local'],
-          paths: { msb: binary, libkrunfw: firmware, agentd, snapshots },
-        }),
-        { mode: 0o600, flag: 'wx' },
-      );
+      msb = await configureMsb(home, config);
       await seedPublicImageCache(
         publicImageCache,
         publicOci.baseImage,
@@ -417,14 +549,58 @@ export async function captureTemplate({
         signal,
       );
       requireCapture(
-        JSON.parse(await msb(['ls', '--format', 'json'], 'empty home'))
-          .length === 0,
+        (await listSandboxes(signal)).length === 0,
         'sandbox home is not empty',
       );
+      await msb(
+        [
+          'volume',
+          'create',
+          runtimeVolume,
+          '--kind',
+          'disk',
+          '--size',
+          runtimeSizeMiB + 'M',
+        ],
+        'private public-runtime volume',
+      );
+      const allocated = JSON.parse(
+        await msb(
+          ['volume', 'ls', '--format', 'json'],
+          'native volume inventory',
+        ),
+      );
+      requireCapture(
+        allocated.length === 1 &&
+          allocated[0].name === runtimeVolume &&
+          allocated[0].kind === 'disk' &&
+          allocated[0].disk_format === 'raw' &&
+          allocated[0].disk_fstype === 'ext4' &&
+          allocated[0].capacity_bytes === runtimeSize,
+        'unexpected native volume allocation',
+      );
+      const blank = await exactPath(join(volumes, runtimeVolume, 'disk.raw'));
+      const blankStat = await lstat(blank);
+      requireCapture(
+        blankStat.isFile() &&
+          blankStat.uid === process.getuid() &&
+          blankStat.nlink === 1 &&
+          blankStat.size === runtimeSize,
+        'unowned native volume file',
+      );
+      const seeded = blank + '.seeded';
+      const seededDisk = await inventoryFile(runtimeDisk, signal, seeded);
+      requireCapture(
+        seededDisk.sha256 === inputs.dshRuntimeDiskSha256 &&
+          seededDisk.sizeBytes === runtimeSize,
+        'public runtime disk changed while seeding',
+      );
+      await rename(seeded, blank);
       dispatch = true;
+      const archive = join(capture, 'template.msb');
       await msb(
         captureCreateArgs({
-          runtimeDisk,
+          runtimeSizeMiB,
           dsh,
           controlsHost,
           controls: controls.guestDirectory,
@@ -493,15 +669,50 @@ export async function captureTemplate({
         signal,
       );
       await msb(
-        [
-          'snap',
-          'export',
-          snapshot,
-          '--output',
-          join(capture, 'template.msb'),
-          '--with-image',
-        ],
+        ['snap', 'export', snapshot, '--output', archive, '--with-image'],
         'portable export',
+      );
+      await stopAndRemove();
+      // Import into a fresh registry and empty image cache. This checks the exported closure
+      // without resuming any guest or pulling an image for that guest.
+      const readbackGroup = 'template-archive-readback';
+      const readbackHome = join(scratch, 'r');
+      const readback = await configureMsb(
+        readbackHome,
+        join(scratch, 'readback.json'),
+      );
+      await readback(
+        ['snap', 'import', archive, '--group', readbackGroup],
+        'portable archive readback',
+      );
+      const imported = JSON.parse(
+        await readback(
+          ['snap', 'ls', '--group', readbackGroup, '--format', 'json'],
+          'portable archive inventory',
+        ),
+      );
+      const importedPath = imported[0]?.artifact_path;
+      requireCapture(
+        imported.length === 1 &&
+          typeof importedPath === 'string' &&
+          importedPath.startsWith(
+            join(readbackHome, 'snapshots', readbackGroup) + '/',
+          ),
+        'portable archive identity mismatch',
+      );
+      const importedRoot = await exactPath(importedPath);
+      const archiveCheckpoint = await readNativeCheckpoint(
+        importedRoot,
+        expected,
+        signal,
+      );
+      requireCapture(
+        archiveCheckpoint.checkpointRoot === nativeCapture.checkpointRoot,
+        'portable archive checkpoint mismatch',
+      );
+      await readback(
+        ['snap', 'verify', importedRoot],
+        'portable archive integrity',
       );
       const files = [];
       for (const [path, source] of Object.entries({
@@ -528,34 +739,6 @@ export async function captureTemplate({
           ...(await inventoryFile(join(capture, path), signal)),
         });
       }
-
-      const cleanupSignal = globalThis.AbortSignal.timeout(60000);
-      await msb(['stop', '-t', '30', vm], 'stop', cleanupSignal);
-      const stopped = JSON.parse(
-        await msb(
-          ['ls', '--format', 'json'],
-          'stopped readback',
-          cleanupSignal,
-        ),
-      );
-      requireCapture(
-        stopped.length === 1 &&
-          stopped[0].name === vm &&
-          stopped[0].status === 'Stopped',
-        'stop not confirmed',
-      );
-      await msb(['rm', vm], 'remove', cleanupSignal);
-      requireCapture(
-        JSON.parse(
-          await msb(
-            ['ls', '--format', 'json'],
-            'removed readback',
-            cleanupSignal,
-          ),
-        ).length === 0,
-        'sandbox removal not confirmed',
-      );
-      stoppedAndRemoved = true;
 
       const receipt = {
         version: 1,
@@ -586,39 +769,19 @@ export async function captureTemplate({
       return { directory, captureSha256 };
     } catch (error) {
       if (dispatch && !stoppedAndRemoved) {
-        const active = globalThis.AbortSignal.timeout(60000);
         try {
-          const entries = JSON.parse(
-            await msb(['ls', '--format', 'json'], 'cleanup inventory', active),
-          );
-          if (entries.length === 1 && entries[0].name === vm) {
-            if (entries[0].status !== 'Stopped')
-              await msb(['stop', '-t', '30', vm], 'cleanup stop', active);
-            const stopped = JSON.parse(
-              await msb(['ls', '--format', 'json'], 'cleanup readback', active),
-            );
-            requireCapture(
-              stopped.length === 1 &&
-                stopped[0].name === vm &&
-                stopped[0].status === 'Stopped',
-              'cleanup stop not confirmed',
-            );
-            await msb(['rm', vm], 'cleanup remove', active);
-            stoppedAndRemoved =
-              JSON.parse(
-                await msb(
-                  ['ls', '--format', 'json'],
-                  'cleanup removed readback',
-                  active,
-                ),
-              ).length === 0;
-          }
+          await stopAndRemove();
         } catch {
           // Leave the exact private scratch with its native owner for inspection.
         }
         requireCapture(
           stoppedAndRemoved,
-          'stop unconfirmed; retained isolated scratch ' + scratch,
+          'stop unconfirmed; retained isolated scratch ' +
+            scratch +
+            (error.message.startsWith('Snapshot capture refused:')
+              ? '. First failure was ' +
+                error.message.slice('Snapshot capture refused: '.length)
+              : '. First failure was capture readback'),
         );
       }
       throw error;

@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { verifyTemplate } from './verify.mjs';
+import { verifyTemplate, verifyTemplateInventory } from './verify.mjs';
 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
@@ -115,7 +115,7 @@ async function fixture(t) {
 
 test('reads back a pinned signed inventory with the approved topology and inputs', async (t) => {
   const { manifest, options } = await fixture(t);
-  assert.deepEqual(await verifyTemplate(options), {
+  assert.deepEqual(await verifyTemplateInventory(options), {
     seal: options.seal,
     manifest,
   });
@@ -124,13 +124,16 @@ test('reads back a pinned signed inventory with the approved topology and inputs
 test('refuses an independently pinned but incompatible device topology', async (t) => {
   const { options } = await fixture(t);
   options.expected.deviceTopologySha256 = digest('other layout');
-  await assert.rejects(verifyTemplate(options), /device topology mismatch/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /device topology mismatch/,
+  );
 });
 
 test('refuses a signature from a different publisher key', async (t) => {
   const { options } = await fixture(t);
   options.publicKey = generateKeyPairSync('ed25519').publicKey;
-  await assert.rejects(verifyTemplate(options), /invalid signature/);
+  await assert.rejects(verifyTemplateInventory(options), /invalid signature/);
 });
 
 test('refuses changed bytes in a same-length sealed volume', async (t) => {
@@ -139,7 +142,10 @@ test('refuses changed bytes in a same-length sealed volume', async (t) => {
   await chmod(path, 0o644);
   await writeFile(path, 'public XYZ volume');
   await chmod(path, 0o444);
-  await assert.rejects(verifyTemplate(options), /file digest mismatch/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /file digest mismatch/,
+  );
 });
 
 test('refuses changed manifest bytes before parsing the inventory', async (t) => {
@@ -148,17 +154,26 @@ test('refuses changed manifest bytes before parsing the inventory', async (t) =>
   await chmod(path, 0o644);
   await writeFile(path, '{}');
   await chmod(path, 0o444);
-  await assert.rejects(verifyTemplate(options), /manifest digest mismatch/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /manifest digest mismatch/,
+  );
 });
 
 test('refuses a writable file or a different publisher UID', async (t) => {
   const { root, options } = await fixture(t);
   await assert.rejects(
-    verifyTemplate({ ...options, publisherUid: options.publisherUid + 1 }),
+    verifyTemplateInventory({
+      ...options,
+      publisherUid: options.publisherUid + 1,
+    }),
     /owner or permissions/,
   );
   await chmod(join(root, 'ram.bin'), 0o644);
-  await assert.rejects(verifyTemplate(options), /owner or permissions/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /owner or permissions/,
+  );
 });
 
 test('refuses undeclared files and directories', async (t) => {
@@ -167,12 +182,18 @@ test('refuses undeclared files and directories', async (t) => {
   const extra = join(root, 'unexpected');
   await mkdir(extra);
   await chmod(root, 0o555);
-  await assert.rejects(verifyTemplate(options), /unlisted file or directory/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /unlisted file or directory/,
+  );
   await chmod(root, 0o755);
   await rm(extra, { recursive: true });
   await writeFile(extra, 'extra payload', { mode: 0o444 });
   await chmod(root, 0o555);
-  await assert.rejects(verifyTemplate(options), /unlisted file or directory/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /unlisted file or directory/,
+  );
 });
 
 test('refuses a missing inventoried volume', async (t) => {
@@ -181,7 +202,10 @@ test('refuses a missing inventoried volume', async (t) => {
   await chmod(disk, 0o755);
   await rm(join(disk, 'root.raw'));
   await chmod(disk, 0o555);
-  await assert.rejects(verifyTemplate(options), /missing inventoried file/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /missing inventoried file/,
+  );
 });
 
 test('refuses symlink or hardlink substitutions for inventoried files', async (t) => {
@@ -192,16 +216,29 @@ test('refuses symlink or hardlink substitutions for inventoried files', async (t
   await rm(ram);
   await symlink(state, ram);
   await chmod(root, 0o555);
-  await assert.rejects(verifyTemplate(options), { code: 'ELOOP' });
+  await assert.rejects(verifyTemplateInventory(options), { code: 'ELOOP' });
   await chmod(root, 0o755);
   await rm(ram);
   await link(state, ram);
   await chmod(root, 0o555);
-  await assert.rejects(verifyTemplate(options), /expected one regular file/);
+  await assert.rejects(
+    verifyTemplateInventory(options),
+    /expected one regular file/,
+  );
 });
 
 test('refuses a cancelled verification', async (t) => {
   const { options } = await fixture(t);
   options.signal = globalThis.AbortSignal.abort();
-  await assert.rejects(verifyTemplate(options), { name: 'AbortError' });
+  await assert.rejects(verifyTemplateInventory(options), {
+    name: 'AbortError',
+  });
+});
+
+test('the Linux verifier requires a signed capture and archive', async (t) => {
+  const { options } = await fixture(t);
+  await assert.rejects(
+    verifyTemplate(options),
+    /missing signed capture evidence/,
+  );
 });

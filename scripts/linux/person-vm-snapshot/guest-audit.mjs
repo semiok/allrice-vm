@@ -40,14 +40,18 @@ export function assertEmptyGuest(state, { dsh, controls, pageSize }) {
     ['/sys/fs/cgroup', ['cgroup2']],
     ['/run', ['tmpfs']],
     ['/tmp', ['tmpfs']],
-    ['/.msb', ['tmpfs']],
     ['/sys/kernel/security', ['securityfs']],
   ]);
   const mounts = new Set();
-  for (const { path, type, flags } of state.mounts) {
+  for (const { path, type, source, flags } of state.mounts) {
     requireEmpty(!mounts.has(path), 'duplicate mount');
     mounts.add(path);
-    if (external.has(path)) {
+    if (path === '/.msb') {
+      requireEmpty(
+        type === 'virtiofs' && source === 'msb_runtime',
+        'unexpected runtime control mount',
+      );
+    } else if (external.has(path)) {
       requireEmpty(
         type === external.get(path) &&
           flags.includes(path === '/work' ? 'rw' : 'ro'),
@@ -60,7 +64,9 @@ export function assertEmptyGuest(state, { dsh, controls, pageSize }) {
       );
   }
   requireEmpty(
-    mounts.has('/') && [...external.keys()].every((path) => mounts.has(path)),
+    mounts.has('/') &&
+      mounts.has('/.msb') &&
+      [...external.keys()].every((path) => mounts.has(path)),
     'required mount absent',
   );
   const allowedEnv = new Set([
@@ -81,17 +87,25 @@ export function assertEmptyGuest(state, { dsh, controls, pageSize }) {
   requireEmpty(state.processes.length === 2, 'unexpected guest process count');
   const agent = state.processes.find(({ task }) => task === 'agent');
   const audit = state.processes.find(({ task }) => task === 'audit');
-  requireEmpty(agent && audit, 'unexpected guest process');
+  requireEmpty(
+    agent &&
+      audit &&
+      state.agentPorts.length > 0 &&
+      agent.fds.some((fd) => state.agentPorts.includes(fd)),
+    'missing guest agent control descriptor',
+  );
   for (const process of state.processes) {
     requireEmpty(
       process.cwd === '/' && process.env.every((key) => allowedEnv.has(key)),
       'unexpected process working directory or environment',
     );
     requireEmpty(
-      process.fds.every((target) =>
-        /^(?:pipe:\[\d+\]|socket:\[\d+\]|anon_inode:\[[\w-]+\]|\/dev\/(?:null|zero|random|urandom|console|tty|ttyS0|hvc0|vsock))$/.test(
-          target,
-        ),
+      process.fds.every(
+        (target) =>
+          (process.task === 'agent' && state.agentPorts.includes(target)) ||
+          /^(?:pipe:\[\d+\]|socket:\[\d+\]|anon_inode:\[[\w-]+\]|\/dev\/(?:null|zero|random|urandom|console|tty|ttyS0|hvc0|vsock))$/.test(
+            target,
+          ),
       ),
       'unapproved open descriptor',
     );
@@ -156,6 +170,7 @@ function collect() {
     ...entries('/home').filter((name) => name !== 'node'),
     ...entries('/home/node').filter((name) => !homeEntries.has(name)),
     ...entries('/tmp'),
+    ...entries('/var/tmp'),
   );
   const seeds = [
     '/var/lib/systemd/random-seed',
@@ -192,9 +207,22 @@ function collect() {
       return {
         path: fields[4],
         type: filesystem.split(' ')[0],
+        source: filesystem.split(' ')[1],
         flags: fields[5].split(','),
       };
     });
+  const agentPorts = entries('/sys/class/virtio-ports')
+    .filter((port) => /^vport\d+p\d+$/.test(port))
+    .filter((port) =>
+      ['agent', 'agent-bulk'].includes(
+        read('/sys/class/virtio-ports/' + port + '/name').trim(),
+      ),
+    )
+    .map((port) => '/dev/' + port);
+  requireEmpty(
+    agentPorts.every((port) => lstatSync(port).isCharacterDevice()),
+    'unexpected agent port type',
+  );
   const processes = [];
   for (const pid of entries('/proc').filter((name) => /^\d+$/.test(name))) {
     const base = '/proc/' + pid;
@@ -237,6 +265,7 @@ function collect() {
     inet,
     unix,
     mounts,
+    agentPorts,
     processes,
     swap: read('/proc/swaps').trim().split('\n').slice(1),
     pageSize:

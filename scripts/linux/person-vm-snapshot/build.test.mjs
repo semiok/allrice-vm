@@ -34,12 +34,14 @@ const cleanGuest = {
   pageSize: 4096,
   mounts: [
     { path: '/', type: 'ext4', flags: ['rw'] },
+    { path: '/.msb', type: 'virtiofs', source: 'msb_runtime', flags: ['rw'] },
     { path: '/work', type: 'virtiofs', flags: ['rw'] },
     { path: dsh, type: 'ext4', flags: ['ro'] },
     { path: controls, type: 'virtiofs', flags: ['ro'] },
   ],
+  agentPorts: ['/dev/vport0p1', '/dev/vport0p2'],
   processes: [
-    { task: 'agent', cwd: '/', env: ['PATH'], fds: ['socket:[1]'] },
+    { task: 'agent', cwd: '/', env: ['PATH'], fds: ['/dev/vport0p1'] },
     { task: 'audit', cwd: '/', env: ['PATH'], fds: ['pipe:[2]'] },
   ],
 };
@@ -307,7 +309,7 @@ test('permits only empty writable work and public read-only mounts', () => {
     [
       {
         processes: [
-          { ...cleanGuest.processes[0], fds: ['/work/file'] },
+          { ...cleanGuest.processes[0], fds: ['/dev/vport0p1', '/work/file'] },
           cleanGuest.processes[1],
         ],
       },
@@ -332,7 +334,7 @@ test('permits only empty writable work and public read-only mounts', () => {
 
 test('pins the local offline command arguments and all CPU cores', () => {
   const args = captureCreateArgs({
-    runtimeDisk: '/input/runtime.ext4',
+    runtimeSizeMiB: 1536,
     dsh,
     controlsHost: '/input/controls',
     controls,
@@ -342,8 +344,8 @@ test('pins the local offline command arguments and all CPU cores', () => {
   assert.equal(args[args.indexOf('--net-default') + 1], 'deny');
   assert.equal(args[args.indexOf('--mount-dir') + 1], '/scratch/empty:/work');
   assert.equal(
-    args[args.indexOf('--mount-disk') + 1],
-    '/input/runtime.ext4:' + dsh + ':format=raw,fstype=ext4,ro',
+    args[args.indexOf('--mount-named') + 1],
+    'allrice-public-dsh:' + dsh + ':kind=disk,size=1536M,ro',
   );
   assert.deepEqual(
     args.filter((arg) => arg === '--port' || arg === '--net-rule'),
@@ -391,6 +393,22 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
   const disk = await object(
     JSON.stringify({ layers: [{}], pause_generation: 7 }),
   );
+  const runtimeRaw = join(checkpointRoot, 'layers', 'public-dsh.raw');
+  await mkdir(join(checkpointRoot, 'layers'));
+  await writeFile(runtimeRaw, 'runtime.ext4');
+  const runtime = await object(
+    JSON.stringify({
+      device_id: 'dsh-device',
+      layers: [
+        {
+          layer_id: 'public-dsh',
+          format: 'raw',
+          file_size: Buffer.byteLength('runtime.ext4'),
+        },
+      ],
+      pause_generation: 7,
+    }),
+  );
   const geometry = {
     vcpus: 2,
     max_vcpus: 2,
@@ -398,6 +416,30 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
     max_memory_mib: 2048,
   };
   const devices = [{ device_id: 'root', device_type: 2 }];
+  const resources = [
+    {
+      binding: {
+        device_id: 'dsh-device',
+        fstype: 'ext4',
+        guest_path: '/opt/allrice/dsh/' + oci.artifactSha256,
+        managed_disk: 'true',
+        mount_options: '{"readonly":true}',
+      },
+      id: 'virtio:2:dsh-device',
+      kind: 'block',
+      treatment: 'serialize',
+    },
+    {
+      binding: {
+        device_id: 'work',
+        role: 'external_bind',
+        source_sandbox: 'allrice-public-template',
+      },
+      id: 'virtio:26:work',
+      kind: 'fs',
+      treatment: 'reconnect',
+    },
+  ];
   const topology = {
     devices,
     geometry: {
@@ -406,7 +448,7 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
       memory_mib: 2048,
       vcpus: 2,
     },
-    resources: [],
+    resources,
   };
   const expected = {
     host,
@@ -421,9 +463,18 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
     pause_generation: 7,
     execution_state: state.id,
     memory: ram.id,
-    disks: [disk.id],
+    disks: [disk.id, runtime.id],
     geometry,
-    resources: [],
+    resources: [
+      resources[0],
+      {
+        ...resources[1],
+        binding: {
+          ...resources[1].binding,
+          source_binding_token: 'fresh-grant',
+        },
+      },
+    ],
     devices,
   };
   const descriptor = {
@@ -453,7 +504,7 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
   for (const change of [
     { architecture: 'x86_64' },
     { owned_volumes: [{}] },
-    { disks: [disk.id, disk.id] },
+    { disks: [disk.id] },
   ]) {
     await save(change);
     await assert.rejects(
@@ -462,6 +513,12 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
     );
   }
   await save();
+  await writeFile(runtimeRaw, 'altered.ext4');
+  await assert.rejects(
+    readNativeCheckpoint(root, expected, signal()),
+    /runtime disk bytes mismatch/,
+  );
+  await writeFile(runtimeRaw, 'runtime.ext4');
   await writeFile(state.path, 'changed VMM bytes');
   await assert.rejects(
     readNativeCheckpoint(root, expected, signal()),

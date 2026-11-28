@@ -62,7 +62,17 @@ async function readSealedFile(path, publisherUid, signal, consume) {
  * come from trusted build inputs and host preflight, independently of the manifest.
  * A later restore needs its own live ownership and mount proof. */
 export async function verifyTemplate(options) {
-  return verifySealedDirectory(options);
+  const captureMode = options.captureMode ?? 'linux';
+  requireEvidence(
+    captureMode === 'linux' || captureMode === 'fixture',
+    'unknown capture mode',
+  );
+  return verifySealedDirectory({ ...options, captureMode });
+}
+
+/** Shape and byte checks for pre-capture fixture inventories only. */
+export async function verifyTemplateInventory(options) {
+  return verifySealedDirectory({ ...options, captureMode: undefined });
 }
 
 /** A publisher stages the protected directory next to the final digest path,
@@ -70,7 +80,8 @@ export async function verifyTemplate(options) {
 export async function verifyStagedTemplate(staged, options) {
   requireEvidence(
     dirname(staged) === dirname(options.seal.templateDirectory) &&
-      basename(staged).startsWith('.pending-'),
+      basename(staged).startsWith('.pending-') &&
+      ['linux', 'fixture'].includes(options.captureMode),
     'unexpected staging path',
   );
   return verifySealedDirectory(options, staged);

@@ -8,7 +8,6 @@ import { createWriteStream, constants } from 'node:fs';
 import {
   chmod,
   lstat,
-  mkdir,
   mkdtemp,
   open,
   readdir,
@@ -25,11 +24,12 @@ import {
   checkCaptureReceipt,
   firstDayIndex,
   hashPattern,
+  matches,
   payloads,
   requireCapture,
   sha256,
 } from './capture-contract.mjs';
-import { verifyStagedTemplate } from './verify.mjs';
+import { verifyStagedTemplate, verifyTemplate } from './verify.mjs';
 
 export async function readCaptureFile(path, consume) {
   const file = await open(
@@ -175,7 +175,8 @@ export async function sealTemplate({
     },
   );
   requireCapture(
-    hashPattern.test(captureSha256) && sha256(receiptBytes) === captureSha256,
+    matches(hashPattern, captureSha256) &&
+      sha256(receiptBytes) === captureSha256,
     'capture receipt digest mismatch',
   );
   const capture = JSON.parse(receiptBytes.toString('utf8'));
@@ -219,8 +220,6 @@ export async function sealTemplate({
     templateDirectory,
     manifestSha256,
   };
-  const publicationLock = join(output, '.publish-' + manifestSha256);
-  let locked = false;
   let placed = false;
   let published = false;
   try {
@@ -257,16 +256,20 @@ export async function sealTemplate({
       signal,
       captureMode: mode,
     });
-    await mkdir(publicationLock, { mode: 0o700 });
-    locked = true;
     const existing = await lstatIfPresent(templateDirectory);
     requireCapture(!existing, 'template digest already published');
     signal.throwIfAborted();
-    // Darwin requires write permission on a renamed directory. The private
-    // publication parent fences this transition. The verifier treats a writable
-    // destination as unsealed until the single final chmod.
-    await chmod(staged, 0o700);
-    await rename(staged, templateDirectory);
+    try {
+      // Competing publishers cannot replace an existing nonempty directory.
+      await rename(staged, templateDirectory);
+    } catch (error) {
+      if (process.platform !== 'darwin' || error.code !== 'EACCES') throw error;
+      // Darwin needs write permission for directory rename. The private
+      // parent fences this transition, and verification rejects a writable
+      // destination until the final chmod.
+      await chmod(staged, 0o700);
+      await rename(staged, templateDirectory);
+    }
     placed = true;
     await chmod(templateDirectory, 0o555);
     published = true;
@@ -274,31 +277,42 @@ export async function sealTemplate({
   } finally {
     if (placed && !published)
       await rm(templateDirectory, { recursive: true, force: true });
-    if (locked) await rm(publicationLock, { recursive: true });
     const leftover = await lstatIfPresent(staged);
     if (leftover) await chmod(staged, 0o700);
     await rm(staged, { recursive: true, force: true });
   }
 }
 
-async function main([command, configPath, keyPath, ...extra]) {
+async function main([command, configPath, keyPath, ...extra], signal) {
   requireCapture(
     configPath && extra.length === 0,
-    'usage: build.mjs capture CONFIG.json | seal CONFIG.json KEY.pem',
+    'usage: build.mjs capture CONFIG.json | seal CONFIG.json KEY.pem | verify CONFIG.json KEY.pub.pem',
   );
   const config = JSON.parse(
     (await readSmallFile(resolve(configPath))).toString('utf8'),
   );
-  const signal = globalThis.AbortSignal.timeout(45 * 60 * 1000);
   if (command === 'capture' && !keyPath) {
     const { captureTemplate } = await import('./capture.mjs');
     const result = await captureTemplate({ ...config, signal });
     process.stdout.write(JSON.stringify(result) + '\n');
     return;
   }
+  if (command === 'verify' && keyPath) {
+    const publicKey = createPublicKey(
+      await readSmallFile(resolve(keyPath), 8192),
+    );
+    const { seal } = await verifyTemplate({
+      ...config,
+      publicKey,
+      signal,
+      captureMode: 'linux',
+    });
+    process.stdout.write(JSON.stringify(seal) + '\n');
+    return;
+  }
   requireCapture(
     command === 'seal' && keyPath,
-    'expected a capture or seal command',
+    'expected a capture, seal or verify command',
   );
   const privateKey = await readCaptureFile(
     resolve(keyPath),
@@ -332,7 +346,19 @@ if (
   process.argv[1] &&
   pathToFileURL(resolve(process.argv[1])).href === import.meta.url
 ) {
-  await main(process.argv.slice(2)).catch((error) => {
+  const controller = new globalThis.AbortController();
+  const abort = () => controller.abort();
+  process.on('SIGINT', abort);
+  process.on('SIGTERM', abort);
+  try {
+    await main(
+      process.argv.slice(2),
+      globalThis.AbortSignal.any([
+        controller.signal,
+        globalThis.AbortSignal.timeout(45 * 60 * 1000),
+      ]),
+    );
+  } catch (error) {
     // Subprocess diagnostics may contain local paths or raw guest output.
     console.error(
       error.message.startsWith('Snapshot capture refused:')
@@ -340,5 +366,8 @@ if (
         : 'Snapshot build failed',
     );
     process.exitCode = 1;
-  });
+  } finally {
+    process.off('SIGINT', abort);
+    process.off('SIGTERM', abort);
+  }
 }

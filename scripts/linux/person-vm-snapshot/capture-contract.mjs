@@ -5,7 +5,13 @@ export const sha256 = (bytes) =>
   createHash('sha256').update(bytes).digest('hex');
 export const hashPattern = /^[0-9a-f]{64}$/;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
-const device = /^\d+:\d+$/;
+const device = /^(?:0|[1-9]\d*):(?:0|[1-9]\d*)$/;
+
+export function matches(pattern, value) {
+  return (
+    typeof value === 'string' && value === value.trim() && pattern.test(value)
+  );
+}
 
 export const payloads = Object.freeze({
   'template.msb': 'metadata',
@@ -44,12 +50,12 @@ export function checkHostPreflight(host, preflight) {
       preflight.msbVersion === '0.7.16' &&
       preflight.kernel === host.kernel &&
       preflight.pageBytes === host.pageSize &&
-      uuid.test(preflight.dataUuid) &&
-      uuid.test(preflight.scratchUuid) &&
-      uuid.test(preflight.scratchLuksUuid) &&
+      matches(uuid, preflight.dataUuid) &&
+      matches(uuid, preflight.scratchUuid) &&
+      matches(uuid, preflight.scratchLuksUuid) &&
       preflight.dataUuid !== preflight.scratchUuid &&
-      device.test(preflight.dataDevice) &&
-      device.test(preflight.scratchDevice) &&
+      matches(device, preflight.dataDevice) &&
+      matches(device, preflight.scratchDevice) &&
       preflight.dataDevice !== preflight.scratchDevice,
     'Linux host-preflight ABI or scratch identity mismatch',
   );
@@ -116,7 +122,7 @@ export function checkCaptureReceipt(capture, { expected, mode }) {
               file.role === payloads[path] &&
               Number.isSafeInteger(file.sizeBytes) &&
               file.sizeBytes > 0 &&
-              hashPattern.test(file.sha256),
+              matches(hashPattern, file.sha256),
           ).length === 1,
       ),
     'invalid capture file inventory',
@@ -133,15 +139,15 @@ export function checkCaptureReceipt(capture, { expected, mode }) {
 export function firstDayIndex(run, receiptBytes, mode) {
   const validTarget =
     (mode === 'fixture' && run?.target === 'local-fixture') ||
-    (mode === 'linux' && /^i-[0-9a-f]{17}$/.test(run?.target));
+    (mode === 'linux' && matches(/^i-[0-9a-f]{17}$/, run?.target));
   requireCapture(
     validTarget &&
       hasKeys(run, ['mode', 'target', 'id', 'commit', 'tree', 'seal']) &&
       run.mode === mode &&
-      /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(run.id) &&
-      /^[0-9a-f]{40}$/.test(run.commit) &&
-      /^[0-9a-f]{40}$/.test(run.tree) &&
-      /^sha256:[0-9a-f]{64}$/.test(run.seal),
+      matches(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/, run.id) &&
+      matches(/^[0-9a-f]{40}$/, run.commit) &&
+      matches(/^[0-9a-f]{40}$/, run.tree) &&
+      matches(/^sha256:[0-9a-f]{64}$/, run.seal),
     'invalid first-day identity',
   );
   return {
