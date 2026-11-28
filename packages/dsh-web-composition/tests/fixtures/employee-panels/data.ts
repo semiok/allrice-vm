@@ -6,7 +6,7 @@ import {
   ReferencePublicationQueryResultSchema,
   ReferenceRevisionSchema,
 } from '@allrice/contracts';
-import { WorkbenchDeliverablesActionsCatalogSchema } from '../../../../../apps/web/lib/chatflow/workbench-file-actions.js';
+import { WorkbenchDeliverablesActionsCatalogSchema } from '../../../../../apps/web/lib/chatflow/workbench-file-actions';
 
 /** Test data follows the approved rev2 samples. These are synthetic resources,
  * not a second business contract, authenticated owner, or storage receipt. */
