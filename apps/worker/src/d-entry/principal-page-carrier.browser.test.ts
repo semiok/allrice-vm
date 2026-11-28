@@ -31,6 +31,8 @@ import {
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
 import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
+import { publicProfileModules } from '../../../web/lib/d-entry/public-profile-warmup.js';
+import { recordRefreshWaterfall } from './refresh-waterfall.fixture.js';
 import {
   fixture,
   buildProfileFixture,
@@ -61,7 +63,13 @@ it
       : []),
   ] as const)(
   'rc.2 workbench composer (%s)',
-  { timeout: process.env.ALLRICE_RUN_ASSET_BENCH ? 200_000 : 120_000 },
+  {
+    timeout:
+      process.env.ALLRICE_RUN_ASSET_BENCH ||
+      process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL
+        ? 240_000
+        : 120_000,
+  },
   async (scenario) => {
     const coldAssets = scenario === 'cold-assets';
     const bench = coldAssets && process.env.ALLRICE_RUN_ASSET_BENCH;
@@ -74,6 +82,8 @@ it
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const crossRetain = scenario === 'cross-retain';
     const warmRefresh = scenario === 'refresh';
+    const refreshBenchmark =
+      warmRefresh && process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL === '1';
     const usePublicFiles = coldAssets || warmRefresh;
     const realShell =
       switching || nativeCreate || usePublicFiles || crossRetain;
@@ -240,7 +250,7 @@ it
           write: false,
           outdir: '/fixture-dsh-switch',
           jsx: 'automatic',
-          minify: coldAssets,
+          minify: coldAssets || refreshBenchmark,
           loader: {
             '.woff': 'dataurl',
             '.woff2': 'dataurl',
@@ -474,6 +484,9 @@ it
       )
       .join('');
     let coldPaths: string[] = [];
+    let startupUrls: string[] = [];
+    let managedPreloads = '';
+    let parentAssetWarms = 0;
     let stagedPaths: Set<string> | undefined;
     if (independentlyInstalled) {
       const root = await realpath(
@@ -504,6 +517,12 @@ it
           ),
         );
       publicIndex = publicProfileBundles.parse(index.bundles);
+      startupUrls = index.startup
+        .filter((path) => index.paths.includes(path))
+        .map((path) => publicRoot + path);
+      managedPreloads = publicProfileModules(startupUrls)
+        .map((url) => `<link rel="modulepreload" href="${url}">`)
+        .join('');
       if (coldAssets && bench !== 'baseline')
         coldPaths = index.startup.map((path) => publicRoot + path);
       stagedPaths = new Set(index.paths);
@@ -786,7 +805,10 @@ it
           }
           if (url.pathname === '/chatflow/4.0') {
             return response
-              .writeHead(200, { 'content-type': 'text/html' })
+              .writeHead(200, {
+                'content-type': 'text/html',
+                'cache-control': 'private, no-store',
+              })
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
                   (warmRefresh
@@ -794,9 +816,9 @@ it
                       JSON.stringify(f.identity) +
                       '</script>'
                     : '') +
-                  (coldAssets && bench !== 'progress'
+                  (warmRefresh || (coldAssets && bench !== 'progress')
                     ? '<script id="startup-assets" type="application/json">' +
-                      JSON.stringify(coldPaths) +
+                      JSON.stringify(warmRefresh ? startupUrls : coldPaths) +
                       '</script>'
                     : '') +
                   '<script src="/outer.js"></script>',
@@ -807,12 +829,20 @@ it
             const asset = realParent!.outputFiles.find(({ path }) =>
               path.endsWith(css ? '.css' : '.js'),
             );
+            const encoded = refreshBenchmark
+              ? gzipSync(asset!.text)
+              : undefined;
             return response
               .writeHead(200, {
                 'content-type': css ? 'text/css' : 'text/javascript',
                 'cache-control': 'public, max-age=31536000, immutable',
+                ...(encoded && {
+                  'content-encoding': 'gzip',
+                  'content-length': encoded.byteLength,
+                  vary: 'accept-encoding',
+                }),
               })
-              .end(asset!.text);
+              .end(encoded ?? asset!.text);
           }
         }
         if (url.pathname === '/api/v1/d-entry/profile/switch') {
@@ -929,6 +959,7 @@ it
           };
           traffic.push(timing);
           expect(request.headers.cookie).toBeUndefined();
+          if (warmRefresh) expect(request.headers.referer).toBeUndefined();
           if (coldAssets && readyAt === undefined)
             expect(request.headers.referer).toBeUndefined();
           const bytes = await release.read(
@@ -955,6 +986,15 @@ it
         }
         if (usePublicFiles && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
+          if (
+            warmRefresh &&
+            startupUrls.includes(url.pathname) &&
+            request.headers['sec-fetch-dest'] === 'empty'
+          ) {
+            expect(request.headers.cookie).toBeUndefined();
+            expect(request.headers.referer).toBeUndefined();
+            parentAssetWarms++;
+          }
           if (
             !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
           )
@@ -1108,11 +1148,13 @@ it
               bundles: publicIndex,
             });
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
-        response.writeHead(200, { 'content-type': 'text/html' })
-          .end(`<!doctype html>
+        const lifecycle = `<script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>`;
+        const html = `<!doctype html>
+          ${refreshBenchmark ? lifecycle : ''}
+          ${usePublicFiles ? managedPreloads : ''}
           ${usePublicFiles || crossRetain ? nativeStyles : ''}
           <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
-          <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
+          ${refreshBenchmark ? '' : lifecycle}
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
@@ -1121,7 +1163,20 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
+          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`;
+        const encoded = refreshBenchmark ? gzipSync(html) : undefined;
+        response
+          .writeHead(200, {
+            'content-type': 'text/html',
+            'cache-control': 'private, no-store',
+            'referrer-policy': 'no-referrer',
+            ...(encoded && {
+              'content-encoding': 'gzip',
+              'content-length': encoded.byteLength,
+              vary: 'accept-encoding',
+            }),
+          })
+          .end(encoded ?? html);
       } catch {
         response.writeHead(500).end();
       }
@@ -2738,6 +2793,7 @@ it
         }),
     );
     if (warmRefresh) {
+      expect(parentAssetWarms).toBeGreaterThan(0);
       expect(
         (await page.evaluate(timings)).reads.map(([path]) => path),
       ).not.toContain('/api/v1/d-entry/native-prewarm');
@@ -2768,6 +2824,23 @@ it
           ([path]) => path === '/api/v1/d-entry/native-prewarm',
         ),
       ).toHaveLength(1);
+      if (refreshBenchmark) {
+        await refreshCdp.detach();
+        for (let sample = 1; sample <= 3; sample++) {
+          for (const cache of ['cold', 'warm'] as const) {
+            const cdp = await context.newCDPSession(page);
+            await cdp.send('Network.enable');
+            await cdp.send('Network.emulateNetworkConditions', {
+              offline: false,
+              latency: 400,
+              downloadThroughput: 1_250_000,
+              uploadThroughput: 1_250_000,
+            });
+            if (cache === 'cold') await cdp.send('Network.clearBrowserCache');
+            await recordRefreshWaterfall(page, editor, cdp, sample, cache);
+          }
+        }
+      }
     }
     if (!warmRefresh)
       await page.evaluate(async () => {

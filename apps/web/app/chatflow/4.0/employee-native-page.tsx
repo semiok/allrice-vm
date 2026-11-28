@@ -270,6 +270,7 @@ function EmployeeNativePane({
       };
     }
     const lifetime = activation.warmup?.lifetime ?? new AbortController();
+    const warmAssetDownloads = new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
     let unbindMemoryWrites: (() => void) | undefined;
@@ -345,6 +346,7 @@ function EmployeeNativePane({
     function retire() {
       if (replacing) return replacing;
       warmup?.stopAssetDownloads();
+      warmAssetDownloads.abort();
       if (prepare) {
         closingNotice = window.setTimeout(
           () => setStatus('closing'),
@@ -1060,6 +1062,10 @@ function EmployeeNativePane({
         warm.employeeInstanceId === selection.employeeInstanceId
       ) {
         await waitForVisibleEntry(lifetime.signal);
+        void warmPublicProfileAssets(
+          assetUrls.current,
+          AbortSignal.any([lifetime.signal, warmAssetDownloads.signal]),
+        );
         selectedQuery = params.toString();
         timer = window.setTimeout(() => finish('failed'), entryWaitMs);
         const attempt = (carrier = connect(warm, selection, true));
@@ -1071,6 +1077,7 @@ function EmployeeNativePane({
           identity = warm;
           opening();
         } catch (error) {
+          warmAssetDownloads.abort();
           lifetime.signal.throwIfAborted();
           // Before the page command it is safe to fall back to the cold path.
           // A dispatched attempt must retain its normal failure and close.

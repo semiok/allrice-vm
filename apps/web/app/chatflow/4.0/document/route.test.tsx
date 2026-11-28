@@ -294,6 +294,7 @@ it('requires the issued scope in the document address and leaves the two exact n
       'native/assets/index-BxpfOGf3.css',
       'managed/employee-web-entry.js',
     ]),
+    startup: ['managed/employee-web-entry.js', 'managed/unpublished.js'],
     bundles: [
       {
         reference: bundle,
@@ -320,6 +321,10 @@ it('requires the issued scope in the document address and leaves the two exact n
     'data-login-session-id="00000000-0000-4000-8000-000000000006"',
   );
   expect(html).not.toContain(cookie.value);
+  expect(html).toContain(
+    'rel="modulepreload" href="' + assetRoot + 'managed/employee-web-entry.js"',
+  );
+  expect(html).not.toContain('managed/unpublished.js');
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
   expect(releasedAssets).toHaveBeenCalledExactlyOnceWith();
   expect(html).toContain(
