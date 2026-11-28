@@ -65,6 +65,7 @@ type Status =
 
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
+const warmUpgradeWaitMs = 3_000;
 const liveSwitchWaitMs = 10_000;
 const closingNoticeMs = 10_000;
 const closingConfirmationMs = 60_000;
@@ -762,19 +763,7 @@ export function EmployeeNativePage({
           location.pathname !== '/chatflow/4.0'
         )
           return;
-        const query = new URLSearchParams({
-          workspaceId: next.data.workspaceId,
-          employeeInstanceId: next.data.employeeInstanceId,
-          threadId: next.data.threadId,
-        }).toString();
-        // The live carrier and its authority stay pinned to the same document.
-        // This is the URL for reload, not a request to replace that document.
-        selectedEmployee = next.data;
-        frameSelection.current = next.data;
-        displayedQuery.current = query;
-        nextQuery.current = query;
-        selectedQuery = query;
-        history.replaceState(history.state, '', '/chatflow/4.0?' + query);
+        if (!beginLiveSwitch(next.data)) navigate(next.data);
       }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
@@ -932,11 +921,14 @@ export function EmployeeNativePage({
       ) {
         await waitForVisibleEntry(lifetime.signal);
         selectedQuery = params.toString();
-        opening();
         const attempt = (carrier = connect(warm, selection, true));
+        const upgradeTimer = window.setTimeout(() => {
+          if (!attempt.dispatched) void attempt.close().catch(() => {});
+        }, warmUpgradeWaitMs);
         try {
           opened = await attempt.ready;
           identity = warm;
+          opening();
         } catch (error) {
           lifetime.signal.throwIfAborted();
           // Before the page command it is safe to fall back to the cold path.
@@ -945,8 +937,8 @@ export function EmployeeNativePage({
           await attempt.close();
           carrier = undefined;
           remoteRevoked = false;
-          window.clearTimeout(timer);
-          setStatus('warming');
+        } finally {
+          window.clearTimeout(upgradeTimer);
         }
       }
       if (!opened || !identity) {

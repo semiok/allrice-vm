@@ -97,7 +97,9 @@ it('offers the warm path only on a document load with an exact owned root', asyn
   const render = () =>
     EntryPage({ searchParams: Promise.resolve(f.selection) });
   expect((await render()).props.warmIdentity).toEqual(f.identity);
-  expect(entryRoot).toHaveBeenCalledExactlyOnceWith(f.context, f.selection);
+  expect(entryRoot).toHaveBeenCalledExactlyOnceWith(f.context, f.selection, {
+    runningSnapshot: true,
+  });
   entryRoot.mockRejectedValueOnce(new DataAccessError('not_found'));
   expect((await render()).props.warmIdentity).toBeUndefined();
   entryRoot.mockClear();

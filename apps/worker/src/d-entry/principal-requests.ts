@@ -97,6 +97,7 @@ export type DEntryPageHandle = Readonly<{
   watchFollow(
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
+  authorizeFollow(nativeSessionId: string, signal: AbortSignal): Promise<void>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -444,6 +445,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
           const threadWrites = new Set<Promise<unknown>>();
+          const registeredRoots = new Set<string>();
           let switching = false;
           let switchProof:
             | {
@@ -670,6 +672,19 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     }
                     active.throwIfAborted();
                   },
+                  async authorizeFollow(nativeSessionId, active) {
+                    // A native create/fork may open its freshly registered
+                    // root before the browser finishes issuing its new page.
+                    if (
+                      registeredRoots.has(nativeSessionId) &&
+                      (await page.canReuseNativeSession(
+                        nativeSessionId,
+                        active,
+                      ))
+                    )
+                      return;
+                    await authorize(nativeSessionId, 'read', active);
+                  },
                   async canReuseNativeSession(nativeSessionId, active) {
                     await assertCurrent(active);
                     const binding = current.view.receipt.binding;
@@ -731,6 +746,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     const thread = ChatSessionSchema.parse(registered.thread);
                     if (thread.id !== registered.identity.threadId)
                       throw denied();
+                    registeredRoots.add(nativeSessionId);
                     return thread;
                   },
                   async invokeTerminal(call, active) {

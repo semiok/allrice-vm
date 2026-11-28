@@ -558,7 +558,7 @@ function pageStreams(
             address.kind === 'session'
               ? address.sessionId
               : address.childSessionId;
-          await page.authorize(id, 'read', child);
+          await page.authorizeFollow(id, child);
         }
         follow = await page.watchFollow(child);
       }

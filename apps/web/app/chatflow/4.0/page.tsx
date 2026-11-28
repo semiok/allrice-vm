@@ -47,7 +47,9 @@ async function readWarmEntry(query: URLSearchParams) {
       const context = await getRequestContext(request);
       signal.throwIfAborted();
       if (!context) return;
-      const root = await getDEntryNativeRootPin(context, selection.data);
+      const root = await getDEntryNativeRootPin(context, selection.data, {
+        runningSnapshot: true,
+      });
       signal.throwIfAborted();
       // This only identifies a known thread. The existing socket checks the
       // current editor proof before admitting the warm attempt.

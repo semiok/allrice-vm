@@ -673,6 +673,30 @@ suite(
           }),
         ).toEqual(forkRoot);
 
+        const forkSelection = {
+          ...f.selection,
+          threadId: fork.identity.threadId,
+        };
+        await expect(
+          getDEntryNativeRootPin(f.context, forkSelection, {
+            runningSnapshot: true,
+          }),
+        ).resolves.toEqual(forkRoot);
+        const lease = randomUUID();
+        await fixture.db`update person_virtual_machines set lease_owner=${lease}, lease_expires_at=now() + interval '1 minute' where vm_id=${binding.vmId}`;
+        try {
+          await expect(
+            getDEntryNativeRootPin(f.context, forkSelection, {
+              runningSnapshot: true,
+            }),
+          ).rejects.toThrow('NATIVE_QUERY_BINDING_UNAVAILABLE');
+          await expect(
+            getDEntryNativeRootPin(f.context, forkSelection),
+          ).resolves.toEqual(forkRoot);
+        } finally {
+          await fixture.db`update person_virtual_machines set lease_owner=null, lease_expires_at=null where vm_id=${binding.vmId} and lease_owner=${lease}`;
+        }
+
         const other = await setup();
         await fixture.db`insert into allrice_memberships (organization_id, workspace_id, user_id, role)
           values (${f.org}, ${f.workspace}, ${other.user}, 'member')`;
