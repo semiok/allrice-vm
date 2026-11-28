@@ -82,7 +82,6 @@ export type DEntryPageHandle = Readonly<{
     ReturnType<typeof currentDEntryNativeOwner>
   >['view']['receipt']['binding'];
   signal: AbortSignal;
-  retireBorrows(): Promise<void>;
   confirmThreadSwitch(
     requestId: string,
     threadId: string,
@@ -136,10 +135,6 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       sessionId: RequestContext['sessionId'];
       selection: DEntrySelectionInput;
       page: DEntryPageHandle;
-      borrow<T>(
-        signal: AbortSignal,
-        operation: (active: AbortSignal) => Promise<T>,
-      ): Promise<T>;
     }
   >();
   const terminalScopes = new Map<
@@ -299,6 +294,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     revoked: (reason: unknown) => void,
     previous?: DEntryPageHandle,
     dispatchSwitch?: (requestId: string, threadId: string) => void,
+    borrowable = true,
   ) {
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
@@ -446,8 +442,6 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const lifetime = AbortSignal.any([admitted, ended.signal]);
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
-          const borrowed = new Set<Promise<unknown>>();
-          const borrowLifetime = new AbortController();
           const threadWrites = new Set<Promise<unknown>>();
           let switching = false;
           let switchProof:
@@ -614,11 +608,6 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   sessionId: auth.context.sessionId,
                   vmBinding: current.view.receipt.binding,
                   signal: lifetime,
-                  async retireBorrows() {
-                    pages.delete(scopeId);
-                    borrowLifetime.abort();
-                    await Promise.allSettled(borrowed);
-                  },
                   confirmThreadSwitch(requestId, threadId, direct = false) {
                     lifetime.throwIfAborted();
                     if (switching || !pin || (direct && !dispatchSwitch))
@@ -773,23 +762,12 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   },
                 };
                 if (pages.has(scopeId)) throw denied();
-                pages.set(scopeId, {
-                  sessionId: auth.context.sessionId,
-                  selection: input.selection,
-                  page,
-                  borrow(signal, operation) {
-                    const task = page.use(
-                      AbortSignal.any([signal, borrowLifetime.signal]),
-                      operation,
-                    );
-                    borrowed.add(task);
-                    void task.then(
-                      () => borrowed.delete(task),
-                      () => borrowed.delete(task),
-                    );
-                    return task;
-                  },
-                });
+                if (borrowable)
+                  pages.set(scopeId, {
+                    sessionId: auth.context.sessionId,
+                    selection: input.selection,
+                    page,
+                  });
                 // The send is part of run, even when the page closes mid-send.
                 await timing.run('opened-reply', () => opened(page));
                 timing.ready();
@@ -831,7 +809,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       await currentHistory(context, input, caller);
       throw denied();
     }
-    return record.borrow(caller, async (active) => {
+    return record.page.use(caller, async (active) => {
       try {
         const auth = await currentHistory(context, input, active);
         if (

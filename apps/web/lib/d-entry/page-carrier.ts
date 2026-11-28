@@ -56,7 +56,6 @@ export function openNativePageCarrier(
   identity: DEntryIdentity,
   selection: DEntrySelectionInput,
   onRevoked: () => void,
-  beginWithUpgrade = false,
 ) {
   const ready =
     pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
@@ -65,9 +64,9 @@ export function openNativePageCarrier(
   void ready.promise.catch(() => {});
   void joined.promise.catch(() => {});
   const id = crypto.randomUUID();
-  const url = nativeMuxUrl(location.origin, identity.organizationId, selection);
-  if (beginWithUpgrade) url.searchParams.set('openId', id);
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(
+    nativeMuxUrl(location.origin, identity.organizationId, selection),
+  );
   let scopeId: string | undefined;
   let carrierSelection = selection;
   let nativeMux: MessagePort | undefined;
@@ -115,23 +114,12 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'open',
     () => {
-      if (beginWithUpgrade) {
-        dispatched = true;
-        if (requested) {
-          try {
-            end();
-          } catch (error) {
-            failure = fail(error);
-          }
-        }
-        return;
-      }
       if (requested) return;
       try {
         send({
           type: 'open',
           endpoint: '$d-entry/page',
-          payload: { args: {} },
+          payload: { args: { reuseEmployee: true } },
         });
         dispatched = true;
       } catch (error) {
@@ -245,8 +233,7 @@ export function openNativePageCarrier(
       closeMux();
       ready.reject(new DOMException('Page closed', 'AbortError'));
       if (socket.readyState === WebSocket.OPEN) end();
-      if (socket.readyState === WebSocket.CONNECTING && !beginWithUpgrade)
-        socket.close();
+      if (socket.readyState === WebSocket.CONNECTING) socket.close();
     }
     return joined.promise;
   }

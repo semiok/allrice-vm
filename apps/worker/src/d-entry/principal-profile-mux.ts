@@ -18,6 +18,7 @@ import {
   DEntryPageRpcRequestSchema,
   DEntryPageUnarySchema,
   DEntryPageSwitchSchema,
+  sameDEntryIdentity,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
@@ -38,6 +39,9 @@ import {
 } from './principal-requests.js';
 
 const emptyPayload = z.object({ args: z.strictObject({}) }).strict();
+const pageOpenPayload = z.strictObject({
+  args: z.strictObject({ reuseEmployee: z.literal(true).optional() }),
+});
 const denied = () => new DataAccessError('authorization_denied');
 type Frame = ReturnType<typeof parseRemoteStreamClientMessage>;
 type Send = (value: RemoteStreamServerMessage) => Promise<void>;
@@ -159,6 +163,7 @@ async function runOwner(
     selection: DEntrySelectionInput,
     publish: (generation: OwnedPage, page: DEntryPageHandle) => Promise<void>,
     previous?: DEntryPageHandle,
+    borrowable = true,
   ) {
     const setup = new AbortController();
     const stop = new AbortController();
@@ -193,6 +198,7 @@ async function runOwner(
             )
             .catch(fail);
         },
+        borrowable,
       ),
     };
     return generation;
@@ -265,14 +271,9 @@ async function runOwner(
         );
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
-        await Promise.all([
-          previousPage.retireBorrows(),
-          previous.resources?.retire(),
-        ]);
-        if (previous !== transport) {
-          endPage(previous);
-          await join(previous);
-        }
+        const retiring = shared ? (previous.resources?.openIds() ?? []) : [];
+        endPage(previous);
+        await join(previous);
         generation.stop.signal.throwIfAborted();
         await page.assertCurrent(page.signal);
         page.signal.throwIfAborted();
@@ -280,6 +281,7 @@ async function runOwner(
         connected.throwIfAborted();
         mount(generation, page);
         staged = undefined;
+        for (const streamId of retiring) await send({ type: 'end', streamId });
         await send({
           type: 'item',
           streamId: id,
@@ -346,16 +348,51 @@ async function runOwner(
         frame.type === 'open' &&
         frame.endpoint === '$d-entry/page'
       ) {
-        emptyPayload.parse(frame.payload);
+        const { args } = pageOpenPayload.parse(frame.payload);
         const id = (streamId = frame.streamId);
-        current = begin(input.selection, async (generation, page) => {
-          mount(generation, page);
-          transport = generation;
-          shared = pageStreams(
-            page,
-            send,
-            AbortSignal.any([connected, generation.stop.signal, page.signal]),
+        const sharedPage = args.reuseEmployee
+          ? Promise.withResolvers<DEntryPageHandle>()
+          : undefined;
+        if (sharedPage) {
+          transport = begin(
+            {
+              workspaceId: input.selection.workspaceId,
+              employeeInstanceId: input.selection.employeeInstanceId,
+            },
+            async (_generation, page) => {
+              sharedPage.resolve(page);
+            },
+            undefined,
+            false,
           );
+          void transport.operation.then(
+            () => sharedPage.reject(denied()),
+            sharedPage.reject,
+          );
+          void sharedPage.promise.catch(fail);
+        }
+        current = begin(input.selection, async (generation, page) => {
+          if (sharedPage) {
+            const employee = await sharedPage.promise;
+            if (
+              !sameDEntryIdentity(employee.identity, {
+                ...page.identity,
+                threadId: null,
+              }) ||
+              employee.sessionId !== page.sessionId ||
+              employee.bindingRef !== page.bindingRef
+            )
+              throw denied();
+            employee.signal.throwIfAborted();
+            shared = pageStreams(
+              employee,
+              send,
+              AbortSignal.any([connected, employee.signal]),
+            );
+          }
+          generation.stop.signal.throwIfAborted();
+          page.signal.throwIfAborted();
+          mount(generation, page);
           await send({
             type: 'item',
             streamId: id,
@@ -374,16 +411,17 @@ async function runOwner(
         const local = current.resources;
         const id = frame.streamId;
         const stable =
-          frame.type === 'open'
+          shared &&
+          (frame.type === 'open'
             ? employeeStreams.has(frame.endpoint)
-            : shared?.has(id);
+            : shared.has(id));
         if (frame.type === 'open' && (local.has(id) || shared?.has(id)))
           throw denied();
         const resources = stable ? shared : local;
         const replaced =
           frame.type === 'open' &&
           !stable &&
-          pageScopeId !== undefined &&
+          (pageScopeId !== undefined || Boolean(shared)) &&
           pageScopeId !== current.page?.scope.opened.scopeId;
         if (resources && !resources.signal.aborted && !replaced)
           resources.accept(frame);
@@ -628,6 +666,8 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
   return {
     signal: active,
     has: (id: string) => streams.has(id),
+    openIds: () =>
+      [...streams].filter(([, entry]) => entry.isOpen()).map(([id]) => id),
     accept(frame: Frame) {
       active.throwIfAborted();
       const prior = streams.get(frame.streamId);
@@ -648,12 +688,6 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
       }
     },
     close,
-    async retire() {
-      const open = [...streams].filter(([, entry]) => entry.isOpen());
-      await close();
-      signal.throwIfAborted();
-      for (const [streamId] of open) await send({ type: 'end', streamId });
-    },
   };
 }
 
@@ -730,9 +764,7 @@ export function createDEntryPageMux(
             workspaceId,
             employeeInstanceId,
             threadId,
-          } = DEntryPageMuxQuerySchema.omit({ openId: true }).parse(
-            Object.fromEntries(searchParams),
-          );
+          } = DEntryPageMuxQuerySchema.parse(Object.fromEntries(searchParams));
           const input = {
             organizationId,
             selection: {

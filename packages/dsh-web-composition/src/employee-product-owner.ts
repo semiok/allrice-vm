@@ -286,68 +286,71 @@ export function installEmployeeProductOwner(ctx: Context) {
       };
     }, 'AllRice employee native root');
   });
-  ctx.inject(['uiWorkspace', 'sessions', 'sidebarRight'], (native) => {
-    native.effect(() => {
-      let pending:
-        | {
-            scope: PageThreadScope;
-            opened: boolean;
+  ctx.inject(
+    ['uiWorkspace', 'sessions', 'connection', 'sidebarRight'],
+    (native) => {
+      native.effect(() => {
+        let pending:
+          | {
+              scope: PageThreadScope;
+              opened: boolean;
+            }
+          | undefined;
+        const update = () => {
+          if (!pending || signal.aborted) return;
+          const request = pending;
+          const root = native.sessions.list
+            .getSnapshot()
+            .ids.find((id) => id === pending?.scope.nativeSessionId);
+          if (!root) return;
+          if (!pending.opened) {
+            pending.opened = true;
+            native.uiWorkspace.openSession(root);
           }
-        | undefined;
-      const update = () => {
-        if (!pending || signal.aborted) return;
-        const request = pending;
-        const root = native.sessions.list
-          .getSnapshot()
-          .ids.find((id) => id === pending?.scope.nativeSessionId);
-        if (!root) return;
-        if (!pending.opened) {
-          pending.opened = true;
-          native.uiWorkspace.openSession(root);
-        }
-        if (pending !== request) return;
-        if (native.sidebarRight.mounted.getSnapshot() !== root) return;
-        const next = pending.scope;
-        pending = undefined;
-        switchingScope = false;
-        activeNativeSession = next.nativeSessionId;
-        selectThread(next.threadId);
-        parent.postMessage(
-          {
-            type: pageThreadSelected,
-            scopeId,
-            resourceScopeId: next.scopeId,
-          },
-          location.origin,
-        );
-      };
-      const onScope = (event: Event) => {
-        if (signal.aborted) return;
-        const next = (event as CustomEvent<PageThreadScope>).detail;
-        resourceScopeId = next.scopeId;
-        registered.set(next.nativeSessionId, {
-          threadId: next.threadId,
-          scopeId: next.scopeId,
-        });
-        switchingScope = true;
-        pending = {
-          scope: next,
-          opened: false,
+          if (pending !== request) return;
+          if (native.sidebarRight.mounted.getSnapshot() !== root) return;
+          const next = pending.scope;
+          pending = undefined;
+          switchingScope = false;
+          activeNativeSession = next.nativeSessionId;
+          selectThread(next.threadId);
+          parent.postMessage(
+            {
+              type: pageThreadSelected,
+              scopeId,
+              resourceScopeId: next.scopeId,
+            },
+            location.origin,
+          );
         };
-        update();
-      };
-      document.addEventListener(pageThreadScope, onScope);
-      const cleanup = [
-        native.sessions.list.subscribe(update),
-        native.sidebarRight.mounted.subscribe(update),
-      ];
-      parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
-      return () => {
-        document.removeEventListener(pageThreadScope, onScope);
-        cleanup.forEach((unsubscribe) => unsubscribe());
-      };
-    }, 'AllRice authorized thread selection');
-  });
+        const onScope = (event: Event) => {
+          if (signal.aborted) return;
+          const next = (event as CustomEvent<PageThreadScope>).detail;
+          resourceScopeId = next.scopeId;
+          registered.set(next.nativeSessionId, {
+            threadId: next.threadId,
+            scopeId: next.scopeId,
+          });
+          switchingScope = true;
+          pending = {
+            scope: next,
+            opened: false,
+          };
+          update();
+        };
+        document.addEventListener(pageThreadScope, onScope);
+        const cleanup = [
+          native.sessions.list.subscribe(update),
+          native.sidebarRight.mounted.subscribe(update),
+        ];
+        parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
+        return () => {
+          document.removeEventListener(pageThreadScope, onScope);
+          cleanup.forEach((unsubscribe) => unsubscribe());
+        };
+      }, 'AllRice authorized thread selection');
+    },
+  );
 
   const workspaceTask = Promise.resolve().then(() => {
     const embedded = document.getElementById(

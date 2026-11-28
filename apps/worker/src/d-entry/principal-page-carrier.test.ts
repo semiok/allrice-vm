@@ -220,7 +220,7 @@ it('replaces the borrowed root while keeping native employee events on the same 
   const f = await fixture();
   const target = randomUUID();
   const revoked = f.registerThread(target);
-  const { peer, scopeId, receive } = await open(f);
+  const { peer, scopeId, receive } = await open(f, true);
   const requestId = randomUUID();
   send(peer, {
     type: 'open',
@@ -250,6 +250,7 @@ it('replaces the borrowed root while keeping native employee events on the same 
   });
   const nextScope = switched.value.scopeId as string;
   expect(nextScope).not.toBe(scopeId);
+  expect(f.pageSignals.get(scopeId)?.aborted).toBe(true);
   peer.send(
     JSON.stringify({
       type: 'open',

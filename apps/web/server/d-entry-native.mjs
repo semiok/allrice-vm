@@ -82,15 +82,9 @@ export function createDEntryNativeGateway({
           const { organizationId, ...selection } = selectors;
           const input = page
             ? (() => {
-                const {
-                  carrier,
-                  organizationId,
-                  scopeId,
-                  openId,
-                  ...selection
-                } = DEntryPageMuxQuerySchema.parse(selectors);
-                if (scopeId && openId) throw Error('D_ENTRY_SELECTORS');
-                return { carrier, organizationId, selection, scopeId, openId };
+                const { carrier, organizationId, scopeId, ...selection } =
+                  DEntryPageMuxQuerySchema.parse(selectors);
+                return { carrier, organizationId, selection, scopeId };
               })()
             : DEntryNativeOwnerRequestSchema.parse({
                 organizationId,
@@ -235,13 +229,7 @@ export function createDEntryNativeGateway({
             });
             peer.once('close', stop);
             peer.on('error', stop);
-            const send = (to, message) =>
-              new Promise((resolve, reject) =>
-                to.send(message, { binary: false }, (error) =>
-                  error ? reject(error) : resolve(),
-                ),
-              );
-            const forward = async (from, to, initial) => {
+            const forward = async (from, to) => {
               for await (const [message, binary] of on(from, 'message', {
                 signal: abort.signal,
                 close: ['close'],
@@ -249,32 +237,17 @@ export function createDEntryNativeGateway({
                 lowWaterMark: 1,
               })) {
                 if (binary) throw Error('D_ENTRY_MUX_BINARY');
-                await initial;
                 abort.signal.throwIfAborted();
-                await send(to, message);
+                await new Promise((resolve, reject) =>
+                  to.send(message, { binary: false }, (error) =>
+                    error ? reject(error) : resolve(),
+                  ),
+                );
               }
             };
-            const forwarding = forward(worker, peer);
-            // Use the same authenticated page open at the Web upgrade.
-            // The browser owns its join once the upgrade has been accepted.
-            const initial = input.openId
-              ? send(
-                  worker,
-                  JSON.stringify({
-                    type: 'open',
-                    streamId: input.openId,
-                    endpoint: '$d-entry/page',
-                    payload: { args: {} },
-                  }),
-                ).catch((error) => {
-                  stop(error);
-                  throw error;
-                })
-              : undefined;
             const [, downlink] = await Promise.allSettled([
-              forward(peer, worker, initial).finally(stop),
-              forwarding.finally(stop),
-              initial,
+              forward(peer, worker).finally(stop),
+              forward(worker, peer).finally(stop),
             ]);
             if (page && !input.scopeId && downlink.status === 'fulfilled') {
               // Follow the actual delivered native frames with the normal

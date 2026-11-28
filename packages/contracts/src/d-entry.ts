@@ -170,7 +170,6 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   carrier: z.literal('page'),
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
-  openId: UuidSchema.optional(),
 });
 // Connection's canonical namespace/method syntax. A caller can name a method
 // here, but only the admitted guest can resolve and authorize its descriptor.

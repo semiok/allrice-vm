@@ -262,10 +262,8 @@ suite('4.0 browser entry with a running employee', () => {
           downloadThroughput: 1_250_000,
           uploadThroughput: 1_250_000,
         });
-        const openingIds: (string | null)[] = [];
         const browserOpens: string[] = [];
         page.on('websocket', (socket) => {
-          openingIds.push(new URL(socket.url()).searchParams.get('openId'));
           socket.on('framesent', ({ payload }) => {
             const frame = JSON.parse(payload.toString());
             if (frame.type === 'open' && frame.endpoint === '$d-entry/page')
@@ -300,8 +298,7 @@ suite('4.0 browser entry with a running employee', () => {
               ({ phase }) => phase === 'document',
             )!;
             expect(documentRequest.start).toBeGreaterThanOrEqual(prewarm.end!);
-            expect(openingIds.at(-1)).toMatch(/^[a-f0-9-]{36}$/u);
-            expect(browserOpens).toEqual([]);
+            expect(browserOpens).toHaveLength(mode === 'refresh' ? 2 : 1);
             samples.push({
               attempt: attempt + 1,
               mode,
@@ -504,26 +501,14 @@ suite('4.0 browser entry with a running employee', () => {
         threadId: randomUUID(),
       };
       f.registerThread(target.threadId);
-      await abandoned.evaluate((threadId) => {
-        const fetchEntry = window.fetch;
-        window.fetch = (input, init) => {
-          const endpoint = new URL(String(input), location.origin);
-          if (
-            endpoint.pathname === '/api/v1/d-entry/identity' &&
-            endpoint.searchParams.get('threadId') === threadId
-          ) {
-            init?.signal?.addEventListener('abort', () => {
-              document.documentElement.dataset.abandonedIdentity = 'true';
-            });
-          }
-          return fetchEntry(input, init);
-        };
+      await abandoned.evaluate(() => {
         const pushState = window.history.pushState.bind(window.history);
         window.history.pushState = (...args) => {
           pushState(...args);
           window.dispatchEvent(new Event('pagehide'));
+          document.documentElement.dataset.abandonedNavigation = 'true';
         };
-      }, target.threadId);
+      });
       const offsetBeforeRetire = requests.length;
       await oldDocument.evaluate(
         (_, message) => {
@@ -543,7 +528,7 @@ suite('4.0 browser entry with a running employee', () => {
               pending.find((request) => request.phase === phase)?.selection,
           );
         })
-        .toEqual([target, target]);
+        .toEqual([undefined, target]);
       expect(new URL(abandoned.url()).searchParams.get('threadId')).toBe(
         f.selection.threadId,
       );
@@ -556,9 +541,12 @@ suite('4.0 browser entry with a running employee', () => {
         ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed'),
       );
       await abandoned.waitForFunction(
-        () => document.documentElement.dataset.abandonedIdentity === 'true',
+        () => document.documentElement.dataset.abandonedNavigation === 'true',
       );
       expect(sockets).toEqual(['connect', 'closed']);
+      expect(
+        requests.slice(offsetBeforeRetire).map(({ phase }) => phase),
+      ).toEqual(['prewarm']);
       await abandoned.close();
 
       cold = true;

@@ -2195,6 +2195,30 @@ it
     expect(scopedBundleReads).toBe(0);
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(2);
+    const timings = () => ({
+      navigation: performance.getEntriesByType('navigation').map((entry) => {
+        const timing = entry as PerformanceNavigationTiming;
+        return [timing.responseStart, timing.responseEnd];
+      }),
+      reads: performance.getEntriesByType('resource').map((entry) => {
+        const timing = entry as PerformanceResourceTiming;
+        const url = new URL(timing.name);
+        return [
+          url.pathname,
+          Math.round(timing.startTime),
+          Math.round(timing.responseStart),
+          Math.round(timing.responseEnd),
+          timing.transferSize,
+        ];
+      }),
+    });
+    console.info(
+      'SEALED_PROFILE_REFRESH_WATERFALL ' +
+        JSON.stringify({
+          shell: await page.evaluate(timings),
+          workbench: await workbench.locator('#app').evaluate(timings),
+        }),
+    );
     console.info(
       'SEALED_PROFILE_REFRESH ' +
         JSON.stringify({

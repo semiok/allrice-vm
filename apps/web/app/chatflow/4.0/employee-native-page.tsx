@@ -858,40 +858,35 @@ export function EmployeeNativePage({
         warmIdentity ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(
-        identity,
-        selection,
-        () => {
-          remoteRevoked = true;
-          unbindMemoryWrites?.();
-          send(pageRevoked);
-          if (!prepare && !lifetime.signal.aborted) setFailed(true);
-          // Before issuance, ready's rejection is handled by setting below.
-          if (prepare && mounted) finish('failed');
-          // Password changes and logout can revoke this carrier before their
-          // responses reach the iframe. Only the current cookie decides where
-          // the outer page goes.
-          if (mounted)
-            void retire()
-              .then(async () => {
-                if (detached || replace.current !== applyQuery) return;
-                const response = await fetch('/api/v1/auth/session', {
-                  credentials: 'same-origin',
-                  cache: 'no-store',
-                  signal: lifetime.signal,
-                });
-                // The unqualified entry checks the cookie again on navigation.
-                if (
-                  response.status === 401 &&
-                  !detached &&
-                  replace.current === applyQuery
-                )
-                  location.replace('/chatflow/4.0');
-              })
-              .catch(() => {});
-        },
-        Boolean(warmIdentity),
-      );
+      carrier = openNativePageCarrier(identity, selection, () => {
+        remoteRevoked = true;
+        unbindMemoryWrites?.();
+        send(pageRevoked);
+        if (!prepare && !lifetime.signal.aborted) setFailed(true);
+        // Before issuance, ready's rejection is handled by setting below.
+        if (prepare && mounted) finish('failed');
+        // Password changes and logout can revoke this carrier before their
+        // responses reach the iframe. Only the current cookie decides where
+        // the outer page goes.
+        if (mounted)
+          void retire()
+            .then(async () => {
+              if (detached || replace.current !== applyQuery) return;
+              const response = await fetch('/api/v1/auth/session', {
+                credentials: 'same-origin',
+                cache: 'no-store',
+                signal: lifetime.signal,
+              });
+              // The unqualified entry checks the cookie again on navigation.
+              if (
+                response.status === 401 &&
+                !detached &&
+                replace.current === applyQuery
+              )
+                location.replace('/chatflow/4.0');
+            })
+            .catch(() => {});
+      });
       const issued = (await carrier.ready).scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
