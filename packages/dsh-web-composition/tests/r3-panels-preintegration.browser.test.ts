@@ -285,6 +285,7 @@ suite('R3 preintegration through the installed workbench', () => {
         await menu
           .getByRole('button', { name: '文件与文件夹', exact: true })
           .click();
+        expect((await editor.innerText()).trimEnd().endsWith('@"')).toBe(true);
         await output.click();
         await editor.getByText(file.fileName, { exact: true }).waitFor();
         const references = await page.evaluate(() =>

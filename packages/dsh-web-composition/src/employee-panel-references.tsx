@@ -271,6 +271,7 @@ export function apply(ctx: Context) {
         );
       };
       const rootCrumb = 'root';
+      const quotedRootCrumb = 'root-quoted';
       const folderCrumb = 'materials';
       const quotedFolderCrumb = 'materials-quoted';
       native.effect(() =>
@@ -278,10 +279,13 @@ export function apply(ctx: Context) {
           trigger: '@',
           name: source,
           showGroupTitle: false,
-          header: (_, { query }) =>
+          header: (_, { query, quoted }) =>
             query.startsWith(materialPath)
               ? [
-                  { label: filesSection, value: rootCrumb },
+                  {
+                    label: filesSection,
+                    value: quoted ? quotedRootCrumb : rootCrumb,
+                  },
                   { label: materialFolder, value: folderCrumb, current: true },
                 ]
               : undefined,
@@ -435,8 +439,14 @@ export function apply(ctx: Context) {
           },
           onPick({ session, candidate }) {
             if (!current(session.sessionId) || !candidate.value) return;
-            if (candidate.value === rootCrumb)
-              return { text: '@', continue: true };
+            if (
+              candidate.value === rootCrumb ||
+              candidate.value === quotedRootCrumb
+            )
+              return {
+                text: candidate.value === quotedRootCrumb ? '@"' : '@',
+                continue: true,
+              };
             if (
               candidate.value === folderCrumb ||
               candidate.value === quotedFolderCrumb

@@ -1893,7 +1893,9 @@ suite(
       } as ModelCallBinding;
     }
     function referenceMessage(threadId: string, pin: EmployeeFileMentionPin) {
-      const id = randomUUID() as GatewayModelInput['messages'][number]['id'];
+      const id = randomUUID() as NonNullable<
+        GatewayModelInput['messages'][number]['id']
+      >;
       return [
         {
           id,
