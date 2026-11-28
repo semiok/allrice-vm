@@ -77,6 +77,7 @@ function advance(pool: EmployeeFramePool): EmployeeFramePool {
       ),
       sequence,
       visible: found.id,
+      wanted: undefined,
     };
   }
   if (frames.length >= employeeFrameLimit) {

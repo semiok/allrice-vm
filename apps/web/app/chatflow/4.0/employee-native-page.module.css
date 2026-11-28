@@ -57,3 +57,19 @@
 .status a:hover {
   background: var(--ar-surface-hover);
 }
+
+.framePool {
+  position: relative;
+  min-height: 100dvh;
+}
+
+.foregroundFrame,
+.backgroundFrame {
+  position: absolute;
+  inset: 0;
+}
+
+.backgroundFrame {
+  visibility: hidden;
+  pointer-events: none;
+}

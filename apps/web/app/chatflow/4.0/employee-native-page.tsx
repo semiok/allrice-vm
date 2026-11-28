@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   DEntrySelectionInputSchema,
@@ -40,6 +41,11 @@ import {
 import { warmPublicProfileAssets } from '../../../lib/d-entry/public-profile-warmup';
 import { createEmployeeMemoryPageWrites } from '../../../lib/memory/employee-memory-page-writes';
 import styles from './employee-native-page.module.css';
+import {
+  EmployeeNativeFrameShell,
+  readFrameIntent,
+  type EmployeeFrameOwner,
+} from './employee-native-frame-shell';
 
 const noStartupAssets: readonly string[] = [];
 
@@ -157,22 +163,57 @@ async function waitForVisibleEntry(signal: AbortSignal) {
   });
 }
 
-export function EmployeeNativePage({
-  query,
-  prepare = false,
-  initialUnavailable = false,
-  startupAssetUrls = noStartupAssets,
-}: {
+type EmployeeNativePageProps = {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
   startupAssetUrls?: readonly string[];
+};
+
+export function EmployeeNativePage(props: EmployeeNativePageProps) {
+  const initial =
+    props.prepare && !props.initialUnavailable && readFrameIntent(props.query);
+  if (!initial) return <EmployeeNativePane {...props} />;
+  return (
+    <EmployeeNativeFrameShell
+      initial={initial}
+      renderFrame={(frame, owner, pendingArea) => (
+        <EmployeeNativePane
+          {...props}
+          query={frame.query}
+          owner={owner}
+          pendingArea={pendingArea}
+        />
+      )}
+      fallback={(status) => (
+        <EntryStatus
+          status={status}
+          settled
+          stop={() => {}}
+          retry={() => location.reload()}
+        />
+      )}
+    />
+  );
+}
+
+function EmployeeNativePane({
+  query,
+  prepare = false,
+  initialUnavailable = false,
+  startupAssetUrls = noStartupAssets,
+  owner,
+  pendingArea,
+}: EmployeeNativePageProps & {
+  owner?: EmployeeFrameOwner;
+  pendingArea?: HTMLElement | null;
 }) {
   const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
   const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
-  const [bindMemoryWrites] = useState(createEmployeeMemoryPageWrites);
+  const [standaloneMemoryWrites] = useState(createEmployeeMemoryPageWrites);
+  const bindMemoryWrites = owner?.bindMemoryWrites ?? standaloneMemoryWrites;
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
     initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
@@ -363,6 +404,12 @@ export function EmployeeNativePage({
           window.clearTimeout(closingConfirmation);
         });
       return replacing;
+    }
+    function commitRoute(query: string, push: boolean) {
+      if (owner) owner.route(query, push);
+      else if (push)
+        history.pushState(history.state, '', '/chatflow/4.0?' + query);
+      else history.replaceState(history.state, '', '/chatflow/4.0?' + query);
     }
     function finish(
       status:
@@ -559,8 +606,8 @@ export function EmployeeNativePage({
           } else if (prepare && location.pathname === '/chatflow/4.0') {
             nextQuery.current = query;
             pendingWarmup.current = warmup;
-            if (location.search !== '?' + query)
-              history.pushState(null, '', '/chatflow/4.0?' + query);
+            if (location.search !== '?' + query || owner)
+              commitRoute(query, true);
             activateSelection(query, warmup);
           } else location.assign('/chatflow/4.0?' + query);
         } else {
@@ -614,6 +661,7 @@ export function EmployeeNativePage({
     }
     const receive = (event: MessageEvent) => {
       if (
+        !event.isTrusted ||
         event.origin !== location.origin ||
         event.source !== frame.current?.contentWindow ||
         !scopeId ||
@@ -658,14 +706,16 @@ export function EmployeeNativePage({
         frameSelection.current = selection;
         selectedQuery = query;
         nextQuery.current = displayedQuery.current = query;
-        history.pushState(history.state, '', '/chatflow/4.0?' + query);
+        commitRoute(query, true);
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
+        if (owner?.ready() && !navigating) owner.revoked();
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
       if (event.data.type === pageStartupFailed) {
+        if (owner?.ready() && !navigating) owner.revoked();
         if (prepare)
           finish(
             event.data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed',
@@ -693,11 +743,10 @@ export function EmployeeNativePage({
           nextQuery.current === displayedQuery.current
         ) {
           nextQuery.current = displayedQuery.current = selectedQuery;
-          history.replaceState(
-            history.state,
-            '',
-            '/chatflow/4.0?' + selectedQuery,
-          );
+          if (owner) {
+            const app = frame.current?.contentDocument?.getElementById('app');
+            owner.activate(selectedQuery, app?.dataset.loginSessionId);
+          } else commitRoute(selectedQuery, false);
         }
       }
       if (
@@ -738,13 +787,14 @@ export function EmployeeNativePage({
         displayedQuery.current = query;
         nextQuery.current = query;
         selectedQuery = query;
-        history.replaceState(history.state, '', '/chatflow/4.0?' + query);
+        commitRoute(query, false);
       }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (
           !next.success ||
           !carrier ||
+          (owner && !owner.visible()) ||
           detached ||
           navigationClosed ||
           remoteRevoked ||
@@ -754,47 +804,61 @@ export function EmployeeNativePage({
         )
           return;
         const selection = next.data;
-        if (
-          !pendingNavigation &&
-          selection.threadId &&
-          selectedEmployee?.threadId === selection.threadId &&
-          selectedEmployee.workspaceId === selection.workspaceId &&
-          selectedEmployee.employeeInstanceId === selection.employeeInstanceId
-        )
-          return;
-        if (
-          prepare &&
-          !navigating &&
-          switchReady &&
-          selection.threadId &&
-          !document.hidden &&
-          !remoteRevoked &&
-          !detached &&
-          location.pathname === '/chatflow/4.0' &&
-          selectedEmployee?.workspaceId === selection.workspaceId &&
-          selectedEmployee.employeeInstanceId ===
-            selection.employeeInstanceId &&
-          selectedEmployee.threadId !== selection.threadId
-        ) {
-          const target: ThreadHandoff = {
-            selection: { ...selection, threadId: selection.threadId },
-            requestId: crypto.randomUUID(),
-          };
-          switching = target;
-          switchTimer = window.setTimeout(() => {
-            if (switching === target) cancelSwitch(target);
-          }, liveSwitchWaitMs);
-          frame.current?.contentWindow?.postMessage(
-            {
-              type: pageThreadSwitchPrepare,
-              scopeId,
-              requestId: target.requestId,
-            },
-            location.origin,
+        const crossEmployee =
+          selection.workspaceId !== selectedEmployee?.workspaceId ||
+          selection.employeeInstanceId !== selectedEmployee?.employeeInstanceId;
+        if (owner && (crossEmployee || event.data.resumeEmployee === true))
+          owner.navigate(
+            selection,
+            event.data.reopen === true,
+            event.data.resumeEmployee === true,
           );
-        } else navigate(selection, event.data.reopen === true);
+        else requestNavigation(selection, event.data.reopen === true);
       }
     };
+    function requestNavigation(
+      selection: DEntrySelectionInput,
+      reopen: boolean,
+    ) {
+      if (
+        !pendingNavigation &&
+        selection.threadId &&
+        selectedEmployee?.threadId === selection.threadId &&
+        selectedEmployee.workspaceId === selection.workspaceId &&
+        selectedEmployee.employeeInstanceId === selection.employeeInstanceId
+      )
+        return;
+      if (
+        prepare &&
+        !navigating &&
+        switchReady &&
+        selection.threadId &&
+        !document.hidden &&
+        !remoteRevoked &&
+        !detached &&
+        location.pathname === '/chatflow/4.0' &&
+        selectedEmployee?.workspaceId === selection.workspaceId &&
+        selectedEmployee.employeeInstanceId === selection.employeeInstanceId &&
+        selectedEmployee.threadId !== selection.threadId
+      ) {
+        const target: ThreadHandoff = {
+          selection: { ...selection, threadId: selection.threadId },
+          requestId: crypto.randomUUID(),
+        };
+        switching = target;
+        switchTimer = window.setTimeout(() => {
+          if (switching === target) cancelSwitch(target);
+        }, liveSwitchWaitMs);
+        frame.current?.contentWindow?.postMessage(
+          {
+            type: pageThreadSwitchPrepare,
+            scopeId,
+            requestId: target.requestId,
+          },
+          location.origin,
+        );
+      } else navigate(selection, reopen);
+    }
     window.addEventListener('message', receive);
     const leaving = () => {
       if (detached) return;
@@ -813,7 +877,7 @@ export function EmployeeNativePage({
       nextQuery.current = location.search.slice(1);
       if (nextQuery.current !== displayedQuery.current) applyQuery();
     };
-    window.addEventListener('popstate', restoreQuery);
+    if (!owner) window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
       employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
     );
@@ -873,6 +937,7 @@ export function EmployeeNativePage({
       lifetime.signal.throwIfAborted();
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
+        owner?.revoked();
         unbindMemoryWrites?.();
         send(pageRevoked);
         if (!prepare && !lifetime.signal.aborted) setFailed(true);
@@ -881,7 +946,7 @@ export function EmployeeNativePage({
         // Password changes and logout can revoke this carrier before their
         // responses reach the iframe. Only the current cookie decides where
         // the outer page goes.
-        if (mounted)
+        if (mounted && !owner)
           void retire()
             .then(async () => {
               if (detached || replace.current !== applyQuery) return;
@@ -907,7 +972,12 @@ export function EmployeeNativePage({
       selectedEmployee = selection;
       frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
-      unbindMemoryWrites = bindMemoryWrites(window, issued.scopeId, identity);
+      unbindMemoryWrites = bindMemoryWrites(
+        window,
+        issued.scopeId,
+        identity,
+        owner?.visible,
+      );
       mounted = true;
       const documentUrl = '/chatflow/4.0/document?' + params;
       const retainedWindow = activation.retainFrame
@@ -931,7 +1001,29 @@ export function EmployeeNativePage({
         finish('selection-unavailable');
       else finish('failed', error.status === 408);
     });
+    const unregister = owner?.register({
+      element: () => frame.current,
+      select: requestNavigation,
+      async retire() {
+        navigating = true;
+        unbindMemoryWrites?.();
+        window.clearTimeout(timer);
+        window.clearTimeout(switchTimer);
+        nextWarmup?.lifetime.abort();
+        const expiry = window.setTimeout(() => {
+          lifetime.abort();
+          local.resolve('unknown');
+          carrier?.abandon();
+        }, closingConfirmationMs);
+        try {
+          return await retire();
+        } finally {
+          window.clearTimeout(expiry);
+        }
+      },
+    });
     return () => {
+      unregister?.();
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
       window.clearTimeout(closingConfirmation);
@@ -947,12 +1039,31 @@ export function EmployeeNativePage({
       window.removeEventListener('pagehide', leaving);
       window.removeEventListener('popstate', restoreQuery);
     };
-  }, [activation, activeQuery, bindMemoryWrites, prepare, initialUnavailable]);
+  }, [
+    activation,
+    activeQuery,
+    bindMemoryWrites,
+    prepare,
+    initialUnavailable,
+    owner,
+  ]);
 
   useEffect(() => {
     if (nextQuery.current !== displayedQuery.current) replace.current?.();
   }, [query, activeQuery]);
 
+  const entryStatus = prepare && status !== 'ready' && (
+    <EntryStatus
+      status={status}
+      activeLimit={activeLimit}
+      settled={initialUnavailable || settled}
+      stop={() => cancel.current?.()}
+      retry={() => {
+        if (initialUnavailable) location.reload();
+        else resume.current?.(status === 'restart-confirmation');
+      }}
+    />
+  );
   return (
     <main data-employee-selection={activeQuery}>
       {source && (
@@ -974,18 +1085,25 @@ export function EmployeeNativePage({
           }}
         />
       )}
-      {prepare && status !== 'ready' && (
-        <EntryStatus
-          status={status}
-          activeLimit={activeLimit}
-          settled={initialUnavailable || settled}
-          stop={() => cancel.current?.()}
-          retry={() => {
-            if (initialUnavailable) location.reload();
-            else resume.current?.(status === 'restart-confirmation');
-          }}
-        />
-      )}
+      {entryStatus}
+      {pendingArea &&
+        status !== 'ready' &&
+        createPortal(
+          ['warming', 'accepted', 'starting', 'restarting', 'opening'].includes(
+            status,
+          ) ? (
+            <div
+              role="status"
+              style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+            >
+              <StateDot state="ongoing" size={16} />
+              正在打开工作台
+            </div>
+          ) : (
+            entryStatus
+          ),
+          pendingArea,
+        )}
       {!prepare && failed && <p role="alert">当前入口暂不可用</p>}
     </main>
   );

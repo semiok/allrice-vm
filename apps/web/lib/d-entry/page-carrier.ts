@@ -337,5 +337,9 @@ export function openNativePageCarrier(
       port.postMessage({ type: 'open' });
     },
     close,
+    abandon() {
+      const reason = Error('Native page close is unconfirmed');
+      failure = fail(reason) ?? failure;
+    },
   };
 }

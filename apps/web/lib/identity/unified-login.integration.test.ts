@@ -174,6 +174,35 @@ integration('shared portal HTTP identity with real PostgreSQL', () => {
       await getRequestContext(request('/api/v1/auth/session')),
     ).toMatchObject({ actor: { id: a.user.id } });
   });
+  it('revokes only the login replaced in this browser after successful authentication', async () => {
+    const old = await employee();
+    const next = await employee();
+    const credentials = (username: string, password = 'admin@321') =>
+      request('/api/v1/auth/login', { username, password });
+    const session = () => getRequestContext(request('/api/v1/auth/session'));
+    const independent = await login({
+      username: old.name,
+      password: 'admin@321',
+    });
+
+    expect((await signIn(credentials(old.name))).status).toBe(200);
+    const previousCookie = jar.get('allrice_session')!;
+    expect(
+      (await signIn(credentials(next.name, 'incorrect-password'))).status,
+    ).toBe(401);
+    expect(jar.get('allrice_session')).toBe(previousCookie);
+    expect(await session()).toMatchObject({ actor: { id: old.user.id } });
+
+    expect((await signIn(credentials(next.name))).status).toBe(200);
+    const replacement = jar.get('allrice_session')!;
+    expect(await session()).toMatchObject({ actor: { id: next.user.id } });
+    jar.set('allrice_session', previousCookie);
+    expect(await session()).toBeNull();
+    jar.set('allrice_session', { value: independent.session.token });
+    expect(await session()).toMatchObject({ actor: { id: old.user.id } });
+    jar.set('allrice_session', replacement);
+    expect(await session()).toMatchObject({ actor: { id: next.user.id } });
+  });
   it('authenticates an independent admin with zero memberships through login, session and technical API; revocation is immediate', async () => {
     const host = 'allrice-admin.bplabs.xyz';
     const portal = resolvePortal(host)!;
