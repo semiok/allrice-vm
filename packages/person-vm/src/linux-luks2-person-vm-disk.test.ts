@@ -49,6 +49,7 @@ type Device = {
   loop?: number;
   mapping?: string;
   mounted?: string;
+  savedWork?: string;
   luksUuid?: string;
   xfsUuid?: string;
   erased?: boolean;
@@ -131,7 +132,7 @@ async function fixture() {
                   lstat(row.backing, { bigint: true }).then((info) => ({
                     name: '/dev/loop' + row.loop,
                     'back-file': row.backing,
-                    'back-ino': String(info.ino),
+                    'back-ino': Number(info.ino),
                     'back-maj:min': linuxDeviceNumber(info.dev),
                     offset: assertions.invalidLoop ? 4096 : 0,
                     sizelimit: 0,
@@ -217,13 +218,25 @@ async function fixture() {
         return '';
       case linuxTools.blkid:
         return 'TYPE=xfs\nUUID=' + deviceForMap(last).xfsUuid + '\n';
-      case linuxTools.mount:
-        deviceForMap(command.args.at(-2)).mounted = last;
+      case linuxTools.mount: {
+        const device = deviceForMap(command.args.at(-2));
+        device.mounted = last;
+        if (device.savedWork) {
+          await rename(device.savedWork, join(last!, 'work'));
+          device.savedWork = undefined;
+        }
         return '';
+      }
       case linuxTools.umount: {
         const row = all().find((row) => row.mounted === last);
         if (!row) throw Error('unmounted');
-        await rm(join(last!, 'work'), { recursive: true, force: true });
+        const hiddenWork = join(root, '.volume-' + row.luksUuid);
+        try {
+          await rename(join(last!, 'work'), hiddenWork);
+          row.savedWork = hiddenWork;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
         row.mounted = undefined;
         return '';
       }
@@ -310,7 +323,9 @@ async function fixture() {
           .filter((row) => row.mounted)
           .map(
             (row) =>
-              '42 1 253:' +
+              40 +
+              row.loop! +
+              ' 1 253:' +
               row.loop +
               ' / ' +
               row.mounted +
@@ -350,7 +365,8 @@ async function fixture() {
 
   const keys = {
     readOrCreate: vi.fn(async (id: string) => {
-      if (!passes.has(id)) passes.set(id, Buffer.from(secret));
+      if (!passes.has(id))
+        passes.set(id, Buffer.concat([secret, Buffer.from(id)]));
       return Buffer.from(passes.get(id)!);
     }),
     async read(id: string) {
@@ -451,6 +467,44 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     await expect(
       f.adapter.verifyOwnedWorkDisk(receipt, disk, binding, signal),
     ).rejects.toThrow();
+  });
+
+  it('keeps two users’ disks, keys and work contents independent across a remount', async () => {
+    const f = await fixture();
+    const otherDisk = { ...disk, vmId: otherVm };
+    const otherBinding = {
+      ...binding,
+      vmId: otherVm,
+      personId: 'person-b',
+      instanceId: 'generation-b',
+    };
+    await f.adapter.create(disk, signal);
+    await f.adapter.create(otherDisk, signal);
+    const first = await f.adapter.attach(disk, signal);
+    const second = await f.adapter.attach(otherDisk, signal);
+    await writeFile(join(first, 'work', 'only-a'), 'for A');
+    await writeFile(join(second, 'work', 'only-b'), 'for B');
+    f.assertions.use = otherBinding;
+    const receipt = await f.adapter.issueOwnedWorkDisk(
+      otherDisk,
+      otherBinding,
+      signal,
+    );
+    await f.adapter.detach(disk, signal);
+    await f.adapter.verifyOwnedWorkDisk(
+      receipt,
+      otherDisk,
+      otherBinding,
+      signal,
+    );
+    await f.adapter.attach(disk, signal);
+    expect(await readFile(join(first, 'work', 'only-a'), 'utf8')).toBe('for A');
+    await expect(lstat(join(first, 'work', 'only-b'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(await readFile(join(second, 'work', 'only-b'), 'utf8')).toBe(
+      'for B',
+    );
   });
 
   it('moves only detached images across tiers with unchanged physical identity', async () => {
@@ -784,6 +838,17 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     f.assertions.fault = undefined;
     await f.adapter.delete(disk, signal, erase);
     expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
+  });
+
+  it('runs the native cleanup callback for a proven never-created or already-erased disk', async () => {
+    const f = await fixture();
+    const beforeErase = vi.fn(async (mount: string) => {
+      expect(mount).toBe(join(f.root, 'mounts', vm));
+    });
+    await f.adapter.delete(disk, signal, { identitySha256: null, beforeErase });
+    expect(beforeErase).toHaveBeenCalledOnce();
+    expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
+    expect(f.history).not.toContain('cryptsetup luksErase');
   });
 
   it('uses the verified deletion target, erases keyslots, and retries key-store failure without re-erasing', async () => {

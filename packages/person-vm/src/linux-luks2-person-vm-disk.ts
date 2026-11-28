@@ -511,6 +511,28 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     );
   }
 
+  private async verifyKey(state: DiskState, id: string, signal: AbortSignal) {
+    requireDisk(state.file);
+    const path = state.file.path;
+    await this.withKey(id, false, (key) =>
+      this.execute(
+        'crypt',
+        [
+          'open',
+          '--type',
+          'luks2',
+          '--test-passphrase',
+          '--disable-locks',
+          '--key-file',
+          '-',
+          path,
+        ],
+        signal,
+        key,
+      ),
+    );
+  }
+
   private async verifyXfs(state: DiskState, signal: AbortSignal) {
     requireDisk(state.record && state.observed.mapper);
     const facts = (
@@ -565,23 +587,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
       );
       await this.verifyHeader(state, signal);
       if (state.record.phase === 'ready')
-        await this.withKey(id, false, (key) =>
-          this.execute(
-            'crypt',
-            [
-              'open',
-              '--type',
-              'luks2',
-              '--test-passphrase',
-              '--disable-locks',
-              '--key-file',
-              '-',
-              state.file!.path,
-            ],
-            signal,
-            key,
-          ),
-        );
+        await this.verifyKey(state, id, signal);
       if (state.observed.mapper) await this.verifyXfs(state, signal);
       return {
         state: 'ready',
@@ -802,6 +808,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
       const prior = await this.ensureLayout(disk, signal);
       if (prior.record?.phase === 'ready') {
         await this.verifyHeader(prior, signal);
+        await this.verifyKey(prior, disk.vmId, signal);
         return;
       }
       requireDisk(
@@ -1069,6 +1076,17 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         requireDisk(
           !state.file && (await this.options.keys.confirmAbsence(disk.vmId)),
         );
+        if (erase) {
+          await erase.beforeErase(state.layout.mount);
+          const empty = await this.assertDetached(disk, signal);
+          requireDisk(
+            !empty.record &&
+              !empty.file &&
+              (await this.options.keys.confirmAbsence(disk.vmId)),
+          );
+          await optional(() => rmdir(empty.layout.mount));
+          await syncDiskPoolDirectory(dirname(empty.layout.mount));
+        }
         return;
       }
       requireDisk(
