@@ -581,15 +581,18 @@ function NativeDeliveryVersionAction({
 
 function nativeDeliveryAddress(ctx: Context, address: string) {
   const file = parseFileAddress(address);
+  const currentSessionId = ctx.sidebarRight.mounted.getSnapshot();
   if (
     file?.scope !== 'session' ||
+    !currentSessionId ||
+    file.sessionId !== currentSessionId ||
     (file.path.startsWith('/') && !file.path.startsWith('/work/'))
   )
     return;
   const canonical = file.path.startsWith('/')
     ? file.path
     : [
-        ctx.sessions?.list.getSnapshot().byId[file.sessionId]?.cwd,
+        ctx.sessions?.list.getSnapshot().byId[currentSessionId]?.cwd,
         file.path,
       ].join('/');
   if (!canonical.startsWith('/work/')) return;
@@ -606,7 +609,7 @@ function nativeDeliveryAddress(ctx: Context, address: string) {
   )
     return;
   return {
-    sessionId: file.sessionId,
+    sessionId: currentSessionId,
     path: '/work/' + parts.join('/'),
     name: parts.at(-1)!,
   };

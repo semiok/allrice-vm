@@ -239,10 +239,13 @@ it
     const createdNativeId = 'native-created';
     const outerNativeId = 'native-outer-created';
     let expectedNativeId: string | undefined;
-    const deliveryPath = '/work/hello-word.md';
+    const deliveryPath = '/work/team/hello-word.md';
     const deliveryObjectId = randomUUID();
     const earlierDeliveryId = randomUUID();
     if (outerCreate) {
+      f.host.catalog.items = f.host.catalog.items.map((item) =>
+        item.sessionId === 'root' ? { ...item, cwd: '/work/team' } : item,
+      );
       let records: readonly SessionHistoryRecord[] = [];
       f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
       f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
