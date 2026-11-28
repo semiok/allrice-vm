@@ -312,7 +312,12 @@ it
     };
     const late = deferred();
     const reads: unknown[] = [];
-    const materialReads: string[] = [];
+    const materialReads: {
+      kind: 'catalog' | 'selection';
+      threadId: string | null;
+      workspaceId: string | null;
+      viewerId: string | string[] | undefined;
+    }[] = [];
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -367,9 +372,14 @@ it
               reference.revisionId +
               '/selection'
         ) {
-          const thread = url.searchParams.get('threadId');
-          if (thread) materialReads.push(thread);
-          if (url.pathname.endsWith('/selection'))
+          const selectionRead = url.pathname.endsWith('/selection');
+          materialReads.push({
+            kind: selectionRead ? 'selection' : 'catalog',
+            threadId: url.searchParams.get('threadId'),
+            workspaceId: url.searchParams.get('workspaceId'),
+            viewerId: request.headers['x-allrice-expected-viewer-id'],
+          });
+          if (selectionRead)
             return await copy(
               Response.json({
                 ...materials.selection(reference.revisionId),
@@ -913,15 +923,35 @@ it
         .click();
     }
     async function useMaterial(nativeId: string, threadId: string) {
-      const file = reference.fileName;
       const before = materialReads.length;
+      const right = dock(nativeId);
       await openWorkbenchPane(nativeId, '企业资料');
-      await dock(nativeId)
+      await right
         .locator(`[data-file-id="${reference.revisionId}"]`)
         .getByRole('button', { name: '引用到对话', exact: true })
         .click();
-      await expect.poll(() => editor.textContent()).toContain(file);
-      expect(materialReads.slice(before)).toEqual([threadId, threadId]);
+      const expectedScope = {
+        threadId,
+        workspaceId: f.identity.workspaceId,
+        viewerId: f.identity.personId,
+      };
+      await expect.poll(() => materialReads.slice(before)).toEqual([
+        { kind: 'catalog', ...expectedScope },
+        { kind: 'selection', ...expectedScope },
+      ]);
+      const chip = editor.locator(
+        '[data-composer-chip="allrice-panel-reference"]',
+      );
+      try {
+        await chip.waitFor({ state: 'visible', timeout: 5_000 });
+      } catch (cause) {
+        const alerts = await right.getByRole('alert').allTextContents();
+        throw Error(
+          'Native reference insertion did not render: ' + JSON.stringify(alerts),
+          { cause },
+        );
+      }
+      expect(await chip.textContent()).toContain(reference.fileName);
       await closeWorkbenchPane(nativeId, '企业资料');
     }
     async function checkR3SelectedRoot(nativeId: string, threadId: string) {
