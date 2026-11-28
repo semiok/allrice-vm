@@ -41,7 +41,7 @@ export class LocalStorageAdapter implements StoragePort {
         if (chunk.done) break;
         size += chunk.value.byteLength;
         hash.update(chunk.value);
-        await handle.write(chunk.value);
+        await handle.writeFile(chunk.value);
       }
       await handle.sync();
       await handle.close();
