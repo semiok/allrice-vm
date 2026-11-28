@@ -933,7 +933,7 @@ instance/profile、线程配置和导出时机须由MET-273/原生route owner绑
 
 ## MET273：Native Web 宿主认证与控制
 
-4.0 员工资料随精确实例和修订写入独立的 DSH_HOME/AGENTS.md。rc.2 原生工作区指令负责加载与对账。通过公开 system-prompt 和原生 preset 配置移除 Web 默认的编程助手与 Harness 自称，保留每种 preset 的工具和路由。暖态更新复用该员工 owner 的真实关闭和启动路径，提交新修订并复核当前权限和活动后才替换，原会话仍从其持久根恢复。MET-225 对照 allrice-native-web-local-auth-v1。
+4.0 员工资料随精确实例和修订写入独立的 DSH_HOME/AGENTS.md。rc.2 原生工作区指令负责加载与对账。通过公开 system-prompt 和原生 preset 配置移除 Web 默认的编程助手与 Harness 自称，保留每种 preset 的工具和路由。关闭模型可见的上游开发定位和 Web URL 导引。员工自称采用 AllRice 数字员工的名字和职责。暖态更新复用该员工 owner 的真实关闭和启动路径，提交新修订并复核当前权限、活动和原生定时后才替换，原会话仍从其持久根恢复。有活跃定时或在途工作时保留旧 owner，避免在无移交保证的情况下丢失调度。MET-225 对照 allrice-native-web-local-auth-v1。
 
 `allrice-native-web-local-auth-v1` 复用 rc.2 的公开 `connection.authenticatedUrl`、`/connect`、Node Connection/Gateway/SessionController 和 Cordis Fiber lifecycle。Host 插件只原子投送0600、宿主 nonce 指定的 native local auth；Microsandbox 固定有界 reader 私下读取。Worker 固定已声明 endpoint 和 VM binding/epoch，独立长期 lifetime，关闭 join 自有 HTTP/WS/iterator 与 exact Job；无私有DSH接口、stdio桥、Agent状态或PG权威。该门卫/租约片不启用4.0流量，不代表 editor-ready、发送许可、完整idle或Linux工件已交付；新增员工端口的三方冻结安全重启另片实现。
 

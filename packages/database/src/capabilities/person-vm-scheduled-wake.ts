@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import {
+  DefaultPartnerProfile,
   EmployeeInstanceProfileSchema,
+  EmployeeManifestSchema,
   selectDEntryGeneration,
 } from '@allrice/contracts';
 import {
@@ -236,8 +238,13 @@ export async function readPersonVmEmployeeInstructions(
     if (!(await readPersonVmWakeRoster(tx, binding, [employee])))
       throw new PersonVmError('AUTHORIZATION_DENIED');
     const [row] = await tx<
-      { profile: unknown; name: string; description: string }[]
-    >`select i.profile,v.name,v.description
+      {
+        profile: unknown;
+        name: string;
+        description: string;
+        manifest: unknown;
+      }[]
+    >`select i.profile,v.name,v.description,v.manifest
       from allrice_employee_instances i
       join allrice_employee_versions v on v.id=${employee.employeeVersionId}
         and v.organization_id=i.organization_id and v.workspace_id=i.workspace_id
@@ -245,13 +252,17 @@ export async function readPersonVmEmployeeInstructions(
     if (!row) throw new PersonVmError('AUTHORIZATION_DENIED');
     const { name, description, role, mission, workStyle, expressionStyle } =
       EmployeeInstanceProfileSchema.parse(row.profile);
+    const version = EmployeeManifestSchema.safeParse(row.manifest).data;
+    const identity =
+      version?.schemaVersion === 2 ? version.identity : undefined;
+    const partner = version?.partnerProfile ?? DefaultPartnerProfile;
     return {
       name: name ?? row.name,
       description: description ?? row.description,
-      role,
-      mission,
-      workStyle,
-      expressionStyle,
+      role: role ?? identity?.role ?? partner.role,
+      mission: mission ?? identity?.mission ?? partner.mission,
+      workStyle: workStyle ?? identity?.workStyle,
+      expressionStyle: expressionStyle ?? partner.communicationStyle,
     };
   });
 }

@@ -291,6 +291,8 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
         readPersonVmEmployeeInstructions(owner, target, fixture.db);
       await expect(read()).resolves.toMatchObject({
         name: 'Original employee',
+        role: f.source.definition.identity.role,
+        mission: f.source.definition.identity.mission,
       });
       await expect(
         read(entry, { ...binding, personId: f.b.user.id }),

@@ -280,6 +280,7 @@ export function apply(ctx, config) {
                   id: 'system-prompt',
                   config: { includeHarnessIdentity: false, personaPrefix: '' },
                 },
+                { id: 'harness-dev-context', disabled: true },
               ]
             : []),
           {
@@ -288,7 +289,7 @@ export function apply(ctx, config) {
             config: {
               openBrowser: false,
               publicUrl: publicUrl.href,
-              surfaceContext: true,
+              surfaceContext: config.employeeInstructions === undefined,
               printUrl: false,
             },
           },

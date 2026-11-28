@@ -1145,6 +1145,10 @@ it.skipIf(!cli)(
       );
       expect(modelContext).not.toContain('You are a coding agent');
       expect(modelContext).not.toContain('You are ChatGPT');
+      expect(modelContext).not.toContain('DeepSeek Harness Web GUI');
+      expect(modelContext).not.toContain(
+        'DeepSeek Harness implementation checkout',
+      );
       expect(tools?.length).toBeGreaterThan(0);
     }
     expect(assistantInputs[1]!.messages).toEqual(
