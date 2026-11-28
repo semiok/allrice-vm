@@ -36,7 +36,10 @@ import {
   readEmployeeEntryIdentity,
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
+import { warmPublicProfileAssets } from '../../../lib/d-entry/public-profile-warmup';
 import styles from './employee-native-page.module.css';
+
+const noStartupAssets: readonly string[] = [];
 
 type Status =
   | 'warming'
@@ -83,6 +86,7 @@ type EntryWarmup = {
 function startEntryWarmup(
   selection: DEntrySelectionInput,
   lifetime: AbortController,
+  startupAssetUrls: readonly string[],
   ticket?: DEntryNativePrewarmTicket,
   foregroundOpen?: boolean,
 ): EntryWarmup {
@@ -101,6 +105,7 @@ function startEntryWarmup(
       lookup?.cancel.abort();
       lookup = undefined;
       progress.ticket = accepted;
+      void warmPublicProfileAssets(startupAssetUrls, lifetime.signal);
     },
     progress(state) {
       progress.current = state;
@@ -140,11 +145,14 @@ export function EmployeeNativePage({
   query,
   prepare = false,
   initialUnavailable = false,
+  startupAssetUrls = noStartupAssets,
 }: {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
+  startupAssetUrls?: readonly string[];
 }) {
+  const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
   const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
@@ -178,6 +186,10 @@ export function EmployeeNativePage({
     lastPropQuery.current = query;
     nextQuery.current = query;
   }
+
+  useEffect(() => {
+    assetUrls.current = startupAssetUrls;
+  }, [startupAssetUrls]);
 
   useEffect(() => {
     const discardPending = () => pendingWarmup.current?.lifetime.abort();
@@ -469,7 +481,11 @@ export function EmployeeNativePage({
         selectedEmployee?.workspaceId === selection.workspaceId &&
         selectedEmployee.employeeInstanceId === selection.employeeInstanceId;
       if (sameEmployee && !document.hidden) {
-        nextWarmup = startEntryWarmup(selection, new AbortController());
+        nextWarmup = startEntryWarmup(
+          selection,
+          new AbortController(),
+          assetUrls.current,
+        );
       }
       void retire().then((closed) => {
         if (replace.current !== applyQuery || detached) return;
@@ -727,6 +743,7 @@ export function EmployeeNativePage({
           warmup ??= startEntryWarmup(
             selection,
             lifetime,
+            assetUrls.current,
             ticket,
             activation.foregroundOpen,
           );

@@ -37,6 +37,7 @@ it
   .skipIf(!browserExecutable)
   .each([
     'refresh',
+    'cold-assets',
     'stall',
     'switch',
     'baseline',
@@ -48,15 +49,17 @@ it
       : []),
   ] as const)(
   'rc.2 workbench composer (%s)',
-  { timeout: 120_000 },
+  { timeout: process.env.ALLRICE_RUN_ASSET_BENCH ? 200_000 : 120_000 },
   async (scenario) => {
+    const coldAssets = scenario === 'cold-assets';
+    const bench = coldAssets && process.env.ALLRICE_RUN_ASSET_BENCH;
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
     const nativeCreate = scenario.startsWith('native-create');
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate;
+    const realShell = switching || nativeCreate || coldAssets;
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
@@ -180,7 +183,8 @@ it
             contents: `import { createRoot } from 'react-dom/client';
               import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
               createRoot(document.getElementById('root')).render(
-                <EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+                <EmployeeNativePage prepare query={location.search.slice(1)}
+                  startupAssetUrls={JSON.parse(document.getElementById('startup-assets')?.textContent ?? '[]')} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
           },
@@ -276,6 +280,45 @@ it
         bundle,
       ]),
     );
+    const publicEntry = publicRoot + 'managed/employee-web-entry.js';
+    const publicStyle = publicRoot + 'managed/employee-web-entry.css';
+    const coldPaths = [...publicBundles.keys(), publicEntry, publicStyle];
+    const coldRequests = new Map<string, number>();
+    const coldFinished = new Map<string, number>();
+    let readyAt: number | undefined;
+    let prewarmAt: number | undefined;
+    const operationId = randomUUID();
+    const coldWindow = bench ? 60_000 : 1_500;
+    const applicationTransfers: {
+      start: number;
+      end?: number;
+      bytes: number;
+    }[] = [];
+    async function sendColdApplication(
+      response: ServerResponse,
+      bytes: Buffer,
+    ) {
+      const transfer: (typeof applicationTransfers)[number] = {
+        start: performance.now(),
+        bytes: 0,
+      };
+      applicationTransfers.push(transfer);
+      const client = new AbortController();
+      response.once('close', () => client.abort());
+      try {
+        for (let offset = 0; offset < bytes.length; offset += 16_384) {
+          const chunk = bytes.subarray(offset, offset + 16_384);
+          response.write(chunk);
+          transfer.bytes += chunk.byteLength;
+          if (offset + chunk.byteLength < bytes.length)
+            await delay(350, undefined, { signal: client.signal });
+        }
+        transfer.end = performance.now();
+        response.end();
+      } catch (error) {
+        if (!client.signal.aborted) throw error;
+      }
+    }
     let earlyUrls: string[] = [];
     const seenEarly = new Set<string>();
     const earlyBootstrapSeen = deferred<void>();
@@ -314,13 +357,43 @@ it
           }
           if (url.pathname === '/api/v1/d-entry/native-prewarm') {
             request.resume();
-            return response.writeHead(204).end();
+            if (!coldAssets) return response.writeHead(204).end();
+            prewarmAt = performance.now();
+            return await copy(
+              new Response(
+                JSON.stringify({
+                  operationId,
+                  pollAfterMs: 1000,
+                  expiresAt: new Date(Date.now() + 180_000).toISOString(),
+                }),
+                {
+                  status: 202,
+                  headers: { 'content-type': 'application/json' },
+                },
+              ),
+            );
+          }
+          if (
+            coldAssets &&
+            url.pathname === '/api/v1/d-entry/native-prewarm/status'
+          ) {
+            const ready = performance.now() - prewarmAt! >= coldWindow;
+            if (ready) readyAt ??= performance.now();
+            return await copy(
+              Response.json({ state: ready ? 'ready' : 'starting' }),
+            );
           }
           if (url.pathname === '/chatflow/4.0') {
             return response
               .writeHead(200, { 'content-type': 'text/html' })
               .end(
-                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
+                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
+                  (coldAssets && bench !== 'progress'
+                    ? '<script id="startup-assets" type="application/json">' +
+                      JSON.stringify(coldPaths) +
+                      '</script>'
+                    : '') +
+                  '<script src="/outer.js"></script>',
               );
           }
           if (url.pathname === '/outer.js' || url.pathname === '/outer.css') {
@@ -394,18 +467,40 @@ it
           }
           const timing = { kind, start: performance.now(), end: 0 };
           traffic.push(timing);
-          await copy(
-            await f.publish(
-              kind,
-              scopeId!,
-              Object.fromEntries(url.searchParams),
-            ),
+          const result = await f.publish(
+            kind,
+            scopeId!,
+            Object.fromEntries(url.searchParams),
           );
+          if (
+            bench &&
+            kind === 'assets' &&
+            result.ok &&
+            url.searchParams.get('reference') === application.url
+          ) {
+            const bytes = gzipSync(Buffer.from(await result.arrayBuffer()));
+            response.writeHead(200, {
+              'content-type': 'text/javascript',
+              'content-encoding': 'gzip',
+              'content-length': bytes.length,
+              'cache-control': 'no-store',
+            });
+            await sendColdApplication(response, bytes);
+          } else await copy(result);
           timing.end = performance.now();
           return;
         }
         const publicBundle = !stall && publicBundles.get(url.pathname);
         if (publicBundle) {
+          if (coldAssets) {
+            coldRequests.set(
+              url.pathname,
+              (coldRequests.get(url.pathname) ?? 0) + 1,
+            );
+            response.once('finish', () =>
+              coldFinished.set(url.pathname, performance.now()),
+            );
+          }
           if (earlyUrls.includes(url.pathname)) {
             seenEarly.add(url.pathname);
             if (seenEarly.size === earlyUrls.length)
@@ -428,16 +523,45 @@ it
           const encoded = gzipSync(bytes);
           await delay(180);
           timing.end = performance.now();
-          response
+          response.writeHead(200, {
+            'content-type': 'text/javascript',
+            'cache-control': 'public, max-age=31536000, immutable',
+            'content-encoding': 'gzip',
+            'content-length': encoded.length,
+            vary: 'accept-encoding',
+          });
+          if (bench && publicBundle.phase === 'application')
+            await sendColdApplication(response, encoded);
+          else response.end(encoded);
+          return;
+        }
+        if (coldAssets && url.pathname.startsWith(publicRoot)) {
+          const file = url.pathname.slice(publicRoot.length);
+          if (!staticFiles.has('/' + file))
+            return response.writeHead(404).end();
+          if (coldPaths.includes(url.pathname)) {
+            coldRequests.set(
+              url.pathname,
+              (coldRequests.get(url.pathname) ?? 0) + 1,
+            );
+            response.once('finish', () =>
+              coldFinished.set(url.pathname, performance.now()),
+            );
+            if (readyAt === undefined)
+              expect(request.headers.cookie).toBeUndefined();
+          }
+          const encoded = gzipSync(
+            await readFile(join(release.directory, file)),
+          );
+          return response
             .writeHead(200, {
-              'content-type': 'text/javascript',
-              'cache-control': 'public, max-age=31536000, immutable',
+              'content-type': mime[extname(file)] ?? 'application/octet-stream',
               'content-encoding': 'gzip',
               'content-length': encoded.length,
+              'cache-control': 'public, max-age=31536000, immutable',
               vary: 'accept-encoding',
             })
             .end(encoded);
-          return;
         }
         if (staticFiles.has(url.pathname)) {
           if (
@@ -561,7 +685,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          <link rel="stylesheet" href="/managed/employee-web-entry.css">
+          <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
@@ -570,7 +694,7 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="/managed/employee-web-entry.js"></script>`);
+          <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
       } catch {
         response.writeHead(500).end();
       }
@@ -584,6 +708,16 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (bench) {
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false,
+        latency: 200,
+        downloadThroughput: 228_000,
+        uploadThroughput: 228_000,
+      });
+    }
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
       await page.addInitScript((linuxProfile) => {
@@ -696,6 +830,52 @@ it
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
+    if (coldAssets) {
+      const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
+      if (bench === 'baseline') {
+        await alert.waitFor({ timeout: 145_000 });
+        expect(applicationTransfers).toHaveLength(2);
+        expect(
+          applicationTransfers.every(
+            (transfer) => transfer.bytes > 0 && !transfer.end,
+          ),
+        ).toBe(true);
+        expect(scopedBundleReads).toBe(1);
+      } else {
+        await editor.fill('冷启动后的草稿', {
+          timeout: bench ? 145_000 : 20_000,
+        });
+        expect(await editor.isEditable()).toBe(true);
+        await expect.poll(() => alert.count()).toBe(0);
+        expect(scopedBundleReads).toBe(0);
+        if (bench !== 'progress')
+          for (const url of coldPaths) {
+            expect(coldFinished.get(url)).toBeLessThan(readyAt!);
+            expect(coldRequests.get(url)).toBe(1);
+          }
+      }
+      console.info(
+        'COLD_ASSET_BENCH ' +
+          JSON.stringify({
+            mode: bench || 'warming-test',
+            readyToOutcomeMs: Math.round(performance.now() - readyAt!),
+            prewarmToReadyMs: Math.round(readyAt! - prewarmAt!),
+            browser: browser.version(),
+            initialTransferMs: applicationTransfers.map(({ start, end }) =>
+              end === undefined ? null : Math.round(end - start),
+            ),
+            originApplicationBytes: applicationTransfers.map(
+              ({ bytes }) => bytes,
+            ),
+            requests: Object.fromEntries(coldRequests),
+            completedBeforeReady: coldPaths.filter(
+              (url) => (coldFinished.get(url) ?? Infinity) < readyAt!,
+            ).length,
+          }),
+      );
+      await context.close();
+      return;
+    }
     try {
       // The iframe loads its native bundles before opening workspace/follow.
       // Navigation alone does not mean the browser has even sent that open.

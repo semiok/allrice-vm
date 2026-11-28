@@ -37,6 +37,31 @@ async function listFiles(root, prefix = '') {
   return files;
 }
 
+const managedEntry = 'managed/employee-web-entry.js';
+const nativeStartup = /^native\/assets\/(?:index|vendor)-[\w-]+\.(?:js|css)$/;
+
+function managedStartupImports(outputs) {
+  const entry = Object.keys(outputs).find((path) =>
+    path.endsWith('/' + managedEntry),
+  );
+  if (!entry) throw new Error('Missing Employee Web startup entry');
+  const seen = new Set();
+  function visit(path) {
+    if (seen.has(path)) return;
+    if (!outputs[path] || !/\/managed\/[\w-]+\.js$/.test(path))
+      throw new Error('Invalid Employee Web startup import');
+    seen.add(path);
+    for (const item of outputs[path].imports)
+      if (item.kind === 'import-statement') {
+        if (item.external)
+          throw new Error('Unsealed Employee Web startup import');
+        visit(item.path);
+      }
+  }
+  visit(entry);
+  return [...seen].map((path) => path.slice(path.lastIndexOf('/managed/') + 1));
+}
+
 /** Only sealed code is copied. The profile graph and all authenticated responses
  * remain on their existing private paths. Next serves the staged bytes itself. */
 export async function stageDshProfileAssets(root, sourceSha) {
@@ -86,10 +111,7 @@ export async function stageDshProfileAssets(root, sourceSha) {
     const paths = [...proofs.keys()].filter(
       (path) => typeof path === 'string' && browserAsset.test(path),
     );
-    const required = [
-      'managed/employee-web-entry.js',
-      'managed/employee-web-entry.css',
-    ];
+    const required = [managedEntry, 'managed/employee-web-entry.css'];
     if (required.some((path) => !paths.includes(path)))
       throw new Error('Employee Web public entry is missing');
     for (const path of paths) await copy(path, path);
@@ -123,7 +145,20 @@ export async function stageDshProfileAssets(root, sourceSha) {
         sha256: row.sha256,
       });
     }
-    const index = JSON.stringify({ stamp, paths, bundles }) + '\n';
+    const kernel = JSON.parse(
+      await readRegular(join(source, 'kernel-inputs.json')),
+    );
+    const startup = [
+      ...new Set([
+        ...bundles.map(({ sha256 }) => 'bundles/' + sha256 + '.js'),
+        ...managedStartupImports(kernel.outputs),
+        required[1],
+        ...paths.filter((path) => nativeStartup.test(path)),
+      ]),
+    ];
+    if (startup.some((path) => !paths.includes(path)))
+      throw new Error('Employee Web startup asset is not public');
+    const index = JSON.stringify({ stamp, paths, bundles, startup }) + '\n';
     await rename(staging, target).catch(async (error) => {
       if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
       // Re-preparing the same build verifies its existing staged copy.
@@ -141,7 +176,7 @@ export async function stageDshProfileAssets(root, sourceSha) {
           );
       }
     });
-    const indexPath = join(next, 'server/dsh-profile-' + stamp + '.json');
+    const indexPath = join(next, 'server/dsh-profile.json');
     await writeFile(indexPath, index, { flag: 'wx' }).catch(async (error) => {
       if (
         error.code !== 'EEXIST' ||

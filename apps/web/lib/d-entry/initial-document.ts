@@ -6,15 +6,11 @@ import {
   pageStartupFailed,
 } from './page-messages.ts';
 
-export const profileBundleTimeoutMs = 30_000;
-
-// These options are only for content-addressed JS from the verified release
-// index. A page refresh should reuse these bytes even if other requests recheck.
-export const sealedProfileBundleFetch = {
-  cache: 'force-cache',
-  credentials: 'omit',
-  redirect: 'error',
-} as const;
+import {
+  downloadProfileResource,
+  profileDownloadLimits,
+  sealedProfileBundleFetch,
+} from './profile-download.ts';
 
 const publicBundlePath =
   /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/bundles\/[a-f0-9]{64}\.js$/;
@@ -86,19 +82,13 @@ export const initialDocumentLifecycle = `(() => {
   catch { urls = []; }
   if (Array.isArray(urls) && urls.length <= 2) for (const url of urls) {
     if (typeof url !== 'string' || !pattern.test(url) || reads.has(url)) continue;
-    const bytes = (async () => {
-      const signal = AbortSignal.any([
-        controller.signal, earlyRequest.signal, AbortSignal.timeout(${profileBundleTimeoutMs}),
-      ]);
-      const response = await fetch(url, { ...${JSON.stringify(sealedProfileBundleFetch)}, signal });
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw Error('Employee profile bundle unavailable');
-      }
-      const bytes = await response.arrayBuffer();
-      signal.throwIfAborted();
-      return bytes;
-    })();
+    const bytes = (${downloadProfileResource.toString()})(
+      url,
+      AbortSignal.any([controller.signal, earlyRequest.signal]),
+      ${JSON.stringify(sealedProfileBundleFetch)},
+      ${JSON.stringify(profileDownloadLimits)},
+      (body) => new Response(body).arrayBuffer()
+    );
     reads.set(url, bytes);
     pending.add(bytes);
     const settled = () => pending.delete(bytes);

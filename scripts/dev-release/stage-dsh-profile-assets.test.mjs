@@ -12,7 +12,10 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
-import { readReleasedProfileAssets } from '../../apps/web/lib/d-entry/released-profile-assets.ts';
+import {
+  readReleasedProfileAssets,
+  readStartupProfileAssetUrls,
+} from '../../apps/web/lib/d-entry/released-profile-assets.ts';
 import { stageDshProfileAssets } from './stage-dsh-profile-assets.mjs';
 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -24,6 +27,8 @@ const reference = 'plugins/??application/client.js&rev=build';
 const paths = {
   'managed/employee-web-entry.js': 'export const runtime = 1;',
   'managed/employee-web-entry.css': '.entry {color: black}',
+  'managed/chunk-startup.js': 'export const dependency = 1;',
+  'managed/lazy-language.js': 'export const language = 1;',
   'managed/entry.js.map': '{"privateSource":true}',
   'native/index.html': '<div>Do not publish HTML</div>',
   'native/assets/vendor-aaaaaaaa.css':
@@ -68,6 +73,27 @@ async function fixture(op) {
           ],
         },
       });
+      await writeFile(
+        join(root, artifact, 'kernel-inputs.json'),
+        JSON.stringify({
+          outputs: {
+            '../fixture/managed/employee-web-entry.js': {
+              imports: [
+                {
+                  path: '../fixture/managed/chunk-startup.js',
+                  kind: 'import-statement',
+                },
+                {
+                  path: '../fixture/managed/lazy-language.js',
+                  kind: 'dynamic-import',
+                },
+              ],
+            },
+            '../fixture/managed/chunk-startup.js': { imports: [] },
+            '../fixture/managed/lazy-language.js': { imports: [] },
+          },
+        }),
+      );
       await writeFile(join(root, artifact, 'artifact.json'), manifest);
       return digest(manifest);
     };
@@ -93,17 +119,16 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
       ),
     ).toBe('test font payload');
     expect(await readdir(join(directory, 'managed'))).toEqual([
+      'chunk-startup.js',
       'employee-web-entry.css',
       'employee-web-entry.js',
+      'lazy-language.js',
     ]);
     const bundle = 'bundles/' + digest(body) + '.js';
     expect(await readFile(join(directory, bundle), 'utf8')).toBe(body);
     expect(
       JSON.parse(
-        await readFile(
-          join(root, next, 'server/dsh-profile-' + first + '.json'),
-          'utf8',
-        ),
+        await readFile(join(root, next, 'server/dsh-profile.json'), 'utf8'),
       ),
     ).toMatchObject({
       stamp: first,
@@ -113,6 +138,15 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
     const entrypoint = join(root, 'apps/web/server.mjs');
     const released = await readReleasedProfileAssets(first, entrypoint);
     expect(released.root).toBe('/_next/static/dsh-profile/' + first + '/');
+    expect(await readStartupProfileAssetUrls(entrypoint)).toEqual(
+      [
+        bundle,
+        'managed/employee-web-entry.js',
+        'managed/chunk-startup.js',
+        'managed/employee-web-entry.css',
+        'native/assets/vendor-aaaaaaaa.css',
+      ].map((path) => released.root + path),
+    );
     await expect(
       readReleasedProfileAssets('0'.repeat(64), entrypoint),
     ).resolves.toBeUndefined();

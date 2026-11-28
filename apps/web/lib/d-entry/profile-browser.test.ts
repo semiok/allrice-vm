@@ -192,3 +192,62 @@ it('bounds a stalled public bundle plus its scoped fallback', async () => {
   await rejected;
   expect(request).toHaveBeenCalledTimes(2);
 });
+
+it('keeps receiving a progressing bundle past thirty seconds without restarting', async () => {
+  vi.useFakeTimers();
+  let body!: ReadableStreamDefaultController<Uint8Array>;
+  const request = vi.fn(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            body = controller;
+          },
+        }),
+      ),
+  );
+  vi.stubGlobal('fetch', request);
+  const result = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    new AbortController().signal,
+  );
+  for (let i = 0; i < 4; i++) {
+    await vi.advanceTimersByTimeAsync(15_000);
+    body.enqueue(Uint8Array.of(65 + i));
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  body.close();
+  expect(new TextDecoder().decode(await result)).toBe('ABCD');
+  expect(request).toHaveBeenCalledOnce();
+});
+
+it('bounds even a continuously progressing download', async () => {
+  vi.useFakeTimers();
+  const bodies: ReadableStreamDefaultController<Uint8Array>[] = [];
+  const request = vi.fn(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            bodies.push(controller);
+          },
+        }),
+      ),
+  );
+  vi.stubGlobal('fetch', request);
+  const result = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    new AbortController().signal,
+    '/public.js',
+  );
+  for (let i = 0; i < 7; i++) {
+    await vi.advanceTimersByTimeAsync(15_000);
+    bodies[0]!.enqueue(Uint8Array.of(65));
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(request).toHaveBeenCalledTimes(2);
+  bodies[1]!.enqueue(Uint8Array.of(66));
+  bodies[1]!.close();
+  expect(new TextDecoder().decode(await result)).toBe('B');
+});

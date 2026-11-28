@@ -11,11 +11,12 @@ import {
   decodeDEntryRegisteredThread,
 } from '@allrice/contracts';
 import { z } from 'zod';
+import type { EarlyProfileBundles } from './initial-document';
 import {
-  profileBundleTimeoutMs,
+  downloadProfileResource,
+  profileDownloadLimits,
   sealedProfileBundleFetch,
-  type EarlyProfileBundles,
-} from './initial-document';
+} from './profile-download';
 import {
   nativeMuxUrl,
   pageClosing,
@@ -139,34 +140,19 @@ export class EmployeeProfileBundleTimeout extends Error {
   }
 }
 
-async function fetchProfileBundle(
+function fetchProfileBundle(
   url: URL | string,
   parent: AbortSignal,
   options: Pick<RequestInit, 'credentials' | 'cache' | 'redirect'>,
 ) {
-  parent.throwIfAborted();
-  const timeout = new AbortController();
-  const until = AbortSignal.any([parent, timeout.signal]);
-  const timer = setTimeout(
-    () => timeout.abort(new EmployeeProfileBundleTimeout()),
-    profileBundleTimeoutMs,
+  return downloadProfileResource(
+    url,
+    parent,
+    options,
+    profileDownloadLimits,
+    (body) => new Response(body).arrayBuffer(),
+    new EmployeeProfileBundleTimeout(),
   );
-  try {
-    const response = await fetch(url, { ...options, signal: until });
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw Error('Employee profile bundle unavailable');
-    }
-    // A 200 with a stalled body is subject to the same deadline as headers.
-    const bytes = await response.arrayBuffer();
-    until.throwIfAborted();
-    return bytes;
-  } catch (error) {
-    until.throwIfAborted();
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 export async function readProfileBundle(
