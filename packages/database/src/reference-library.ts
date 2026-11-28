@@ -516,6 +516,7 @@ export async function readReferenceWriteReceipt(
         source_workspace_id?: string;
         revision_id?: string;
         ready?: boolean;
+        archived?: boolean;
       }
     | undefined;
   if (
@@ -565,7 +566,8 @@ export async function readReferenceWriteReceipt(
     ['publish-file', 'publish-upload', 'capture'].includes(value.operation)
   ) {
     [row] =
-      await db`select q.input,s.id source_id,r.id revision_id,(o.state='ready') ready
+      await db`select q.input,s.id source_id,r.id revision_id,(o.state='ready') ready,
+        (s.status='archived') archived
       from allrice_knowledge_save_requests q join allrice_knowledge_revisions r on r.id=q.revision_id
       join allrice_knowledge_sources s on s.id=r.knowledge_source_id
       join allrice_storage_objects o on o.id=r.file_object_id
@@ -599,6 +601,9 @@ export async function readReferenceWriteReceipt(
         }
       : null,
     ready: row?.ready ?? null,
+    ...(value.operation === 'publish-upload' && row?.archived
+      ? { archived: true }
+      : {}),
   });
 }
 

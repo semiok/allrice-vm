@@ -96,6 +96,8 @@ export const PanelWriteReceiptSchema = z
       ])
       .nullable(),
     ready: z.boolean().nullable(),
+    // Positive proof that an original publication is no longer active.
+    archived: z.literal(true).optional(),
   })
   .strict();
 export interface AuthorizedMaterialResource {

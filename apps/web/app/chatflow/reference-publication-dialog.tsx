@@ -75,6 +75,7 @@ const receiptList = z.array(receiptSchema);
 type SavedPublication = Parameters<Props['onSaved']>[0];
 type Resolution =
   { outcome: 'recorded'; saved: SavedPublication } | { outcome: 'rejected' };
+type PublicationRead = Resolution | { outcome: 'archived' };
 const settledPublications = new Map<string, Resolution>();
 const publicationRecordKey = (key: string, requestId: string) =>
   key + '/' + requestId;
@@ -182,7 +183,7 @@ async function checkPublication(
   key: string,
   receipt: PublicationReceipt,
   signal: AbortSignal,
-): Promise<Resolution | undefined> {
+): Promise<PublicationRead | undefined> {
   signal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
   signal.throwIfAborted();
   const known = settledPublications.get(
@@ -208,6 +209,8 @@ async function checkPublication(
       (response.ready !== true || !('revisionId' in saved)))
   )
     return;
+  if (receipt.operation === 'publish-upload' && response.archived)
+    return { outcome: 'archived' };
   // A background read can refresh the list, but only a matching submission
   // can acknowledge the result and retire its intent.
   return { outcome: 'recorded', saved } as const;
@@ -389,7 +392,7 @@ function PublicationForm({
       string,
       {
         controller: AbortController;
-        result: Promise<Resolution | undefined>;
+        result: Promise<PublicationRead | undefined>;
       }
     >(),
   ).current;
@@ -553,7 +556,7 @@ function PublicationForm({
       let requestId = requestIds.current.get(intentDigest) ?? proposed;
       if (dataClient) {
         if (!receiptKey) throw new ReceiptStorageUnavailable();
-        const held = readPending();
+        let held = readPending();
         const sameIntent = (receipt: PublicationReceipt) =>
           receipt.intentDigest === intentDigest;
         const prior =
@@ -579,9 +582,20 @@ function PublicationForm({
           if (resolution?.outcome === 'recorded') {
             settlePublication(receiptKey, prior, resolution);
             onSaved(resolution.saved);
-          } else
+            return;
+          }
+          if (resolution?.outcome !== 'archived') {
             setError(target.kind === 'upload' ? uploadError : publishError);
-          return;
+            return;
+          }
+          // An explicitly deleted upload has a terminal record. Only that
+          // proof permits a new publication for the same intent.
+          settlePublication(receiptKey, prior, { outcome: 'rejected' });
+          held = readPending();
+          if (held.some(sameIntent)) {
+            setError(uploadError);
+            return;
+          }
         }
         requestId = proposed;
         const record: PublicationReceipt = {

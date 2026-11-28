@@ -1067,6 +1067,80 @@ suite(
           await page
             .getByRole('button', { name: '‹ 企业资料', exact: true })
             .click();
+          const deletedName = '删除后再上传的资料.txt';
+          const deletedContent = '删除前后是同一个文件。';
+          await openUpload();
+          await selectFile(deletedName, deletedContent);
+          dropPublishReply = true;
+          await Promise.all([
+            page.waitForResponse(
+              (response) =>
+                response.request().method() === 'POST' &&
+                new URL(response.url()).pathname === publicationPath,
+            ),
+            publishMaterial(),
+          ]);
+          expect(incompleteReply?.writableFinished).toBe(false);
+          incompleteReply?.destroy();
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          const deletedRequest = publishWrites.at(-1)!;
+          await closeUpload();
+          const catalogBeforeDelete = await p.client.queryMaterials(
+            {
+              workspaceId: p.selection.workspaceId,
+              query: { query: '' },
+            },
+            signal(),
+          );
+          const deleted = catalogBeforeDelete.references.find(
+            (reference) => reference.fileName === deletedName,
+          );
+          expect(deleted?.publication?.origin).toBe('upload');
+          await p.client.changePublication(
+            {
+              sourceId: deleted!.sourceId,
+              body: {
+                workspaceId: p.selection.workspaceId,
+                expectedRevision: deleted!.publication!.audienceRevision,
+                requestId: randomUUID(),
+                action: 'delete',
+              },
+            },
+            signal(),
+          );
+          const [archivedReceipt] = await Promise.all([
+            page.waitForResponse(receiptResponse(deletedRequest)),
+            openUpload(),
+          ]);
+          expect(await archivedReceipt.json()).toMatchObject({
+            status: 'recorded',
+            archived: true,
+            result: { sourceId: deleted!.sourceId },
+          });
+          await selectFile(deletedName, deletedContent);
+          await publishMaterial();
+          await material.waitFor({ state: 'hidden' });
+          expect(publishWrites).toHaveLength(5);
+          expect(publishWrites.at(-1)).not.toBe(deletedRequest);
+          const replacement = await p.client.readWriteReceipt(
+            {
+              workspaceId: p.selection.workspaceId,
+              requestId: publishWrites.at(-1)!,
+              operation: 'publish-upload',
+            },
+            signal(),
+          );
+          expect(replacement.ready).toBe(true);
+          expect(replacement.archived).toBeUndefined();
+          expect(replacement.result).not.toMatchObject({
+            sourceId: deleted!.sourceId,
+          });
+          const beforeRejection = browserPublicationAttempts.length;
+          await page
+            .getByRole('button', { name: '‹ 企业资料', exact: true })
+            .click();
           await openUpload();
           await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
           await page.route(
@@ -1082,8 +1156,8 @@ suite(
             })
             .waitFor();
           const unknownId = browserPublicationAttempts.at(-1)!;
-          expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
-          expect(publishWrites).toHaveLength(3);
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
+          expect(publishWrites).toHaveLength(5);
           const [unknown] = await Promise.all([
             page.waitForResponse(receiptResponse(unknownId)),
             publishMaterial(),
@@ -1096,7 +1170,7 @@ suite(
           await material
             .getByText('上传中断，请重试。', { exact: true })
             .waitFor();
-          expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
           await assertQuiet(unknownId);
           // Two independent background reads straddle a real release change.
           // The earlier authorised reply cannot tell the UI what happened to
@@ -1136,11 +1210,27 @@ suite(
               status: 'recorded',
             });
             await assertQuiet(withdrawnId, unknownId);
-            expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
+            expect(browserPublicationAttempts).toHaveLength(
+              beforeRejection + 1,
+            );
           } finally {
             allowUnknown();
             lateRecorded.close();
           }
+          await policy('fixture-late-recorded-restored', true);
+          await openUpload();
+          await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
+          const [stillUnknown] = await Promise.all([
+            page.waitForResponse(receiptResponse(unknownId)),
+            publishMaterial(),
+          ]);
+          expect(await stillUnknown.json()).toMatchObject({
+            status: 'unknown',
+          });
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
           expect(referenceWrites).toBe(0);
           await page.unrouteAll({ behavior: 'wait' });
           await context.close();
