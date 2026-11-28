@@ -18,7 +18,6 @@ import {
   createEmployeeInstance,
   createSession,
   ensureBootstrapPortalPrincipal,
-  hasExistingDEntryEmployeeOrVm,
   requireDEntryNativeIdentity,
   revokeSession,
   updateDEntryReleasePolicy,
@@ -311,9 +310,11 @@ suite(
         phase: 'deleted',
         diskRetained: false,
       });
-      expect(await hasExistingDEntryEmployeeOrVm(owner, fixture.db)).toBe(
-        false,
-      );
+      expect(await store.read(personId)).toMatchObject({
+        phase: 'deleted',
+        diskRetained: false,
+        verifiedWebSlotCapacity: null,
+      });
     });
     const expiredTicket = { status: 410, json: { state: 'expired' } };
     const failedTicket = {
@@ -1792,7 +1793,7 @@ suite(
       });
       expect((await store.read(personId))?.diskRetained).toBe(true);
     });
-    it('requires real platform authorization, binds confirmation to the exact login and tombstone, and clears the first-employee VM gate only after purge', async () => {
+    it('requires real platform authorization for exact disk purge, preserving employees created after compute retirement', async () => {
       const owner = await createTarget();
       const personId = owner.actor.id;
       const admin = await authenticatePlatformSession(token);
@@ -1808,7 +1809,7 @@ suite(
         expectedOwnerId: personId,
         profile: {
           name: 'Disposable employee',
-          description: 'QA creation after VM purge',
+          description: 'QA creation after compute retirement',
         },
       };
       const created = await service.create(owner, signal());
@@ -1862,11 +1863,9 @@ suite(
         phase: 'deleted',
         diskRetained: true,
       });
-      expect(await hasExistingDEntryEmployeeOrVm(owner, fixture.db)).toBe(true);
-      await expect(
-        createEmployeeInstance(owner, employee),
-      ).rejects.toMatchObject({
-        code: 'd_entry_first_employee_limit',
+      const instance = await createEmployeeInstance(owner, employee);
+      expect(instance).toMatchObject({
+        profile: { name: employee.profile.name },
       });
       expect((await post(token, purge)).status).toBe(403);
       const next = await post(token, request);
@@ -1877,12 +1876,7 @@ suite(
         diskRetained: false,
       });
       expect((await post(token, confirmed)).status).toBe(403);
-      expect(await hasExistingDEntryEmployeeOrVm(owner, fixture.db)).toBe(
-        false,
-      );
-      expect(await createEmployeeInstance(owner, employee)).toMatchObject({
-        profile: { name: employee.profile.name },
-      });
+      expect(await createEmployeeInstance(owner, employee)).toEqual(instance);
       const audit =
         await fixture.db`select actor_id,resource_id,action,metadata,occurred_at
       from allrice_audit_events where resource_id=${created.vmId} order by occurred_at,action`;
@@ -2133,9 +2127,6 @@ suite(
           );
           await expect(crash).rejects.toThrow('resume preflight interrupted');
         }
-        expect(await hasExistingDEntryEmployeeOrVm(owner, fixture.db)).toBe(
-          true,
-        );
         await expect(service.create(owner, signal())).rejects.toMatchObject({
           code: 'CLEANUP_INCOMPLETE',
         });
@@ -2163,9 +2154,11 @@ suite(
             })
           ).json.vm.diskRetained,
         ).toBe(false);
-        expect(await hasExistingDEntryEmployeeOrVm(owner, fixture.db)).toBe(
-          false,
-        );
+        expect(await store.read(personId)).toMatchObject({
+          phase: 'deleted',
+          diskRetained: false,
+          verifiedWebSlotCapacity: null,
+        });
       },
     );
   },

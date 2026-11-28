@@ -5,9 +5,11 @@ import { UuidSchema } from '@allrice/contracts';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  readCompletePersonVmWakeRoster,
   readPersonNativeWebRoster,
   readPersonVmWakeRoster,
   getDatabase,
+  type ScheduledWakeClaim,
 } from '@allrice/database';
 import {
   PersonVmError,
@@ -53,58 +55,120 @@ export type ProductionScheduledWakeSource = Readonly<{
   start: WakeOptions['start'];
 }>;
 
+type WakeStore = ReturnType<typeof createPostgresPersonVmScheduledWakeStore>;
+function claimAuthority(
+  store: WakeStore,
+  claim: ScheduledWakeClaim,
+  assertClaim: () => Promise<boolean>,
+): Parameters<PersonVmService['startRetainedForSchedule']>[2] {
+  return {
+    async readStartup(active) {
+      active.throwIfAborted();
+      const read = async () =>
+        (await assertClaim()) ? store.readClaimStartup(claim) : null;
+      const startup = await read().catch((cause) => {
+        throw new PersonVmError('RUNTIME_NOT_READY', { cause });
+      });
+      active.throwIfAborted();
+      if (!startup) throw new PersonVmError('AUTHORIZATION_DENIED');
+      return startup;
+    },
+    async withCurrentAuthority(digest, active, work) {
+      active.throwIfAborted();
+      const completed = await store.withClaimAuthority(
+        claim,
+        active,
+        async (startup, dispatchSignal) => {
+          if (startup.digest !== digest)
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          return { result: await work(dispatchSignal) };
+        },
+      );
+      if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');
+      return completed.result;
+    },
+  };
+}
+
+export function createProductionRetainedWake(
+  store: WakeStore,
+): NonNullable<
+  ConstructorParameters<typeof PersonVmService>[0]['retainedWake']
+> {
+  return {
+    read: store.readRetainedWake,
+    async claim(binding, digest, ownerToken, signal) {
+      const claim = await store.claimRetainedWake(
+        binding,
+        digest,
+        ownerToken,
+        signal,
+      );
+      return {
+        ...claimAuthority(store, claim, () => store.isCurrent(claim)),
+        async finish(result) {
+          if (result === 'not-started') {
+            await store.releaseUnusedClaim(claim);
+            return;
+          }
+          const settled = await store.settle(
+            claim,
+            result === 'ready'
+              ? { state: 'ready' }
+              : { state: 'unknown', reason: 'START_UNCONFIRMED' },
+          );
+          if (result === 'ready' && !settled)
+            throw new PersonVmError('LEASE_LOST');
+        },
+      };
+    },
+  };
+}
+
 export function createProductionScheduledWakeSource(
   vm: Pick<PersonVmService, 'startRetainedForSchedule'>,
+  employeeMaxRunning: number,
+  db = getDatabase(),
 ): ProductionScheduledWakeSource {
-  const db = getDatabase();
   const store = createPostgresPersonVmScheduledWakeStore(db);
   return {
     async assertDeliverable({ binding }, profiles, signal) {
       signal.throwIfAborted();
-      const roster = await db.begin(
+      const scheduledEmployees = profiles.filter(({ batch }) =>
+        batch.items.some(({ status }) => status === 'active'),
+      ).length;
+      await db.begin(
         'isolation level repeatable read read only',
-        (tx) =>
-          readPersonVmWakeRoster(
+        async (tx) => {
+          const roster = await readPersonVmWakeRoster(
             tx,
             binding,
             profiles.map(({ origin }) => origin),
-          ),
+          );
+          if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+          const [physical] = await tx<
+            { verified_web_slot_capacity: number | null }[]
+          >`
+            select verified_web_slot_capacity from person_virtual_machines
+            where person_id=${binding.personId} and organization_id=${binding.organizationId}
+              and vm_id=${binding.vmId} and instance_id=${binding.instanceId}
+              and lease_epoch=${binding.leaseEpoch} and phase='running'`;
+          if (
+            !physical?.verified_web_slot_capacity ||
+            scheduledEmployees >
+              Math.min(employeeMaxRunning, physical.verified_web_slot_capacity)
+          )
+            throw new PersonVmError('RUNTIME_NOT_READY');
+        },
       );
       signal.throwIfAborted();
-      if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
     },
     async start(claim, assertClaim, signal) {
       try {
         await vm.startRetainedForSchedule(
           claim,
           claim.claimId,
-          {
-            async readRoster(active) {
-              active.throwIfAborted();
-              const read = async () =>
-                (await assertClaim()) ? store.readClaimRoster(claim) : null;
-              const roster = await read().catch((cause) => {
-                throw new PersonVmError('RUNTIME_NOT_READY', { cause });
-              });
-              active.throwIfAborted();
-              if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
-              return roster;
-            },
-            async withCurrentAuthority(digest, active, work) {
-              active.throwIfAborted();
-              const completed = await store.withClaimAuthority(
-                claim,
-                active,
-                async (roster, dispatchSignal) => {
-                  if (roster.digest !== digest)
-                    throw new PersonVmError('AUTHORIZATION_DENIED');
-                  return { result: await work(dispatchSignal) };
-                },
-              );
-              if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');
-              return completed.result;
-            },
-          },
+          claimAuthority(store, claim, assertClaim),
           signal,
         );
         return 'ready';
@@ -208,9 +272,20 @@ export function createProductionScheduledWake(input: {
           const roster =
             'context' in request
               ? await readPersonNativeWebRoster(request.context, input.database)
-              : request.scheduledRoster;
+              : await input.database.begin(
+                  'isolation level repeatable read read only',
+                  (tx) =>
+                    readCompletePersonVmWakeRoster(
+                      tx,
+                      binding,
+                      request.scheduledRoster.entries,
+                    ),
+                );
           signal.throwIfAborted();
           if (
+            !roster ||
+            (!('context' in request) &&
+              roster.digest !== request.scheduledRoster.digest) ||
             roster.personId !== binding.personId ||
             roster.organizationId !== binding.organizationId ||
             roster.entries.length === 0
@@ -331,7 +406,7 @@ export function createProductionScheduledWake(input: {
       if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
       const roster = await input.database.begin(
         'isolation level repeatable read read only',
-        (tx) => readPersonVmWakeRoster(tx, binding, expected.entries),
+        (tx) => readCompletePersonVmWakeRoster(tx, binding, expected.entries),
       );
       signal.throwIfAborted();
       if (paused || roster?.digest !== expected.digest)

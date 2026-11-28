@@ -71,7 +71,7 @@ export interface VmLease {
         },
   ): Promise<void>;
   /** Returns whether the replaced generation had already released capacity. */
-  reserveStartup?(row: VmRecord): Promise<boolean>;
+  reserveStartup?(row: VmRecord, audit?: VmAudit): Promise<boolean>;
   guard(expected?: DiskPoolOwner): Promise<void>;
   assertPhysicalOwner?(): Promise<void>;
   idleStopReceipt?(
@@ -1050,7 +1050,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         ...(this.maxResidentVms === undefined
           ? {}
           : {
-              reserveStartup: (record: VmRecord) =>
+              reserveStartup: (record: VmRecord, audit?: VmAudit) =>
                 session.query(() =>
                   sql.begin('isolation level read committed', async (tx) => {
                     if (reviewOnly || erasing || !ownsDurable)
@@ -1069,7 +1069,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
                       await tx`select ${releasedVmCapacity(tx)} as released
                       from person_virtual_machines vm
                       where vm.person_id=${personId} and vm.lease_owner=${token}`;
-                    await saveRecord(record, tx);
+                    await saveRecord(record, tx, audit);
                     return previous?.released === true;
                   }),
                 ),

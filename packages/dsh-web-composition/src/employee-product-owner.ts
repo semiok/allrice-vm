@@ -79,12 +79,17 @@ export function installEmployeeProductOwner(ctx: Context) {
     'x-allrice-workspace-id': selection.workspaceId,
     'x-allrice-organization-id': organizationId,
   };
-  function navigate(employeeInstanceId: string, target?: string) {
+  function navigate(
+    employeeInstanceId: string,
+    target?: string,
+    reopen = false,
+  ) {
     signal!.throwIfAborted();
     parent.postMessage(
       {
         type: pageNavigate,
         scopeId,
+        ...(reopen && { reopen }),
         selection: {
           workspaceId: selection.workspaceId,
           employeeInstanceId,
@@ -437,16 +442,15 @@ export function installEmployeeProductOwner(ctx: Context) {
               navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
-            if (
-              !employeeChoice(workspace, id) ||
-              id === selection.employeeInstanceId
-            )
+            if (!employeeChoice(workspace, id)) return;
+            if (id === selection.employeeInstanceId) {
+              navigate(id, activeThreadId);
               return;
+            }
             const session = sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
-            if (session) navigate(id, session.id);
-            else notice('此员工暂没有可打开的工作。');
+            navigate(id, session?.id, !session);
           },
           onNewSession(id) {
             if (!employeeChoice(workspace, id) || switchingScope) return;
@@ -476,7 +480,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             viewerId,
           },
           headers: requestHeaders,
-          onCreated: (instance) => navigate(instance.id),
+          onCreated: (instance) => navigate(instance.id, undefined, true),
         },
         openArchive: () => notice('当前入口暂无法打开归档。'),
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
+  cancelEmployeeCapacityWait,
   employeeEntryQuery,
   prepareEmployeeEntry,
   prewarmEmployeeEntry,
@@ -58,6 +59,41 @@ it('polls one ticket at 1, 2, then 3 seconds and can open after 125 seconds with
   expect(
     fetch.mock.calls.filter(([, options]) => options?.method === 'POST'),
   ).toHaveLength(1);
+});
+
+it('reports the active limit while queued and cancels only the exact ticket', async () => {
+  vi.useFakeTimers();
+  const ticket = {
+    operationId: randomUUID(),
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    pollAfterMs: 1000,
+  };
+  const fetch = vi
+    .fn<typeof globalThis.fetch>()
+    .mockResolvedValueOnce(
+      Response.json({ state: 'waiting_for_capacity', activeLimit: 3 }),
+    )
+    .mockResolvedValueOnce(
+      Response.json({ state: 'expired' }, { status: 410 }),
+    );
+  vi.stubGlobal('fetch', fetch);
+  const controller = new AbortController();
+  const progress = vi.fn();
+  const waiting = expect(
+    prewarmEmployeeEntry(selection, controller.signal, { ticket, progress }),
+  ).rejects.toBeInstanceOf(Error);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(progress).toHaveBeenLastCalledWith('starting', 3);
+  controller.abort();
+  await waiting;
+  await expect(
+    cancelEmployeeCapacityWait(selection, ticket, new AbortController().signal),
+  ).resolves.toBe(true);
+  expect(fetch.mock.calls[1]?.[0]).toBe(fetch.mock.calls[0]?.[0]);
+  expect(fetch.mock.calls[1]?.[1]).toMatchObject({
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
 });
 
 it('never restarts an expired ticket or polls after the browser abandons its wait', async () => {

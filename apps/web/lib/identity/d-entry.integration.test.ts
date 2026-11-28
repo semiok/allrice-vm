@@ -10,7 +10,6 @@ import {
   describe,
   expect,
   it,
-  onTestFinished,
   vi,
 } from 'vitest';
 import * as contracts from '@allrice/contracts';
@@ -28,7 +27,6 @@ import {
   signal,
 } from '../../../../packages/person-vm/src/test-support.ts';
 import * as client from '../../../../packages/database/src/core/client.ts';
-import * as firstEmployeeLimit from '../../../../packages/database/src/employees/d-entry-first-employee-limit.ts';
 import * as serviceBuild from '../../../../packages/database/src/service-build-identity.ts';
 import {
   createRuntimeFixtureDatabase,
@@ -114,7 +112,6 @@ import {
   preparePersonNativeWebRoster,
   readPersonNativeWebRoster,
   runDEntryAdmittedActivity,
-  hasExistingDEntryEmployeeOrVm,
   createEmployeeInstance,
   getEmployeeDetails,
   getOrganizationAiSharedDetails,
@@ -220,24 +217,14 @@ suite(
     beforeEach(() => {
       cookie.token = '';
     });
-    async function expectFirstEmployeeLimit(response: Response) {
+    async function expectEmployeeQuota(response: Response, message: string) {
       expect(response.status).toBe(409);
       expect(await response.json()).toMatchObject({
         error: {
-          code: 'CONFLICT',
-          message: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+          code: 'QUOTA_EXCEEDED',
+          message,
           retryable: false,
         },
-      });
-    }
-    function allowIsolatedSlotFixture() {
-      // Only these internal scenarios exercise multi-employee writes before
-      // release removes the temporary one-employee gate. All other checks use PG.
-      const guard = vi
-        .spyOn(firstEmployeeLimit, 'readFirstEmployeeLimit')
-        .mockResolvedValue(false);
-      onTestFinished(() => {
-        guard.mockRestore();
       });
     }
     afterAll(async () => {
@@ -2074,27 +2061,25 @@ suite(
           selections: [{ organizationId: f.org, personId: user }],
         });
         expect(await findDEntryEmployee(context)).toBeNull();
-        expect(await hasExistingDEntryEmployeeOrVm(context)).toBe(true);
         cookie.token = token;
         const requestId = randomUUID();
-        await expectFirstEmployeeLimit(
-          await createEmployee(
-            new Request('https://allrice.test/api/v1/employee-instances', {
-              method: 'POST',
-              headers: {
-                origin: 'https://allrice.test',
-                'x-allrice-organization-id': f.org,
-                'x-allrice-workspace-id': f.workspace,
-              },
-              body: JSON.stringify({
-                assignmentId,
-                workspaceId: f.workspace,
-                requestId,
-                profile: { name: '额外员工' },
-              }),
+        const legacyCreate = await createEmployee(
+          new Request('https://allrice.test/api/v1/employee-instances', {
+            method: 'POST',
+            headers: {
+              origin: 'https://allrice.test',
+              'x-allrice-organization-id': f.org,
+              'x-allrice-workspace-id': f.workspace,
+            },
+            body: JSON.stringify({
+              assignmentId,
+              workspaceId: f.workspace,
+              requestId,
+              profile: { name: '额外员工' },
             }),
-          ),
+          }),
         );
+        expect(legacyCreate.status).toBe(403);
         expect(
           await fixture.db`select id from allrice_employee_instances where owner_id=${user}`,
         ).toEqual([]);
@@ -2183,7 +2168,6 @@ suite(
         expect(await findDEntryEmployee(owner)).toBeNull();
         expect(await ensureDefaultEmployee(owner)).toBeNull();
         expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
-        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
         expect(
           await readPersonVmDiskPreparationTarget(ownerId, signal),
         ).toBeNull();
@@ -2192,17 +2176,15 @@ suite(
         await fixture.db`insert into person_virtual_machines
           (person_id,vm_id,organization_id,phase,disk_tier)
           values(${ownerId},${vmId},${f.org},'starting','warm')`;
-        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
-        await expectFirstEmployeeLimit(await create());
-        await fixture.db`update person_virtual_machines
-          set phase='deleted' where vm_id=${vmId}`;
-        await expectFirstEmployeeLimit(await create());
+        await expectEmployeeQuota(
+          await create(),
+          '当前工作台还没确认停机，停机后可以创建更多员工。',
+        );
         expect(
           await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
         ).toEqual([]);
         await fixture.db`update person_virtual_machines
-          set disk_retained=false where vm_id=${vmId}`;
-        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
+          set phase='deleted',disk_retained=false where vm_id=${vmId}`;
 
         const other = await setup();
         const legacy = await createBusinessThread(
@@ -2259,34 +2241,22 @@ suite(
         expect((await create()).status).toBe(403);
         await fixture.db`update allrice_memberships set role='member' where user_id=${ownerId}`;
 
-        const attempts = [input, { ...input, requestId: randomUUID() }];
-        const concurrent = await Promise.all(attempts.map(create));
-        expect(concurrent.map(({ status }) => status).sort()).toEqual([
-          201, 409,
-        ]);
-        await expectFirstEmployeeLimit(
-          concurrent.find((result) => result.status === 409)!,
-        );
-        const winner =
-          attempts[concurrent.findIndex((result) => result.status === 201)]!;
-        const responses = await Promise.all([create(winner), create(winner)]);
+        const responses = await Promise.all([create(), create()]);
         expect(responses.map(({ status }) => status)).toEqual([201, 201]);
         const [{ instance }, replay] = await Promise.all(
           responses.map((response) => response.json()),
         );
         expect(replay.instance).toEqual(instance);
-        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
-        await expectFirstEmployeeLimit(
-          await create({ ...input, requestId: randomUUID() }),
-        );
-        await expectFirstEmployeeLimit(
-          await create({
-            workspaceId: f.workspace,
-            assignmentId: instance.assignmentId,
-            requestId: randomUUID(),
-            profile: input.profile,
-          }),
-        );
+        expect(
+          (
+            await create({
+              workspaceId: f.workspace,
+              assignmentId: instance.assignmentId,
+              requestId: randomUUID(),
+              profile: input.profile,
+            })
+          ).status,
+        ).toBe(403);
         expect(
           await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
         ).toEqual([{ id: instance.id }]);
@@ -2464,7 +2434,6 @@ suite(
     });
 
     it('preserves a running legacy roster until its physical lifecycle has settled', async () => {
-      allowIsolatedSlotFixture();
       const f = await setup();
       const vmId = randomUUID(),
         instanceId = randomUUID();
@@ -2514,14 +2483,10 @@ suite(
         ]);
         for (const phase of ['running', 'starting', 'failed']) {
           await fixture.db`update person_virtual_machines set phase=${phase} where vm_id=${vmId}`;
-          const response = await create();
-          expect(response.status).toBe(409);
-          expect(await response.json()).toMatchObject({
-            error: {
-              code: 'QUOTA_EXCEEDED',
-              message: '当前工作台还没确认停机，停机后可以创建更多员工。',
-            },
-          });
+          await expectEmployeeQuota(
+            await create(),
+            '当前工作台还没确认停机，停机后可以创建更多员工。',
+          );
           expect(await readPersonNativeWebRoster(f.context)).toEqual(before);
         }
         await expect(
@@ -2533,7 +2498,10 @@ suite(
 
         await fixture.db`update person_virtual_machines set phase='stopped',lease_owner=${randomUUID()},
           lease_expires_at=clock_timestamp()+interval '2 minutes',egress_receipt=null where vm_id=${vmId}`;
-        expect((await create()).status).toBe(409);
+        await expectEmployeeQuota(
+          await create(),
+          '当前工作台还没确认停机，停机后可以创建更多员工。',
+        );
         await fixture.db`update person_virtual_machines set lease_owner=null,lease_expires_at=null where vm_id=${vmId}`;
         const accepted = await create();
         expect(accepted.status).toBe(201);
@@ -2550,7 +2518,6 @@ suite(
     });
 
     it('preserves the verified physical width across workspace writes when the platform cap changes in either direction', async () => {
-      allowIsolatedSlotFixture();
       const f = await setup();
       const other = randomUUID();
       const limit = 4;
@@ -2768,7 +2735,6 @@ suite(
     }
 
     it('shares the last real slot between self-creation and admin assignment and leaves the old roster usable', async () => {
-      allowIsolatedSlotFixture();
       const f = await setup();
       const source = await secondAssignmentSource(f);
       await clearPublished();
@@ -2914,8 +2880,36 @@ suite(
       );
     }
 
+    it('admits personal employees up to the default of 20 before the first VM is allocated', async () => {
+      const f = await setup();
+      await clearPublished();
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      try {
+        await updateDEntryReleasePolicy(f.context, {
+          revision: 'initial',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: f.org, personId: f.user }],
+        });
+        // The assignment already owns one slot, including before first boot.
+        for (let count = 1; count < 20; count++)
+          expect((await createPersonalThroughRoute(f)).status).toBe(201);
+        await expectEmployeeQuota(
+          await createPersonalThroughRoute(f),
+          '每人最多 20 个员工',
+        );
+        expect(
+          (await readPersonNativeWebRoster(f.context)).entries,
+        ).toHaveLength(20);
+        expect(
+          await fixture.db`select vm_id from person_virtual_machines where person_id=${f.user}`,
+        ).toEqual([]);
+      } finally {
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
+
     it('rolls back the real quality release as one write when disable freed the last 4.0 slot', async () => {
-      allowIsolatedSlotFixture();
       const f = await setup(),
         legacy = await setup(),
         admin = await setup();
@@ -3052,7 +3046,6 @@ suite(
     });
 
     it('fences writable membership while a real account activation owns the person row', async () => {
-      allowIsolatedSlotFixture();
       const f = await setup(),
         admin = await setup(),
         second = randomUUID();
@@ -3199,7 +3192,6 @@ suite(
     it.each(['running legacy', 'foreign owner', 'full pool'] as const)(
       'validates dormant member restore before account activation: %s',
       async (mode) => {
-        allowIsolatedSlotFixture();
         const f = await setup(),
           admin = await setup();
         const foreign = mode === 'foreign owner' ? await setup() : undefined;
@@ -3357,7 +3349,6 @@ suite(
     );
 
     it('refuses foreign create, restore and dormant assignment after A allocates the VM', async () => {
-      allowIsolatedSlotFixture();
       const a = await setup(),
         b = await setup(),
         admin = await setup();

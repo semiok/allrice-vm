@@ -40,6 +40,7 @@ import {
 } from '../d-entry/released-profile.js';
 
 import { dEntryStartupTiming } from '../d-entry/startup-timing.js';
+import type { ReportPrewarmCapacity } from '../d-entry/native-prewarm.js';
 
 type Startup = Pick<
   ReturnType<typeof createAssignedNativeWebStartup>,
@@ -168,6 +169,7 @@ export function installProductionDEntrySource(input: {
     identity: DEntryIdentity,
     signal: AbortSignal,
     expectedBinding?: PersonVmBinding,
+    reportCapacity?: ReportPrewarmCapacity,
   ) {
     async function readyProof(active: AbortSignal, expected?: PersonVmBinding) {
       const current = await currentDEntryNativeOwner(
@@ -245,6 +247,7 @@ export function installProductionDEntrySource(input: {
                   identity,
                   check,
                   running,
+                  ...(reportCapacity ? [reportCapacity] : []),
                 );
               return readyProof(running, binding);
             })();
@@ -270,9 +273,21 @@ export function installProductionDEntrySource(input: {
       boundary: input.admission,
       participant: input.admission.participant('entry'),
     },
-    assertEditorReady(context, identity, signal, expectedBinding) {
+    assertEditorReady(
+      context,
+      identity,
+      signal,
+      expectedBinding,
+      reportCapacity,
+    ) {
       return own(signal, (active) =>
-        proveSelectedEmployee(context, identity, active, expectedBinding),
+        proveSelectedEmployee(
+          context,
+          identity,
+          active,
+          expectedBinding,
+          reportCapacity,
+        ),
       );
     },
     confirmVerifiedEditor(context, identity, signal) {

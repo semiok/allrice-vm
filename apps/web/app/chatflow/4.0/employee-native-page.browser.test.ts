@@ -1,3 +1,4 @@
+import type { DEntryIdentity } from '@allrice/contracts';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -13,6 +14,7 @@ import { deferred } from '../../../../../packages/d-entry-principal/test/host-fi
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
 import {
   pageClosing,
+  pageCompletion,
   pageEditorMounted,
   pageNavigate,
 } from '../../../lib/d-entry/page-messages';
@@ -26,6 +28,349 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   const bytes: Buffer[] = [];
   for await (const chunk of request) bytes.push(Buffer.from(chunk));
   return JSON.parse(Buffer.concat(bytes).toString());
+}
+
+async function exerciseMultiEmployeeNavigation(
+  browser: Browser,
+  origin: string,
+  identity: DEntryIdentity,
+) {
+  const names = ['甲研究员', '乙编辑', '丙分析师', '丁文案', '戊顾问'];
+  const employees = names.map((name) => ({
+    id: randomUUID(),
+    isDefault: false,
+    currentVersion: { id: randomUUID(), manifest: { name } },
+  }));
+  const [a, b, c, d, e] = employees.map((employee) => employee.id) as [
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  const threads = new Map<string, string>(
+    [a, b, d, e].map((employee) => [employee, randomUUID()]),
+  );
+  const opens: string[] = [];
+  const warmups: string[] = [];
+  const creates: string[] = [];
+  const capacityTicket = randomUUID();
+  const capacityDeletes: string[] = [];
+  const capacityCancellation = deferred<void>();
+  const allowCapacityCancellation = deferred<void>();
+  const firstClose = deferred<void>();
+  const releaseClose = deferred<void>();
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+  });
+  try {
+    await context.routeWebSocket(
+      /\/api\/v1\/d-entry\/native-mux\?/,
+      (socket) => {
+        const employee = new URL(socket.url()).searchParams.get(
+          'employeeInstanceId',
+        )!;
+        const scopeId = randomUUID();
+        let streamId: string;
+        socket.onMessage(async (raw) => {
+          const packet = JSON.parse(raw.toString());
+          const send = (message: object) =>
+            socket.send(JSON.stringify({ streamId, ...message }));
+          if (packet.type === 'open') {
+            streamId = packet.streamId;
+            opens.push(employee);
+            send({
+              type: 'item',
+              value: {
+                type: 'opened',
+                scopeReference: { scopeId },
+                bindingRef: 'test-owner',
+              },
+            });
+          } else if (packet.type === 'end') {
+            if (opens.length === 1) {
+              firstClose.resolve();
+              await releaseClose.promise;
+            }
+            send({ type: 'item', value: { type: 'closed', scopeId } });
+            send({ type: 'end' });
+            await socket.close({ code: 1000 });
+          }
+        });
+      },
+    );
+    const page = await context.newPage();
+    page.setDefaultTimeout(10_000);
+    await page.addInitScript((completion) => {
+      if (window !== window.top) return;
+      addEventListener('message', (event) => {
+        if (event.origin === location.origin && event.data?.type === completion)
+          document.documentElement.dataset.fixtureOldDocumentClosed = 'yes';
+        if (
+          event.origin === location.origin &&
+          event.data?.fixtureLate === true
+        )
+          document.documentElement.dataset.fixtureLateDelivered = 'yes';
+      });
+    }, pageCompletion);
+    await page.route('**/api/v1/d-entry/native-prewarm', async (route) => {
+      const { selection } = route.request().postDataJSON();
+      warmups.push(selection.employeeInstanceId);
+      if (selection.employeeInstanceId === c) {
+        const attempt = warmups.filter((id) => id === c).length;
+        if (attempt === 1) return route.fulfill({ status: 503 });
+        if (attempt === 2)
+          return route.fulfill({
+            status: 202,
+            json: {
+              operationId: capacityTicket,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              pollAfterMs: 1000,
+            },
+          });
+      }
+      await route.fulfill({ status: 204 });
+    });
+    await page.route(
+      '**/api/v1/d-entry/native-prewarm/status?**',
+      async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        expect(url.origin).toBe(origin);
+        expect(Object.fromEntries(url.searchParams)).toEqual({
+          workspaceId: identity.workspaceId,
+          employeeInstanceId: c,
+          operationId: capacityTicket,
+        });
+        if (request.method() === 'DELETE') {
+          capacityDeletes.push(request.method());
+          capacityCancellation.resolve();
+          await allowCapacityCancellation.promise;
+          return route.fulfill({ status: 410, json: { state: 'expired' } });
+        }
+        expect(request.method()).toBe('GET');
+        await route.fulfill({
+          json: { state: 'waiting_for_capacity', activeLimit: 3 },
+        });
+      },
+    );
+    await page.route('**/api/v1/sessions?entry=4.0', async (route) => {
+      const { selection, operationId } = route.request().postDataJSON();
+      expect(selection).toEqual({
+        workspaceId: identity.workspaceId,
+        employeeInstanceId: c,
+      });
+      expect(operationId).toBeUndefined();
+      creates.push(selection.employeeInstanceId);
+      const threadId = randomUUID();
+      threads.set(c, threadId);
+      await route.fulfill({ json: { ...selection, threadId } });
+    });
+    await page.route('**/api/v1/d-entry/identity?**', async (route) => {
+      const query = new URL(route.request().url()).searchParams;
+      const employeeInstanceId = query.get('employeeInstanceId')!;
+      const threadId = query.get('threadId');
+      expect(threadId).toBe(threads.get(employeeInstanceId));
+      expect(query.get('workspaceId')).toBe(identity.workspaceId);
+      await route.fulfill({
+        json: { identity: { ...identity, employeeInstanceId, threadId } },
+      });
+    });
+    await page.route('**/chatflow/4.0/document?**', async (route) => {
+      const query = new URL(route.request().url()).searchParams;
+      const scopeId = query.get('scopeId');
+      const employee = query.get('employeeInstanceId');
+      const thread = query.get('threadId');
+      const directory = {
+        organizationId: identity.organizationId,
+        workspaceId: identity.workspaceId,
+        viewerId: identity.personId,
+        employees,
+        sessions: [...threads].map(([employeeInstanceId, id]) => ({
+          id,
+          employeeInstanceId,
+          employeeAssignmentId: employeeInstanceId,
+          employeeVersionId: identity.employeeVersionId,
+          title: '合成对话',
+          ownerId: identity.personId,
+          visibility: 'private',
+          updatedAt: '2026-11-27T00:00:00.000Z',
+          archivedAt: null,
+        })),
+      };
+      await route.fulfill({
+        contentType: 'text/html',
+        body: [
+          '<!doctype html><meta charset="utf-8">',
+          '<script data-scope-id="' +
+            scopeId +
+            '">' +
+            initialDocumentLifecycle +
+            '</script>',
+          '<div id="app" data-native-session-id="same-native-id" data-organization-id="' +
+            identity.organizationId +
+            '" data-viewer-id="' +
+            identity.personId +
+            '" data-workspace-id="' +
+            identity.workspaceId +
+            '" data-employee-instance-id="' +
+            employee +
+            '" data-thread-id="' +
+            thread +
+            '" data-scope-id="' +
+            scopeId +
+            '"></div>',
+          '<script id="allrice-employee-directory" type="application/json">' +
+            JSON.stringify(directory) +
+            '</script>',
+          '<script src="/outer.js"></script>',
+        ].join(''),
+      });
+    });
+    await page.goto(
+      origin +
+        '/chatflow/4.0?' +
+        new URLSearchParams({
+          workspaceId: identity.workspaceId,
+          employeeInstanceId: a,
+          threadId: threads.get(a)!,
+        }),
+    );
+    const frame = page.frameLocator('iframe');
+    const employeeButton = (index: number) =>
+      frame.getByRole('treeitem').filter({ hasText: names[index]! }).first();
+    const editor = frame.getByRole('textbox', { name: '消息' });
+    await editor.waitFor();
+    await editor.fill('甲的草稿');
+    await employeeButton(1).evaluate((button, latest) => {
+      if (!(button instanceof HTMLElement))
+        throw new Error('Expected an employee card');
+      button.click();
+      const card = document.querySelector('[aria-label="' + latest + '"]')!;
+      card.querySelector<HTMLElement>('[role=treeitem]')!.click();
+    }, names[2]!);
+    await firstClose.promise;
+    await page.locator('html[data-fixture-old-document-closed="yes"]').waitFor({
+      state: 'attached',
+    });
+    await frame.locator('#app').evaluate(
+      (container, late) => {
+        parent.postMessage(
+          {
+            type: late.type,
+            scopeId: (container as HTMLElement).dataset.scopeId,
+            selection: late.selection,
+            fixtureLate: true,
+          },
+          location.origin,
+        );
+      },
+      {
+        type: pageNavigate,
+        selection: { workspaceId: identity.workspaceId, employeeInstanceId: d },
+      },
+    );
+    await page.locator('html[data-fixture-late-delivered="yes"]').waitFor({
+      state: 'attached',
+    });
+    expect(warmups).toEqual([a]);
+    releaseClose.resolve();
+    await page
+      .getByRole('alert')
+      .getByText('可以点重试，或者返回员工页。')
+      .waitFor();
+    expect(warmups).toEqual([a, c]);
+    expect(creates).toEqual([]);
+    await page.getByRole('button', { name: '重试', exact: true }).click();
+    const waiting = page.getByRole('status');
+    await waiting
+      .getByRole('heading', { name: '正在等待工作台名额' })
+      .waitFor();
+    expect(
+      await waiting
+        .getByText(
+          '当前工作台的 3 个运行名额已占用。有空位会自动继续，也可以取消等待。',
+          {
+            exact: true,
+          },
+        )
+        .isVisible(),
+    ).toBe(true);
+    expect(creates).toEqual([]);
+    await page.getByRole('button', { name: '取消等待', exact: true }).click();
+    await capacityCancellation.promise;
+    const continueButton = page.getByRole('button', {
+      name: '继续',
+      exact: true,
+    });
+    expect(await continueButton.isDisabled()).toBe(true);
+    expect(capacityDeletes).toEqual(['DELETE']);
+    expect(creates).toEqual([]);
+    allowCapacityCancellation.resolve();
+    await expect.poll(() => continueButton.isEnabled()).toBe(true);
+    await continueButton.click();
+    await editor.waitFor();
+    expect(warmups).toEqual([a, c, c, c]);
+    expect(await editor.inputValue()).toBe('');
+    expect(creates).toEqual([c]);
+    await editor.fill('丙的草稿');
+    for (const [index, id] of [
+      [1, b],
+      [3, d],
+      [4, e],
+      [0, a],
+      [2, c],
+    ] as const) {
+      await employeeButton(index).click();
+      await expect
+        .poll(() => new URL(page.url()).searchParams.get('employeeInstanceId'))
+        .toBe(id);
+      await frame.locator(`#app[data-employee-instance-id="${id}"]`).waitFor();
+      await editor.waitFor();
+      expect(await editor.inputValue()).toBe(
+        id === a ? '甲的草稿' : id === c ? '丙的草稿' : '',
+      );
+    }
+    expect(opens).toEqual([a, c, b, d, e, a, c]);
+    expect(creates).toEqual([c]);
+    const historyLength = await page.evaluate(() => history.length);
+    const currentScope = await frame
+      .locator('#app')
+      .getAttribute('data-scope-id');
+    await employeeButton(3).evaluate((row, current) => {
+      if (!(row instanceof HTMLElement))
+        throw Error('Expected an employee card');
+      row.click();
+      document
+        .querySelector<HTMLElement>(
+          '[aria-label="' + current + '"] [role=treeitem]',
+        )!
+        .click();
+    }, names[2]!);
+    await expect
+      .poll(() => frame.locator('#app').getAttribute('data-scope-id'))
+      .not.toBe(currentScope);
+    await editor.waitFor();
+    expect(opens).toEqual([a, c, b, d, e, a, c, c]);
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
+    await page.route('**/api/v1/employee-instances', (route) =>
+      route.fulfill({ status: 401 }),
+    );
+    await frame.getByRole('button', { name: '创建员工', exact: true }).click();
+    const dialog = frame.getByRole('dialog', { name: '创建 AI 员工' });
+    await dialog.locator('[data-employee-name]').fill('资料专员');
+    await dialog.getByRole('button', { name: '确认创建' }).click();
+    await dialog
+      .getByRole('alert')
+      .getByText('登录已过期，请重新登录')
+      .waitFor();
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    expect(await editor.inputValue()).toBe('丙的草稿');
+  } finally {
+    releaseClose.resolve();
+    allowCapacityCancellation.resolve();
+    await context.close();
+  }
 }
 
 suite('4.0 browser cold entry', () => {
@@ -46,11 +391,41 @@ suite('4.0 browser cold entry', () => {
         await require('esbuild').build({
           stdin: {
             contents: `import { createRoot } from 'react-dom/client';
+          import { useSyncExternalStore, useState } from 'react';
           import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
           import { EmployeeFirstStart } from './app/chatflow/4.0/employee-first-start';
-          createRoot(document.getElementById('root')).render(location.search
+          import { EmployeeCreateDialog } from './app/chatflow/employee-create-dialog';
+          import { EmployeeSidebarView } from './app/chatflow/employee-sidebar-view';
+          import { installEmployeeProductOwner } from '../../packages/dsh-web-composition/src/employee-product-owner';
+          import { installEmployeeDraftStorage } from '../../packages/dsh-web-composition/src/employee-draft-storage';
+          import { readEmployeeDocument } from './lib/d-entry/profile-browser';
+          const app = document.getElementById('app');
+          if (app) {
+            const owner = window.__ALLRICE_EMPLOYEE_DOCUMENT__;
+            window.__ALLRICE_D_ENTRY_LIFETIME__ = owner.signal;
+            installEmployeeDraftStorage(readEmployeeDocument(app.dataset));
+            const storageKey = 'dsh.conversation.fixture';
+            const root = createRoot(app);
+            function Sidebar({ port }) {
+              const snapshot = useSyncExternalStore(port.subscribe, port.getSnapshot);
+              const [draft, setDraft] = useState(() => localStorage.getItem(storageKey) ?? '');
+              const [creating, setCreating] = useState(false);
+              return snapshot && <><EmployeeSidebarView {...snapshot.tree} collapsed={false}/>
+                {snapshot.error && <p role="alert">{snapshot.error}</p>}
+                <button onClick={() => setCreating(true)}>创建员工</button>
+                {creating && <EmployeeCreateDialog {...port.createEmployee} personal onClose={() => setCreating(false)}/>}
+                <label>消息<input value={draft} onChange={e => {
+                  setDraft(e.target.value); localStorage.setItem(storageKey, e.target.value);
+                }}/></label></>;
+            }
+            installEmployeeProductOwner({ effect() {}, inject() {}, provide(name, port) {
+              if (name !== 'allriceEmployeeSidebar') return;
+              root.render(<Sidebar port={port}/>);
+              parent.postMessage({type: '${pageEditorMounted}', scopeId: owner.scopeId}, location.origin);
+            }});
+          } else createRoot(document.getElementById('root')).render(location.search
             ? <EmployeeNativePage prepare query={location.search.slice(1)} />
-            : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} creationBlocked={location.pathname === '/creation-limited'} />);`,
+            : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
           },
@@ -764,31 +1139,7 @@ suite('4.0 browser cold entry', () => {
         await firstStart.close();
       }
 
-      const limited = await context.newPage();
-      try {
-        const createRequests: string[] = [];
-        await limited.route('**/api/v1/employee-instances', async (route) => {
-          createRequests.push(route.request().method());
-          await route.abort();
-        });
-        await limited.goto(f.origin + '/creation-limited');
-        const notice = limited.getByRole('status').filter({
-          hasText: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
-        });
-        await notice.waitFor();
-        expect(await notice.textContent()).toBe(
-          '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
-        );
-        expect(
-          await limited
-            .getByRole('button', { name: '创建员工', exact: true })
-            .count(),
-        ).toBe(0);
-        expect(await limited.getByRole('dialog').count()).toBe(0);
-        expect(createRequests).toEqual([]);
-      } finally {
-        await limited.close();
-      }
+      await exerciseMultiEmployeeNavigation(browser, f.origin, f.identity);
     },
   );
 });

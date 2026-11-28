@@ -719,6 +719,7 @@ function prewarmStatus(
   server: Awaited<ReturnType<typeof nativeEntryServer>>,
   operationId: string,
   token = 'original_session_opaque_token',
+  method: 'GET' | 'DELETE' = 'GET',
 ) {
   const { threadId, ...selection } = server.body.selection;
   const query = new URLSearchParams({
@@ -730,6 +731,7 @@ function prewarmStatus(
   return fetch(
     `${server.origin}/internal/d-entry/native-prewarm/status?${query}`,
     {
+      method,
       headers: { authorization: `Bearer ${token}` },
     },
   );
@@ -991,6 +993,7 @@ it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
         identity,
         expect.any(AbortSignal),
         await f.h.service.resolve(context, signal()),
+        expect.any(Function),
       );
     else expect(assertEditorReady).not.toHaveBeenCalled();
   },
@@ -2129,6 +2132,131 @@ it('serves short polls over a cold startup longer than 125 seconds and deduplica
   }
 });
 
+it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
+  'exposes the owned capacity wait and only cancels before dispatch (%s)',
+  async (outcome) => {
+    const f = fixture();
+    const queued = deferred<void>();
+    const advance = deferred<void>();
+    const dispatched = deferred<void>();
+    const aborted = deferred<void>();
+    const joined = deferred<void>();
+    let owned: AbortSignal | undefined;
+    let waitingCurrent = true;
+    const otherToken = 'other_valid_login_token';
+    const otherLogin = { ...f.base.context, sessionId: randomUUID() };
+    const prewarm: DEntryNativePrewarmPort['prewarm'] = async (
+      _context,
+      _identity,
+      _trigger,
+      active,
+      _revoked,
+      _plan,
+      reportCapacity,
+    ) => {
+      owned = active;
+      active.addEventListener('abort', () => aborted.resolve(), { once: true });
+      reportCapacity?.(4);
+      queued.resolve();
+      await Promise.race([advance.promise, aborted.promise]);
+      if (!active.aborted) {
+        reportCapacity?.(undefined);
+        dispatched.resolve();
+      }
+      await joined.promise;
+      if (outcome === 'cleanup failure') throw Error('Join unconfirmed');
+      active.throwIfAborted();
+    };
+    const server = await nativeEntryServer(f.base, {
+      ...f.base.deps,
+      authenticate: async (token) =>
+        token === otherToken ? otherLogin : f.base.context,
+      prewarm: {
+        isCurrent: async (_context, _identity, _plan, _signal, mode) =>
+          mode !== 'waiting' || waitingCurrent,
+        prepare: async () => ({ key: 'exact-wait', target: f.base.binding }),
+        prewarm,
+      },
+    });
+    cleanups.push(server.close);
+    try {
+      const reply = await server.request('native-prewarm', {
+        ...f.base.body,
+        trigger: 'page',
+      });
+      expect(reply.status).toBe(202);
+      const { ticket } = await reply.json();
+      const id = ticket.operationId;
+      await queued.promise;
+      const status = await prewarmStatus(server, id);
+      expect(status.status).toBe(200);
+      expect(await status.json()).toEqual({
+        state: 'waiting_for_capacity',
+        activeLimit: 4,
+      });
+      for (const method of ['GET', 'DELETE'] as const) {
+        const foreign = await prewarmStatus(server, id, otherToken, method);
+        expect(foreign.status).toBe(410);
+        expect(await foreign.json()).toEqual({ state: 'expired' });
+      }
+      waitingCurrent = false;
+      for (const method of ['GET', 'DELETE'] as const) {
+        const guarded = await prewarmStatus(server, id, undefined, method);
+        expect(guarded.status).toBe(200);
+        expect(await guarded.json()).toEqual({ state: 'starting' });
+      }
+      waitingCurrent = true;
+      expect(owned?.aborted).toBe(false);
+      if (outcome === 'dispatch') {
+        advance.resolve();
+        await dispatched.promise;
+        const ignored = await prewarmStatus(server, id, undefined, 'DELETE');
+        expect(await ignored.json()).toEqual({ state: 'starting' });
+        expect(owned?.aborted).toBe(false);
+      } else {
+        let answered = false;
+        const cancelling = prewarmStatus(server, id, undefined, 'DELETE').then(
+          (response) => {
+            answered = true;
+            return response;
+          },
+        );
+        await aborted.promise;
+        expect(answered).toBe(false);
+        expect(f.base.authorityClose).not.toHaveBeenCalled();
+        joined.resolve();
+        const cancelled = await cancelling;
+        if (outcome === 'cleanup failure') {
+          expect(cancelled.status).toBe(503);
+          expect(
+            (
+              await server.request(
+                'native-prewarm',
+                {
+                  ...f.base.body,
+                  trigger: 'page',
+                },
+                { authorization: `Bearer ${otherToken}` },
+              )
+            ).status,
+          ).toBe(202);
+          expect(
+            (await prewarmStatus(server, id, undefined, 'DELETE')).status,
+          ).toBe(503);
+        } else {
+          expect(cancelled.status).toBe(410);
+          expect(await cancelled.json()).toEqual({ state: 'expired' });
+        }
+        expect(f.base.authorityClose).toHaveBeenCalled();
+        expect((await prewarmStatus(server, id)).status).toBe(410);
+      }
+    } finally {
+      advance.resolve();
+      joined.resolve();
+    }
+  },
+);
+
 it.each([
   [new DataAccessError('authorization_denied'), 'AUTHORITY_REVOKED'],
   [Error('authority observer disconnected'), 'START_UNAVAILABLE'],
@@ -2179,7 +2307,7 @@ it.each([
             'other_valid_login_token',
           )
         ).status,
-      ).toBe(404);
+      ).toBe(410);
       const gone = await prewarmStatus(restarted, ticket.operationId);
       expect(gone.status).toBe(410);
       expect(await gone.json()).toEqual({ state: 'expired' });

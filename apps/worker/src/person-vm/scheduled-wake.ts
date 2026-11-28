@@ -6,6 +6,7 @@ import type {
   NativeScheduleLedgerOrigin,
   ScheduledWakeClaim,
 } from '@allrice/database';
+import { PERSON_VM_WAKE_CLAIM_MS } from '@allrice/database';
 import {
   readNativeScheduleObservations,
   type NativeScheduleObservationBatch,
@@ -72,7 +73,6 @@ export type PrepareStopWithWakeResult =
     };
 
 const retryDelayMs = [10_000, 30_000, 60_000] as const;
-const claimMs = 5 * 60_000;
 export const DEFAULT_SCHEDULE_WAKE_LEAD_MS = 120_000;
 
 export function earliestNativeScheduleTarget(
@@ -196,7 +196,7 @@ export function createPersonVmScheduledWake(input: Options) {
      * interval, shutdown join, and monitoring of rejection/failure audit. */
     async runDueOnce(signal: AbortSignal): Promise<boolean> {
       signal.throwIfAborted();
-      const claim = await input.store.claim(claimMs);
+      const claim = await input.store.claim(PERSON_VM_WAKE_CLAIM_MS);
       if (!claim)
         return signal.aborted
           ? false

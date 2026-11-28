@@ -22,6 +22,7 @@ import type { ProductionPersonVmHostSources } from './production-host.js';
 import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
 import {
   DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  assertCompleteNativeActivityCensus,
   createProductionNativeActivity,
   getIdleScheduleGuardMs,
 } from './production-native-activity.js';
@@ -183,8 +184,13 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
-          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          scheduledWake: createProductionScheduledWakeSource(
+            host.vm,
+            host.providers.employeeRuntimeSettings.employeeMaxRunning,
+          ),
           nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            assertCompleteCensus: (binding, signal) =>
+              assertCompleteNativeActivityCensus(startup, binding, signal),
             sampleIntervalMs:
               host.providers.configuration.lifecycle.idleSampleIntervalMs ??
               DEFAULT_IDLE_SAMPLE_INTERVAL_MS,

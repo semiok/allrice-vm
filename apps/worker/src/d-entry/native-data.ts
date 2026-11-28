@@ -17,6 +17,7 @@ import {
   createDEntryPrincipalChildren,
 } from './principal-activity.js';
 import type { parseDEntryNativeInvocation } from './native-invocation.js';
+import type { ReportPrewarmCapacity } from './native-prewarm.js';
 
 export type DEntryNativeInvocation = Awaited<
   ReturnType<typeof parseDEntryNativeInvocation>
@@ -37,6 +38,7 @@ export interface DEntryNativeDataPort {
     identity: DEntryIdentity,
     signal: AbortSignal,
     expectedBinding?: PersonVmBinding,
+    reportCapacity?: ReportPrewarmCapacity,
   ): Promise<AbortSignal>;
   confirmVerifiedEditor?(
     context: RequestContext,

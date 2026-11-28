@@ -456,6 +456,8 @@ export * from './employee-memory-port.ts';
 export * from './capabilities/native-schedule-observation-ledger.ts';
 export {
   createPostgresPersonVmScheduledWakeStore,
+  PERSON_VM_WAKE_CLAIM_MS,
+  readCompletePersonVmWakeRoster,
   readPersonVmWakeRoster,
   withOwnedPersonVmAuthorityTransaction,
   type ScheduledWakeClaim,

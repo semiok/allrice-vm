@@ -83,6 +83,7 @@ import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 import {
   createProductionScheduledWake,
+  createProductionRetainedWake,
   type PersonVmWakePreparation,
   type ProductionScheduledWakeSource,
 } from './production-scheduled-wake.js';
@@ -92,6 +93,7 @@ import {
   IDLE_RECONCILE_TIMEOUT_MS,
 } from './production-native-activity.js';
 import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -722,6 +724,10 @@ export function createProductionPersonVmHost(input: {
               Math.floor(budget / (4096 + 512)),
             );
       if (budget !== undefined) capacityStore = store;
+      const employeeRuntime = createProductionEmployeeRuntime(
+        providers.employeeRuntimeSettings,
+        providers.platform.employeePortSlots,
+      );
       const diskRoot = providers.configuration.disk.root;
       const diskPool = new PersonVmDiskPool(
         diskRoot,
@@ -769,6 +775,8 @@ export function createProductionPersonVmHost(input: {
         disk: providers.disk,
         diskPool,
         nativeWeb: personNativeWebRoster,
+        employeeMaxRunning: employeeRuntime?.maxRunning,
+        retainedWake: createProductionRetainedWake(wakeStore),
         runtime,
         egress,
         observeOwnedStart(binding, context) {
@@ -885,6 +893,7 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
+        employeeRuntime,
         archive: {
           subscribe: subscribeDEntryEmployeeArchive,
           confirm: confirmDEntryEmployeeArchive,

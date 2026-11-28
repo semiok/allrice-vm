@@ -190,7 +190,10 @@ function fixture(useOpenAi = false) {
     current: Object.freeze({ withCurrentSelection }),
     startup: Object.freeze({ slottedEntryReceipt: vi.fn() }),
     admission: Object.freeze({}),
-    providers: { configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } } },
+    providers: {
+      configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } },
+      employeeRuntimeSettings: { employeeMaxRunning: 4 },
+    },
     lifetime: lifetime.signal,
   }) as unknown as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {
@@ -225,7 +228,7 @@ it.each([false, true])(
     const bound = await sources.bind(f.host);
     expect(io.openai).toHaveBeenCalledTimes(useOpenAi ? 1 : 0);
     expect(io.codex).toHaveBeenCalledTimes(useOpenAi ? 0 : 1);
-    expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm);
+    expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm, 4);
     expect(bound.scheduledWake).toBe(f.wake);
     const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
     const { context, identity, binding } = f.candidate;
