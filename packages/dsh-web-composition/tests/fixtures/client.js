@@ -3,7 +3,14 @@
 window.__ModuleLoader__.load({
   id: '@allrice/composition-test-fixture',
   factory: (require) => ({
-    inject: ['sessions', 'workspaces', 'uiWorkspace', 'theme', 'slots'],
+    inject: [
+      'sessions',
+      'workspaces',
+      'uiWorkspace',
+      'theme',
+      'slots',
+      'locale',
+    ],
     apply(ctx) {
       ctx.effect(() => {
         const product = require('@allrice/dsh-web-composition');
