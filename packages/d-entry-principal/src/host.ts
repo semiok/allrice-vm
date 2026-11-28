@@ -1206,22 +1206,23 @@ class PrincipalService extends TypertRemoteService {
           'unary',
         );
         let nativeArgs = args;
-        const workspace = this.graphObserver?.defaultWorkspace();
-        if (endpoint === 'session/create' && workspace) {
+        if (endpoint === 'session/create') {
           const { request } = Native.methods[endpoint]
             .input({ strict: true })
             .create()
             .parse(args);
+          const create = { ...request, agentPreset: 'standard' };
+          const workspace = this.graphObserver?.defaultWorkspace();
           if (
-            request.workspaceId === undefined &&
-            (request.cwd === undefined || request.cwd === workspace.path)
+            workspace &&
+            create.workspaceId === undefined &&
+            (create.cwd === undefined || create.cwd === workspace.path)
           ) {
-            const workspaceId = await workspace.ensure();
+            create.workspaceId = await workspace.ensure();
             active.throwIfAborted();
-            const create = { ...request, workspaceId };
             delete create.cwd;
-            nativeArgs = { request: create };
           }
+          nativeArgs = { request: create };
         }
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
         const modelInput =
