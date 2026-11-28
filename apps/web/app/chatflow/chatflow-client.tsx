@@ -3581,14 +3581,23 @@ export function ChatFlowClient({
                     if (useWorkbenchReference(reference) && layout.compact)
                       layout.close();
                   }}
-                  onUpload={(options) =>
-                    openPublicationDialog({ kind: 'upload' }, options)
+                  onUpload={
+                    workbenchEnabled
+                      ? (options) =>
+                          openPublicationDialog({ kind: 'upload' }, options)
+                      : undefined
                   }
                   onNotice={(text) =>
                     setPublicationNotice({ scope: settingsScope, text })
                   }
-                  onManage={(reference, action, options) =>
-                    openPublicationDialog({ kind: action, reference }, options)
+                  onManage={
+                    workbenchEnabled
+                      ? (reference, action, options) =>
+                          openPublicationDialog(
+                            { kind: action, reference },
+                            options,
+                          )
+                      : undefined
                   }
                 />
               ) : kind === 'experience' &&

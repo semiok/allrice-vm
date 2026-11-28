@@ -15637,6 +15637,34 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       await linkedWorkspace;
       await panel.getByRole('heading', { name: '资料原文' }).waitFor();
 
+      expect(
+        await panel
+          .getByRole('button', { name: /上传|编辑资料|删除资料|撤销资料/ })
+          .count(),
+      ).toBe(0);
+      const downloadPath = `/api/v1/references/revisions/${reference.revisionId}/download`;
+      await f.page.route(`**${downloadPath}?*`, (route) =>
+        route.fulfill({
+          contentType: 'text/plain',
+          body: 'scoped publication bytes',
+        }),
+      );
+      const [downloadRequest, download] = await Promise.all([
+        f.page.waitForRequest(
+          (request) => new URL(request.url()).pathname === downloadPath,
+        ),
+        f.page.waitForEvent('download'),
+        panel
+          .locator('header[aria-label="文件操作"]')
+          .getByRole('button', { name: '下载', exact: true })
+          .click(),
+      ]);
+      expect(downloadRequest.headers()['x-allrice-organization-id']).toBe(org);
+      expect(
+        new URL(downloadRequest.url()).searchParams.get('workspaceId'),
+      ).toBe(workspace);
+      expect(download.suggestedFilename()).toBe(reference.fileName);
+
       f.materials.references = [];
       f.materials.reads.length = 0;
       await f.page.goto(link.href);
