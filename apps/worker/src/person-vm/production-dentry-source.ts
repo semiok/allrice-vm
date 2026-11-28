@@ -399,9 +399,7 @@ export function installProductionDEntrySource(input: {
         const assertCurrent = (caller: AbortSignal) =>
           own(AbortSignal.any([revoked, caller]), async (signal) => {
             await owner.assertCurrent(scope, signal);
-            if (employeeStreams)
-              await input.confirmPhysical(scope, expected, binding, signal);
-            else if (!threadId)
+            if (!employeeStreams && !threadId)
               input.startup.assertVerifiedEditor(binding, signal, employee);
             sameHost(owner, expected);
             signal.throwIfAborted();

@@ -2261,6 +2261,18 @@ it
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
     );
+    if (warmRefresh) {
+      const proofAttempts = f.confirmVerifiedEditor.mock.calls.length;
+      f.confirmVerifiedEditor.mockResolvedValueOnce(undefined);
+      await page.reload({ waitUntil: 'commit' });
+      await editor.fill('热校验拒绝后由原预热入口打开', { timeout: 15_000 });
+      expect(f.confirmVerifiedEditor).toHaveBeenCalledTimes(proofAttempts + 1);
+      expect(
+        (await page.evaluate(timings)).reads.filter(
+          ([path]) => path === '/api/v1/d-entry/native-prewarm',
+        ),
+      ).toHaveLength(1);
+    }
     if (!warmRefresh)
       await page.evaluate(async () => {
         const finish: unknown = Reflect.get(window, 'finishCarrier');

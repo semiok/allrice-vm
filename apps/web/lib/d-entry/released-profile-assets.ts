@@ -30,6 +30,17 @@ export async function readLocalProfileAssets(entrypoint = process.argv[1]) {
   }
 }
 
+/** Private document delivery may only use the exact authorized Worker seal. */
+export async function readReleasedProfileAssets(
+  manifestSha256: string,
+  entrypoint?: string,
+) {
+  if (!sha.safeParse(manifestSha256).success) return undefined;
+  const release = await readLocalProfileAssets(entrypoint);
+  if (release?.stamp !== manifestSha256) return undefined;
+  return { root: release.root, paths: release.paths, bundles: release.bundles };
+}
+
 /** Warming only gets a list of code already staged in the public release. */
 export async function readStartupProfileAssetUrls(entrypoint?: string) {
   const release = await readLocalProfileAssets(entrypoint);

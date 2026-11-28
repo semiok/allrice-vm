@@ -455,10 +455,8 @@ it('only requires authenticated VM authority for employee-wide read streams', as
     access: 'employee-streams',
   });
   expect(f.beforeProof).not.toHaveBeenCalled();
-  expect(f.confirmPhysical).toHaveBeenCalledWith(
+  expect(f.owner.assertCurrent).toHaveBeenCalledWith(
     f.context,
-    input.identity,
-    f.binding,
     expect.any(AbortSignal),
   );
   await expect(
