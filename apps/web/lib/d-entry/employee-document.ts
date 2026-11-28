@@ -50,6 +50,7 @@ export async function renderEmployeeDocument(
   const address = inline
     ? { ...document!.address, selection, scopeId }
     : target;
+  const { bindingRef, graphRev } = address;
   const released = local?.stamp === address.manifestSha256 ? local : undefined;
   const bootstrap = document?.bootstrap;
   const assets = profileDirectory('static', address);

@@ -14,6 +14,7 @@ import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
   dEntryRegisteredThreadHeader,
+  dEntryWarmIdentityHeader,
   type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
@@ -70,7 +71,8 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const warmRefresh = scenario === 'refresh';
+    const realShell = switching || nativeCreate || coldAssets || warmRefresh;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -644,8 +646,23 @@ it
             );
           }
           if (url.pathname === '/api/v1/d-entry/native-prewarm') {
+            if (!coldAssets) {
+              const chunks: Buffer[] = [];
+              for await (const chunk of request)
+                chunks.push(Buffer.from(chunk));
+              const { selection } = JSON.parse(
+                Buffer.concat(chunks).toString(),
+              );
+              const headers = selection.threadId
+                ? {
+                    [dEntryWarmIdentityHeader]: JSON.stringify({
+                      identity: f.selectionIdentity(selection),
+                    }),
+                  }
+                : {};
+              return response.writeHead(204, headers).end();
+            }
             request.resume();
-            if (!coldAssets) return response.writeHead(204).end();
             prewarmAt = performance.now();
             return await copy(
               new Response(
@@ -2129,19 +2146,28 @@ it
         late.resolve();
       }
     }
-    await page.evaluate(async () => {
-      const finish: unknown = Reflect.get(window, 'finishCarrier');
-      if (typeof finish !== 'function')
-        throw Error('Fixture carrier unavailable');
-      await finish();
-    });
+    if (!warmRefresh)
+      await page.evaluate(async () => {
+        const finish: unknown = Reflect.get(window, 'finishCarrier');
+        if (typeof finish !== 'function')
+          throw Error('Fixture carrier unavailable');
+        await finish();
+      });
 
     const downloaded = () =>
       traffic.filter(({ kind }) => kind.startsWith('public-'));
     expect(downloaded()).toHaveLength(2);
     expect(scopedBundleReads).toBe(0);
+    const refreshCdp = await context.newCDPSession(page);
+    await refreshCdp.send('Network.enable');
+    await refreshCdp.send('Network.emulateNetworkConditions', {
+      offline: false,
+      latency: 400,
+      downloadThroughput: 1_250_000,
+      uploadThroughput: 1_250_000,
+    });
     const refreshedAt = performance.now();
-    await page.reload();
+    await page.reload({ waitUntil: 'commit' });
     await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
     const cached = await workbench.locator('#app').evaluate(
       (_, url) =>
@@ -2173,6 +2199,7 @@ it
       'SEALED_PROFILE_REFRESH ' +
         JSON.stringify({
           browser: browser.version(),
+          networkLatencyMs: 400,
           sealedBundleRequests: downloaded().length - 2,
           scopedBundleRequests: scopedBundleReads,
           applicationTransferBytes: cached[0]!.transferSize,
@@ -2183,12 +2210,13 @@ it
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
     );
-    await page.evaluate(async () => {
-      const finish: unknown = Reflect.get(window, 'finishCarrier');
-      if (typeof finish !== 'function')
-        throw Error('Fixture carrier unavailable');
-      await finish();
-    });
+    if (!warmRefresh)
+      await page.evaluate(async () => {
+        const finish: unknown = Reflect.get(window, 'finishCarrier');
+        if (typeof finish !== 'function')
+          throw Error('Fixture carrier unavailable');
+        await finish();
+      });
 
     await context.close();
   },
