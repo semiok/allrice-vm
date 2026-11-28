@@ -287,7 +287,9 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     const begin = db.begin.bind(db);
     let replies = 0;
     const lostCommitReply = vi.spyOn(db, 'begin').mockImplementation(((
-      operation: Parameters<typeof db.begin>[0],
+      operation: (
+        tx: Parameters<typeof assertDEntryNativeDeliveryRun>[0],
+      ) => Promise<unknown>,
     ) =>
       begin(operation).then((committed) => {
         if (++replies === 2) throw Error('fixture disconnected after COMMIT');
