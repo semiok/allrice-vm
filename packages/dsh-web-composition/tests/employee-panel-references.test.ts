@@ -7,6 +7,7 @@ import {
   employeePanelReferences,
 } from '../src/employee-panel-references';
 import { createEmployeePanelsDataPort } from '../src/employee-panels-data';
+import type { EmployeePanelsSnapshot } from '../src/employee-panels-port';
 import { syntheticPanelSnapshot } from './fixtures/employee-panels/presentation';
 import {
   createSyntheticPanelsData,
@@ -59,7 +60,9 @@ const fixture = (deferred = false) => {
     ...createSyntheticPanelsData().selection(revision.revisionId),
     canReference: true,
   };
-  const fetch = vi.fn(async () => new Response(JSON.stringify(result)));
+  const fetch = vi.fn<typeof globalThis.fetch>(
+    async () => new Response(JSON.stringify(result)),
+  );
   vi.stubGlobal('fetch', fetch);
   vi.stubGlobal('document', doc);
   vi.stubGlobal('__ALLRICE_D_ENTRY_LIFETIME__', lifetime.signal);
@@ -98,10 +101,16 @@ const fixture = (deferred = false) => {
       if (!deferred) activate();
     },
   } as Context);
-  const bindOwner = (signal: AbortSignal) => {
+  const bindOwner = (
+    signal: AbortSignal,
+    read?: (id: SessionIdOf) => EmployeePanelsSnapshot | null,
+  ) => {
     const snapshot = ownerSnapshot();
     return createEmployeePanelsDataPort(
-      { getSnapshot: () => snapshot, subscribe: () => () => undefined },
+      {
+        getSnapshot: read ?? (() => snapshot),
+        subscribe: () => () => undefined,
+      },
       () => unboundEmployeePanelDataClient,
       signal,
     );
@@ -124,6 +133,12 @@ const fixture = (deferred = false) => {
       ) => port?.useReference?.(request) ?? false,
     },
     bindOwner,
+    mountEditor(id: SessionIdOf) {
+      registerSlot.mock.calls[0]![1]({
+        sessionId: id,
+        inputActions: { captureInsertion },
+      });
+    },
     currentBinding,
     binding,
     currentSession,
@@ -139,6 +154,54 @@ const fixture = (deferred = false) => {
 };
 
 afterEach(() => vi.unstubAllGlobals());
+
+it('binds the saved reference to the currently selected root after an in-place switch', async () => {
+  const f = fixture();
+  const nextId = 'another-native-panel-session' as SessionIdOf;
+  const nextThread = uid(29);
+  const first = ownerSnapshot();
+  const next = {
+    ...first,
+    scopeKey: scopeId + '/' + nextThread,
+    publicationManagement: {
+      ...first.publicationManagement,
+      threadId: nextThread,
+    },
+    materials: { ...first.materials, sessionId: nextThread },
+    files: { ...first.files, sessionId: nextThread },
+  };
+  const port = f.bindOwner(f.lifetime.signal, (id) =>
+    id === sessionId ? first : id === nextId ? next : null,
+  );
+  expect(port.useReference?.(f.request)).toBe(true);
+  const [[oldChip]] = f.insertReference.mock.calls as unknown as [
+    [{ ref: string }],
+  ];
+  f.currentSession.mockReturnValue(nextId);
+  f.mountEditor(nextId);
+  expect(port.useReference?.(f.request)).toBe(false);
+  await expect(
+    f.codec.serialize(oldChip.ref, f.lifetime.signal),
+  ).rejects.toThrow('引用已失效');
+  expect(f.fetch).not.toHaveBeenCalled();
+  expect(
+    port.useReference?.({
+      ...f.request,
+      sessionId: nextId,
+      scopeKey: next.scopeKey,
+    }),
+  ).toBe(true);
+  const [, [nextChip]] = f.insertReference.mock.calls as unknown as [
+    [{ ref: string }],
+    [{ ref: string }],
+  ];
+  expect(await f.codec.serialize(nextChip.ref, f.lifetime.signal)).toContain(
+    revision.checksum,
+  );
+  const request = new URL(String(f.fetch.mock.calls[0]?.[0]), 'http://fixture');
+  expect(request.searchParams.get('threadId')).toBe(nextThread);
+  f.cleanup.forEach((close) => close());
+});
 
 it('uses the captured native span and reselects the immutable authorized revision on submit', async () => {
   const f = fixture();

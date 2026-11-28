@@ -899,8 +899,9 @@ it
           .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
           .click();
         await dock(nativeId)
-          .getByRole('button', {
-            name: new RegExp('^' + name + '\\s*打开这位员工的业务工作台$'),
+          .getByRole('button')
+          .filter({
+            has: workbench.locator('strong').getByText(name, { exact: true }),
           })
           .click();
       }
@@ -1496,6 +1497,7 @@ it
             workspaceHeader: f.identity.workspaceId,
           })),
         );
+        await editor.fill('');
         await useMaterial('root', f.selection.threadId!);
       } catch (error) {
         const state = await workbench.locator('html').evaluate(() => ({

@@ -237,7 +237,9 @@ export function apply(ctx: Context) {
               if (
                 current(selected.sessionId) !== binding ||
                 rechecked?.bound !== bound ||
-                rechecked.snapshot !== snapshot ||
+                rechecked.snapshot.scopeKey !== snapshot.scopeKey ||
+                rechecked.snapshot.publicationManagement !==
+                  snapshot.publicationManagement ||
                 result.viewerId !== viewerId ||
                 result.workspaceId !== workspaceId ||
                 result.canReference !== true ||
@@ -321,7 +323,9 @@ export function apply(ctx: Context) {
             request.signal.aborted ||
             current(request.sessionId) !== binding ||
             rechecked?.bound !== target.bound ||
-            rechecked.snapshot !== target.snapshot
+            rechecked.snapshot.scopeKey !== target.snapshot.scopeKey ||
+            rechecked.snapshot.publicationManagement !==
+              target.snapshot.publicationManagement
           )
             return false;
           return native.conversation.input.for(binding.ctx).insertReference(
