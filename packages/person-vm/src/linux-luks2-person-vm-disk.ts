@@ -23,6 +23,7 @@ import type {
   PersonVmKeyStore,
 } from './encrypted-disk.ts';
 import {
+  linuxDeviceNumber,
   linuxDiskKernel,
   linuxTools,
   observeLinuxDisk,
@@ -35,21 +36,29 @@ import type { OwnedWorkDiskReceipt } from './template-snapshot-contract.ts';
 
 const uuid = z.uuid();
 const vmIdSchema = z.uuidv4().refine((id) => id.toLowerCase() === id);
-const recordSchema = z.strictObject({
+const tiers = ['warm', 'cold'] as const;
+const creationFields = {
   version: z.literal(1),
-  phase: z.enum(['formatting', 'ready', 'erasing']),
   vmId: vmIdSchema,
-  image: z.strictObject({
-    device: z.string().regex(/^\d+$/),
-    inode: z.string().regex(/^\d+$/),
-  }),
+  tier: z.enum(tiers),
   capacityBytes: z.int().positive(),
+  storageUuid: uuid,
   luksUuid: uuid,
   xfsUuid: uuid,
-});
+};
+const recordSchema = z.discriminatedUnion('phase', [
+  z.strictObject({ ...creationFields, phase: z.literal('allocating') }),
+  z.strictObject({
+    ...creationFields,
+    phase: z.enum(['formatting', 'ready', 'erasing']),
+    image: z.strictObject({
+      inode: z.string().regex(/^\d+$/),
+    }),
+  }),
+]);
 type DiskRecord = z.infer<typeof recordSchema>;
+type RegisteredDisk = Exclude<DiskRecord, { phase: 'allocating' }>;
 
-const tiers = ['warm', 'cold'] as const;
 const ownedDirectory = 0o700n;
 const regularFile = 0o600n;
 
@@ -58,6 +67,7 @@ type DirectoryLayout = {
   journal: string;
   images: Readonly<Record<PersonDisk['tier'], string>>;
   name: string;
+  storageDevice: string;
 };
 type DiskState = Readonly<{
   layout: DirectoryLayout;
@@ -79,6 +89,7 @@ type DiskAuthority = <T>(
 
 type LinuxDiskOptions = Readonly<{
   root: string;
+  rootIdentity: Readonly<{ uuid: string; inode: string }>;
   capacityGiB: number;
   keys: PersonVmKeyStore &
     Required<Pick<PersonVmKeyStore, 'confirmAbsence' | 'listDiskIds'>>;
@@ -126,12 +137,12 @@ function detached(observed: LinuxDiskObservation) {
   return !observed.mount && !observed.mapper && !observed.loop;
 }
 
-function deletionIdentity(record: DiskRecord) {
+function deletionIdentity(record: RegisteredDisk) {
   return createHash('sha256')
     .update(
       JSON.stringify([
         record.vmId,
-        record.image.device,
+        record.storageUuid,
         record.image.inode,
         record.capacityBytes,
         record.luksUuid,
@@ -173,7 +184,10 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           (!runner && !kernel && process.platform === 'linux' && uid === 0)),
       'PROVIDER_FAILED',
     );
-    this.options = Object.freeze({ ...options });
+    this.options = Object.freeze({
+      ...options,
+      rootIdentity: Object.freeze({ ...options.rootIdentity }),
+    });
     this.bytes = capacityGiB * 1024 ** 3;
     this.uid = BigInt(uid);
     this.env = hostEnvironment(root);
@@ -201,8 +215,9 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     return done;
   }
 
-  private async roots() {
+  private async roots(signal: AbortSignal) {
     const root = this.options.root;
+    let storageDevice = '';
     for (let path = root; ; path = dirname(path)) {
       const info = await lstat(path, { bigint: true });
       requireDisk(
@@ -211,12 +226,41 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           (info.uid === 0n || info.uid === this.uid) &&
           (info.mode & 0o022n) === 0n,
       );
-      if (path === root)
+      if (path === root) {
         requireDisk(
-          info.uid === this.uid && (info.mode & 0o777n) === ownedDirectory,
+          info.uid === this.uid &&
+            (info.mode & 0o777n) === ownedDirectory &&
+            String(info.ino) === this.options.rootIdentity.inode,
         );
+        storageDevice = String(info.dev);
+      }
       if (path === '/') break;
     }
+    const outer = z
+      .object({
+        filesystems: z.tuple([
+          z.object({
+            uuid,
+            'maj:min': z.string(),
+          }),
+        ]),
+      })
+      .parse(
+        JSON.parse(
+          await this.execute(
+            'findmnt',
+            ['--json', '--list', '--target', root, '--output', 'UUID,MAJ:MIN'],
+            signal,
+          ),
+        ),
+      ).filesystems[0];
+    const again = await lstat(root, { bigint: true });
+    requireDisk(
+      outer.uuid === this.options.rootIdentity.uuid &&
+        outer['maj:min'] === linuxDeviceNumber(BigInt(storageDevice)) &&
+        String(again.dev) === storageDevice &&
+        String(again.ino) === this.options.rootIdentity.inode,
+    );
     for (const name of [...tiers, 'journal', 'mounts']) {
       const path = join(root, name);
       await mkdir(path, { mode: Number(ownedDirectory) }).catch(
@@ -224,24 +268,28 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           if (error.code !== 'EEXIST') throw error;
         },
       );
-      await this.privateDirectory(path);
+      await this.privateDirectory(path, storageDevice);
     }
-    return root;
+    return { root, storageDevice };
   }
 
-  private async privateDirectory(path: string) {
+  private async privateDirectory(path: string, storageDevice?: string) {
     const info = await lstat(path, { bigint: true });
     requireDisk(
       info.isDirectory() &&
         !info.isSymbolicLink() &&
         info.uid === this.uid &&
-        (info.mode & 0o777n) === ownedDirectory,
+        (info.mode & 0o777n) === ownedDirectory &&
+        (storageDevice === undefined || String(info.dev) === storageDevice),
     );
   }
 
-  private async layout(id: string): Promise<DirectoryLayout> {
+  private async layout(
+    id: string,
+    signal: AbortSignal,
+  ): Promise<DirectoryLayout> {
     const vmId = checkedId(id);
-    const root = await this.roots();
+    const { root, storageDevice } = await this.roots(signal);
     const hash = createHash('sha256')
       .update(root)
       .update('\0')
@@ -255,6 +303,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         cold: join(root, 'cold', vmId + '.luks'),
       },
       name: 'allrice-' + hash,
+      storageDevice,
     };
   }
 
@@ -348,7 +397,9 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
 
   private async imageAt(
     path: string,
+    storageDevice: string,
     capacity = this.bytes,
+    allocating = false,
   ): Promise<PersonVmDiskIdentity | null> {
     const info = await optional(() => lstat(path, { bigint: true }));
     if (!info) return null;
@@ -357,30 +408,70 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         !info.isSymbolicLink() &&
         info.uid === this.uid &&
         info.nlink === 1n &&
+        String(info.dev) === storageDevice &&
         (info.mode & 0o777n) === regularFile &&
-        info.size === BigInt(capacity),
+        (allocating
+          ? info.size <= BigInt(capacity)
+          : info.size === BigInt(capacity)),
     );
     return { device: String(info.dev), inode: String(info.ino) };
   }
 
   private async state(id: string, signal: AbortSignal): Promise<DiskState> {
     signal.throwIfAborted();
-    const layout = await this.layout(id);
+    const layout = await this.layout(id, signal);
     const record = await this.readRecord(layout.journal);
-    if (record) requireDisk(record.vmId === id);
+    if (record)
+      requireDisk(
+        record.vmId === id &&
+          record.storageUuid === this.options.rootIdentity.uuid,
+      );
+    const registered =
+      record && record.phase !== 'allocating' ? record : undefined;
     let file: DiskState['file'];
     for (const tier of tiers) {
       const path = layout.images[tier];
-      const identity = await this.imageAt(path, record?.capacityBytes);
+      const identity = await this.imageAt(
+        path,
+        layout.storageDevice,
+        record?.capacityBytes,
+      );
       if (!identity) continue;
-      requireDisk(!file && record && exactImage(identity, record.image));
+      requireDisk(
+        !file && registered && identity.inode === registered.image.inode,
+      );
       file = { path, identity, tier };
+    }
+    const staging = record && this.staging(layout, record);
+    const staged =
+      staging &&
+      (await this.imageAt(
+        staging,
+        layout.storageDevice,
+        record.capacityBytes,
+        record.phase === 'allocating',
+      ));
+    if (staged) {
+      requireDisk(
+        !file &&
+          record &&
+          (record.phase === 'allocating' ||
+            (record.phase === 'formatting' &&
+              staged.inode === record.image.inode)),
+      );
+      if (registered)
+        file = { path: staging!, identity: staged, tier: record.tier };
     }
     const observed = await observeLinuxDisk(
       {
         image: file,
-        allImagePaths: Object.values(layout.images),
-        expectedIdentity: record?.image,
+        allImagePaths: [
+          ...Object.values(layout.images),
+          ...(staging ? [staging] : []),
+        ],
+        expectedIdentity: registered
+          ? { device: layout.storageDevice, inode: registered.image.inode }
+          : staged || undefined,
         mount: layout.mount,
         name: layout.name,
         luksUuid: record?.luksUuid,
@@ -392,22 +483,30 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     );
     if (!observed.mount) {
       const target = await optional(() => lstat(layout.mount));
-      if (target) await this.privateDirectory(layout.mount);
+      if (target)
+        await this.privateDirectory(layout.mount, layout.storageDevice);
     }
     if (!file) requireDisk(detached(observed));
     return { layout, record, file, observed };
   }
 
+  // cryptsetup's LUKS2 metadata read normally auto-recovers a bad replica.
+  // The metadata lock is already supplied by our exclusive disk owner.
+  // Disable the CLI's locking for read probes to suppress that write-back.
   private async verifyHeader(state: DiskState, signal: AbortSignal) {
     requireDisk(state.file && state.record);
     await this.execute(
       'crypt',
-      ['isLuks', '--type', 'luks2', state.file.path],
+      ['isLuks', '--type', 'luks2', '--disable-locks', state.file.path],
       signal,
     );
     requireDisk(
       (
-        await this.execute('crypt', ['luksUUID', state.file.path], signal)
+        await this.execute(
+          'crypt',
+          ['luksUUID', '--disable-locks', state.file.path],
+          signal,
+        )
       ).trim() === state.record.luksUuid,
     );
   }
@@ -466,7 +565,23 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
       );
       await this.verifyHeader(state, signal);
       if (state.record.phase === 'ready')
-        await this.withKey(id, false, async () => undefined);
+        await this.withKey(id, false, (key) =>
+          this.execute(
+            'crypt',
+            [
+              'open',
+              '--type',
+              'luks2',
+              '--test-passphrase',
+              '--disable-locks',
+              '--key-file',
+              '-',
+              state.file!.path,
+            ],
+            signal,
+            key,
+          ),
+        );
       if (state.observed.mapper) await this.verifyXfs(state, signal);
       return {
         state: 'ready',
@@ -503,7 +618,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
 
   listFormalDiskIds(signal: AbortSignal) {
     return this.serial(signal, async () => {
-      const root = await this.roots();
+      const { root } = await this.roots(signal);
       const ids = new Set(
         (await this.options.keys.listDiskIds(signal)).map(checkedId),
       );
@@ -642,8 +757,48 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     return state;
   }
 
+  private staging(layout: DirectoryLayout, record: DiskRecord) {
+    return layout.journal + '.' + record.luksUuid + '.alloc';
+  }
+
+  /** Under the same exclusive physical lease as create. Only ever retires a
+   * disk that was never declared ready. Unknown native state retains everything. */
+  recoverIncompleteCreation(disk: PersonDisk, signal: AbortSignal) {
+    return this.serial(signal, () => this.recoverAllocation(disk, signal));
+  }
+
+  private async recoverAllocation(disk: PersonDisk, signal: AbortSignal) {
+    const state = await this.ensureLayout(disk, signal);
+    if (state.record?.phase === 'allocating') {
+      requireDisk(
+        state.record.tier === disk.tier &&
+          !state.file &&
+          detached(state.observed),
+      );
+      const path = this.staging(state.layout, state.record);
+      const staged = await this.imageAt(
+        path,
+        state.layout.storageDevice,
+        state.record.capacityBytes,
+        true,
+      );
+      requireDisk(await this.options.keys.confirmAbsence(disk.vmId));
+      signal.throwIfAborted();
+      if (staged) await unlink(path);
+      await unlink(state.layout.journal);
+      await syncDiskPoolDirectory(dirname(state.layout.journal));
+      return true;
+    }
+    if (state.record?.phase !== 'formatting') return false;
+    const closed = await this.closeOwned(disk, signal);
+    requireDisk(closed.record?.phase === 'formatting');
+    await this.removeFileAndKey(closed, signal);
+    return true;
+  }
+
   create(disk: PersonDisk, signal: AbortSignal) {
     return this.serial(signal, async () => {
+      await this.recoverAllocation(disk, signal);
       const prior = await this.ensureLayout(disk, signal);
       if (prior.record?.phase === 'ready') {
         await this.verifyHeader(prior, signal);
@@ -655,35 +810,51 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           detached(prior.observed) &&
           (await this.options.keys.confirmAbsence(disk.vmId)),
       );
-      const path = prior.layout.images[disk.tier];
-      const file = await open(
-        path,
-        constants.O_RDWR |
-          constants.O_CREAT |
-          constants.O_EXCL |
-          constants.O_NOFOLLOW,
-        Number(regularFile),
-      );
-      let record: DiskRecord;
+      const reservation = {
+        version: 1,
+        phase: 'allocating',
+        vmId: disk.vmId,
+        tier: disk.tier,
+        capacityBytes: this.bytes,
+        storageUuid: this.options.rootIdentity.uuid,
+        luksUuid: randomUUID(),
+        xfsUuid: randomUUID(),
+      } as const;
+      // Persist the exact staging locator before any image bytes or key exist.
+      signal.throwIfAborted();
+      await this.writeRecord(prior.layout.journal, reservation);
       try {
-        await file.truncate(this.bytes);
-        await file.sync();
-        const info = await file.stat({ bigint: true });
-        record = {
-          version: 1,
+        const staging = this.staging(prior.layout, reservation);
+        const file = await open(
+          staging,
+          constants.O_RDWR |
+            constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_NOFOLLOW,
+          Number(regularFile),
+        );
+        let image: PersonVmDiskIdentity;
+        try {
+          await file.truncate(this.bytes);
+          await file.sync();
+          const info = await file.stat({ bigint: true });
+          image = { device: String(info.dev), inode: String(info.ino) };
+        } finally {
+          await file.close();
+        }
+        await syncDiskPoolDirectory(dirname(staging));
+        const record = {
+          ...reservation,
           phase: 'formatting',
-          vmId: disk.vmId,
-          capacityBytes: this.bytes,
-          image: { device: String(info.dev), inode: String(info.ino) },
-          luksUuid: randomUUID(),
-          xfsUuid: randomUUID(),
-        };
-      } finally {
-        await file.close();
-      }
-      await syncDiskPoolDirectory(dirname(path));
-      await this.writeRecord(prior.layout.journal, record);
-      try {
+          image: { inode: image.inode },
+        } as const;
+        await this.writeRecord(prior.layout.journal, record);
+        signal.throwIfAborted();
+        const path = prior.layout.images[disk.tier];
+        await rename(staging, path);
+        await syncDiskPoolDirectory(dirname(staging));
+        await syncDiskPoolDirectory(dirname(path));
+
         const opened = await this.openMapper(
           disk,
           await this.ensureLayout(disk, signal),
@@ -708,16 +879,9 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           ...record,
           phase: 'ready',
         });
-        return record.image;
+        return image;
       } catch {
-        const cleanup = AbortSignal.timeout(30_000);
-        const current = await this.closeOwned(disk, cleanup);
-        requireDisk(
-          current.record?.phase === 'formatting' &&
-            current.file &&
-            exactImage(record.image, current.file.identity),
-        );
-        await this.removeFileAndKey(current, cleanup);
+        await this.recoverAllocation(disk, AbortSignal.timeout(30_000));
         return unavailable();
       }
     });
@@ -756,7 +920,10 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           if (error.code !== 'EEXIST') throw error;
         },
       );
-      await this.privateDirectory(state.layout.mount);
+      await this.privateDirectory(
+        state.layout.mount,
+        state.layout.storageDevice,
+      );
       requireDisk((await readdir(state.layout.mount)).length === 0);
       signal.throwIfAborted();
       beforeDispatch?.();
@@ -856,7 +1023,11 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
   }
 
   private async removeFileAndKey(state: DiskState, signal: AbortSignal) {
-    requireDisk(state.record && detached(state.observed));
+    requireDisk(
+      state.record &&
+        state.record.phase !== 'allocating' &&
+        detached(state.observed),
+    );
     const disk = {
       vmId: state.record.vmId,
       tier: state.file?.tier ?? 'cold',
@@ -877,8 +1048,12 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     requireDisk(
       !gone.file &&
         gone.record &&
+        gone.record.phase !== 'allocating' &&
         deletionIdentity(gone.record) === deletionIdentity(state.record),
     );
+    for (const path of Object.values(state.layout.images))
+      await syncDiskPoolDirectory(dirname(path));
+    await syncDiskPoolDirectory(dirname(state.layout.journal));
     signal.throwIfAborted();
     await this.options.keys.delete(disk.vmId);
     requireDisk(await this.options.keys.confirmAbsence(disk.vmId));
@@ -896,18 +1071,19 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         );
         return;
       }
-      const identity = deletionIdentity(state.record);
       requireDisk(
         state.record.phase === 'ready' || state.record.phase === 'erasing',
         'LEASE_LOST',
       );
-      if (erase) {
-        requireDisk(erase.identitySha256 === identity, 'LEASE_LOST');
-        await erase.beforeErase(state.layout.mount);
-      }
+      const identity = deletionIdentity(state.record);
+      // The platform delete flow installs a durable erasing checkpoint in
+      // #59's lease and supplies this exact reviewed digest on every retry.
+      requireDisk(erase && erase.identitySha256 === identity, 'LEASE_LOST');
+      await erase.beforeErase(state.layout.mount);
       const after = await this.assertDetached(disk, signal);
       requireDisk(
         after.record &&
+          after.record.phase !== 'allocating' &&
           deletionIdentity(after.record) === identity &&
           after.record.phase === state.record.phase,
         'LEASE_LOST',
@@ -940,7 +1116,12 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
             JSON.parse(
               await this.execute(
                 'crypt',
-                ['luksDump', '--dump-json-metadata', state.file.path],
+                [
+                  'luksDump',
+                  '--dump-json-metadata',
+                  '--disable-locks',
+                  state.file.path,
+                ],
                 signal,
               ),
             ),

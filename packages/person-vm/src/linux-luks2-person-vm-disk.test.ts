@@ -1,11 +1,15 @@
 import {
   chmod,
   lstat,
+  mkdir,
   mkdtemp,
+  readFile,
   realpath,
+  rename,
   rm,
   symlink,
   truncate,
+  writeFile,
 } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -20,6 +24,7 @@ import {
 import type { Command } from './process.ts';
 
 const vm = '550e8400-e29b-41d4-a716-446655440000';
+const storageUuid = '550e8400-e29b-41d4-a716-446655440012';
 const otherVm = '550e8400-e29b-41d4-a716-446655440001';
 const disk = { vmId: vm, tier: 'warm' } as const satisfies PersonDisk;
 const binding: PersonVmBinding = {
@@ -63,6 +68,7 @@ async function fixture() {
   const secret = Buffer.from('fixture-only-key-never-in-arguments-or-output');
   const assertions = {
     use: binding,
+    fsUuid: storageUuid,
     unknown: false,
     invalidLoop: false,
     invalidDm: false,
@@ -103,6 +109,17 @@ async function fixture() {
     const [op, second] = command.args;
     const last = command.args.at(-1);
     switch (command.executable) {
+      case linuxTools.findmnt:
+        return JSON.stringify({
+          filesystems: [
+            {
+              uuid: assertions.fsUuid,
+              'maj:min': linuxDeviceNumber(
+                (await lstat(root, { bigint: true })).dev,
+              ),
+            },
+          ],
+        });
       case linuxTools.loop:
         if (op === '--list') {
           if (assertions.unknown) return '{broken output';
@@ -165,10 +182,13 @@ async function fixture() {
           return '';
         }
         if (op === 'open') {
-          const row = deviceForLoop(command.args.at(-2));
+          const probe = command.args.includes('--test-passphrase');
+          const row = probe
+            ? await deviceForFile(last)
+            : deviceForLoop(command.args.at(-2));
           if (!command.input || !verifiedKeys.get(row)?.equals(command.input))
             throw Error('bad secret');
-          row.mapping = last;
+          if (!probe) row.mapping = last;
           return '';
         }
         if (op === 'close') {
@@ -217,7 +237,25 @@ async function fixture() {
     expect(JSON.stringify([command.env, command.args])).not.toContain(
       secret.toString(),
     );
-    const action = basename(command.executable) + ' ' + command.args[0];
+    const action = command.args.includes('--test-passphrase')
+      ? 'cryptsetup test-passphrase'
+      : basename(command.executable) + ' ' + command.args[0];
+    const observed = [
+      'cryptsetup isLuks',
+      'cryptsetup luksUUID',
+      'cryptsetup test-passphrase',
+      'cryptsetup luksDump',
+    ];
+    if (observed.includes(action))
+      expect(command.args).toContain('--disable-locks');
+    if (
+      [
+        'cryptsetup open',
+        'cryptsetup luksFormat',
+        'cryptsetup luksErase',
+      ].includes(action)
+    )
+      expect(command.args).not.toContain('--disable-locks');
     if (action === 'losetup --list')
       expect(command.args).toEqual([
         '--list',
@@ -330,9 +368,11 @@ async function fixture() {
       return [...passes.keys()];
     },
   };
+  const info = await lstat(root, { bigint: true });
   const adapter = new LinuxLuks2PersonVmDisk({
     keys,
     root,
+    rootIdentity: { uuid: storageUuid, inode: String(info.ino) },
     capacityGiB: 1,
     runner: command,
     kernel,
@@ -354,6 +394,7 @@ async function fixture() {
     devices,
     inputRefs,
     secret,
+    corruptKey: () => passes.set(vm, Buffer.alloc(48, 17)),
     image: (tier: PersonDisk['tier'] = 'warm', id = vm) =>
       join(root, tier, id + '.luks'),
   };
@@ -392,7 +433,9 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     const released = vi.fn(async (path: string) => {
       expect(path).toBe(mount);
       expect(f.history).toContain('cryptsetup close');
-      expect(f.history.at(-2)).toBe('losetup --list');
+      expect(f.history.indexOf('cryptsetup close')).toBeLessThan(
+        f.history.lastIndexOf('losetup --list'),
+      );
     });
     await f.adapter.detach(disk, signal, released);
     expect(released).toHaveBeenCalledOnce();
@@ -618,6 +661,103 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
   });
 
+  it('keeps unknown when the protected filesystem root is replaced at the same path', async () => {
+    const f = await fixture();
+    await f.adapter.create(disk, signal);
+    const former = f.root + '-former';
+    await rename(f.root, former);
+    roots.add(former);
+    await mkdir(f.root, { mode: 0o700 });
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
+    await expect(f.adapter.create(disk, signal)).rejects.toThrow();
+    expect(f.keys.delete).not.toHaveBeenCalled();
+    expect(await lstat(join(former, 'warm', vm + '.luks'))).toBeTruthy();
+  });
+
+  it('recovers an interrupted staging allocation before re-creating', async () => {
+    const f = await fixture();
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'absent' });
+    const journal = join(f.root, 'journal', vm + '.json');
+    const luksUuid = '550e8400-e29b-41d4-a716-446655440010';
+    await writeFile(
+      journal,
+      JSON.stringify({
+        version: 1,
+        phase: 'allocating',
+        vmId: vm,
+        tier: 'warm',
+        capacityBytes: 1024 ** 3,
+        storageUuid,
+        luksUuid,
+        xfsUuid: '550e8400-e29b-41d4-a716-446655440011',
+      }),
+      { mode: 0o600 },
+    );
+    const staging = journal + '.' + luksUuid + '.alloc';
+    await writeFile(staging, Buffer.alloc(15), { mode: 0o600 });
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
+    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(true);
+    await expect(lstat(staging)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
+    await f.adapter.create(disk, signal);
+    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(false);
+    expect(await f.adapter.inspect(vm, signal)).toMatchObject({
+      state: 'ready',
+    });
+  });
+
+  it('recovers a registered partially formatted disk once its remaining mapping can be joined', async () => {
+    const f = await fixture();
+    f.assertions.fault = { action: 'mkfs.xfs -m', mode: 'no-op' };
+    f.assertions.busy = true;
+    await expect(f.adapter.create(disk, signal)).rejects.toThrow(
+      'CLEANUP_INCOMPLETE',
+    );
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
+    await expect(
+      f.adapter.recoverIncompleteCreation(disk, signal),
+    ).rejects.toThrow('CLEANUP_INCOMPLETE');
+    expect(f.keys.delete).not.toHaveBeenCalled();
+    f.assertions.busy = false;
+    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(true);
+    expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
+    f.assertions.fault = undefined;
+    await f.adapter.create(disk, signal);
+    expect(await f.adapter.inspect(vm, signal)).toMatchObject({
+      state: 'ready',
+    });
+  });
+
+  it('binds persistent identity to the outer filesystem UUID and inode, not a boot-local device number', async () => {
+    const f = await fixture();
+    const created = await f.adapter.create(disk, signal);
+    expect(
+      JSON.parse(await readFile(join(f.root, 'journal', vm + '.json'), 'utf8')),
+    ).toMatchObject({ storageUuid, image: { inode: created?.inode } });
+    expect(
+      JSON.parse(await readFile(join(f.root, 'journal', vm + '.json'), 'utf8'))
+        .image,
+    ).not.toHaveProperty('device');
+    f.assertions.fsUuid = '550e8400-e29b-41d4-a716-446655440013';
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
+    await expect(f.adapter.attach(disk, signal)).rejects.toThrow();
+    f.assertions.fsUuid = storageUuid;
+    expect(await f.adapter.inspect(vm, signal)).toMatchObject({
+      state: 'ready',
+    });
+  });
+
+  it('does not report ready when a present key cannot unlock the exact LUKS2 header', async () => {
+    const f = await fixture();
+    await f.adapter.create(disk, signal);
+    f.corruptKey();
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
+    expect(f.history.at(-1)).toBe('cryptsetup test-passphrase');
+    expect(
+      f.inputRefs.every((bytes) => bytes.every((byte) => byte === 0)),
+    ).toBe(true);
+  });
+
   it('rejects a writable protected root before doing storage work', async () => {
     const f = await fixture();
     await chmod(f.root, 0o777);
@@ -628,15 +768,21 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
   it('preserves the backing image and key when keyslot erasure is unconfirmed', async () => {
     const f = await fixture();
     await f.adapter.create(disk, signal);
+    const target = await f.adapter.inspectDeletionTarget(vm, signal);
+    if (target.state !== 'ready') throw Error('fixture target unverified');
+    const erase = {
+      identitySha256: target.identitySha256!,
+      beforeErase: async () => {},
+    };
     f.assertions.fault = { action: 'cryptsetup luksErase', mode: 'no-op' };
-    await expect(f.adapter.delete(disk, signal)).rejects.toThrow(
+    await expect(f.adapter.delete(disk, signal, erase)).rejects.toThrow(
       'CLEANUP_INCOMPLETE',
     );
     expect(f.keys.delete).not.toHaveBeenCalled();
     expect(await lstat(f.image())).toBeTruthy();
     expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
     f.assertions.fault = undefined;
-    await f.adapter.delete(disk, signal);
+    await f.adapter.delete(disk, signal, erase);
     expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
   });
 
@@ -648,6 +794,11 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     const result = await f.adapter.inspectDeletionTarget(vm, signal);
     expect(result.state).toBe('ready');
     if (result.state !== 'ready') throw Error('not ready');
+    await expect(f.adapter.delete(disk, signal)).rejects.toThrow('LEASE_LOST');
+    expect(f.history).not.toContain('cryptsetup luksErase');
+    expect(await f.adapter.inspect(vm, signal)).toMatchObject({
+      state: 'ready',
+    });
     const beforeErase = vi.fn(async (mount: string) => {
       expect(mount).toBe(join(f.root, 'mounts', vm));
     });

@@ -11,6 +11,7 @@ export const linuxTools = Object.freeze({
   crypt: '/usr/sbin/cryptsetup',
   xfs: '/usr/sbin/mkfs.xfs',
   blkid: '/usr/sbin/blkid',
+  findmnt: '/usr/bin/findmnt',
   mount: '/usr/bin/mount',
   umount: '/usr/bin/umount',
 });
