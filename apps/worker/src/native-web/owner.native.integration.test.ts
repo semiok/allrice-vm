@@ -2390,6 +2390,8 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
       // Normal stale abort rejects a real in-flight binding guard. It must not
       // enter lost and kill the carrier before the other page's close ACK.
       const closing = f.owner.close();
+      expect(f.owner.revoked.reason).toMatchObject({ code: 'LEASE_LOST' });
+      expect(secondScope.revoked.reason).toBe(f.owner.revoked.reason);
       await expect(reading).rejects.toBeDefined();
       await closing;
     } else {
