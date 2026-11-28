@@ -197,7 +197,7 @@ export function createProductionPersonVmSources(
               if (context && editor) {
                 if (routing.applies(binding)) {
                   const proof = editor.starting
-                    ? await startup.assertStartingEditor(
+                    ? startup.assertStartingEditor(
                         binding,
                         context,
                         editor,

@@ -332,19 +332,23 @@ it('proves the exact scoped thread during starting without using running-only or
       expect.objectContaining({ threadId: editor.threadId }),
       expect.any(AbortSignal),
     );
-    await expect(
+    f.startup.abort();
+    vi.mocked(f.scope.assertCurrent).mockRejectedValue(
+      new Error('closed bootstrap scope'),
+    );
+    expect(
       f.service.assertStartingEditor(f.binding, web.context, editor, signal()),
-    ).resolves.toBe(proof.signal);
+    ).toBe(proof.signal);
     expect(owner.verifyRunningEditor).not.toHaveBeenCalled();
     expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow();
-    await expect(
+    expect(() =>
       f.service.assertStartingEditor(
         f.binding,
         web.context,
         { ...editor, threadId: randomUUID() },
         signal(),
       ),
-    ).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+    ).toThrow(expect.objectContaining({ code: 'RUNTIME_NOT_READY' }));
   } finally {
     await f.service.close();
   }

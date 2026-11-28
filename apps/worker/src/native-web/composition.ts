@@ -175,7 +175,6 @@ export function createAssignedNativeWebStartup(input: {
         sessionId: string;
         endpoint: Endpoint;
         proof: AbortSignal;
-        assertCurrent(): Promise<void>;
       };
       owners: Map<string, NativeWebOwner>;
       added: Map<string, PersonVmWebEndpointReceipt>;
@@ -701,7 +700,6 @@ export function createAssignedNativeWebStartup(input: {
                     sessionId: context.sessionId,
                     endpoint,
                     proof,
-                    assertCurrent: () => scope.assertCurrent(),
                   };
                 } else group.verifiedEmployees.set(employeeId, proof);
               }
@@ -903,7 +901,7 @@ export function createAssignedNativeWebStartup(input: {
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
     },
-    async assertStartingEditor(
+    assertStartingEditor(
       binding: PersonVmBinding,
       context: RequestContext,
       editor: PersonVmEditorSelection,
@@ -917,12 +915,15 @@ export function createAssignedNativeWebStartup(input: {
         started.sessionId !== context.sessionId ||
         started.threadId !== editor.threadId ||
         !sameEmployee(started.endpoint, editor.employee) ||
+        editor.employee.personId !== binding.personId ||
+        editor.employee.organizationId !== binding.organizationId ||
         context.actor.type !== 'user' ||
         context.actor.id !== binding.personId ||
         context.organizationId !== binding.organizationId
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
-      await started.assertCurrent();
+      // PersonVmService rechecks its starting lease around this readiness
+      // read. The native bootstrap capability has already been closed.
       const catalog = this.catalog(
         binding,
         started.endpoint.employeeInstanceId,
@@ -1355,7 +1356,7 @@ export function createAssignedNativeWebStartup(input: {
       context: RequestContext,
       editor: PersonVmEditorSelection,
       signal: AbortSignal,
-    ): Promise<AbortSignal>;
+    ): AbortSignal;
     needsEmployee(
       context: RequestContext,
       binding: PersonVmBinding,
