@@ -1468,16 +1468,13 @@ it
               employeeInstanceId,
               threadId,
             } = node.dataset;
-            const namespace =
+            const employeeNamespace =
               'allrice:d-entry:conversation:v1:' +
-              [
-                organizationId,
-                viewerId,
-                workspaceId,
-                employeeInstanceId,
-                threadId,
-              ].join('/') +
+              [organizationId, viewerId, workspaceId, employeeInstanceId].join(
+                '/',
+              ) +
               '/';
+            const namespace = employeeNamespace + threadId + '/';
             const otherDraft = namespace + 'dsh.conversation.old';
             parent.localStorage.setItem(otherDraft, 'kept draft');
             const next = 'dsh.conversation.root';
@@ -1493,7 +1490,7 @@ it
               }
             });
             parent.localStorage.setItem(
-              namespace + 'other/dsh.conversation.other',
+              employeeNamespace + 'other/dsh.conversation.other',
               'other employee draft',
             );
             parent.localStorage.setItem(
