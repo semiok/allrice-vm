@@ -6,6 +6,7 @@ import {
   apply,
   employeePanelReferences,
 } from '../src/employee-panel-references';
+import { conversationCandidate } from '../src/employee-mention-source';
 import { createEmployeePanelsDataPort } from '../src/employee-panels-data';
 import type { EmployeePanelsSnapshot } from '../src/employee-panels-port';
 import { syntheticPanelSnapshot } from './fixtures/employee-panels/presentation';
@@ -96,7 +97,12 @@ const fixture = (deferred = false) => {
   let activate = () => {};
   apply({
     effect: native.effect,
-    inject: (_, ready) => {
+    inject: (dependencies, ready) => {
+      if (
+        dependencies.includes('remote.sessionReferenceResolver') ||
+        dependencies.includes('uiConversation')
+      )
+        return;
       activate = () => ready(native as never);
       if (!deferred) activate();
     },
@@ -398,3 +404,27 @@ it('enables references only for the current production data port and respects na
   stop();
   f.cleanup.forEach((close) => close());
 });
+
+it.each([
+  ['session-27026a2e-e079-411b-9852-524971a2d81a', '新建对话'],
+  ['27026a2e-e079-411b-9852-524971a2d81a', '新建对话'],
+  ['  ', '新建对话'],
+  ['季度报告 [已完成]', '季度报告 [已完成]'],
+])(
+  'uses a human conversation label for %j without changing the native reference URI',
+  (title, label) => {
+    const sessionId = 'session-27026a2e-e079-411b-9852-524971a2d81a';
+    const row = conversationCandidate({
+      sessionId,
+      label: sessionId,
+      displayTitle: title,
+      mention: '@[' + sessionId + '](dsh-session:opaque)',
+    });
+    expect(row.name).toBe(label);
+    expect(row.label).toBeUndefined();
+    expect(row.section).toBe('对话');
+    const { mention } = JSON.parse(row.value!);
+    expect(mention).toContain('](dsh-session:opaque)');
+    expect(mention).not.toContain(sessionId);
+  },
+);

@@ -289,6 +289,7 @@ async function caller<T>(
   work: (bound: BoundMemory) => Promise<T>,
   scopeLock: true | 'read' = true,
   ownerAssembly?: MemoryRuntimeAssembly,
+  operation?: 'dispatch',
 ) {
   signal.throwIfAborted();
   const assembly = ownerAssembly ?? requireMemoryRuntimeAssembly();
@@ -303,6 +304,12 @@ async function caller<T>(
   return withDedicatedCallerTransaction(
     getDatabase(),
     async (tx) => {
+      if (operation === 'dispatch') {
+        // An occupied pin must not hold a socket or the foreground memory
+        // order indefinitely after its caller has left.
+        await tx`set local lock_timeout = '2000ms'`;
+        await tx`set local statement_timeout = '3000ms'`;
+      }
       const scope = await employeeMemoryScope(
         context,
         target.workspaceId,
@@ -552,6 +559,10 @@ async function restoreNativeEmployeeMemoryContext(
   input: NativeMemoryRestoreTarget,
   signal: AbortSignal,
   assembly?: MemoryRuntimeAssembly,
+  dispatch?: {
+    codex?: NativeMemoryCodexRoute;
+    start(document: string, tx: Sql): Promise<void> | void;
+  },
 ) {
   const target = NativeMemoryRestoreTargetSchema.parse(input);
   const { module, ...selector } = target;
@@ -575,13 +586,48 @@ async function restoreNativeEmployeeMemoryContext(
         qualifier(bound, signal, context),
       );
       requireOriginalContextOrigin(saved.origin, execution);
+      if (dispatch) {
+        if (dispatch.codex)
+          await lockNativeMemoryCodexDispatch(bound.tx, dispatch.codex);
+        signal.throwIfAborted();
+        await dispatch.start(saved.document, bound.tx);
+      }
       return saved.document;
     },
     'read',
     assembly,
+    dispatch ? 'dispatch' : undefined,
   );
   signal.throwIfAborted();
   return document;
+}
+
+type NativeMemoryCodexRoute = Readonly<{
+  connectionId: string;
+  slot: 1 | 2;
+  revision: string;
+}>;
+
+export async function lockNativeMemoryCodexDispatch(
+  tx: Sql,
+  route: NativeMemoryCodexRoute,
+) {
+  // Lock the exact ready generation after every awaited memory read. A
+  // concurrent administrative write must win or fail the send, never queue
+  // behind a lock waiter keeping the memory pin and foreground order held.
+  const [selected] = await tx<{ allowed: boolean }[]>`
+    select true as allowed
+    from allrice_codex_subscriptions s
+    join allrice_model_connections c on c.id=${route.connectionId}
+    join allrice_model_providers p on p.id=c.provider_id
+    where s.slot=${route.slot} and s.enabled
+      and extract(epoch from s.updated_at)::text=${route.revision}
+      and c.scope='platform' and c.status='ready'
+      and c.credential_reference='deployment:codex-default' and c.base_url is null
+      and p.enabled and p.provider_key in ('codex','openai-codex')
+      and p.auth_mode='chatgpt_subscription'
+    for share of s,c,p nowait`;
+  if (!selected?.allowed) return denied();
 }
 
 export async function readNativeEmployeeMemoryOrdinal(
@@ -743,6 +789,39 @@ export function createNativeEmployeeMemoryHost() {
             : denied();
       signal.throwIfAborted();
       return { executionRef: runId, memoryIndexDocument };
+    },
+    async dispatchRoot(
+      context: RequestContext,
+      input: Extract<NativeMemoryRootObservation, { mode: 'restore' }>,
+      signal: AbortSignal,
+      codex: NativeMemoryCodexRoute | undefined,
+      start: (
+        root: {
+          executionRef: string;
+          memoryIndexDocument: string;
+        },
+        tx: Sql,
+      ) => Promise<void> | void,
+    ) {
+      const { workspaceId, employeeInstanceId, threadId } = input;
+      const runId = UuidSchema.parse(input.runId);
+      await restoreNativeEmployeeMemoryContext(
+        context,
+        {
+          workspaceId,
+          employeeInstanceId,
+          threadId,
+          module: nativeMemoryModule,
+          b: runId,
+        },
+        signal,
+        workflowMemoryRuntime({ root: input }),
+        {
+          codex,
+          start: (memoryIndexDocument, tx) =>
+            start({ executionRef: runId, memoryIndexDocument }, tx),
+        },
+      );
     },
     async call(
       context: RequestContext,

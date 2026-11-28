@@ -41,6 +41,9 @@ it('offline-installs the actual tarball with native Host exports in an empty HOM
     XDG_CONFIG_HOME: join(home, '.config'),
     XDG_DATA_HOME: join(home, '.local/share'),
     COREPACK_ENABLE_NETWORK: '0',
+    ...(process.env.COREPACK_HOME && {
+      COREPACK_HOME: process.env.COREPACK_HOME,
+    }),
     LANG: 'zh_CN.UTF-8',
     DO_NOT_TRACK: '1',
   };

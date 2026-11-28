@@ -15,11 +15,13 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import {
   pageNavigate,
+  pageEmployeeArchived,
   pageNativeThreadRegistered,
   pageNativeThreadSelected,
   type PageNativeThreadRegistration,
   pageSwitchReady,
   pageThreadScope,
+  pageSkillsRefreshed,
   pageThreadSelected,
   type PageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
@@ -107,6 +109,7 @@ export function installEmployeeProductOwner(ctx: Context) {
   const requestHeaders = {
     'x-allrice-workspace-id': selection.workspaceId,
     'x-allrice-organization-id': organizationId,
+    'x-allrice-expected-viewer-id': viewerId,
   };
   function navigate(
     employeeInstanceId: string,
@@ -410,7 +413,11 @@ export function installEmployeeProductOwner(ctx: Context) {
           };
           connection.reconnect();
         };
+        const onSkills = () => {
+          if (!signal.aborted) connection.reconnect();
+        };
         document.addEventListener(pageThreadScope, onScope);
+        document.addEventListener(pageSkillsRefreshed, onSkills);
         const cleanup = [
           connection.generation.subscribe(update),
           native.sessions.list.subscribe(update),
@@ -419,6 +426,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
         return () => {
           document.removeEventListener(pageThreadScope, onScope);
+          document.removeEventListener(pageSkillsRefreshed, onSkills);
           cleanup.forEach((unsubscribe) => unsubscribe());
         };
       }, 'AllRice authorized thread selection');
@@ -530,18 +538,21 @@ export function installEmployeeProductOwner(ctx: Context) {
               navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
-            if (!employeeChoice(workspace, id)) return;
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || !employeeChoice(tree.workspace, id)) return;
             if (id === selection.employeeInstanceId) {
               navigate(id, activeThreadId);
               return;
             }
-            const session = sessions.find(
+            const session = tree.sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
             navigate(id, session?.id, !session);
           },
           onNewSession(id) {
-            if (!employeeChoice(workspace, id) || switchingScope) return;
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || !employeeChoice(tree.workspace, id) || switchingScope)
+              return;
             if (
               id === selection.employeeInstanceId &&
               startNativeSession?.(() => notice('暂时无法新建会话。'))
@@ -549,7 +560,6 @@ export function installEmployeeProductOwner(ctx: Context) {
               return;
             navigate(id);
           },
-          onDetails: () => notice('当前入口暂无法打开员工详情。'),
         },
       };
       function notice(error: string) {
@@ -571,7 +581,167 @@ export function installEmployeeProductOwner(ctx: Context) {
           headers: requestHeaders,
           onCreated: (instance) => navigate(instance.id, undefined, true),
         },
-        openArchive: () => notice('当前入口暂无法打开归档。'),
+        management: {
+          scopeId: ownerKey,
+          headers: requestHeaders,
+          lifetime: signal,
+          onSessionChanged(session) {
+            const current = sidebar.getSnapshot();
+            if (!current || signal.aborted || session.ownerId !== viewerId)
+              return;
+            const sessions = current.tree.sessions.filter(
+              (row) => row.id !== session.id,
+            );
+            if (
+              !session.archivedAt &&
+              employeeChoice(
+                current.tree.workspace,
+                sessionEmployeeKey(session),
+              )
+            ) {
+              const previous = current.tree.sessions.find(
+                (row) => row.id === session.id,
+              );
+              sessions.push({ ...previous, ...session });
+              sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+            }
+            sidebar.update({
+              ...current,
+              tree: {
+                ...current.tree,
+                sessions,
+                workspace: { ...current.tree.workspace, sessions },
+              },
+            });
+            if (session.archivedAt && session.id === activeThreadId)
+              navigate(selection.employeeInstanceId, undefined, true);
+          },
+          async onEmployeeChanged(instance) {
+            const current = sidebar.getSnapshot();
+            if (
+              !current ||
+              signal.aborted ||
+              instance.ownerId !== viewerId ||
+              instance.workspaceId !== selection.workspaceId ||
+              instance.organizationId !== organizationId
+            )
+              return;
+            const workspace = current.tree.workspace;
+            if (
+              !instance.archivedAt &&
+              !employeeChoice(workspace, instance.id)
+            ) {
+              try {
+                const query = new URLSearchParams({
+                  ...selection,
+                  threadId: activeThreadId,
+                  entry: '4.0',
+                });
+                const response = await fetch('/api/v1/workspace?' + query, {
+                  headers: requestHeaders,
+                  signal,
+                  cache: 'no-store',
+                });
+                if (!response.ok) throw Error('Employee catalog unavailable');
+                const directory = (await response.json()) as Pick<
+                  Workspace,
+                  | 'viewerId'
+                  | 'workspaceId'
+                  | 'organizationId'
+                  | 'employees'
+                  | 'sessions'
+                >;
+                const latest = sidebar.getSnapshot();
+                if (signal.aborted || !latest) return;
+                if (
+                  directory.viewerId !== viewerId ||
+                  directory.organizationId !== organizationId ||
+                  directory.workspaceId !== selection.workspaceId
+                )
+                  throw Error('Employee catalog changed');
+                const choice = employeeChoice(
+                  {
+                    ...latest.tree.workspace,
+                    employees: directory.employees,
+                  },
+                  instance.id,
+                );
+                if (!choice) throw Error('Employee unavailable');
+                if (employeeChoice(latest.tree.workspace, instance.id)) return;
+                const employees = [...latest.tree.workspace.employees, choice];
+                const sessions = [
+                  ...latest.tree.sessions,
+                  ...directory.sessions.filter(
+                    (row) =>
+                      row.ownerId === viewerId &&
+                      !row.archivedAt &&
+                      sessionEmployeeKey(row) === instance.id,
+                  ),
+                ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+                sidebar.update({
+                  ...latest,
+                  tree: {
+                    ...latest.tree,
+                    sessions,
+                    workspace: {
+                      ...latest.tree.workspace,
+                      employees,
+                      sessions,
+                    },
+                  },
+                });
+              } catch {
+                notice('员工已恢复，暂时无法刷新员工列表。');
+              }
+              return;
+            }
+            if (
+              instance.archivedAt &&
+              instance.id === selection.employeeInstanceId
+            ) {
+              parent.postMessage(
+                { type: pageEmployeeArchived, scopeId },
+                location.origin,
+              );
+              return;
+            }
+            const employees = workspace.employees.flatMap((employee) => {
+              if (employee.instanceId !== instance.id) return [employee];
+              if (instance.archivedAt) return [];
+              const currentVersion = {
+                ...employee.currentVersion,
+                manifest: {
+                  ...employee.currentVersion.manifest,
+                  name:
+                    instance.profile.name ??
+                    employee.currentVersion.manifest.name,
+                  appearance: instance.profile.appearance,
+                },
+              };
+              return [
+                {
+                  ...employee,
+                  instances: [instance],
+                  currentVersion,
+                  versions: [currentVersion],
+                },
+              ];
+            });
+            const sessions = instance.archivedAt
+              ? current.tree.sessions.filter(
+                  (row) => sessionEmployeeKey(row) !== instance.id,
+                )
+              : current.tree.sessions;
+            sidebar.update({
+              ...current,
+              tree: {
+                ...current.tree,
+                sessions,
+                workspace: { ...workspace, employees, sessions },
+              },
+            });
+          },
+        },
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),
       });
     })

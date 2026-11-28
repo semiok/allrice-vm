@@ -18,8 +18,10 @@ import {
   pageEditorMounted,
   pageMuxAttach,
   pageNavigate,
+  pageEmployeeArchived,
   pageSwitchReady,
   pageThreadScope,
+  pageSkillsRefreshed,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
   pageThreadSwitchPrepared,
@@ -27,6 +29,7 @@ import {
   pageNativeThreadSelected,
   pageRevoked,
   pageStartupFailed,
+  readPageMessage,
 } from '../../../lib/d-entry/page-messages';
 import {
   cancelEmployeeCapacityWait,
@@ -613,23 +616,24 @@ export function EmployeeNativePage({
         });
     }
     const receive = (event: MessageEvent) => {
+      const data = readPageMessage(
+        event,
+        frame.current?.contentWindow,
+        scopeId,
+      );
+      if (!data) return;
       if (
-        event.origin !== location.origin ||
-        event.source !== frame.current?.contentWindow ||
-        !scopeId ||
-        event.data?.scopeId !== scopeId
+        data.type === pageMuxAttach &&
+        event.ports.length === 1 &&
+        (data.resourceScopeId === undefined ||
+          typeof data.resourceScopeId === 'string')
       )
-        return;
-      if (event.data.type === pageMuxAttach && event.ports.length === 1)
-        carrier?.attachMux(
-          event.ports[0]!,
-          event.data.resourceScopeId ?? scopeId,
-        );
-      if (event.data.type === pageSwitchReady) switchReady = true;
+        carrier?.attachMux(event.ports[0]!, data.resourceScopeId ?? scopeId);
+      if (data.type === pageSwitchReady) switchReady = true;
       if (
-        event.data.type === pageThreadSwitchPrepared &&
+        data.type === pageThreadSwitchPrepared &&
         switching &&
-        switching.requestId === event.data.requestId &&
+        switching.requestId === data.requestId &&
         !switching.submitted &&
         !navigating &&
         !detached &&
@@ -637,9 +641,9 @@ export function EmployeeNativePage({
       )
         submitSwitch(switching);
       if (
-        event.data.type === pageThreadSelected &&
+        data.type === pageThreadSelected &&
         switching?.scopeId &&
-        event.data.resourceScopeId === switching.scopeId &&
+        data.resourceScopeId === switching.scopeId &&
         !navigating &&
         !detached &&
         !remoteRevoked
@@ -660,27 +664,25 @@ export function EmployeeNativePage({
         nextQuery.current = displayedQuery.current = query;
         history.pushState(history.state, '', '/chatflow/4.0?' + query);
       }
-      if (event.data.type === pageClosing) {
+      if (data.type === pageClosing) {
         navigationClosed = true;
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
-      if (event.data.type === pageStartupFailed) {
+      if (data.type === pageStartupFailed) {
         if (prepare)
-          finish(
-            event.data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed',
-          );
+          finish(data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed');
         else {
           setFailed(true);
           void close();
         }
       }
-      if (event.data.type === pageDocumentReady) {
+      if (data.type === pageDocumentReady) {
         documentStarted = true;
         if (replacing || remoteRevoked) send(pageRevoked);
       }
       if (
-        event.data.type === pageEditorMounted &&
+        data.type === pageEditorMounted &&
         prepare &&
         !navigating &&
         !remoteRevoked
@@ -701,19 +703,19 @@ export function EmployeeNativePage({
         }
       }
       if (
-        event.data.type === pageCompletion &&
-        ['closed', 'unknown'].includes(event.data.state)
+        data.type === pageCompletion &&
+        (data.state === 'closed' || data.state === 'unknown')
       ) {
         navigationClosed = true;
-        local.resolve(event.data.state);
+        local.resolve(data.state);
       }
-      if (event.data.type === pageNativeThreadSelected) {
-        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+      if (data.type === pageNativeThreadSelected) {
+        const next = DEntrySelectionInputSchema.safeParse(data.selection);
         if (
           !prepare ||
           !carrier ||
           switching?.submitted ||
-          event.data.resourceScopeId !== resourceScopeId ||
+          data.resourceScopeId !== resourceScopeId ||
           !next.success ||
           !next.data.threadId ||
           next.data.workspaceId !== selectedEmployee?.workspaceId ||
@@ -740,8 +742,28 @@ export function EmployeeNativePage({
         selectedQuery = query;
         history.replaceState(history.state, '', '/chatflow/4.0?' + query);
       }
-      if (event.data.type === pageNavigate) {
-        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+      if (
+        data.type === pageEmployeeArchived &&
+        prepare &&
+        !navigating &&
+        !detached &&
+        !remoteRevoked
+      ) {
+        navigating = true;
+        void retire().then((closed) => {
+          if (!closed) setStatus('unknown');
+          else if (!detached && replace.current === applyQuery)
+            location.replace(
+              '/chatflow/4.0?' +
+                new URLSearchParams({
+                  workspaceId: selectedEmployee!.workspaceId,
+                }),
+            );
+        });
+        return;
+      }
+      if (data.type === pageNavigate) {
+        const next = DEntrySelectionInputSchema.safeParse(data.selection);
         if (
           !next.success ||
           !carrier ||
@@ -792,7 +814,7 @@ export function EmployeeNativePage({
             },
             location.origin,
           );
-        } else navigate(selection, event.data.reopen === true);
+        } else navigate(selection, data.reopen === true);
       }
     };
     window.addEventListener('message', receive);
@@ -871,35 +893,111 @@ export function EmployeeNativePage({
         speculative ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(identity, selection, () => {
-        remoteRevoked = true;
-        unbindMemoryWrites?.();
-        send(pageRevoked);
-        if (!prepare && !lifetime.signal.aborted) setFailed(true);
-        // Before issuance, ready's rejection is handled by setting below.
-        if (prepare && mounted) finish('failed');
-        // Password changes and logout can revoke this carrier before their
-        // responses reach the iframe. Only the current cookie decides where
-        // the outer page goes.
-        if (mounted)
-          void retire()
-            .then(async () => {
-              if (detached || replace.current !== applyQuery) return;
-              const response = await fetch('/api/v1/auth/session', {
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: lifetime.signal,
-              });
-              // The unqualified entry checks the cookie again on navigation.
-              if (
-                response.status === 401 &&
-                !detached &&
-                replace.current === applyQuery
-              )
-                location.replace('/chatflow/4.0');
-            })
-            .catch(() => {});
-      });
+      carrier = openNativePageCarrier(
+        identity,
+        selection,
+        () => {
+          const mayReopenSelection = !navigating && !superseded;
+          const target = selectedEmployee;
+          remoteRevoked = true;
+          unbindMemoryWrites?.();
+          send(pageRevoked);
+          if (!prepare && !lifetime.signal.aborted) setFailed(true);
+          // Before issuance, ready's rejection is handled by setting below.
+          if (prepare && mounted) finish('failed');
+          // Password changes and logout can revoke this carrier before their
+          // responses reach the iframe. Only the current cookie decides where
+          // the outer page goes.
+          if (mounted)
+            void retire()
+              .then(async (closed) => {
+                if (!closed || detached || replace.current !== applyQuery)
+                  return;
+                const response = await fetch('/api/v1/auth/session', {
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: lifetime.signal,
+                });
+                // The unqualified entry checks the cookie again on navigation.
+                const stillCurrent = () =>
+                  !detached &&
+                  !superseded &&
+                  nextQuery.current === displayedQuery.current &&
+                  replace.current === applyQuery;
+                if (!stillCurrent()) return;
+                if (response.status === 401) {
+                  location.replace('/chatflow/4.0');
+                  return;
+                }
+                if (!mayReopenSelection || !prepare || !response.ok || !target)
+                  return;
+                // Committed metadata can revoke the old document before the
+                // initiating dialog receives its HTTP reply.
+                const { threadId, ...employee } = target;
+                const readCurrent = (selection: typeof target) =>
+                  readEmployeeEntryIdentity(
+                    selection,
+                    lifetime.signal,
+                    'execute',
+                  ).catch((error: unknown) => {
+                    if (
+                      error instanceof EmployeeEntryError &&
+                      [403, 404, 409].includes(error.status) &&
+                      !error.reason
+                    )
+                      return null;
+                    throw error;
+                  });
+                const next = await readCurrent(employee);
+                if (!stillCurrent() || target !== selectedEmployee) return;
+                if (!next) {
+                  location.replace(
+                    '/chatflow/4.0?' +
+                      new URLSearchParams({
+                        workspaceId: employee.workspaceId,
+                      }),
+                  );
+                  return;
+                }
+                if (
+                  next.organizationId !== identity.organizationId ||
+                  next.personId !== identity.personId
+                )
+                  return;
+                const thread = threadId ? await readCurrent(target) : next;
+                if (!stillCurrent() || target !== selectedEmployee) return;
+                if (
+                  !thread ||
+                  next.employeeRevision !== identity.employeeRevision ||
+                  next.employeeVersionId !== identity.employeeVersionId
+                )
+                  location.replace(
+                    '/chatflow/4.0?' +
+                      new URLSearchParams(thread ? target : employee),
+                  );
+              })
+              .catch(() => {});
+        },
+        (refreshedScopeId) => {
+          if (
+            !mounted ||
+            navigating ||
+            detached ||
+            remoteRevoked ||
+            (refreshedScopeId !== resourceScopeId &&
+              refreshedScopeId !== switching?.scopeId)
+          )
+            return;
+          frame.current?.contentWindow?.postMessage(
+            {
+              type: pageSkillsRefreshed,
+              scopeId,
+              resourceScopeId: refreshedScopeId,
+            },
+            location.origin,
+          );
+        },
+      );
       const issued = (await carrier.ready).scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
@@ -961,7 +1059,10 @@ export function EmployeeNativePage({
           title="员工工作区"
           data-page-mux="v1"
           src={source}
-          onLoad={(event) => loaded.current?.(event.currentTarget)}
+          onLoad={(event) => {
+            if (event.nativeEvent.isTrusted)
+              loaded.current?.(event.currentTarget);
+          }}
           referrerPolicy="no-referrer"
           className={
             prepare && status !== 'ready' ? styles.startingFrame : undefined

@@ -153,7 +153,7 @@ export async function prepareReferenceImage(
 }
 
 export async function readReferenceBytes(
-  storage: StoragePort,
+  storage: Pick<StoragePort, 'get'>,
   object: StorageObject,
   maximumBytes: number,
   reason: ReferenceImageError['reason'],

@@ -28,6 +28,7 @@ import type {
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import {
   DEntryNativeTurnEndSchema,
+  type DEntryNativeDeliveryClaim,
   getDEntryPageNativeRoot,
 } from '@allrice/database';
 import type {
@@ -69,6 +70,7 @@ import {
   type PublishNativeMemoryCall,
 } from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
+import { nativeWebSkillSource } from './skill-source.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
 
 export class NativeRootJoinUnknown extends Error {
@@ -446,8 +448,11 @@ export async function openNativeWebOwner(input: {
         });
     });
     ready = false;
-    principals.fence(new PersonVmError('LEASE_LOST'));
-    stale.abort(new PersonVmError('LEASE_LOST'));
+    // Both authority paths describe the same withdrawal. The page carrier
+    // can then match the admitted operation's terminal to this exact reason.
+    const reason = new PersonVmError('LEASE_LOST');
+    principals.fence(reason);
+    stale.abort(reason);
     return closing;
   }
   function retireExitedOwner() {
@@ -463,8 +468,9 @@ export async function openNativeWebOwner(input: {
       input.lifetime.removeEventListener('abort', aborted);
     });
     ready = false;
-    principals.fence(new PersonVmError('LEASE_LOST'));
-    stale.abort();
+    const reason = new PersonVmError('LEASE_LOST');
+    principals.fence(reason);
+    stale.abort(reason);
     carrier.abort();
     waitAbort.abort();
     return closing;
@@ -891,6 +897,7 @@ export async function openNativeWebOwner(input: {
                 request: {
                   ...request,
                   workspaceId: WorkspaceId(workspace.workspaceId),
+                  agentPreset: 'standard',
                 },
               });
             // rc.2 create has no native cancellation slot. Let a dispatched
@@ -1059,6 +1066,7 @@ export async function openNativeWebOwner(input: {
               },
             };
           },
+          context && nativeWebSkillSource(context, issue, binding, input.vm),
         );
       },
       readSessions(requestSignal: AbortSignal) {
@@ -1534,6 +1542,32 @@ export async function openNativeWebOwner(input: {
               follow.dispose();
               await frames.return?.();
             }
+          },
+        );
+      },
+      exchangeNativeDeliveryFor(
+        request:
+          | { action: 'delivery-pending' }
+          | (DEntryNativeDeliveryClaim & {
+              action: 'delivery-read' | 'delivery-live' | 'delivery-ack';
+            }),
+        caller: AbortSignal,
+      ) {
+        const active = AbortSignal.any([caller, AbortSignal.timeout(5_000)]);
+        return readCurrent(
+          active,
+          async () => {},
+          async (signal) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const wire = await transport.readManagedModelProof(
+              JSON.stringify({ ...request, adapterId: installedModelAdapter }),
+              signal,
+              false,
+              undefined,
+              request.action === 'delivery-read' ? 22_000_000 : undefined,
+            );
+            return wire ? (JSON.parse(wire) as unknown) : null;
           },
         );
       },

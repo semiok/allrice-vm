@@ -11,11 +11,18 @@ import {
   type createPostgresPersonalSkillPackageSource,
 } from '@allrice/database';
 import { Context } from '@deepseek-ai/cordis';
+import Agents from '@deepseek-ai/dsh-agent';
 import SkillRegistry, {
   isModelInvocable,
   isUserInvocable,
 } from '@deepseek-ai/dsh-skill';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import Tools from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  installPrincipalSkillProvider,
+  PrincipalSkillClient,
+} from '../../../packages/d-entry-principal/src/skill-provider.js';
 import {
   registerNativeCapabilitySkillProvider,
   type NativeCapabilitySkillConfiguration,
@@ -120,6 +127,85 @@ async function fixture() {
 }
 afterEach(async () => {
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose();
+});
+
+it('keeps complete native Skill catalogs inside the exact authenticated discovery turn', async () => {
+  const ctx = new Context();
+  contexts.push(ctx);
+  await ctx.plugin(SystemPrompt, {});
+  await ctx.plugin(Agents);
+  await ctx.plugin(Tools, {});
+  await ctx.plugin(SkillRegistry);
+  const abort = new AbortController();
+  const identity = {
+    organizationId: randomUUID(),
+    personId: randomUUID(),
+    workspaceId: randomUUID(),
+    employeeInstanceId: randomUUID(),
+    employeeRevision: 1,
+    employeeVersionId: randomUUID(),
+    threadId: randomUUID(),
+  };
+  const scopeId = randomUUID();
+  const skills = new PrincipalSkillClient(
+    scopeId,
+    abort.signal,
+    (frame) => {
+      if (frame.type !== 'skill-read') return;
+      queueMicrotask(() =>
+        skills.receive({
+          type: 'skill-result',
+          id: frame.id,
+          result: {
+            kind: 'catalog',
+            entries: [
+              {
+                name: 'bound-only',
+                description: 'Visible for this caller',
+                revision: 'exact-pin',
+                modelInvocable: true,
+                userInvocable: true,
+              },
+            ],
+          },
+        }),
+      );
+    },
+    () => {},
+  );
+  const scope = {
+    issue: { scopeId, identity, access: 'page' as const },
+    active: true,
+    abort,
+    skills,
+  };
+  const mounted = installPrincipalSkillProvider(
+    ctx,
+    new Map([[scopeId, scope]]),
+  );
+  const entered = deferred<void>(),
+    resume = deferred<void>();
+  const lookup = { cwd: '/fixture', signal: abort.signal };
+  const allowed = mounted.run(scope, abort.signal, async () => {
+    const snapshot = await ctx.skills.snapshot(lookup);
+    entered.resolve();
+    await resume.promise;
+    return snapshot;
+  });
+  await entered.promise;
+  const rejected = mounted.run(undefined, abort.signal, () =>
+    ctx.skills.snapshot(lookup),
+  );
+  resume.resolve();
+  expect(await allowed).toMatchObject({
+    complete: true,
+    skills: [{ name: 'bound-only' }],
+  });
+  expect(await rejected).toEqual({ complete: false, skills: [] });
+  expect(await ctx.skills.snapshot(lookup)).toEqual({
+    complete: false,
+    skills: [],
+  });
 });
 
 describe('actual native registry consuming AllRice sources; authority substitutes', () => {

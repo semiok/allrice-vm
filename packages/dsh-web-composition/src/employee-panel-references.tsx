@@ -1,13 +1,34 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
-import type {} from '@deepseek-ai/dsh-client-ui-input-trigger/client';
+import type { InputTriggerCandidate } from '@deepseek-ai/dsh-client-ui-input-trigger/client';
+import type {} from '@deepseek-ai/dsh-session-reference/remote';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type {
   PropsRuntime,
   SessionIdOf,
 } from '@deepseek-ai/dsh-client-ui-slots';
-import { ReferenceSelectionSchema } from '@allrice/contracts';
+import {
+  type ReferencePublicationQuerySchema,
+  decodeEmployeeFileMention,
+  employeeFileMentionPrefix,
+  supportsEmployeeFileMentionText,
+  encodeEmployeeFileMention,
+  ReferenceSelectionSchema,
+} from '@allrice/contracts';
+import {
+  conversationCandidate,
+  conversationPick,
+  filesSection,
+  materialFolder,
+  materialPath,
+  materialPin as pin,
+  materialTarget,
+  mentionOccurrence,
+  mentionChoices,
+  nativeReferenceSource,
+  type MentionTarget,
+} from './employee-mention-source';
 import { useEffect } from 'react';
 import { z } from 'zod';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
@@ -18,15 +39,6 @@ import type {
 } from './employee-panels-port';
 
 const source = 'allrice-panel-reference';
-const pin = ReferenceSelectionSchema.pick({
-  sourceId: true,
-  revisionId: true,
-  revision: true,
-  checksum: true,
-  fileName: true,
-})
-  .strip()
-  .extend({ digest: ReferenceSelectionSchema.shape.digest.optional() });
 const selectionPin = pin.extend({
   manifestDigest: ReferenceSelectionSchema.shape.digest.optional(),
 });
@@ -143,6 +155,57 @@ export function apply(ctx: Context) {
     listeners.clear();
   });
 
+  ctx.inject(['uiConversation'], (native) => {
+    if (!native.uiConversation) return;
+    native.effect(() =>
+      native.uiConversation.userText.register({
+        id: 'allrice-file-mention',
+        order: 20,
+        match(text, from) {
+          let start = text.indexOf(employeeFileMentionPrefix, from);
+          while (start >= 0) {
+            const end = text.indexOf(']', start) + 1;
+            if (end > start) {
+              const raw = text.slice(start, end);
+              try {
+                const mention = decodeEmployeeFileMention(raw);
+                if (mention)
+                  return {
+                    id: 'text',
+                    start,
+                    end,
+                    data: { text: raw, display: '@' + mention.label },
+                  };
+              } catch {
+                // Ordinary user text that is not a valid fixed locator stays literal.
+              }
+            }
+            start = text.indexOf(
+              employeeFileMentionPrefix,
+              start + employeeFileMentionPrefix.length,
+            );
+          }
+        },
+      }),
+    );
+  });
+  let lookupConversations:
+    Context['remote']['sessionReferenceResolver']['candidates'] | undefined;
+  ctx.inject(['remote', 'remote.sessionReferenceResolver'], (native) => {
+    const resolver = native.remote?.sessionReferenceResolver;
+    if (!resolver) return;
+    const lookup: NonNullable<typeof lookupConversations> = (
+      id,
+      query,
+      signal,
+    ) => resolver.candidates(id, query, signal);
+    native.effect(() => {
+      lookupConversations = lookup;
+      return () => {
+        if (lookupConversations === lookup) lookupConversations = undefined;
+      };
+    });
+  });
   ctx.inject(
     ['slots', 'sessions', 'conversation', 'sidebarRight', 'inputTriggers'],
     (native) => {
@@ -172,7 +235,9 @@ export function apply(ctx: Context) {
           : undefined;
       };
       const parse = (raw: string) => {
-        const value = occurrence.parse(JSON.parse(raw));
+        const decoded: unknown = JSON.parse(raw);
+        const menu = mentionOccurrence.safeParse(decoded);
+        const value = menu.success ? menu.data : occurrence.parse(decoded);
         if (value.sessionId !== native.sidebarRight.mounted.getSnapshot())
           throw unavailable();
         return value;
@@ -189,15 +254,256 @@ export function apply(ctx: Context) {
           : undefined;
       };
 
+      const dataClient = (threadId: string) =>
+        createEmployeePanelsHttpClient(
+          { ...selection, threadId },
+          { expectedViewerId: viewerId, lifetimeSignal: lifetime },
+        );
+      const sameOwner = (
+        id: SessionIdOf,
+        target: NonNullable<ReturnType<typeof currentPanelOwner>>,
+      ) => {
+        const live = currentPanelOwner(id);
+        return (
+          live?.bound === target.bound &&
+          live.snapshot.scopeKey === target.snapshot.scopeKey &&
+          live.snapshot.publicationManagement ===
+            target.snapshot.publicationManagement
+        );
+      };
+      const rootCrumb = 'root';
+      const quotedRootCrumb = 'root-quoted';
+      const folderCrumb = 'materials';
+      const quotedFolderCrumb = 'materials-quoted';
       native.effect(() =>
         native.inputTriggers.registerSource({
           trigger: '@',
           name: source,
           showGroupTitle: false,
-          candidates: async () => [],
-          onPick: () => undefined,
+          header: (_, { query, quoted }) =>
+            // r1-exempt(format): The literal @ breadcrumb path opens the materials header.
+            query.startsWith(materialPath)
+              ? [
+                  {
+                    label: filesSection,
+                    value: quoted ? quotedRootCrumb : rootCrumb,
+                  },
+                  { label: materialFolder, value: folderCrumb, current: true },
+                ]
+              : undefined,
+          async candidates(session, { query, quoted, signal }) {
+            const id = session.sessionId;
+            const binding = current(id);
+            if (!binding) return [];
+            const target = currentPanelOwner(id);
+            const threadId = target?.snapshot.publicationManagement?.threadId;
+            // r1-exempt(format): The explicit @ breadcrumb path selects the catalog to search. Both paths still recheck authority.
+            const inFolder = query.startsWith(materialPath);
+            const candidates: InputTriggerCandidate[] = [];
+            const attempt = AbortSignal.any(
+              target ? [signal, active, target.bound.signal] : [signal, active],
+            );
+            const catalog =
+              target && threadId ? dataClient(threadId) : undefined;
+            const encode = (value: MentionTarget) =>
+              JSON.stringify({
+                version: 2,
+                target: value,
+                sessionId: id,
+                documentId,
+                ownerEpoch: target?.bound.epoch,
+              });
+            if (inFolder) {
+              if (!catalog || !target) return [];
+              const choices = await mentionChoices<
+                InputTriggerCandidate,
+                NonNullable<
+                  z.input<typeof ReferencePublicationQuerySchema>['cursor']
+                >
+              >(async (cursor) => {
+                const result = await catalog.queryMaterials(
+                  {
+                    workspaceId,
+                    query: {
+                      category: 'all',
+                      query: query.slice(
+                        materialPath.length,
+                        materialPath.length + 200,
+                      ),
+                      limit: 50,
+                      cursor,
+                    },
+                  },
+                  attempt,
+                );
+                if (
+                  attempt.aborted ||
+                  current(id) !== binding ||
+                  !sameOwner(id, target) ||
+                  result.viewerId !== viewerId ||
+                  result.options.workspaceId !== workspaceId
+                )
+                  return { choices: [], next: null };
+                return {
+                  choices: result.references
+                    .filter(
+                      (row) =>
+                        row.status === 'active' &&
+                        row.processing !== 'uploading' &&
+                        (row.readCapabilities?.archive ||
+                          supportsEmployeeFileMentionText(row)),
+                    )
+                    .map((row) => ({
+                      name: row.fileName,
+                      icon: 'file',
+                      value: encode(materialTarget(row)),
+                    })),
+                  next: result.nextCursor,
+                };
+              }, attempt);
+              return current(id) === binding &&
+                sameOwner(id, target) &&
+                !attempt.aborted
+                ? choices
+                : [];
+            }
+            const [files, sessions] = await Promise.allSettled([
+              catalog && target
+                ? mentionChoices<InputTriggerCandidate, string>(
+                    async (cursor) => {
+                      const result = await catalog.listDeliverables(
+                        {
+                          workspaceId,
+                          category: 'artifact',
+                          mention: true,
+                          query: query.slice(0, 200),
+                          cursor,
+                        },
+                        attempt,
+                      );
+                      if (
+                        !sameOwner(id, target) ||
+                        result.viewerId !== viewerId
+                      )
+                        return { choices: [], next: null };
+                      const quotable = new Set(result.quotableFileIds);
+                      return {
+                        choices: result.files
+                          .filter(
+                            (file) =>
+                              file.ownedByMe &&
+                              file.origin === 'business-deliverable' &&
+                              quotable.has(file.objectId),
+                          )
+                          .map((file) => ({
+                            name: file.fileName,
+                            icon: 'file',
+                            section: filesSection,
+                            value: encode({
+                              fileName: file.fileName,
+                              pin: {
+                                kind: 'deliverable',
+                                objectId: file.objectId,
+                                checksum: file.checksum,
+                              },
+                            }),
+                          })),
+                        next: result.nextCursor,
+                      };
+                    },
+                    attempt,
+                  )
+                : undefined,
+              quoted ? undefined : lookupConversations?.(id, query, attempt),
+            ]);
+            if (attempt.aborted || current(id) !== binding) return [];
+            if (target && sameOwner(id, target)) {
+              if (!query || materialFolder.includes(query))
+                candidates.push({
+                  name: materialFolder,
+                  icon: 'folder',
+                  section: filesSection,
+                  drill: true,
+                  value: quoted ? quotedFolderCrumb : folderCrumb,
+                });
+              if (files.status === 'fulfilled' && files.value)
+                candidates.push(...files.value);
+            }
+            if (sessions.status === 'fulfilled' && sessions.value?.ok) {
+              const listed = native.sessions.list.getSnapshot().byId;
+              candidates.push(
+                ...sessions.value.value.map((row) =>
+                  conversationCandidate(row, listed[row.sessionId]?.title),
+                ),
+              );
+            }
+            return candidates;
+          },
+          onPick({ session, candidate }) {
+            if (!current(session.sessionId) || !candidate.value) return;
+            if (
+              candidate.value === rootCrumb ||
+              candidate.value === quotedRootCrumb
+            )
+              return {
+                text: candidate.value === quotedRootCrumb ? '@"' : '@',
+                continue: true,
+              };
+            if (
+              candidate.value === folderCrumb ||
+              candidate.value === quotedFolderCrumb
+            ) {
+              if (currentPanelOwner(session.sessionId))
+                return {
+                  text:
+                    (candidate.value === quotedFolderCrumb ? '@"' : '@') +
+                    materialPath,
+                  continue: true,
+                };
+              return;
+            }
+            const value: unknown = JSON.parse(candidate.value);
+            const conversation = conversationPick.safeParse(value);
+            if (conversation.success)
+              return {
+                insert: {
+                  source: nativeReferenceSource,
+                  ref: conversation.data.mention,
+                  appearance: 'session',
+                  label: candidate.name,
+                  clipboardText: conversation.data.mention,
+                },
+              };
+            const menu = mentionOccurrence.safeParse(value);
+            const target = currentPanelOwner(session.sessionId);
+            if (
+              !target ||
+              !menu.success ||
+              menu.data.sessionId !== session.sessionId ||
+              menu.data.ownerEpoch !== target.bound.epoch ||
+              menu.data.documentId !== documentId
+            )
+              return;
+            return {
+              insert: {
+                source,
+                ref: candidate.value,
+                appearance: 'file',
+                label: menu.data.target.fileName,
+                clipboardText: '@' + menu.data.target.fileName,
+              },
+            };
+          },
           codec: {
-            clipboardText: (raw) => `@${parse(raw).fileName}`,
+            clipboardText: (raw) => {
+              const selected = parse(raw);
+              return (
+                '@' +
+                (selected.version === 2
+                  ? selected.target.fileName
+                  : selected.fileName)
+              );
+            },
             async serialize(raw, signal) {
               const selected = parse(raw);
               const id = native.sidebarRight.mounted.getSnapshot();
@@ -220,10 +526,11 @@ export function apply(ctx: Context) {
               const { bound, snapshot } = target;
               const attempt = AbortSignal.any([signal, active, bound.signal]);
               attempt.throwIfAborted();
-              const data = createEmployeePanelsHttpClient(
-                { ...selection, threadId },
-                { expectedViewerId: viewerId, lifetimeSignal: lifetime },
-              );
+              const data = dataClient(threadId);
+              if (selected.version === 2) {
+                // The native journal and drafts retain a stable locator only.
+                return `\n${encodeEmployeeFileMention({ threadId, label: selected.target.fileName.slice(0, 160), pin: selected.target.pin })}\n`;
+              }
               const result = await data.selectMaterial(
                 {
                   workspaceId,
@@ -270,6 +577,21 @@ export function apply(ctx: Context) {
                 fileName,
               })}\n`;
             },
+          },
+        }),
+      );
+      // Keep serialization for restored native chips. The profile no longer
+      // registers the native source that discovers arbitrary guest files.
+      native.effect(() =>
+        native.inputTriggers.registerSource({
+          trigger: '@',
+          name: nativeReferenceSource,
+          showGroupTitle: false,
+          candidates: async () => [],
+          onPick: () => undefined,
+          codec: {
+            clipboardText: (ref) => ref,
+            serialize: async (ref) => ref,
           },
         }),
       );

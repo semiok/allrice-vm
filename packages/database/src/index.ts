@@ -17,7 +17,16 @@ export * from './d-entry-release-policy.ts';
 export * from './d-entry-admission.ts';
 export * from './d-entry-native-root.ts';
 export {
+  DEntryNativeDeliveryClaimSchema,
+  DEntryNativeDeliveryCaptureSchema,
+  publishCapturedDEntryDelivery,
+  sweepDEntryNativeDeliveryReservations,
+  type DEntryNativeDeliveryClaim,
+  findDEntryNativeDelivery,
+} from './d-entry-native-delivery.ts';
+export {
   DEntryNativeTurnEndSchema,
+  assertDEntryNativeDeliveryRun,
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
   nextRetainedDEntryNativeRunJournalOwner,
@@ -437,7 +446,10 @@ export {
 
 export { ReferenceArchiveInputError } from './reference-archive-read.ts';
 
-export { checkReferenceImageSignal } from './reference-image-read.ts';
+export {
+  checkReferenceImageSignal,
+  readReferenceBytes,
+} from './reference-image-read.ts';
 export * from './brand-media/server-wiring.ts';
 export * from './employees/employee-module-bindings.ts';
 
@@ -467,3 +479,4 @@ export {
   createPostgresPersonalSkillPackageSource,
   type PersonalSkillPackageRead,
 } from './capabilities/personal-skill-package-source.ts';
+export { withEmployeeFileMentions } from './employee-file-mention.ts';

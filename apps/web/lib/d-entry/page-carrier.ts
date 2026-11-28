@@ -2,6 +2,8 @@ import { EmployeeEntryError } from './entry-client';
 import {
   DEntryPageClosedSchema,
   DEntryPageOpenedSchema,
+  DEntryPageRevokedSchema,
+  DEntryPageSkillRefreshSchema,
   DEntryPageSwitchResultSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
@@ -56,6 +58,7 @@ export function openNativePageCarrier(
   identity: DEntryIdentity,
   selection: DEntrySelectionInput,
   onRevoked: () => void,
+  onSkillsRefreshed?: (scopeId: string) => void,
 ) {
   const ready =
     pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
@@ -70,6 +73,7 @@ export function openNativePageCarrier(
   let scopeId: string | undefined;
   let carrierSelection = selection;
   let nativeMux: MessagePort | undefined;
+  let refreshingSkills: string | undefined;
   let switching:
     | {
         id: string;
@@ -82,6 +86,7 @@ export function openNativePageCarrier(
     complete = false,
     dispatched = false,
     setupCancelled = false,
+    revoked = false,
     gotClosed = false,
     gotEnd = false;
   function send(value: object) {
@@ -101,7 +106,7 @@ export function openNativePageCarrier(
     if (complete) return;
     complete = true;
     closeMux();
-    onRevoked();
+    if (!revoked) onRevoked();
     ready.reject(reason);
     switching?.proof.abort(reason);
     switching?.result.reject(reason);
@@ -135,7 +140,9 @@ export function openNativePageCarrier(
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
       if (frame.streamId !== id) {
-        if (requested) return;
+        // Already-delivered old-generation frames can follow the reset
+        // notice. Reconnect opens new native reads from their normal cursors.
+        if (requested || refreshingSkills) return;
         if (!nativeMux) throw Error('Unexpected native page stream');
         nativeMux.postMessage({ type: 'frame', data: event.data });
         return;
@@ -162,6 +169,39 @@ export function openNativePageCarrier(
       if (frame.type !== 'item' || gotClosed)
         throw Error('Unexpected native page terminal');
       if (scopeId) {
+        const withdrawal = DEntryPageRevokedSchema.safeParse(frame.value);
+        if (withdrawal.success) {
+          if (revoked || withdrawal.data.scopeId !== scopeId)
+            throw Error('Unexpected native page withdrawal');
+          revoked = true;
+          requested = true;
+          closeMux();
+          const reason = Error('Native page authority withdrawn');
+          switching?.proof.abort(reason);
+          switching?.result.reject(reason);
+          switching = undefined;
+          onRevoked();
+          return;
+        }
+        const skillNotice = DEntryPageSkillRefreshSchema.safeParse(frame.value);
+        if (skillNotice.success) {
+          const notice = skillNotice.data;
+          if (notice.scopeId !== scopeId || requested) return;
+          if (notice.type === 'skills-changed') {
+            if (!onSkillsRefreshed || refreshingSkills) return;
+            refreshingSkills = scopeId;
+            nativeMux?.close();
+            nativeMux = undefined;
+            send({ type: 'item', value: { type: 'refresh-skills', scopeId } });
+          } else if (
+            notice.type === 'skills-refreshed' &&
+            refreshingSkills === scopeId
+          ) {
+            refreshingSkills = undefined;
+            onSkillsRefreshed?.(scopeId);
+          }
+          return;
+        }
         if (switching) {
           const decoded = DEntryPageSwitchResultSchema.safeParse(frame.value);
           if (decoded.success) {
@@ -176,6 +216,7 @@ export function openNativePageCarrier(
             switching = undefined;
             if (value.type === 'switched') {
               scopeId = value.scopeId;
+              refreshingSkills = undefined;
               carrierSelection = { ...selection, threadId: value.threadId };
               nativeMux?.close();
               nativeMux = undefined;
@@ -299,6 +340,7 @@ export function openNativePageCarrier(
         !scopeId ||
         scopeId !== requestedScope ||
         nativeMux ||
+        refreshingSkills ||
         requested ||
         complete ||
         socket.readyState !== WebSocket.OPEN

@@ -5,6 +5,7 @@ import type {
 
 export const pageClosing = 'allrice:d-entry:close';
 export const pageCompletion = 'allrice:d-entry:completion';
+export const pageEmployeeArchived = 'allrice:d-entry:employee-archived';
 export const pageNavigate = 'allrice:d-entry:navigate';
 export const pageRevoked = 'allrice:d-entry:revoked';
 export const pageStartupFailed = 'allrice:d-entry:startup-failed';
@@ -33,3 +34,31 @@ export type PageNativeThreadRegistration = {
   nativeSessionId: string;
   thread: ReturnType<typeof ChatSessionSchema.parse>;
 };
+
+export const pageSkillsRefreshed = 'allrice:d-entry:skills-refreshed';
+
+export function readPageMessage(
+  event: MessageEvent,
+  peer: Window | null | undefined,
+  scopeId: string | undefined,
+): (Record<string, unknown> & { type: string }) | undefined {
+  if (
+    !event.isTrusted ||
+    !peer ||
+    !scopeId ||
+    event.origin !== location.origin ||
+    event.source !== peer
+  )
+    return;
+  const data = event.data;
+  if (
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    Object.hasOwn(data, 'type') &&
+    typeof data.type === 'string' &&
+    Object.hasOwn(data, 'scopeId') &&
+    data.scopeId === scopeId
+  )
+    return data;
+}

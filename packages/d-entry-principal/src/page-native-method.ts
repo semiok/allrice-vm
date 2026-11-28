@@ -35,7 +35,7 @@ export function requirePageNativeMethod(
     !method.id.endsWith(`#${endpoint}`) ||
     pageEndpoint(method) !== endpoint
   ) {
-    throw new RemoteError('remote-access/denied', 'DSH method unavailable', {
+    throw new RemoteError('remote-access/denied', '此操作暂不可用', {
       action: endpoint,
       reason: 'method-unavailable',
     });
@@ -46,14 +46,10 @@ export function requirePageNativeMethod(
     pluginSettings,
   });
   if (category) {
-    throw new RemoteError(
-      'remote-access/denied',
-      'DSH method is platform managed',
-      {
-        action: endpoint,
-        reason: category,
-      },
-    );
+    throw new RemoteError('remote-access/denied', '此操作由平台管理', {
+      action: endpoint,
+      reason: category,
+    });
   }
   return method;
 }

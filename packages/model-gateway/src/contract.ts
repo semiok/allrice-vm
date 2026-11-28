@@ -117,6 +117,16 @@ export type GatewayFetchClassification = Readonly<{
   kind: 'model' | 'auth-refresh';
   protocol: 'openai-chat-completions' | 'openai-responses' | 'opaque';
 }>;
+/** Host-owned authority for the selected upstream generation. Its database
+ * part can be locked by the business caller immediately before dispatch. */
+export type ModelDispatchAuthority = Readonly<{
+  codex?: Readonly<{
+    connectionId: string;
+    slot: 1 | 2;
+    revision: string;
+  }>;
+  assertCurrent(): void;
+}>;
 export type DshGatewayRoute = ModelRouteKey &
   Readonly<{
     transport: 'sse';
@@ -132,7 +142,9 @@ export interface GatewayProvider {
   confirmTransportClosed?(): Promise<boolean>;
   /** Optional exact Host-owned transport. Only the gateway calls it after it
    * has committed the metered attempt. No Guest data selects the dispatcher. */
-  assertDispatchCurrent?(signal: AbortSignal): Promise<void>;
+  assertDispatchCurrent?(
+    signal: AbortSignal,
+  ): Promise<ModelDispatchAuthority | void>;
   fetchOwned?: (
     fetch: typeof globalThis.fetch,
     request: Request,

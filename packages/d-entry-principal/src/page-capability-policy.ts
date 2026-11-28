@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 export type SensitivePageCapability =
   | 'native-identity'
   | 'plugin-management'
@@ -10,6 +12,22 @@ type Method = Readonly<{
   method: string;
   service: string;
 }>;
+
+/** The employee command menu combines these native rows with the native
+ * file/model clients. No name from an unapproved provider is advertised. */
+const employeeCommands = new Set(['file', 'plan', 'goal', 'compact', 'model']);
+
+const commandRows = z.array(z.record(z.string(), z.unknown()));
+
+export function projectEmployeePageCatalog(endpoint: string, result: unknown) {
+  return endpoint === 'commands/list'
+    ? commandRows
+        .parse(result)
+        .filter(
+          ({ name }) => typeof name === 'string' && employeeCommands.has(name),
+        )
+    : result;
+}
 
 type Configuration = Readonly<{
   args: Readonly<Record<string, unknown>>;
@@ -33,7 +51,8 @@ export function pageSettingsNamespaces(
       providerSettings?.add(options.id);
     if (
       options.name === '@deepseek-ai/dsh-plugin-market' ||
-      options.name === '@deepseek-ai/dsh-plugin-manager'
+      options.name === '@deepseek-ai/dsh-plugin-manager' ||
+      options.name === '@deepseek-ai/dsh-permission-presets'
     )
       pluginSettings.add(options.id);
   }
@@ -111,6 +130,30 @@ export function sensitivePageCapability(
     return 'provider-configuration';
   }
 
+  if (namespace === 'commands' && method === 'execute') {
+    const line = configuration?.args.line;
+    if (typeof line === 'string' && line.startsWith('/')) {
+      // The native protocol sends a slash command here, separate from
+      // session/prompt and ordinary text.
+      const [name] = line.slice(1).split(/[\t\n\r ]/u, 1);
+      if (name && !employeeCommands.has(name)) return 'platform-settings';
+    }
+  }
+  if (namespace === 'session' && method === 'create') {
+    const payload = configuration?.args.request;
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      'agentPreset' in payload &&
+      payload.agentPreset !== undefined &&
+      payload.agentPreset !== 'standard'
+    )
+      return 'platform-settings';
+  }
+
+  if (namespace === 'agentPresets' && method === 'select')
+    return 'platform-settings';
+
   if (namespace === 'settings' && method === 'openSettingsDocument') {
     return 'platform-settings';
   }
@@ -120,7 +163,10 @@ export function sensitivePageCapability(
   if (namespace === 'settings' && /^(?:mutate|replace|update)/u.test(method)) {
     if (!configuration) return 'provider-configuration';
     const ns = configuration.args.ns;
-    if (typeof ns === 'string' && configuration.pluginSettings?.has(ns)) {
+    if (
+      ns === 'agent-preset-registry' ||
+      (typeof ns === 'string' && configuration.pluginSettings?.has(ns))
+    ) {
       return 'platform-settings';
     }
     if (

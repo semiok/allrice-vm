@@ -1,3 +1,4 @@
+import { UuidSchema } from '@allrice/contracts';
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { IdentityError, preparePersonNativeWebRoster } from '@allrice/database';
@@ -27,7 +28,11 @@ export default async function EmployeeNativeEntryPage({
         : [value])
       query.append(key, item);
   }
-  if (!query.size) {
+  const requestedWorkspace =
+    query.size === 1 && query.has('workspaceId')
+      ? UuidSchema.safeParse(query.get('workspaceId'))
+      : undefined;
+  if (!query.size || requestedWorkspace?.success) {
     const auth = await getRequestContext(
       new Request('http://localhost/chatflow/4.0', {
         headers: await headers(),
@@ -54,7 +59,14 @@ export default async function EmployeeNativeEntryPage({
         />
       );
     if (!auth.context) redirect('/login?next=%2Fchatflow%2F4.0');
-    const context = auth.context;
+    const context = requestedWorkspace?.success
+      ? { ...auth.context, workspaceId: requestedWorkspace.data }
+      : auth.context;
+    if (
+      auth.context.workspaceId &&
+      auth.context.workspaceId !== context.workspaceId
+    )
+      return <EmployeeNativePage query="" prepare />;
     try {
       let selection = await findDEntryEmployee(context);
       if (!selection && context.actor.type === 'user') {

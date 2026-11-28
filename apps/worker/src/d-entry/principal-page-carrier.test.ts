@@ -20,6 +20,7 @@ import { expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import Llm from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
@@ -405,6 +406,42 @@ it('drains an already dispatched native create through registration and response
   expect(await receive('life')).toMatchObject({ value: { type: 'closed' } });
   expect(await receive('life')).toMatchObject({ type: 'end' });
 });
+
+it.each([
+  new DataAccessError('authorization_denied'),
+  new PersonVmError('LEASE_LOST'),
+])(
+  'fences a revoked page and waits for the owned authority join (%s)',
+  async (reason) => {
+    const f = await fixture();
+    const { peer, scopeId, receive, revoked } = await open(f);
+    const closing = deferred();
+    const release = deferred();
+    f.authorityClose.mockImplementationOnce(async () => {
+      closing.resolve();
+      await release.promise;
+    });
+    const fenced = once(revoked, 'abort');
+    const socketClosed = once(peer, 'close');
+    f.identityRevoked.abort(reason);
+    try {
+      await fenced;
+      expect(await receive('life')).toMatchObject({
+        value: { type: 'revoked', scopeId },
+      });
+      await closing.promise;
+      expect((await f.invoke(scopeId)).status).toBe(404);
+      expect(peer.readyState).toBe(peer.OPEN);
+    } finally {
+      release.resolve();
+    }
+    expect(await receive('life')).toMatchObject({
+      value: { type: 'closed', scopeId },
+    });
+    expect(await receive('life')).toEqual({ type: 'end', streamId: 'life' });
+    await socketClosed;
+  },
+);
 
 it('joins a cancelled target lookup and the old page on close during a handoff', async () => {
   const f = await fixture();
@@ -1659,7 +1696,9 @@ it('uses actual DSH replies for create and fork registration on a page without a
     decodeDEntryRegisteredThread(create.headers.get('x-allrice-d-entry-thread'))
       ?.id,
   ).toBe((await f.registerRoot.mock.results[0]?.value)?.identity.threadId);
-  expect(f.host.catalog.creationRequests).toEqual([{}]);
+  expect(f.host.catalog.creationRequests).toEqual([
+    { agentPreset: 'standard' },
+  ]);
   expect(f.prepareEditorRoot).not.toHaveBeenCalled();
   expect(f.registerRoot).toHaveBeenNthCalledWith(
     1,

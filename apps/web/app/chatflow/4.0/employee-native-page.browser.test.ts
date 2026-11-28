@@ -1,4 +1,5 @@
 import type { DEntryIdentity } from '@allrice/contracts';
+import { DataAccessError } from '@allrice/database';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -424,7 +425,7 @@ suite('4.0 browser cold entry', () => {
               root.render(<Sidebar port={port}/>);
               parent.postMessage({type: '${pageEditorMounted}', scopeId: owner.scopeId}, location.origin);
             }});
-          } else createRoot(document.getElementById('root')).render(location.search
+          } else createRoot(document.getElementById('root')).render(new URLSearchParams(location.search).has("employeeInstanceId")
             ? <EmployeeNativePage prepare query={location.search.slice(1)} />
             : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} />);`,
             loader: 'tsx',
@@ -1207,8 +1208,43 @@ suite('4.0 browser cold entry', () => {
       await page.route('**/login', (route) =>
         route.fulfill({ body: 'synthetic login' }),
       );
-      f.identityRevoked.abort();
-      await page.waitForURL(f.origin + '/login');
+      // The same carrier invalidation can precede the response to archiving
+      // the selected employee. Verify the outer shell looks up the current
+      // selection and returns to the zero-employee page after both closes.
+      const archivedSelection = await context.newPage();
+      archivedSelection.setDefaultTimeout(8_000);
+      try {
+        await archivedSelection.route('**/api/v1/auth/session', (route) =>
+          route.fulfill({ json: { user: { id: f.identity.personId } } }),
+        );
+        await archivedSelection.route(
+          '**/api/v1/d-entry/native-prewarm',
+          (route) => route.fulfill({ status: 204 }),
+        );
+        const target = new URLSearchParams(f.selection);
+        await archivedSelection.goto(f.origin + '/chatflow/4.0?' + target);
+        const frame = archivedSelection.frameLocator('iframe');
+        await frame
+          .locator('body[data-mount-ready=yes]')
+          .evaluate(() =>
+            (window as unknown as { publishMount(): void }).publishMount(),
+          );
+        await frame.getByRole('textbox', { name: '消息' }).waitFor();
+        await archivedSelection.route(
+          '**/api/v1/d-entry/identity?**',
+          (route) => route.fulfill({ status: 404 }),
+        );
+        f.identityRevoked.abort(new DataAccessError('authorization_denied'));
+        await page.waitForURL(f.origin + '/login', { timeout: 8_000 });
+        await archivedSelection.waitForURL(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams({ workspaceId }),
+        );
+        await archivedSelection
+          .getByRole('button', { name: '查看归档' })
+          .waitFor();
+      } finally {
+        await archivedSelection.close();
+      }
     },
   );
 });

@@ -6,6 +6,7 @@ import type {
   RequestContext,
 } from '@allrice/contracts';
 import {
+  createProductionNativeMemorySource,
   selectNativeMemoryConfiguration,
   type ProductionNativeMemorySource,
 } from './production-native-memory.js';
@@ -182,6 +183,12 @@ export type ProductionPersonVmHostSources = Readonly<{
         signal: AbortSignal,
         phase: 'seal' | 'dispatch',
       ): Promise<string | undefined>;
+      withMemoryIndex?: Parameters<
+        typeof createModelGateway
+      >[0]['withTrustedContext'];
+      prepareReferences?: Parameters<
+        typeof createModelGateway
+      >[0]['prepareReferences'];
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
@@ -246,10 +253,11 @@ export function createProductionPersonVmHost(input: {
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
     );
   const sources = input.sources;
-  const memory =
+  const configuredMemory =
     input.nativeMemory &&
     Object.freeze({
       toolVersions: Object.freeze({ ...input.nativeMemory.toolVersions }),
+      tools: input.nativeMemory.tools,
       publication: Object.freeze({
         root: input.nativeMemory.publication.root.bind(
           input.nativeMemory.publication,
@@ -257,13 +265,17 @@ export function createProductionPersonVmHost(input: {
         call: input.nativeMemory.publication.call.bind(
           input.nativeMemory.publication,
         ),
+        dispatchRoot: input.nativeMemory.publication.dispatchRoot?.bind(
+          input.nativeMemory.publication,
+        ),
       }),
     });
   if (
-    memory &&
-    [memory.toolVersions.memory_read, memory.toolVersions.memory_remember].some(
-      (value) => typeof value !== 'string' || !value || value.length > 256,
-    )
+    configuredMemory &&
+    [
+      configuredMemory.toolVersions.memory_read,
+      configuredMemory.toolVersions.memory_remember,
+    ].some((value) => typeof value !== 'string' || !value || value.length > 256)
   )
     return Promise.reject(
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
@@ -979,6 +991,14 @@ export function createProductionPersonVmHost(input: {
       });
       personVm = vm;
       const { native, web } = providers.configuration;
+      const memory = web.nativeMemoryEnabled
+        ? (configuredMemory ?? createProductionNativeMemorySource())
+        : undefined;
+      if (
+        web.nativeMemoryEnabled &&
+        (!memory?.tools || !memory.publication.dispatchRoot)
+      )
+        throw new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE');
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
@@ -1157,6 +1177,8 @@ export function createProductionPersonVmHost(input: {
         build.manifestDigest === providers.applicationBuild.manifestDigest
           ? build
           : null;
+      if (memory && !nativeExecutionBuild)
+        throw new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE');
       bound = await sources.bind({
         vm,
         admission,
@@ -1185,6 +1207,11 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
+      if (
+        memory &&
+        (!modelSource.readMemoryIndex || !modelSource.withMemoryIndex)
+      )
+        throw new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE');
       const egressSource = bound.egress;
       const modelRoute = Object.freeze({ ...modelSource.route });
       const modelOwner = createModelGateway({
@@ -1200,6 +1227,8 @@ export function createProductionPersonVmHost(input: {
             modelSource.scopeStream,
           ),
         readTrustedContext: memory && modelSource.readMemoryIndex,
+        withTrustedContext: memory && modelSource.withMemoryIndex,
+        prepareReferences: modelSource.prepareReferences,
         store: storeModel,
         confirmTransportStopped:
           modelSource.confirmTransportStopped ??

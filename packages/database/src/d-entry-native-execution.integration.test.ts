@@ -1,20 +1,37 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type { StoragePort } from '@allrice/contracts';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as database from './core/client.ts';
+import { lockWorkspaceStorageQuota } from './core/storage-quota.ts';
 import { DataAccessError } from './data.ts';
 import { createDEntryAuthorityFeed } from './d-entry-authority.ts';
 import * as rootPin from './d-entry-native-root.ts';
+import { dEntryReleasePolicyKey } from './d-entry-release-policy.ts';
 import {
+  assertDEntryNativeDeliveryRun,
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
   nextRetainedDEntryNativeRunJournalOwner,
   publishDEntryNativeRunTerminal,
 } from './d-entry-native-execution.ts';
+import {
+  findDEntryNativeDelivery,
+  publishCapturedDEntryDelivery,
+  sweepDEntryNativeDeliveryReservations,
+} from './d-entry-native-delivery.ts';
 import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
-import { authenticateSession, createSession } from './identity.ts';
+import {
+  authenticateSession,
+  createSession,
+  revokeSession,
+} from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import { createRunAuthorityFixture } from './run-authority.fixture.ts';
-import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
+import {
+  createRuntimeFixtureDatabase,
+  runtimeFixtureStorage,
+} from './runtime.fixture.ts';
+import { LocalStorageAdapter } from '../../storage/src/local.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1' ? describe : describe.skip;
@@ -94,6 +111,15 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       organizationId,
       workspaceId,
     }))!;
+    const publishRollout = (enabled: boolean) =>
+      db`insert into allrice_settings(scope_type,key,value)
+        values ('system',${dEntryReleasePolicyKey},${db.json({
+          revision: randomUUID(),
+          defaultGeneration: '3.x',
+          selections: enabled ? [{ organizationId, personId }] : [],
+        })})
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    await publishRollout(true);
     const rootSessionId = 'session-' + randomUUID();
     const runId = randomUUID();
     const executionId = randomUUID();
@@ -210,6 +236,307 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     expect(
       await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
     ).toBe(true);
+    const coordinate = (parts: (string | number)[]) =>
+      createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+    const file = '/work/report.md';
+    const capture = (callId: string, bytes: string, callSequence = 17) => ({
+      ticket: randomUUID(),
+      sessionId: rootSessionId,
+      turn: 1,
+      callId,
+      callSequence,
+      attemptId: attempt.attemptId,
+      cursor: attempt.cursor,
+      files: [{ path: file, base64: Buffer.from(bytes).toString('base64') }],
+    });
+    const stored = new Map<string, Parameters<StoragePort['put']>[0]>();
+    const disk = runtimeFixtureStorage(db);
+    const storage: StoragePort = {
+      async put(object, content) {
+        await disk.put(object, content);
+        stored.set(object.id, object);
+      },
+      get: (object) => disk.get(object),
+      async delete(object) {
+        await disk.delete(object);
+        stored.delete(object.id);
+      },
+      exists: (object) => disk.exists(object),
+    };
+    let boundaries = 0;
+    const first = capture('first-present', 'exact first bytes');
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        first,
+        storage,
+        async (tx) => {
+          await assertDEntryNativeDeliveryRun(tx, candidate, owner, signal);
+          if (++boundaries === 2) {
+            const [connection] = await tx<
+              { pid: number }[]
+            >`select pg_backend_pid() as pid`;
+            await db`select pg_terminate_backend(${connection!.pid})`;
+          }
+        },
+        signal,
+      ),
+    ).rejects.toThrow();
+    expect(boundaries).toBe(2);
+    expect(stored.size).toBe(1);
+    const [pendingObject] =
+      await db`select id,state from allrice_storage_objects where id=${[...stored.keys()][0]!}`;
+    expect(pendingObject?.state).toBe('pending');
+    const selection = {
+      workspaceId,
+      threadId: f.session,
+      employeeInstanceId: f.assignment,
+    };
+    const pathDigest = coordinate([rootSessionId, file]);
+    await expect(
+      findDEntryNativeDelivery(context, selection, pathDigest),
+    ).rejects.toThrow();
+    const assertCurrent = (
+      tx: Parameters<typeof assertDEntryNativeDeliveryRun>[0],
+    ) => assertDEntryNativeDeliveryRun(tx, candidate, owner, signal);
+    const begin = db.begin.bind(db);
+    let replies = 0;
+    const lostCommitReply = vi.spyOn(db, 'begin').mockImplementation(((
+      operation: (
+        tx: Parameters<typeof assertDEntryNativeDeliveryRun>[0],
+      ) => Promise<unknown>,
+    ) =>
+      begin(operation).then((committed) => {
+        if (++replies === 2) throw Error('fixture disconnected after COMMIT');
+        return committed;
+      })) as typeof db.begin);
+    try {
+      await expect(
+        publishCapturedDEntryDelivery(
+          candidate,
+          first,
+          storage,
+          assertCurrent,
+          signal,
+        ),
+      ).rejects.toThrow('fixture disconnected after COMMIT');
+    } finally {
+      lostCommitReply.mockRestore();
+    }
+    expect(await disk.exists(stored.get(pendingObject!.id)!)).toBe(true);
+    // A replacement reader recovers the committed receipt from the same disk.
+    await publishCapturedDEntryDelivery(
+      candidate,
+      first,
+      new LocalStorageAdapter(fixture.storageRoot),
+      assertCurrent,
+      signal,
+    );
+    expect(stored.size).toBe(1);
+    expect(await findDEntryNativeDelivery(context, selection, pathDigest)).toBe(
+      pendingObject?.id,
+    );
+    const second = capture('first-present', 'new immutable bytes', 26);
+    await publishCapturedDEntryDelivery(
+      candidate,
+      second,
+      storage,
+      assertCurrent,
+      signal,
+    );
+    const latest = await findDEntryNativeDelivery(
+      context,
+      selection,
+      pathDigest,
+    );
+    expect(latest).not.toBe(pendingObject?.id);
+    expect(await new Response(await disk.get(stored.get(latest)!)).text()).toBe(
+      'new immutable bytes',
+    );
+    expect(
+      await findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 17, 'first-present', 0]),
+      ),
+    ).toBe(pendingObject?.id);
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 17, 'first-present', 1]),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      findDEntryNativeDelivery(
+        { ...context, actor: { type: 'user', id: randomUUID() } },
+        selection,
+        pathDigest,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        { ...selection, employeeInstanceId: randomUUID() },
+        pathDigest,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        capture('first-present', 'replacement'),
+        storage,
+        assertCurrent,
+        signal,
+      ),
+    ).rejects.toThrow();
+    const rows = await db`select v.version, o.visibility, o.state
+      from allrice_deliverable_versions v join allrice_storage_objects o on o.id=v.object_id
+      where v.session_id=${f.session} order by v.version`;
+    expect(rows).toEqual([
+      { version: 1, visibility: 'private', state: 'ready' },
+      { version: 2, visibility: 'private', state: 'ready' },
+    ]);
+
+    let didLock!: () => void;
+    let releaseLock!: () => void;
+    const held = new Promise<void>((resolve) => {
+      didLock = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lock = db.begin(async (tx) => {
+      await lockWorkspaceStorageQuota(tx, organizationId, workspaceId);
+      didLock();
+      await release;
+    });
+    const bounded = database.createDedicatedDatabase(db, {
+      max: 1,
+      lockTimeoutMs: 150,
+      statementTimeoutMs: 800,
+    });
+    try {
+      await held;
+      await expect(
+        publishCapturedDEntryDelivery(
+          candidate,
+          capture('blocked-lock', 'never staged'),
+          storage,
+          assertCurrent,
+          signal,
+          bounded,
+        ),
+      ).rejects.toMatchObject({ code: '55P03' });
+      expect(stored.size).toBe(2);
+    } finally {
+      releaseLock();
+      await lock;
+      await bounded.end({ timeout: 1 });
+    }
+
+    let livenessChecks = 0;
+    const canceled = capture(
+      'canceled-before-commit',
+      'saved but not published',
+      31,
+    );
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        canceled,
+        storage,
+        async (tx) => {
+          await assertCurrent(tx);
+          if (++livenessChecks === 3)
+            throw Error('native offer canceled before COMMIT');
+        },
+        signal,
+      ),
+    ).rejects.toThrow('native offer canceled before COMMIT');
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 31, canceled.callId, 0]),
+      ),
+    ).rejects.toThrow();
+
+    const abandoned = capture('unacknowledged', 'abandoned bytes');
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        abandoned,
+        {
+          ...storage,
+          async put(object, content) {
+            await storage.put(object, content);
+            throw Error('storage lost reply');
+          },
+        },
+        assertCurrent,
+        signal,
+      ),
+    ).rejects.toThrow('storage lost reply');
+    for (const boundary of ['original login', '4.0 rollout'] as const) {
+      const revoked = capture(boundary, 'private bytes pending', 32);
+      const newerLogin = await createSession(personId);
+      const put = vi.fn(async (...args: Parameters<StoragePort['put']>) => {
+        await storage.put(...args);
+        if (boundary === 'original login') await revokeSession(login.token);
+        else await publishRollout(false);
+      });
+      try {
+        await expect(
+          publishCapturedDEntryDelivery(
+            candidate,
+            revoked,
+            { ...storage, put },
+            assertCurrent,
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'not_found' });
+        expect(put).toHaveBeenCalledOnce();
+        const newer = await authenticateSession(newerLogin.token, {
+          organizationId,
+          workspaceId,
+        });
+        expect(newer?.sessionId).toBeDefined();
+        expect(newer?.sessionId).not.toBe(prompt.loginSessionId);
+        const [object] = put.mock.calls[0]!;
+        expect(
+          await db`select state from allrice_storage_objects where id=${object.id}`,
+        ).toEqual([{ state: 'pending' }]);
+        expect(
+          await db`select id from allrice_deliverable_versions where object_id=${object.id}`,
+        ).toEqual([]);
+        await expect(db.begin(assertCurrent)).rejects.toMatchObject({
+          code: 'not_found',
+        });
+        expect(
+          await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
+        ).toBe(true);
+      } finally {
+        if (boundary === 'original login')
+          await db`update allrice_sessions set revoked_at=null where id=${prompt.loginSessionId}`;
+        else await publishRollout(true);
+        await revokeSession(newerLogin.token);
+      }
+    }
+
+    const expired =
+      await db`update allrice_storage_objects set updated_at=clock_timestamp()-interval '2 hours'
+      where workspace_id=${workspaceId} and state='pending' returning id`;
+    expect(expired).toHaveLength(4);
+    await sweepDEntryNativeDeliveryReservations(storage, signal);
+    await db`update allrice_storage_objects set deleted_at=clock_timestamp()-interval '6 minutes'
+      where workspace_id=${workspaceId} and state='deleted'`;
+    await sweepDEntryNativeDeliveryReservations(storage, signal);
+    for (const { id } of expired) expect(stored.has(id)).toBe(false);
+    expect(stored.size).toBe(2);
     await db.unsafe(`
       create function refuse_native_terminal_fixture() returns trigger
       language plpgsql as $$
@@ -251,6 +578,17 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     expect(
       await isDEntryNativeRunJournalCurrent(candidate, restarted, signal),
     ).toBe(true);
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        capture('stale-epoch', 'stale'),
+        storage,
+        (tx) => assertDEntryNativeDeliveryRun(tx, candidate, restarted, signal),
+        signal,
+      ),
+    ).rejects.toThrow();
+    expect(stored.size).toBe(2);
+
     expect(
       await isDEntryNativeRunJournalCurrent(
         {

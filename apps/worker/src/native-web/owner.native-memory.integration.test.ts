@@ -1,10 +1,7 @@
+import { encodeEmployeeFileMention } from '@allrice/contracts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import {
-  MemoryOrdinalInputSchema,
-  RememberPersonalMemoryInputSchema,
-} from '@allrice/contracts';
 import type { ModelCallBinding } from '@allrice/model-gateway';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { expect, it, vi } from 'vitest';
@@ -42,6 +39,8 @@ import {
   recordNativeMemoryToolCall,
 } from '../person-vm/production-native-execution-evidence.js';
 import {
+  createProductionNativeMemorySource,
+  executeProductionNativeMemoryTool,
   selectNativeMemoryConfiguration,
   type MemoryHostPublication,
   type MemoryRootObservation,
@@ -61,12 +60,10 @@ const confirmed = {
 const tools = [
   {
     id: 'memory_read',
-    schema: z.toJSONSchema(MemoryOrdinalInputSchema),
     args: { number: 1 },
   },
   {
     id: 'memory_remember',
-    schema: z.toJSONSchema(RememberPersonalMemoryInputSchema, { io: 'input' }),
     args: candidate,
   },
 ] as const;
@@ -205,12 +202,8 @@ it.skipIf(
       const signal = AbortSignal.timeout(35_000);
       const host = createNativeEmployeeMemoryHost();
       const publication: MemoryHostPublication = host;
-      const version = 'isolated-memory-v1';
       const selected = selectNativeMemoryConfiguration(
-        {
-          toolVersions: { memory_read: version, memory_remember: version },
-          publication,
-        },
+        createProductionNativeMemorySource(),
         build,
       );
       const modelName = 'fixture-codex';
@@ -228,6 +221,7 @@ it.skipIf(
       const results = deferredPromptFact<void>();
       const delivered = new Map<string, { id: string; value: unknown }>();
       const rememberCallId = randomUUID();
+      const retryCallId = randomUUID();
       const callbackInputs = new Map<
         string,
         Parameters<MemoryHostPublication['call']>[1]
@@ -402,6 +396,65 @@ it.skipIf(
         expect(await publication.root(context, restore, signal)).toEqual(
           issued,
         );
+        const [route] = await db<
+          { connectionId: string; slot: 1 | 2; revision: string }[]
+        >`
+          select c.id as "connectionId",s.slot,extract(epoch from s.updated_at)::text
+          as revision from allrice_model_connections c
+          join allrice_model_providers p on p.id=c.provider_id
+          cross join allrice_codex_subscriptions s
+          where p.provider_key='codex' and c.credential_reference='deployment:codex-default'
+            and c.scope='platform' and c.status='ready' and s.enabled`;
+        if (!route) throw Error('Missing isolated ready Codex route');
+        const dispatch = vi.fn();
+        const send = () =>
+          host.dispatchRoot(context, restore, signal, route, dispatch);
+        await send();
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch.mock.calls[0]?.[0]).toEqual(issued);
+        expect(typeof dispatch.mock.calls[0]?.[1]).toBe('function');
+        dispatch.mockClear();
+        const held = deferredPromptFact<number>();
+        const release = deferredPromptFact<void>();
+        const blocker = db.begin(async (tx) => {
+          await tx`select id from allrice_employee_memory_contexts where budget_ref=${run.runId} for update`;
+          const [connection] = await tx<
+            { pid: number }[]
+          >`select pg_backend_pid() as pid`;
+          held.resolve(connection!.pid);
+          await release.promise;
+        });
+        try {
+          const pid = await held.promise;
+          const sending = send();
+          const rejected = expect(sending).rejects.toMatchObject({
+            code: 'authorization_denied',
+          });
+          try {
+            await vi.waitFor(
+              async () => {
+                const [row] = await db<{ waiting: boolean }[]>`
+                select exists(select 1 from pg_stat_activity a where a.pid <> ${pid}
+                and ${pid}=any(pg_blocking_pids(a.pid))) as waiting`;
+                expect(row?.waiting).toBe(true);
+              },
+              { timeout: 5_000 },
+            );
+            await db`update allrice_model_connections set status='disabled' where id=${route.connectionId}`;
+          } finally {
+            release.resolve();
+            await rejected;
+          }
+          expect(dispatch).not.toHaveBeenCalled();
+        } finally {
+          release.resolve();
+          await blocker;
+          await db`update allrice_model_connections set status='ready' where id=${route.connectionId}`;
+        }
+        await send();
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch.mock.calls[0]?.[0]).toEqual(issued);
+        expect(typeof dispatch.mock.calls[0]?.[1]).toBe('function');
       }
 
       async function commitWithoutDelivery(ref: string, input: unknown) {
@@ -447,54 +500,35 @@ it.skipIf(
         });
       }
 
+      const fileMarker = encodeEmployeeFileMention({
+        threadId: primary.id,
+        label: 'Native transport fixture',
+        pin: {
+          kind: 'deliverable',
+          objectId: randomUUID(),
+          checksum: 'sha256:' + 'f'.repeat(64),
+        },
+      });
       const server = createServer((request, response) => {
         void (async () => {
           if (request.headers.authorization !== 'Bearer ' + capability)
             throw Error('Fixture capability mismatch');
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(Buffer.from(chunk));
-          if (request.url === '/fixture-memory-tool') {
-            const body = z
-              .object({
-                id: z.enum(['memory_read', 'memory_remember']),
-                ref: z.string(),
-                args: z.unknown(),
-              })
-              .strict()
-              .parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-            if (body.id === 'memory_remember' && attempts.size === 2) {
-              await commitWithoutDelivery(body.ref, body.args);
-              delivered.set(body.ref, { id: body.id, value: null });
-              response.writeHead(409).end();
-              results.resolve();
-              return;
-            }
-            const value =
-              body.id === 'memory_read'
-                ? await host.readOrdinal(
-                    context,
-                    target(body.ref),
-                    body.args,
-                    signal,
-                  )
-                : await host.remember(
-                    context,
-                    target(body.ref),
-                    body.args,
-                    signal,
-                  );
-            delivered.set(body.ref, { id: body.id, value });
-            response
-              .writeHead(200, { 'content-type': 'application/json' })
-              .end(JSON.stringify(value));
-            return;
-          }
           if (
             request.url === '/v1/reference' ||
             request.url === '/v1/reference/session-title'
           ) {
             const title = request.url.endsWith('/session-title');
             if (!title && assistantCalls < 2) await sealRequest();
+            if (!title && assistantCalls === 2) {
+              const attempt = await owner.readNativeAttemptFor(
+                context,
+                { kind: 'session', sessionId: nativeSessionId },
+                signal,
+              );
+              expect(attempt?.observation?.proofState).toBe('adopted');
+            }
             const reference = randomBytes(32).toString('base64url');
             references.set(reference, title);
             response
@@ -508,8 +542,47 @@ it.skipIf(
           if (request.url !== '/v1/stream' || title === undefined)
             throw Error('Unknown test model request');
           if (!title) assistantCalls++;
+          if (!title && assistantCalls === 1) {
+            const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            const message = input.messages.find(
+              (value: {
+                role: string;
+                source?: { kind: string };
+                content: { text?: string }[];
+              }) =>
+                value.role === 'user' &&
+                value.source?.kind === 'user' &&
+                value.content.some((block) => block.text?.includes(fileMarker)),
+            );
+            const attempt = await owner.readNativeAttemptFor(
+              context,
+              { kind: 'session', sessionId: nativeSessionId },
+              signal,
+            );
+            expect(
+              attempt?.prompts.map(({ messageId }) => messageId),
+            ).toContain(message?.id);
+          }
+
+          if (!title && assistantCalls === 3) {
+            const modelInput = Buffer.concat(chunks).toString('utf8');
+            expect(modelInput).toContain(confirmed.details);
+            expect(modelInput).toContain(
+              'Memory candidate outcome is unconfirmed. Do not retry.',
+            );
+          }
+          if (!title && assistantCalls === 4) {
+            const modelInput = Buffer.concat(chunks).toString('utf8');
+            expect(modelInput).toContain(retryCallId);
+            expect(
+              modelInput.match(
+                /Memory candidate outcome is unconfirmed\. Do not retry\./g,
+              )?.length,
+            ).toBeGreaterThanOrEqual(2);
+            results.resolve();
+          }
           const called =
-            title || assistantCalls > 2
+            title || assistantCalls > 3
               ? []
               : assistantCalls === 1
                 ? tools
@@ -518,7 +591,12 @@ it.skipIf(
             ? called.map(({ id, args }, index) => ({
                 type: 'tool-call-delta',
                 index,
-                id: id === 'memory_remember' ? rememberCallId : randomUUID(),
+                id:
+                  id === 'memory_remember'
+                    ? assistantCalls === 3
+                      ? retryCallId
+                      : rememberCallId
+                    : randomUUID(),
                 name: 'mcp__allrice__' + id,
                 argumentsDelta: JSON.stringify(args),
               }))
@@ -558,29 +636,6 @@ it.skipIf(
       });
       const origin = await listen(server);
       cleanup.push(() => closeServer(server));
-      const probe = `
-        import { withNativeMemoryToolPublication } from './owner.mjs';
-        export const inject = ['tools'];
-        export function apply(ctx) {
-          for(const tool of ${JSON.stringify(tools)}) {
-            ctx.tools.register(withNativeMemoryToolPublication({
-              name: 'mcp__allrice__' + tool.id,
-              description: 'Validate the isolated native memory contract.',
-              parameters: tool.schema,
-              output: { schema: {type:'string'}, render: (_ctx, text) => [{type:'text',text}] },
-              async execute(args, exec, ref) {
-                const response = await fetch(${JSON.stringify(origin + '/fixture-memory-tool')}, {
-                  method: 'POST', signal: exec.signal,
-                  headers: {authorization: ${JSON.stringify('Bearer ' + capability)}, 'content-type':'application/json'},
-                  body: JSON.stringify({id:tool.id,args,ref}),
-                });
-                if (!response.ok) throw Error('Fixture tool refused');
-                return JSON.stringify(await response.json());
-              },
-            }, ${JSON.stringify(version)}));
-          }
-        }
-      `;
       const owner = (
         await setupNativeWebFixture(
           cli,
@@ -590,7 +645,7 @@ it.skipIf(
           {
             identity,
             loginSessionId: login.id,
-            nativeToolEvidenceProbe: probe,
+            nativeMemoryEnabled: true,
           },
           {
             origin,
@@ -610,7 +665,7 @@ it.skipIf(
             const observation = request.observe(
               signal,
               undefined,
-              async (fact, active) => {
+              async (fact, active, args) => {
                 try {
                   const receipt = attempts.get(fact.attemptId);
                   if (!receipt)
@@ -652,7 +707,44 @@ it.skipIf(
                     input,
                     active,
                   );
-                  return nativeRequestRef;
+                  if (nativeRequestRef !== ref || !args)
+                    throw Error(
+                      'The sealed production tool did not send its own arguments',
+                    );
+                  const unknownWrite =
+                    toolId === 'memory_remember' && attempts.size === 2;
+                  const toolActions = unknownWrite
+                    ? {
+                        ...host,
+                        async remember() {
+                          await commitWithoutDelivery(ref, args.value);
+                          throw Error('Candidate result was lost after commit');
+                        },
+                      }
+                    : host;
+                  const result = await executeProductionNativeMemoryTool(
+                    toolActions,
+                    toolId,
+                    context,
+                    target(ref),
+                    args.value,
+                    active,
+                  );
+                  delivered.set(ref, {
+                    id: toolId,
+                    value: unknownWrite
+                      ? null
+                      : toolId === 'memory_read'
+                        ? result.text
+                        : JSON.parse(result.text),
+                  });
+                  if (unknownWrite) {
+                    expect(result.outcome).toBe('unknown');
+                    // The database commit happened, but the private response
+                    // carries no authoritative result to the waiting tool.
+                    return null;
+                  }
+                  return result;
                 } catch (cause) {
                   error.reject(cause);
                   throw cause;
@@ -727,7 +819,10 @@ it.skipIf(
                   sessionId: nativeSessionId,
                   requestId: nativePromptId,
                   content: [
-                    { type: 'text', text: 'Run the isolated memory check.' },
+                    {
+                      type: 'text',
+                      text: 'Run the isolated memory check.\n' + fileMarker,
+                    },
                   ],
                   mode: 'queue',
                 },

@@ -23,8 +23,12 @@ import {
   type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
-import { nativeSearchToolPatches } from './search-tools.js';
+import {
+  nativeEmployeeSkillPatches,
+  nativeSearchToolPatches,
+} from './search-tools.js';
 import { nativeEmployeePersonaPatches } from './employee-instructions.js';
+import { productionNativeMemoryToolDefinitions } from '../person-vm/production-native-memory.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -39,6 +43,7 @@ export type NativeWebConfiguration = Readonly<{
   startupTimeoutMs: number;
   terminalEnabled?: boolean;
   employeeInstructions?: string;
+  nativeMemoryEnabled?: boolean;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -136,6 +141,8 @@ export async function prepareNativeWebLaunch(
   modelAdapter?: NativeWebModelAdapter,
 ): Promise<NativeWebLaunchPlan> {
   let origin: URL, publicUrl: URL;
+  if (config.nativeMemoryEnabled && !modelAdapter)
+    throw new PersonVmError('PROVIDER_FAILED');
   try {
     origin = new URL(config.origin);
     publicUrl = new URL(config.publicUrl);
@@ -207,6 +214,15 @@ export async function prepareNativeWebLaunch(
     ),
     'utf8',
   );
+  const deliverySource = await readFile(
+    new URL(
+      modelAdapter
+        ? '../../dist/allrice-native-delivery-capture.mjs'
+        : '../../dsh/allrice-native-delivery-capture.mjs',
+      import.meta.url,
+    ),
+    'utf8',
+  );
   const modelOwner = `${directory}/owner-with-model.mjs`;
   const searchPlugin = `${directory}/allrice-managed-web-search.mjs`;
   const searchSource = modelAdapter
@@ -220,6 +236,27 @@ export async function prepareNativeWebLaunch(
       ? nativeScopedModelPatches(modelAdapter.scoped)
       : nativeSearchToolPatches(modelAdapter.webSearchEnabled === true)
     : [];
+  const skillPatches = nativeEmployeeSkillPatches(modelPatches);
+  const permissionPatches = [
+    {
+      id: 'sandbox-policy',
+      config: { mode: 'workspace-write', workspaceRoot: config.workdir },
+    },
+    { id: 'approval', config: { policy: 'never' } },
+    {
+      id: 'permission',
+      config: {
+        defaultPreset: 'workspace-write',
+        presets: {
+          'read-only': { sandbox: 'read-only', approval: 'never' },
+          'workspace-write': {
+            sandbox: 'workspace-write',
+            approval: 'never',
+          },
+        },
+      },
+    },
+  ];
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
@@ -234,6 +271,11 @@ export async function prepareNativeWebLaunch(
             },
           ]
         : []),
+      {
+        path: `${directory}/allrice-native-delivery-capture.mjs`,
+        contents: deliverySource,
+        mode: 0o600,
+      },
       {
         path: `${directory}/allrice-native-run-journal.mjs`,
         contents: journalSource,
@@ -318,6 +360,10 @@ export function apply(ctx, config) {
                           ...modelAdapter,
                           id: auth.modelAdapterId,
                           cliPath: config.cliPath,
+                          ...(config.nativeMemoryEnabled && {
+                            memoryTools:
+                              productionNativeMemoryToolDefinitions(),
+                          }),
                         },
                       }
                     : {}),
@@ -335,11 +381,11 @@ export function apply(ctx, config) {
               ]
             : []),
           ...(commandMemory ?? []),
+          ...modelPatches,
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                ...modelPatches,
                 {
                   id: 'agent-default-model',
                   config: {
@@ -349,8 +395,14 @@ export function apply(ctx, config) {
                 },
               ]
             : []),
+          ...skillPatches,
+          ...permissionPatches,
           ...(config.employeeInstructions !== undefined
-            ? nativeEmployeePersonaPatches(modelPatches)
+            ? nativeEmployeePersonaPatches([
+                ...modelPatches,
+                ...skillPatches,
+                ...permissionPatches,
+              ])
             : []),
         ]),
         mode: 0o600,

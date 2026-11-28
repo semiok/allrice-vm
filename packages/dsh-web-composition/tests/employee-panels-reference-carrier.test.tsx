@@ -616,6 +616,7 @@ it('registers a callable contribution in real Cordis/slot lifetimes and releases
   expect(registered).toEqual(
     referenceKinds.map((kind) => 'allrice-employee-panels.' + kind),
   );
+  // This fixture does not provide a native conversation or remote history.
   expect(ctx.slots.entries('sidebar.right.pane.tab')).toHaveLength(4);
   const ref = window.__allricePanelsReference!;
   ref.open(['files']);

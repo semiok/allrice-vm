@@ -53,9 +53,9 @@ is no default business owner, replacement Dock, or management-main fallback.
 Files use the existing owner-provided unread count; the other three badges keep
 their existing zero values. An unknown files count hides the entries.
 
-The session header shades only the native `agent-preset` display entry. Native
-preset selection/settings, permission services and execution modes remain owned
-by DSH. The final native subagent catalog stays at order 10, followed by the
+The employee profile selects the native Standard preset and disables the
+browser permission and preset selectors. Existing session permission facts
+stay with the native Host. The final native subagent catalog stays at order 10, followed by the
 files/materials/memory/capabilities launchers at order 20. The fixed MET-278 child
 contribution is bundled once with the native React instance; both catalog open
 gestures use the same native read-only right-pane resource.
@@ -115,13 +115,15 @@ root returned after cancellation; repeated disposal does not retry destruction.
 Full module/ownership and recovery contracts are in
 [`allrice-employee-sidebar.md`](../../docs/development/allrice-employee-sidebar.md).
 
-The bundle disables Trajectory and both Open In plugins, selects Chinese,
-and initializes compact chat usage presentation. The client shades only the
-session-log-download header utility, permission/model selectors, and the two
-usage/activity dock pills. Host log export, model/permission services,
-accounting, account usage, and native subagent catalog tokens remain intact.
-Process folding, tool details, questions, documents, and the composer use the
-native implementation.
+The bundle disables Trajectory, Open In, export and feedback for employee Web.
+The AllRice language pack inherits native Chinese and English, and replaces the
+running label and Hero copy. The brand contribution uses the native Hero slot,
+settings row and theme tokens. Its color comes from the currently selected
+employee in the authenticated sidebar snapshot. The native composer and its
+tools, live status, accounting and accessibility remain available. The page
+gateway projects the approved / and + command catalog. Production Guest
+startup removes filesystem Skill discovery from native presets. A business
+Skill must have an authorized provider in its session's composition.
 
 The native General `performance-usage` setting can override the initial
 `compact` preference. M1-17 owns whether employees see that settings entry,

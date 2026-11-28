@@ -1,5 +1,15 @@
+import type { getDatabase } from '@allrice/database';
 import { createHash } from 'node:crypto';
-import { memoryIndexPolicy, type RequestContext } from '@allrice/contracts';
+import {
+  MemoryOrdinalInputSchema,
+  RememberPersonalMemoryInputSchema,
+  memoryIndexPolicy,
+  type RequestContext,
+} from '@allrice/contracts';
+import { createNativeEmployeeMemoryHost } from '@allrice/database';
+import type { ModelDispatchAuthority } from '@allrice/model-gateway';
+import { z } from 'zod';
+import type { NativeMemoryToolResult } from '../native-web/prompt-observation.js';
 import type { NativeExecutionBuild } from './production-native-execution-evidence.js';
 
 export type MemoryRootObservation = Readonly<
@@ -51,6 +61,19 @@ export type MemoryHostPublication = Readonly<{
     input: MemoryRootObservation,
     signal: AbortSignal,
   ): Promise<Readonly<{ executionRef: string; memoryIndexDocument: string }>>;
+  dispatchRoot?(
+    context: RequestContext,
+    input: Extract<MemoryRootObservation, { mode: 'restore' }>,
+    signal: AbortSignal,
+    codex: ModelDispatchAuthority['codex'],
+    start: (
+      root: {
+        executionRef: string;
+        memoryIndexDocument: string;
+      },
+      tx: ReturnType<typeof getDatabase>,
+    ) => Promise<void>,
+  ): Promise<void>;
   call(
     context: RequestContext,
     input: MemoryToolObservation,
@@ -63,7 +86,73 @@ export type MemoryHostPublication = Readonly<{
 export type ProductionNativeMemorySource = Readonly<{
   toolVersions: Readonly<Record<MemoryToolObservation['toolId'], string>>;
   publication: MemoryHostPublication;
+  tools?: Pick<
+    ReturnType<typeof createNativeEmployeeMemoryHost>,
+    'readOrdinal' | 'remember'
+  >;
 }>;
+
+const memoryToolVersion = 'allrice-native-employee-memory-v1';
+const toolVersions = Object.freeze({
+  memory_read: memoryToolVersion,
+  memory_remember: memoryToolVersion,
+});
+
+export function productionNativeMemoryToolDefinitions() {
+  return [
+    {
+      id: 'memory_read',
+      version: toolVersions.memory_read,
+      description:
+        'Read details for a marked number in this Run’s confirmed memory index. Do not guess missing numbers.',
+      parameters: z.toJSONSchema(MemoryOrdinalInputSchema),
+    },
+    {
+      id: 'memory_remember',
+      version: toolVersions.memory_remember,
+      description:
+        'Propose a stable fact personally stated by the current user. The owner must confirm it before it becomes active. Do not retry an unknown outcome.',
+      parameters: z.toJSONSchema(RememberPersonalMemoryInputSchema, {
+        io: 'input',
+      }),
+    },
+  ];
+}
+
+export function createProductionNativeMemorySource(): ProductionNativeMemorySource {
+  const host = createNativeEmployeeMemoryHost();
+  return Object.freeze({ toolVersions, publication: host, tools: host });
+}
+
+export async function executeProductionNativeMemoryTool(
+  tools: NonNullable<ProductionNativeMemorySource['tools']>,
+  toolId: MemoryToolObservation['toolId'],
+  context: RequestContext,
+  target: Parameters<typeof tools.readOrdinal>[1],
+  input: unknown,
+  signal: AbortSignal,
+): Promise<NativeMemoryToolResult> {
+  if (toolId === 'memory_read')
+    return {
+      outcome: 'result',
+      text: await tools.readOrdinal(context, target, input, signal),
+    };
+  const candidate = RememberPersonalMemoryInputSchema.parse(input);
+  try {
+    return {
+      outcome: 'result',
+      text: JSON.stringify(
+        await tools.remember(context, target, candidate, signal),
+      ),
+    };
+  } catch {
+    // Once the writer is entered, a missing receipt does not prove rollback.
+    return {
+      outcome: 'unknown',
+      text: 'Memory candidate outcome is unconfirmed. Do not retry. Check Pending memories before taking further action.',
+    };
+  }
+}
 
 export function selectNativeMemoryConfiguration(
   source: ProductionNativeMemorySource,

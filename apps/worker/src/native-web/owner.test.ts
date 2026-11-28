@@ -25,6 +25,7 @@ import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 import { nativeScopedModelPatches } from './model-task-presets.js';
 import { nativeEmployeePersonaPatches } from './employee-instructions.js';
 import {
+  nativeEmployeeSkillPatches,
   nativeSearchToolPatches,
   nativeWebBundlePatches,
 } from './search-tools.js';
@@ -189,6 +190,110 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     ),
     '10.0.0.6' as PersonVmNativeWebGuestAddress,
   );
+  const modelRoute = { provider: 'openai', model: 'fixture-model' };
+  const modelInfo = {
+    provider: modelRoute.provider,
+    id: modelRoute.model,
+    name: modelRoute.model,
+    inputModalities: ['text'] as const,
+  };
+  const withPersona = await prepareNativeWebLaunch(
+    {
+      ...config,
+      employeeInstructions: '# Fixture employee instructions',
+      nativeMemoryEnabled: true,
+    },
+    binding,
+    profile,
+    undefined,
+    {
+      ...modelRoute,
+      origin: 'http://127.0.0.1:32180/',
+      capability: 'q'.repeat(43),
+      modelInfo,
+      scoped: {
+        rules: [],
+        title: modelRoute,
+        compaction: modelRoute,
+        models: [{ ...modelRoute, modelInfo }],
+      },
+    },
+  );
+  const layeredPatch = withPersona.files.find(({ path }) =>
+    path.endsWith('/owner.patch.json'),
+  );
+  if (!layeredPatch) throw Error('actual native owner patch missing');
+  const layered = composeEntries([
+    ...nativeWebBundlePatches(),
+    JSON.parse(layeredPatch.contents),
+  ]);
+  const managedPermissions = [
+    {
+      id: 'sandbox-policy',
+      config: { mode: 'workspace-write', workspaceRoot: config.workdir },
+    },
+    { id: 'approval', config: { policy: 'never' } },
+    {
+      id: 'permission',
+      config: {
+        defaultPreset: 'workspace-write',
+        presets: {
+          'read-only': { sandbox: 'read-only', approval: 'never' },
+          'workspace-write': { sandbox: 'workspace-write', approval: 'never' },
+        },
+      },
+    },
+  ];
+  for (const { id, config: expected } of managedPermissions) {
+    expect(layered.find((entry) => entry.id === id)?.config).toEqual(expected);
+  }
+  expect(
+    layered.find(({ id }) => id === 'allrice-native-web-owner')?.config,
+  ).toMatchObject({
+    modelAdapter: {
+      memoryTools: [
+        expect.objectContaining({ id: 'memory_read' }),
+        expect.objectContaining({ id: 'memory_remember' }),
+      ],
+    },
+  });
+  expect(
+    layered.find(({ id }) => id === 'agent-default-model')?.config,
+  ).toMatchObject(modelRoute);
+  expect(
+    layered.find(({ id }) => id === 'session-title-llm')?.config,
+  ).toMatchObject(modelRoute);
+  for (const id of ['preset-standard', 'preset-ptc', 'preset-cordis']) {
+    expect(layered.find((entry) => entry.id === id)?.config?.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'skill-filesystem', disabled: true }),
+        expect.objectContaining({ id: 'tool-skill' }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-tool-web',
+          config: expect.objectContaining({ search: false }),
+        }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-persona',
+          config: expect.objectContaining({ prefix: '', complete: false }),
+        }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-agent-instructions',
+        }),
+        expect.objectContaining({
+          id: 'compaction',
+          config: expect.arrayContaining([
+            expect.objectContaining({
+              name: '@deepseek-ai/dsh-compaction-basic',
+              config: expect.objectContaining({
+                summarizationProvider: modelRoute.provider,
+                summarizationModel: modelRoute.model,
+              }),
+            }),
+          ]),
+        }),
+      ]),
+    );
+  }
   expect(a.command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
   expect(a.command.args).toContain('--no-open');
   expect(a.command.args.slice(a.command.args.indexOf('--port'))).toEqual([
@@ -217,6 +322,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   const patch = a.files.find((file) => file.path.endsWith('/owner.patch.json'));
   if (!patch) throw Error('actual native owner patch missing');
   const entries = JSON.parse(patch.contents);
+  expect(entries.slice(-3)).toEqual(managedPermissions);
   const terminalIds = ['terminal-controller', 'ui-sidebar-terminal'];
   expect(
     entries.filter(({ id }: { id?: string }) => terminalIds.includes(id ?? '')),
@@ -313,6 +419,33 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
         profile,
       ),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('turns off filesystem Skill discovery in every preset while retaining tools and earlier overlays', () => {
+  const scoped = nativeScopedModelPatches({
+    compaction: { provider: 'openai', model: 'compact-model' },
+  });
+  const base = [...nativeWebBundlePatches(), scoped];
+  const before = composeEntries(base);
+  const after = composeEntries([...base, nativeEmployeeSkillPatches(scoped)]);
+  const known = ['preset-standard', 'preset-ptc', 'preset-cordis'];
+  for (const id of known) {
+    const original = before.find((entry) => entry.id === id)?.config;
+    expect(after.find((entry) => entry.id === id)?.config).toEqual({
+      ...original,
+      plugins: original.plugins.map((plugin: { id: string }) =>
+        plugin.id === 'skill-filesystem'
+          ? { ...plugin, disabled: true }
+          : plugin,
+      ),
+    });
+    expect(original.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'skill-filesystem' }),
+        expect.objectContaining({ id: 'tool-skill' }),
+      ]),
+    );
+  }
 });
 
 it.each([false, true])(

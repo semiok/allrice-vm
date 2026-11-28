@@ -12,6 +12,7 @@ import type {
   EmployeeInstance,
 } from '@allrice/contracts';
 import type { Session, SessionActivity, Workspace } from './chatflow-types';
+import { EmployeeSidebarView } from './employee-sidebar-view';
 import { EmployeeSidebar } from './employee-sidebar';
 import { employeeAccentStyle } from './employee-navigation';
 import {
@@ -126,6 +127,8 @@ export function EmployeeArchiveDialog({
   onSelectSession,
   onPrepareSession,
   onClose,
+  entry,
+  lifetime,
 }: {
   archive: Archive;
   headers: Record<string, string>;
@@ -136,6 +139,8 @@ export function EmployeeArchiveDialog({
   onSelectSession: (id: string) => void;
   onPrepareSession: (id: string) => void;
   onClose: () => void;
+  entry?: '4.0';
+  lifetime?: AbortSignal;
 }) {
   const sessionArchive = useSessionArchive({
     workspace,
@@ -146,7 +151,10 @@ export function EmployeeArchiveDialog({
       (session) => session.id === activeId,
     ),
     initialFilter: 'only',
+    entry,
+    lifetime,
   });
+  const Sidebar = entry ? EmployeeSidebarView : EmployeeSidebar;
   const [tab, setTab] = useState<'employees' | 'conversations'>('employees');
   const [employeeId, setEmployeeId] = useState<string>();
   const [rootReady, setRootReady] = useState(false);
@@ -366,7 +374,7 @@ export function EmployeeArchiveDialog({
                     正在读取…
                   </p>
                 ) : sessions.length || employeeId ? (
-                  <EmployeeSidebar
+                  <Sidebar
                     workspace={workspace}
                     sessions={sessions}
                     archive={sessionArchive}

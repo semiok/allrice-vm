@@ -4,7 +4,12 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
+import {
+  useEmployeeSidebarManagement,
+  type EmployeeSidebarManagement,
+} from '../../../apps/web/app/chatflow/4.0/employee-sidebar-management';
 import { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
 import { ChatSidebarFrame } from '../../../apps/web/app/chatflow/chat-sidebar-frame';
 import { EmployeeSidebarView } from '../../../apps/web/app/chatflow/employee-sidebar-view';
@@ -33,7 +38,7 @@ type PersonalCreation = Omit<
 /** Business projection and operations supplied by the authenticated AllRice owner. */
 export interface EmployeeSidebarSnapshot {
   tree: Omit<Tree, 'collapsed' | 'onVisibleSessionsChange' | 'archive'> &
-    Required<Pick<Tree, 'onNewSession' | 'onDetails' | 'onEmployeeNavigate'>>;
+    Required<Pick<Tree, 'onNewSession' | 'onEmployeeNavigate'>>;
   archive?: NonNullable<Frame['archive']>;
   employeeArchiveOpen?: boolean;
   settingsOpen: boolean;
@@ -45,7 +50,8 @@ export interface EmployeeSidebarPort {
   getSnapshot: () => EmployeeSidebarSnapshot | null;
   subscribe: (listener: () => void) => () => void;
   createEmployee: (() => void) | PersonalCreation;
-  openArchive: () => void;
+  openArchive?: () => void;
+  management?: EmployeeSidebarManagement;
   /** MET-279 supplies the employee settings surface; never an admin route. */
   openEmployeeSettings: () => void;
 }
@@ -75,7 +81,12 @@ export function EmployeeSidebar({
     () => false,
   );
   const [creating, setCreating] = useState(false);
+  const management = useEmployeeSidebarManagement(
+    snapshot?.tree.workspace ?? null,
+    port.management,
+  );
   if (!snapshot) return null;
+  const archive = management?.archive ?? snapshot.archive;
   const creation = port.createEmployee;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
@@ -83,8 +94,10 @@ export function EmployeeSidebar({
   return (
     <>
       <ChatSidebarFrame
-        archive={snapshot.archive}
-        employeeArchiveOpen={snapshot.employeeArchiveOpen}
+        archive={archive}
+        employeeArchiveOpen={
+          management?.showArchive ?? snapshot.employeeArchiveOpen
+        }
         collapsed={collapsed}
         overlay={compact && !collapsed}
         style={{ height: '100%' }}
@@ -97,7 +110,7 @@ export function EmployeeSidebar({
                 setCreating(true);
               }
         }
-        onOpenArchive={port.openArchive}
+        onOpenArchive={management?.openArchive ?? port.openArchive}
         onOpenAutomations={() => {
           ctx.layout.selectPanel(
             'schedules' as Parameters<typeof ctx.layout.selectPanel>[0],
@@ -108,12 +121,16 @@ export function EmployeeSidebar({
         employeeTree={
           <>
             {snapshot.error && <p role="alert">{snapshot.error}</p>}
+            {management?.archive.error && (
+              <p role="alert">{management.archive.error}</p>
+            )}
             <EmployeeSidebarView
               {...snapshot.tree}
-              archive={snapshot.archive}
+              archive={archive}
               collapsed={collapsed}
+              onDetails={management?.openDetails ?? snapshot.tree.onDetails}
               onNewSession={(id) => {
-                snapshot.archive?.setFilter('default');
+                archive?.setFilter('default');
                 snapshot.tree.onNewSession(id);
                 closeMobile();
               }}
@@ -126,6 +143,7 @@ export function EmployeeSidebar({
         }
         settings={renderSlot('sidebar.settings', { wide: !collapsed })}
       />
+      {management?.overlays}
       {creating && typeof creation !== 'function' && (
         <EmployeeCreateDialog
           {...creation}

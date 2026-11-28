@@ -12,6 +12,7 @@ import {
 } from './employee-web-entry';
 import {
   pageEditorMounted,
+  pageSkillsRefreshed,
   pageStartupFailed,
   pageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
@@ -66,7 +67,6 @@ function boot(
           return { state: 'closed' };
         });
     const finish = (state: EmployeeWebEntryClose['state']) => {
-      window.removeEventListener('pagehide', close);
       documentOwner.signal.removeEventListener('abort', close);
       if (scope.__DSH_TRANSPORT__ === profile?.transport)
         delete scope.__DSH_TRANSPORT__;
@@ -100,6 +100,8 @@ function boot(
         );
       },
       drafts.registerDraft,
+      () =>
+        container.ownerDocument.dispatchEvent(new Event(pageSkillsRefreshed)),
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
@@ -112,7 +114,6 @@ function boot(
       cancel: document.cancel,
       cleanup: document.close,
     });
-    window.addEventListener('pagehide', close, { once: true });
     documentOwner.signal.addEventListener('abort', close, { once: true });
     void entry.started.then((result) => {
       if (result.state === 'ready' && !document.signal.aborted && !closing)

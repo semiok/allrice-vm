@@ -18,6 +18,7 @@ import {
   DEntryPageRpcRequestSchema,
   DEntryPageUnarySchema,
   DEntryPageSwitchSchema,
+  DEntryPageSkillRefreshSchema,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
@@ -25,7 +26,8 @@ import {
   D_ENTRY_PAGE_UPLINK_BYTES,
   type DEntryPageInput,
 } from '@allrice/d-entry-principal/types';
-import { DataAccessError } from '@allrice/database';
+import { DataAccessError, EmployeeInstanceError } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import { controlTitleTargets, snapshotTitleTarget } from './native-title.js';
 import {
@@ -111,6 +113,8 @@ type OwnedPage = {
   stop: AbortController;
   page?: DEntryPageHandle;
   resources?: ReturnType<typeof pageStreams>;
+  stopSkillChanges?: () => void;
+  skillsChanged?: boolean;
   operation: Promise<void>;
 };
 
@@ -131,6 +135,9 @@ async function runOwner(
   let handoff: Promise<void> | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false;
+  const withdrawal = new AbortController();
+  let revokedPage:
+    { generation: OwnedPage; scopeId: string; reason: unknown } | undefined;
   const notify = (error: unknown) => {
     if (!streamId || terminal || connected.aborted) return;
     terminal = send({
@@ -169,7 +176,23 @@ async function runOwner(
           await publish(generation, page);
         },
         (error) => {
-          if (!requestedClose && !stop.signal.aborted) fail(error);
+          if (stop.signal.aborted || revokedPage) return;
+          const scopeId = generation.page?.scope.opened.scopeId;
+          const { status } = dEntryHttpProblem(error);
+          if (
+            scopeId &&
+            current === generation &&
+            !staged &&
+            !terminal &&
+            (status === 401 ||
+              status === 404 ||
+              (error instanceof EmployeeInstanceError &&
+                error.code === 'instance_archived') ||
+              (error instanceof PersonVmError && error.code === 'LEASE_LOST'))
+          ) {
+            revokedPage = { generation, scopeId, reason: error };
+            if (!requestedClose) withdrawal.abort();
+          } else if (!requestedClose) fail(error);
         },
         previous,
       ),
@@ -178,6 +201,7 @@ async function runOwner(
   }
 
   function endPage(generation: OwnedPage | undefined, reason?: unknown) {
+    generation?.stopSkillChanges?.();
     generation?.stop.abort(reason);
     if (!generation?.page) generation?.setup.abort(reason);
   }
@@ -195,7 +219,10 @@ async function runOwner(
           scope.reason === generation.setup.signal.reason) ||
         (generation.stop.signal.aborted &&
           scope.reason === generation.stop.signal.reason);
-      if (!intentional) throw scope.reason;
+      const revoked =
+        revokedPage?.generation === generation &&
+        scope.reason === revokedPage.reason;
+      if (!intentional && !revoked) throw scope.reason;
     }
   }
 
@@ -206,6 +233,22 @@ async function runOwner(
       AbortSignal.any([connected, generation.stop.signal, page.signal]),
     );
     current = generation;
+    generation.stopSkillChanges = page.scope.subscribeSkillChanges?.(() => {
+      if (
+        !streamId ||
+        generation !== current ||
+        requestedClose ||
+        generation.stop.signal.aborted ||
+        generation.skillsChanged
+      )
+        return;
+      generation.skillsChanged = true;
+      void send({
+        type: 'item',
+        streamId,
+        value: { type: 'skills-changed', scopeId: page.scope.opened.scopeId },
+      }).catch(fail);
+    });
   }
 
   function switchThread(
@@ -288,7 +331,7 @@ async function runOwner(
 
   try {
     for await (const [message, binary] of on(peer, 'message', {
-      signal: connected,
+      signal: AbortSignal.any([connected, withdrawal.signal]),
       close: ['close'],
       highWaterMark: 1,
       lowWaterMark: 1,
@@ -315,9 +358,10 @@ async function runOwner(
           });
         });
         void current.operation.catch((error) => {
-          if (!requestedClose) fail(error);
+          if (!requestedClose && !revokedPage) fail(error);
         });
       } else if (frame.streamId !== streamId) {
+        if (revokedPage) continue;
         if (!current?.resources || requestedClose) throw denied();
         if (!current.stop.signal.aborted) current.resources.accept(frame);
       } else if (
@@ -330,6 +374,33 @@ async function runOwner(
         endPage(current, reason);
         endPage(staged, reason);
       } else if (frame.type === 'item' && !requestedClose) {
+        const refresh = DEntryPageSkillRefreshSchema.safeParse(frame.value);
+        if (refresh.success && refresh.data.type === 'refresh-skills') {
+          const generation = current;
+          const page = generation?.page;
+          if (
+            !generation?.skillsChanged ||
+            !page ||
+            refresh.data.scopeId !== page.scope.opened.scopeId
+          )
+            continue; // An in-place thread handoff can supersede the notice.
+          await generation.resources?.close();
+          if (generation !== current || generation.stop.signal.aborted)
+            continue;
+          page.signal.throwIfAborted();
+          generation.skillsChanged = false;
+          generation.resources = pageStreams(
+            page,
+            send,
+            AbortSignal.any([connected, generation.stop.signal, page.signal]),
+          );
+          await send({
+            type: 'item',
+            streamId: frame.streamId,
+            value: { type: 'skills-refreshed', scopeId: refresh.data.scopeId },
+          });
+          continue;
+        }
         await switchThread(
           DEntryPageSwitchSchema.parse(frame.value),
           frame.streamId,
@@ -371,9 +442,40 @@ async function runOwner(
       }
     }
   } catch (error) {
-    endPage(current, error);
-    endPage(staged, error);
-    await notify(error);
+    if (
+      revokedPage &&
+      withdrawal.signal.aborted &&
+      streamId &&
+      !connected.aborted &&
+      error instanceof Error &&
+      error.cause === withdrawal.signal.reason
+    ) {
+      // The original page already fenced its authority. Only receipt of the
+      // exact close below confirms that its streams, principal and permit joined.
+      const { generation, scopeId, reason } = revokedPage;
+      endPage(generation, reason);
+      try {
+        await send({
+          type: 'item',
+          streamId,
+          value: { type: 'revoked', scopeId },
+        });
+        await join(generation);
+        connected.throwIfAborted();
+        await send({
+          type: 'item',
+          streamId,
+          value: { type: 'closed', scopeId },
+        });
+        await send({ type: 'end', streamId });
+      } catch (cleanupError) {
+        await notify(cleanupError);
+      }
+    } else {
+      endPage(current, error);
+      endPage(staged, error);
+      await notify(error);
+    }
   } finally {
     endPage(current, connected.reason);
     endPage(staged, connected.reason);

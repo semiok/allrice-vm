@@ -69,6 +69,24 @@ async function installObserverWeb(
   manual = false,
   listenHost = '127.0.0.1',
 ) {
+  // This fixture observes owner publication without loading a Guest shell.
+  const modes = ['read-only', 'workspace-write'] as const;
+  host.provide('sessions', { list: () => [] });
+  host.provide('approval', { config: { policy: 'never' } });
+  host.provide('sandboxPolicy', {
+    resolve: () => ({ mode: 'workspace-write' }),
+  });
+  host.provide('permissionPresets', {
+    catalog: () => ({
+      defaultPreset: 'workspace-write',
+      options: modes.map((value) => ({ value })),
+    }),
+    resolve: (mode: (typeof modes)[number]) => ({
+      sandbox: mode,
+      approval: 'never',
+    }),
+    set: vi.fn(),
+  });
   let committed = false;
   const listeners = new Set<() => void>();
   host.provide('appReady', {

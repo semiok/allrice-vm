@@ -1,3 +1,4 @@
+import { referenceArchivePolicy } from '@allrice/file-archives';
 import { z } from 'zod';
 import {
   MaterialsActionCommandProjectionSchema,
@@ -6,12 +7,14 @@ import {
   ReferencePublicationQuerySchema,
   ReferencePublishInputSchema,
   UuidSchema,
+  supportsEmployeeFileMentionText,
   WorkbenchDeliverablesFilterSchema,
   WorkbenchFileFavoriteSchema,
   WorkbenchFileUploadSchema,
 } from '@allrice/contracts';
 import {
   DataAccessError,
+  findDEntryNativeDelivery,
   isIndexableKnowledgeTextSource,
 } from '@allrice/database';
 import { workbenchFileError, workbenchFileHeaders } from '../workbench-files';
@@ -255,6 +258,27 @@ export function createEmployeePanelsHandlers(
         throw new DataAccessError('authorization_denied');
       return scope.materials.changeSource(scope.context, value, request.signal);
     }),
+    resolveNativeDelivery: route(false, async (scope, _params, request) => {
+      const query = new URL(request.url).searchParams;
+      if (
+        query.getAll('coordinate').length !== 1 ||
+        query.getAll('occurrence').length > 1
+      )
+        throw new DataAccessError('not_found');
+      const objectId = await findDEntryNativeDelivery(
+        scope.context,
+        scope.selection,
+        query.get('coordinate')!,
+        query.get('occurrence') ?? undefined,
+      );
+      const resource = await scope.deliverables.download(
+        scope.context,
+        { objectId },
+        request.signal,
+      );
+      await resource.reauthorize(request.signal);
+      return { objectId };
+    }),
     listDeliverables: route(false, async (scope, _params, request) => {
       const params = new URL(request.url).searchParams;
       const filter = WorkbenchDeliverablesFilterSchema.parse({
@@ -276,6 +300,12 @@ export function createEmployeePanelsHandlers(
         ...catalog,
         quotableFileIds: catalog.files
           .filter((file) => {
+            if (params.get('mention') === '1')
+              return (
+                supportsEmployeeFileMentionText(file) ||
+                (file.mediaType === 'application/zip' &&
+                  file.sizeBytes <= referenceArchivePolicy.maximumBytes)
+              );
             if (file.reference?.companyTemplate) return true;
             const current =
               file.reference?.checksum === file.checksum

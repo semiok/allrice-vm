@@ -44,6 +44,14 @@
 .body {
   padding: 16px;
 }
+.personaDialog.personaDialog {
+  height: auto;
+}
+.personaBody.personaBody {
+  min-block-size: 0;
+  overflow-y: auto;
+  padding-block-end: var(--ar-space-6, 24px);
+}
 .unifiedDialog.unifiedDialog[role='dialog'] {
   width: min(848px, 100%);
   height: auto;

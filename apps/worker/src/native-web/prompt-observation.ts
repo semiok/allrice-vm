@@ -97,12 +97,21 @@ const nativeMemoryToolObservation = nativeToolObservation.extend({
 export type NativeMemoryToolObservation = z.infer<
   typeof nativeMemoryToolObservation
 >;
+export type NativeMemoryToolResult = Readonly<{
+  outcome: 'result' | 'unknown';
+  text: string;
+}>;
 export type PublishNativeMemoryCall = (
   fact: NativeMemoryToolObservation,
   signal: AbortSignal,
-) => Promise<string | null>;
+  argumentsFromTool?: { value: unknown },
+) => Promise<string | NativeMemoryToolResult | null>;
 const memoryCallFrame = z
-  .object({ ticket: UuidSchema, fact: nativeMemoryToolObservation })
+  .object({
+    ticket: UuidSchema,
+    fact: nativeMemoryToolObservation,
+    argumentsFromTool: z.object({ value: z.json() }).strict().optional(),
+  })
   .strict();
 export type NativeRequestObservation = z.infer<
   typeof NativeRequestObservationSchema
@@ -195,16 +204,19 @@ export function observeNativePrompt(
     const done = Promise.resolve()
       .then(async () => {
         active.throwIfAborted();
-        const nativeRequestRef = await onMemoryCall(frame.fact, active).catch(
-          () => null,
-        );
+        const result = await onMemoryCall(
+          frame.fact,
+          active,
+          frame.argumentsFromTool,
+        ).catch(() => null);
         active.throwIfAborted();
         await transport.readManagedModelProof(
           JSON.stringify({
             ...request,
             action: 'memory-call-result',
             ticket: frame.ticket,
-            nativeRequestRef,
+            nativeRequestRef: typeof result === 'string' ? result : null,
+            ...(result && typeof result === 'object' && { result }),
           }),
           active,
         );

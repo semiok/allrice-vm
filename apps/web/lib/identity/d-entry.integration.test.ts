@@ -1,3 +1,4 @@
+import type { DEntryPrincipalControlScope } from '@allrice/d-entry-principal/types';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { execFile } from 'node:child_process';
@@ -557,6 +558,298 @@ suite(
         expect(runs!.n).toBe(0);
         expect(create).toHaveBeenCalledTimes(1);
       } finally {
+        await clearPublished();
+      }
+    });
+
+    it('runs sidebar rename, archive and restore through the current Worker and PG root', async () => {
+      const f = await enabledFour();
+      const active = new AbortController().signal;
+      const native = nativeEntryFixture({
+        context: f.context,
+        identity: f.identity,
+      });
+      const binding = native.binding;
+      const fact = creation(f, 'dsh-root');
+      fact.host.binding = { ...binding, organizationId: f.org };
+      await ensureDEntryNativeRoot(f.context, f.selection, f.identity, {
+        operationId: randomUUID(),
+        host: fact.host,
+        signal: active,
+        create: async () => fact,
+      });
+      await fixture.db`insert into person_virtual_machines
+        (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+        values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+          ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'sidebar-http' })})`;
+      const feed = createDEntryAuthorityFeed(
+        process.env.ALLRICE_TEST_DATABASE_URL!,
+      );
+      let archived = false;
+      let busy = true;
+      let title = f.thread.title;
+      const close = vi.fn(async () => {});
+      const followed = vi.fn(async () => {});
+      const invokePage = vi.fn<DEntryPrincipalControlScope['invokePage']>(
+        async ({
+          endpoint,
+          args,
+        }): ReturnType<DEntryPrincipalControlScope['invokePage']> => {
+          expect(args).toMatchObject({
+            request: { sessionId: fact.nativeSessionId },
+          });
+          const request = args.request as {
+            title?: string;
+            stopActivity?: boolean;
+          };
+          switch (endpoint) {
+            case 'session/rename':
+              title = request.title!;
+              return {
+                kind: 'page',
+                endpoint,
+                value: { title, seq: 1 },
+                attachments: [],
+              };
+            case 'session/projections':
+              return {
+                kind: 'page',
+                endpoint,
+                value: { kind: 'sequenced', asOfSeq: 1, values: { title } },
+                attachments: [],
+              };
+            case 'workspace/archiveSession':
+              if (busy && !request.stopActivity)
+                throw Object.assign(new Error('native session active'), {
+                  code: 'workspace/session-active',
+                  details: { activity: [{ kind: 'turn' }] },
+                });
+              archived = true;
+              busy = false;
+              break;
+            case 'workspace/unarchiveSession':
+              archived = false;
+              break;
+            default:
+              throw Error('Unexpected native endpoint');
+          }
+          return {
+            kind: 'page',
+            endpoint,
+            value: {
+              archivedSessionIds: archived ? [fact.nativeSessionId] : [],
+            },
+            attachments: [],
+          };
+        },
+      );
+      function temporary(
+        _context: Parameters<typeof native.owner.acquirePrincipal>[0],
+        input: Parameters<typeof native.owner.acquirePrincipal>[1],
+      ) {
+        return {
+          close,
+          run: async (): Promise<DEntryPrincipalControlScope> => ({
+            opened: {
+              type: 'opened',
+              scopeId: input.scopeId,
+              principal: {
+                kind: 'allrice-d-entry',
+                scopeId: input.scopeId,
+                identity: input.identity,
+              },
+              baseline: { type: 'baseline', owner: false, grants: [] },
+            },
+            revoked: active,
+            invoke: vi.fn(),
+            invokePage,
+            stream: vi.fn(),
+            streamPage: ({ endpoint, scopeId }) => ({
+              send: vi.fn(),
+              async *[Symbol.asyncIterator]() {
+                expect(endpoint).toBe('workspace/follow');
+                try {
+                  yield {
+                    type: 'page-item',
+                    scopeId,
+                    value: {
+                      type: 'baseline',
+                      value: {
+                        archivedSessionIds: archived
+                          ? [fact.nativeSessionId]
+                          : [],
+                      },
+                    },
+                  };
+                } finally {
+                  await followed();
+                }
+              },
+            }),
+            close,
+          }),
+        };
+      }
+      vi.mocked(native.owner.acquirePrincipal).mockImplementation(temporary);
+      const prepare = vi.fn(async () => ({
+        key: 'verified-retained-root',
+        target: {
+          vmId: binding.vmId,
+          instanceId: null,
+          leaseEpoch: binding.leaseEpoch,
+        },
+      }));
+      const warm = vi.fn(async () => {
+        await fixture.db`update person_virtual_machines set phase='running' where vm_id=${binding.vmId}`;
+      });
+      const server = await nativeEntryServer(native, {
+        ...dEntryHttpDefaults,
+        owners: native.deps.owners,
+        prewarm: { prepare, isCurrent: async () => true, prewarm: warm },
+        data: native.deps.data,
+        watch: (context, selection, identity, signal) =>
+          watchDEntryNativeAuthority(
+            context,
+            selection,
+            identity,
+            signal,
+            feed,
+          ),
+      });
+      const previous = process.env.ALLRICE_WORKER_INTERNAL_URL;
+      vi.stubEnv('ALLRICE_WORKER_INTERNAL_URL', server.origin);
+      cookie.token = f.login.token;
+      const patch = (
+        change: unknown,
+        employee = f.assignment,
+        origin = 'https://allrice.test',
+        requestSignal?: AbortSignal,
+      ) =>
+        PATCH(
+          new Request(
+            `https://allrice.test/api/v1/sessions/${f.thread.id}?entry=4.0&workspaceId=${f.workspace}&employeeInstanceId=${employee}`,
+            {
+              method: 'PATCH',
+              signal: requestSignal,
+              headers: {
+                origin,
+                host: 'allrice.test',
+                'content-type': 'application/json',
+                'x-allrice-organization-id': f.org,
+                'x-allrice-workspace-id': f.workspace,
+                'x-allrice-expected-viewer-id': f.user,
+              },
+              body: JSON.stringify(change),
+            },
+          ),
+          route(f.thread.id),
+        );
+      const stored = async () =>
+        (
+          await fixture.db`select title, archived_at, execution_generation
+        from allrice_chat_sessions where id=${f.thread.id}`
+        )[0]!;
+      try {
+        expect(
+          (await patch({ archived: true }, randomUUID())).status,
+        ).toBeGreaterThanOrEqual(400);
+        expect(
+          (
+            await patch(
+              { archived: true },
+              f.assignment,
+              'https://foreign.test',
+            )
+          ).status,
+        ).toBe(403);
+        expect(invokePage).not.toHaveBeenCalled();
+        const renamed = await patch({ title: '发票核对' });
+        expect(renamed.status, await renamed.clone().text()).toBe(200);
+        expect(await stored()).toMatchObject({
+          title: '发票核对',
+          archived_at: null,
+        });
+        const conflict = await patch({ archived: true });
+        expect(conflict.status).toBe(409);
+        expect(await conflict.json()).toMatchObject({
+          error: { code: 'SESSION_ACTIVE', activity: [{ kind: 'turn' }] },
+        });
+        expect((await stored()).archived_at).toBeNull();
+        const archivedReply = await patch({
+          archived: true,
+          stopActivity: true,
+        });
+        expect(archivedReply.status, await archivedReply.clone().text()).toBe(
+          200,
+        );
+        expect((await stored()).archived_at).toBeInstanceOf(Date);
+        await expect(
+          requireDEntryNativeIdentity(f.context, f.selection),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await fixture.db`update person_virtual_machines set phase='stopped' where vm_id=${binding.vmId}`;
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
+        prepare.mockResolvedValueOnce({
+          key: 'wrong-disk',
+          target: { vmId: randomUUID(), instanceId: null, leaseEpoch: 1 },
+        });
+        expect((await patch({ archived: false })).status).toBe(503);
+        expect(warm).not.toHaveBeenCalled();
+        expect((await stored()).archived_at).toBeInstanceOf(Date);
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
+        const restored = await patch({ archived: false });
+        expect(warm).toHaveBeenCalledOnce();
+        expect(restored.status, await restored.clone().text()).toBe(200);
+        expect(await stored()).toMatchObject({
+          title: '发票核对',
+          archived_at: null,
+          execution_generation: '4.0',
+        });
+        expect(followed).toHaveBeenCalledTimes(2);
+        expect(close).toHaveBeenCalledTimes(4);
+
+        // An idempotent native unarchive ACK alone cannot prove a vanished root.
+        const invocations = invokePage.mock.calls.length;
+        vi.mocked(native.owner.readSessions).mockResolvedValueOnce({
+          ok: true,
+          value: { items: [] },
+        });
+        expect((await patch({ archived: false })).status).toBe(404);
+        expect(invokePage).toHaveBeenCalledTimes(invocations);
+
+        const baselineRead = deferred<void>();
+        const releaseProjection = deferred<void>();
+        followed.mockImplementationOnce(async () => {
+          baselineRead.resolve();
+          await releaseProjection.promise;
+        });
+        const disconnect = new AbortController();
+        const attempted = patch(
+          { archived: true },
+          f.assignment,
+          'https://allrice.test',
+          disconnect.signal,
+        );
+        try {
+          await baselineRead.promise;
+          disconnect.abort();
+          expect((await stored()).archived_at).toBeNull();
+        } finally {
+          releaseProjection.resolve();
+          await attempted;
+        }
+        await vi.waitFor(async () =>
+          expect((await stored()).archived_at).toBeInstanceOf(Date),
+        );
+      } finally {
+        await server.close();
+        await feed.close();
+        if (previous === undefined)
+          delete process.env.ALLRICE_WORKER_INTERNAL_URL;
+        else process.env.ALLRICE_WORKER_INTERNAL_URL = previous;
         await clearPublished();
       }
     });
@@ -4051,6 +4344,7 @@ suite(
                   observeNativeSearchCallFor: unexpectedOwnerOperation,
                   waitNativeTurnEnd: unexpectedOwnerOperation,
                   readPersistedRunTerminalFor: unexpectedOwnerOperation,
+                  exchangeNativeDeliveryFor: unexpectedOwnerOperation,
                   readManagedModelImageFor: unexpectedOwnerOperation,
                   readModelCatalogFor: unexpectedOwnerOperation,
                   nativeActivityRevision: unexpectedOwnerOperation,

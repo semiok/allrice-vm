@@ -16,7 +16,7 @@ import {
 } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
@@ -163,6 +163,7 @@ export async function setupNativeWebFixture(
     resetProbe?: boolean;
     onPublicationDiagnostic?: (text: string) => void;
     nativeToolEvidenceProbe?: string;
+    nativeMemoryEnabled?: boolean;
     identity?: Omit<DEntryIdentity, 'threadId'>;
     loginSessionId?: string;
     employeeInstructions?: string;
@@ -245,6 +246,7 @@ export async function setupNativeWebFixture(
     workdir: root,
     cliPath,
     startupTimeoutMs: 10000,
+    nativeMemoryEnabled: isolated?.nativeMemoryEnabled,
     principalProfile,
     employeeInstructions: isolated?.employeeInstructions,
   };
@@ -467,7 +469,9 @@ export async function setupNativeWebFixture(
         {
           cwd: root,
           env: {
-            PATH: dirname(process.execPath),
+            PATH: [dirname(process.execPath), '/usr/bin', '/bin'].join(
+              delimiter,
+            ),
             HOME: root,
             ...command.env,
             DO_NOT_TRACK: '1',

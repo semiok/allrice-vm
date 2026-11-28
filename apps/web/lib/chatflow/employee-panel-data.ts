@@ -92,6 +92,13 @@ const methods = {
     WorkbenchDeliverablesFilterSchema,
     WorkbenchDeliverablesActionsCatalogSchema.parse,
   ),
+  resolveNativeDelivery: method(
+    workspace.extend({
+      coordinate: z.hash('sha256'),
+      occurrence: z.hash('sha256').optional(),
+    }),
+    uploadResult.parse,
+  ),
   captureReference: method(
     file.extend({ requestId: UuidSchema }),
     z.object({ reference: ReferenceRevisionSchema }).parse,

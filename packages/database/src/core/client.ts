@@ -103,6 +103,7 @@ export function openDatabaseNotifications(
  * host/port arrays; its constructor declaration narrows those input fields. */
 export function createDedicatedDatabase(
   db: Pick<ReturnType<typeof postgres>, 'options'>,
+  limits?: { max: number; lockTimeoutMs: number; statementTimeoutMs: number },
 ) {
   const shared: unknown = Reflect.get(db.options, 'shared');
   if (
@@ -115,7 +116,14 @@ export function createDedicatedDatabase(
     throw new Error('unsupported_postgres_options');
   return postgres({
     ...db.options,
-    max: 1,
+    max: limits?.max ?? 1,
+    ...(limits && {
+      connection: {
+        ...db.options.connection,
+        lock_timeout: limits.lockTimeoutMs,
+        statement_timeout: limits.statementTimeoutMs,
+      },
+    }),
     // A caller-owned lease can span non-SQL work until its owner calls end().
     idle_timeout: 0,
     shared: { retries: 0, typeArrayMap: { ...shared.typeArrayMap } },

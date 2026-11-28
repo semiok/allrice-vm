@@ -1,3 +1,4 @@
+import { createProductionFileMentionContext } from './production-file-mentions.js';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
@@ -5,6 +6,7 @@ import {
   memoryIndexPolicy,
   type DEntryIdentity,
   type RequestContext,
+  type StoragePort,
 } from '@allrice/contracts';
 import {
   DataAccessError,
@@ -22,7 +24,12 @@ import {
   ModelGatewayError,
   sameModelRoute,
   type ModelCallBinding,
+  type ModelDispatchAuthority,
 } from '@allrice/model-gateway';
+import {
+  executeProductionNativeMemoryTool,
+  type MemoryRootObservation,
+} from './production-native-memory.js';
 import {
   PersonVmError,
   sameVmBinding,
@@ -52,7 +59,10 @@ import {
   webSearchRoute,
   webSearchTimeoutMs,
 } from './production-web-search.js';
-import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
+import {
+  reconcileNativeDeliveries,
+  reconcileNativeRunTerminals,
+} from './production-native-run-reconciliation.js';
 import {
   matchNativeToolObservation,
   nativeAdoptedTextProofVersion,
@@ -383,7 +393,9 @@ const reject = (): never => {
   throw new ModelGatewayError('AUTHORIZATION_DENIED');
 };
 
-export function createProductionNativeModelExecution(): ProductionNativeModelExecution {
+export function createProductionNativeModelExecution(
+  deliveryStorage?: StoragePort,
+): ProductionNativeModelExecution {
   let installed: Installed | undefined;
 
   return {
@@ -460,6 +472,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         }
       >();
       const operations = new Set<Promise<unknown>>();
+      const prepareFileMentions = createProductionFileMentionContext();
       type EvidenceReceipt = NonNullable<
         Awaited<ReturnType<typeof persistExecution>>
       >;
@@ -485,6 +498,16 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         receipt: EvidenceReceipt,
         active: AbortSignal,
         phase: 'seal' | 'dispatch',
+        dispatch?: {
+          authority: ModelDispatchAuthority;
+          start(
+            root: {
+              executionRef: string;
+              memoryIndexDocument: string;
+            },
+            transaction: ReturnType<typeof getDatabase>,
+          ): Promise<void>;
+        },
       ) {
         if (
           !memory ||
@@ -505,36 +528,64 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           return reject();
         await scope.assertObserved(active);
         active.throwIfAborted();
+        const original: MemoryRootObservation = {
+          ...(firstIssue
+            ? { mode: 'issue', nativeRequestRef: receipt.request.executionId }
+            : { mode: 'restore' }),
+          runId: receipt.run.runId,
+          workspaceId: scope.identity.workspaceId,
+          employeeInstanceId: call.employeeInstanceId,
+          threadId: call.allriceThreadRef,
+          originalPromptRequestId: receipt.origin.originalRequestId,
+          originalTurn: receipt.origin.human.occurrence.turn,
+          rootNativeSessionRef: receipt.origin.rootSessionRef,
+          nativeOwnerRef: receipt.origin.nativeOwnerRef,
+          nativeProfileRef: receipt.origin.nativeProfileRef,
+          moduleConfigRevisionRef: receipt.origin.moduleConfigRevisionRef,
+          vm: { vmId, instanceId, leaseEpoch },
+        };
+        const assertIssued = (issued: {
+          executionRef: string;
+          memoryIndexDocument: string;
+        }) => {
+          active.throwIfAborted();
+          if (
+            !issued.executionRef ||
+            issued.executionRef.length > 256 ||
+            Buffer.byteLength(issued.memoryIndexDocument) >
+              memoryIndexPolicy.maximumInitialBytes
+          )
+            return reject();
+        };
+        if (dispatch) {
+          const { authority, start } = dispatch;
+          if (
+            original.mode !== 'restore' ||
+            !memory.publication.dispatchRoot ||
+            (call.provider === 'openai-codex') !== !!authority.codex
+          )
+            return reject();
+          await memory.publication.dispatchRoot(
+            scope.context,
+            original,
+            active,
+            authority.codex,
+            (issued, transaction) => {
+              scope.assertObservedNow();
+              assertIssued(issued);
+              return start(issued, transaction);
+            },
+          );
+          return;
+        }
         const issued = await memory.publication.root(
           scope.context,
-          {
-            ...(firstIssue
-              ? { mode: 'issue', nativeRequestRef: receipt.request.executionId }
-              : { mode: 'restore' }),
-            runId: receipt.run.runId,
-            workspaceId: scope.identity.workspaceId,
-            employeeInstanceId: call.employeeInstanceId,
-            threadId: call.allriceThreadRef,
-            originalPromptRequestId: receipt.origin.originalRequestId,
-            originalTurn: receipt.origin.human.occurrence.turn,
-            rootNativeSessionRef: receipt.origin.rootSessionRef,
-            nativeOwnerRef: receipt.origin.nativeOwnerRef,
-            nativeProfileRef: receipt.origin.nativeProfileRef,
-            moduleConfigRevisionRef: receipt.origin.moduleConfigRevisionRef,
-            vm: { vmId, instanceId, leaseEpoch },
-          },
+          original,
           active,
         );
         if (phase === 'seal') await scope.assertObserved(active);
         else scope.assertObservedNow();
-        active.throwIfAborted();
-        if (
-          !issued.executionRef ||
-          issued.executionRef.length > 256 ||
-          Buffer.byteLength(issued.memoryIndexDocument) >
-            memoryIndexPolicy.maximumInitialBytes
-        )
-          return reject();
+        assertIssued(issued);
         if (
           phase === 'seal' &&
           !(await bindNativeMemoryExecutionRef(
@@ -550,6 +601,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         prompt: PromptOwner,
         fact: NativeMemoryToolObservation,
         signal: AbortSignal,
+        argumentsFromTool?: { value: unknown },
       ) {
         return run(
           AbortSignal.any([signal, prompt.revoked]),
@@ -608,9 +660,27 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             );
             await prompt.assertObserved(active);
             active.throwIfAborted();
-            return result.nativeRequestRef === nativeRequestRef
-              ? nativeRequestRef
-              : null;
+            if (result.nativeRequestRef !== nativeRequestRef) return null;
+            if (!memory.tools)
+              return argumentsFromTool ? null : nativeRequestRef;
+            if (!argumentsFromTool) return null;
+            const target = {
+              workspaceId: prompt.identity.workspaceId,
+              employeeInstanceId: prompt.identity.employeeInstanceId,
+              threadId: receipt.origin.threadId,
+              nativeRequestRef,
+            };
+            const toolResult = await executeProductionNativeMemoryTool(
+              memory.tools,
+              toolId,
+              prompt.context,
+              target,
+              argumentsFromTool.value,
+              active,
+            );
+            prompt.assertObservedNow();
+            active.throwIfAborted();
+            return toolResult;
           },
         );
       }
@@ -1059,7 +1129,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 revoked,
                 (fact) => collectNativeTool(scope, fact),
                 memory &&
-                  ((fact, active) => publishMemoryCall(scope, fact, active)),
+                  ((fact, active, args) =>
+                    publishMemoryCall(scope, fact, active, args)),
               );
               const scope: PromptOwner = Object.freeze({
                 context: structuredClone(context),
@@ -1881,6 +1952,85 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           });
         },
       }));
+      async function readMemoryIndex(
+        call: ModelCallBinding,
+        signal: AbortSignal,
+        phase: 'seal' | 'dispatch',
+        dispatch?: {
+          authority: ModelDispatchAuthority;
+          start(
+            document: string,
+            transaction: ReturnType<typeof getDatabase>,
+          ): Promise<void>;
+        },
+      ) {
+        const entry = calls.get(call.native.callId);
+        if (!memory || !entry?.memoryEvidence || !entry.memoryAuthor) {
+          if (dispatch) return reject();
+          return undefined;
+        }
+        if (!entry.delivery) return reject();
+        const { memoryEvidence, memoryAuthor } = entry;
+        const active = AbortSignal.any([
+          signal,
+          entry.delivery,
+          memoryAuthor.revoked,
+        ]);
+        const { attempt } = await readAuthorizedCall(call, active);
+        if (!matchesMemoryTools(attempt.observation)) return reject();
+        if (
+          JSON.stringify(attempt.observation?.human) !==
+          JSON.stringify(memoryEvidence.request.human)
+        )
+          return reject();
+        const receipts = toolRequests.get(memoryAuthor);
+        const attemptId = memoryEvidence.request.nativeAttemptId;
+        const assertCurrent = () => {
+          active.throwIfAborted();
+          if (calls.get(call.native.callId) !== entry) return reject();
+        };
+        const assertOriginal = (executionRef: string | undefined) => {
+          assertCurrent();
+          if (
+            !executionRef ||
+            executionRef !== receipts?.get(attemptId)?.memoryExecutionRef
+          )
+            return reject();
+        };
+        if (dispatch) {
+          const { authority, start } = dispatch;
+          await publishMemoryRoot(
+            memoryAuthor,
+            call,
+            memoryEvidence,
+            active,
+            phase,
+            {
+              authority,
+              start(issued, transaction) {
+                assertOriginal(issued.executionRef);
+                return start(issued.memoryIndexDocument, transaction);
+              },
+            },
+          );
+          return;
+        }
+        const issued = await publishMemoryRoot(
+          memoryAuthor,
+          call,
+          memoryEvidence,
+          active,
+          phase,
+        );
+        assertCurrent();
+        if (phase === 'dispatch') assertOriginal(issued?.executionRef);
+        if (phase === 'seal' && issued)
+          receipts?.set(attemptId, {
+            ...memoryEvidence,
+            memoryExecutionRef: issued.executionRef,
+          });
+        return issued?.memoryIndexDocument;
+      }
       let closing: Promise<void> | undefined;
       const owner: Installed = {
         assertCall,
@@ -1925,49 +2075,22 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           });
         },
         references: [...references, ...searchService()],
-        async readMemoryIndex(call, signal, phase) {
+        readMemoryIndex,
+        async prepareReferences(call, messages, signal) {
           const entry = calls.get(call.native.callId);
-          if (!memory || !entry?.memoryEvidence || !entry.memoryAuthor)
-            return undefined;
-          if (!entry.delivery) return reject();
-          const { memoryEvidence, memoryAuthor } = entry;
-          const active = AbortSignal.any([
-            signal,
-            entry.delivery,
-            memoryAuthor.revoked,
-          ]);
-          const { attempt } = await readAuthorizedCall(call, active);
-          if (!matchesMemoryTools(attempt.observation)) return reject();
-          if (
-            JSON.stringify(attempt.observation?.human) !==
-            JSON.stringify(memoryEvidence.request.human)
-          )
-            return reject();
-          const issued = await publishMemoryRoot(
-            memoryAuthor,
-            call,
-            memoryEvidence,
-            active,
-            phase,
-          );
+          if (!entry?.delivery) return undefined;
+          const active = AbortSignal.any([signal, entry.delivery, entry.route]);
           active.throwIfAborted();
-          if (calls.get(call.native.callId) !== entry) return reject();
-          const saved = toolRequests
-            .get(memoryAuthor)
-            ?.get(memoryEvidence.request.nativeAttemptId);
-          if (
-            phase === 'dispatch' &&
-            issued?.executionRef !== saved?.memoryExecutionRef
-          )
-            return reject();
-          if (phase === 'seal' && issued)
-            toolRequests
-              .get(memoryAuthor)
-              ?.set(memoryEvidence.request.nativeAttemptId, {
-                ...memoryEvidence,
-                memoryExecutionRef: issued.executionRef,
-              });
-          return issued?.memoryIndexDocument;
+          return prepareFileMentions(
+            call,
+            messages,
+            new Set(entry.prompts.map(({ messageId }) => messageId)),
+            active,
+          );
+        },
+        async withMemoryIndex(call, signal, authority, start) {
+          if (!authority) return reject();
+          await readMemoryIndex(call, signal, 'dispatch', { authority, start });
         },
         redeem(call, signal) {
           const entry = calls.get(call.native.callId);
@@ -2034,6 +2157,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       void run(live, (active) =>
         reconcileNativeRunTerminals(host.startup, active),
       ).catch(() => {});
+      if (deliveryStorage)
+        void run(live, (active) =>
+          reconcileNativeDeliveries(host.startup, deliveryStorage, active),
+        ).catch(() => {});
       return owner;
     },
   };

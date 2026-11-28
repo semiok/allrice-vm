@@ -124,12 +124,15 @@ export async function createProductionOpenAiRuntime(
       release();
     };
   }
-  async function assertCurrent(signal?: AbortSignal) {
+  function checkCurrent(signal?: AbortSignal) {
     signal?.throwIfAborted();
     if (!credential || readKey() !== credential)
       stop.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
     revoked.throwIfAborted();
     return revoked;
+  }
+  async function assertCurrent(signal?: AbortSignal) {
+    return checkCurrent(signal);
   }
   function close() {
     if (closing) return closing;
@@ -243,7 +246,8 @@ export async function createProductionOpenAiRuntime(
       transport: {
         ...transport,
         async beforeDispatch(signal: AbortSignal) {
-          await assertCurrent(signal);
+          checkCurrent(signal);
+          return { assertCurrent: () => checkCurrent(signal) };
         },
       },
       confirmTransportStopped: transport.stoppedEvidence,
