@@ -285,7 +285,6 @@ async function runOwner(
         connected.throwIfAborted();
         mount(generation, page);
         staged = undefined;
-        for (const streamId of retiring) await send({ type: 'end', streamId });
         await send({
           type: 'item',
           streamId: id,
@@ -295,6 +294,7 @@ async function runOwner(
             threadId: command.threadId,
             scopeId: page.scope.opened.scopeId,
             nativeSessionId: root.rootNativeSessionId,
+            ...(retiring.length && { retiredStreams: retiring }),
           },
         });
         publishedScopeId = page.scope.opened.scopeId;
@@ -525,6 +525,7 @@ function pageStreams(
     const id = frame.streamId;
     let settled = false;
     let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
+    let newRoot: string | undefined;
     let buffered = 0;
     let input = Promise.resolve();
     let inputError = Promise.resolve();
@@ -558,7 +559,7 @@ function pageStreams(
             address.kind === 'session'
               ? address.sessionId
               : address.childSessionId;
-          await page.authorizeFollow(id, child);
+          if (await page.authorizeFollow(id, child)) newRoot = id;
         }
         follow = await page.watchFollow(child);
       }
@@ -608,6 +609,7 @@ function pageStreams(
             while ((pending = follow.pending())) await pending;
             follow.signal.throwIfAborted();
           } else await page.assertCurrent(child);
+          if (newRoot) await page.authorizeFollow(newRoot, child);
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });

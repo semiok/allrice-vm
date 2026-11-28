@@ -259,6 +259,28 @@ it('replaces the borrowed root while keeping native employee events on the same 
   expect(await receive('employee-events')).toMatchObject({
     value: { type: 'ready' },
   });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'previous-journal',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('previous-journal')).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
   expect(
     (
       await f.proveSwitch(scopeId, target, requestId, sessionToken, {
@@ -274,6 +296,7 @@ it('replaces the borrowed root while keeping native employee events on the same 
       requestId,
       threadId: target,
       nativeSessionId: 'root-' + target,
+      retiredStreams: ['previous-journal'],
     },
   });
   const nextScope = switched.value.scopeId as string;

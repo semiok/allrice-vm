@@ -5,7 +5,9 @@ export type NativePageSocket = Pick<
   WebSocket,
   'readyState' | 'send' | 'close'
 > &
-  Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
+  Pick<EventTarget, 'addEventListener' | 'removeEventListener'> & {
+    endStreams?(ids: readonly string[]): void;
+  };
 
 /** Expose the rc.2 text-stream socket interface to the owned iframe without
  * opening another connection or handing it the parent page protocol. */
@@ -47,6 +49,14 @@ export function borrowPageMux(
   return {
     get readyState() {
       return readyState;
+    },
+    endStreams(ids) {
+      for (const streamId of ids)
+        events.dispatchEvent(
+          new MessageEvent('message', {
+            data: JSON.stringify({ type: 'end', streamId }),
+          }),
+        );
     },
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),

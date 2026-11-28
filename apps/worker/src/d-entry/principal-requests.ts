@@ -97,7 +97,10 @@ export type DEntryPageHandle = Readonly<{
   watchFollow(
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
-  authorizeFollow(nativeSessionId: string, signal: AbortSignal): Promise<void>;
+  authorizeFollow(
+    nativeSessionId: string,
+    signal: AbortSignal,
+  ): Promise<boolean>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -682,8 +685,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                         active,
                       ))
                     )
-                      return;
+                      return true;
                     await authorize(nativeSessionId, 'read', active);
+                    return false;
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
                     await assertCurrent(active);

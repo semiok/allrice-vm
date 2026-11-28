@@ -319,6 +319,10 @@ export function nativeProfileDocument(
       };
       try {
         onThreadScope(next);
+        // Native consumers may reopen synchronously after reading EOF.
+        // Deliver it only after their requests can use the new page scope.
+        if (next.retiredStreams?.length)
+          peer?.endStreams?.(next.retiredStreams);
       } catch {
         cancel();
         onRevoked();

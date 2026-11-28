@@ -1145,7 +1145,10 @@ it
     let lastScopeId: string | undefined;
     const firstItems: string[] = [];
     const followed = new Set<string>();
-    const followAddresses = new Map<string, string>();
+    const followAddresses = new Map<
+      string,
+      { nativeId: string; scopeId: string }
+    >();
     const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -1166,16 +1169,18 @@ it
           nativeEventOpens++;
         if (frame.type === 'open' && frame.endpoint === 'session/follow') {
           const address = frame.payload.args.request.address;
-          followAddresses.set(
-            frame.streamId,
-            address.sessionId ?? address.childSessionId,
-          );
+          followAddresses.set(frame.streamId, {
+            nativeId: address.sessionId ?? address.childSessionId,
+            scopeId: frame.pageScopeId,
+          });
         }
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'item' && frame.value.type === 'opened')
           lastScopeId = frame.value.scopeReference.scopeId;
+        if (frame.type === 'item' && frame.value.type === 'switched')
+          lastScopeId = frame.value.scopeId;
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
@@ -1187,7 +1192,9 @@ it
           frame.value.type === 'snapshot' &&
           followedSession
         )
-          followed.add(followedSession);
+          followed.add(
+            followedSession.nativeId + '/' + followedSession.scopeId,
+          );
         if (
           frame.type === 'item' &&
           frame.value.type === 'baseline' &&
@@ -1905,7 +1912,9 @@ it
           { timeout: 10_000 },
         )
         .toBe(createdNativeId);
-      await expect.poll(() => followed.has(createdNativeId)).toBe(true);
+      await expect
+        .poll(() => followed.has(createdNativeId + '/' + lastScopeId))
+        .toBe(true);
       const draft = '原生新会话草稿';
       await editor.fill(draft, { timeout: 15_000 });
       const draftPrefix =

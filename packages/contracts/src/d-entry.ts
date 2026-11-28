@@ -160,6 +160,7 @@ export const DEntryPageSwitchResultSchema = z.discriminatedUnion('type', [
     threadId: UuidSchema,
     scopeId: UuidSchema,
     nativeSessionId: z.string().min(1),
+    retiredStreams: z.array(z.string().min(1)).optional(),
   }),
   z.strictObject({
     type: z.literal('switch-unavailable'),

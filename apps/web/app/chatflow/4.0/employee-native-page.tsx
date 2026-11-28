@@ -370,6 +370,7 @@ export function EmployeeNativePage({
       join?: Promise<void>,
     ) {
       if (navigating || replace.current !== applyQuery) return;
+      if (switching?.restored) nextQuery.current = location.search.slice(1);
       navigating = true;
       resumable = retainTicket;
       window.clearTimeout(timer);
@@ -585,7 +586,10 @@ export function EmployeeNativePage({
             return;
           if (!issued) {
             cancelSwitch(target);
-            navigate(target.selection);
+            if (target.restored) {
+              nextQuery.current = location.search.slice(1);
+              applyQuery();
+            } else navigate(target.selection);
             return;
           }
           target.scopeId = issued.scopeId;
@@ -596,6 +600,7 @@ export function EmployeeNativePage({
         })
         .catch((error: unknown) => {
           if (switching !== target) return;
+          if (target.restored) nextQuery.current = location.search.slice(1);
           cancelSwitch(target);
           if (error instanceof EmployeeEntryError) {
             if (error.status === 401) return finish('sign-in');
@@ -637,7 +642,7 @@ export function EmployeeNativePage({
       switchTimer = window.setTimeout(() => {
         if (switching !== target) return;
         cancelSwitch(target);
-        if (restored) {
+        if (target.restored) {
           nextQuery.current = location.search.slice(1);
           applyQuery();
         }
@@ -696,6 +701,8 @@ export function EmployeeNativePage({
         nextQuery.current = displayedQuery.current = query;
         if (!restored)
           history.pushState(history.state, '', '/chatflow/4.0?' + query);
+        else if (location.search.slice(1) !== query)
+          queueMicrotask(restoreQuery);
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
@@ -807,7 +814,13 @@ export function EmployeeNativePage({
     const restoreQuery = () => {
       if (location.pathname !== '/chatflow/4.0') return;
       const query = location.search.slice(1);
-      if (query === displayedQuery.current && !switching) return;
+      if (switching && !navigating) {
+        // Finish the current authority handoff, then consume the latest URL.
+        // Closing the same carrier here would interrupt both navigations.
+        switching.restored = true;
+        return;
+      }
+      if (query === displayedQuery.current) return;
       const params = new URLSearchParams(query);
       const selection = DEntrySelectionInputSchema.safeParse(
         Object.fromEntries(params),
