@@ -70,6 +70,11 @@ vi.mock('../../web/lib/storage/runtime', () => ({
 vi.mock('../../web/lib/identity/session', () => ({
   getRequestContext: async () => client.context ?? null,
 }));
+const nativeSkillCli =
+  process.env.ALLRICE_NATIVE_WEB_TEST_CLI ??
+  (process.env.ALLRICE_RUN_NATIVE_SKILL_CLI === '1'
+    ? 'packages/dsh-web-composition/node_modules/@deepseek-ai/dsh/lib/bin.js'
+    : undefined);
 const hash = (text: string) =>
   'sha256:' + createHash('sha256').update(text).digest('hex');
 const suite =
@@ -326,7 +331,7 @@ suite(
       expect(await first.read(body, signal)).toEqual({ kind: 'unavailable' });
     }, 28_000);
 
-    it.skipIf(!process.env.ALLRICE_NATIVE_WEB_TEST_CLI)(
+    it.skipIf(!nativeSkillCli)(
       'lists a real PG binding over the locked CLI owner duplex and observes a committed withdrawal',
       { timeout: 120_000, tags: ['manual:ALLRICE_NATIVE_WEB_TEST_CLI'] },
       async () => {
@@ -337,7 +342,7 @@ suite(
         const signal = AbortSignal.timeout(45_000);
         try {
           const guest = await setupNativeWebFixture(
-            process.env.ALLRICE_NATIVE_WEB_TEST_CLI,
+            nativeSkillCli,
             roots,
             close,
             undefined,
