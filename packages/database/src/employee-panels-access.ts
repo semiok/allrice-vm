@@ -1,4 +1,4 @@
-import type { TransactionSql } from 'postgres';
+import type { Sql, TransactionSql } from 'postgres';
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
@@ -23,7 +23,7 @@ import {
 export async function requireEmployeePanelsAccess(
   contextInput: RequestContext,
   input: unknown,
-  transaction?: TransactionSql,
+  transaction?: TransactionSql | Sql,
 ) {
   const context = RequestContextSchema.parse(contextInput);
   const selection = DEntrySelectionInputSchema.parse(input);

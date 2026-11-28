@@ -561,7 +561,7 @@ async function restoreNativeEmployeeMemoryContext(
   assembly?: MemoryRuntimeAssembly,
   dispatch?: {
     codex?: NativeMemoryCodexRoute;
-    start(document: string): Promise<void> | void;
+    start(document: string, tx: Sql): Promise<void> | void;
   },
 ) {
   const target = NativeMemoryRestoreTargetSchema.parse(input);
@@ -590,7 +590,7 @@ async function restoreNativeEmployeeMemoryContext(
         if (dispatch.codex)
           await lockNativeMemoryCodexDispatch(bound.tx, dispatch.codex);
         signal.throwIfAborted();
-        await dispatch.start(saved.document);
+        await dispatch.start(saved.document, bound.tx);
       }
       return saved.document;
     },
@@ -608,7 +608,7 @@ type NativeMemoryCodexRoute = Readonly<{
   revision: string;
 }>;
 
-async function lockNativeMemoryCodexDispatch(
+export async function lockNativeMemoryCodexDispatch(
   tx: Sql,
   route: NativeMemoryCodexRoute,
 ) {
@@ -795,10 +795,13 @@ export function createNativeEmployeeMemoryHost() {
       input: Extract<NativeMemoryRootObservation, { mode: 'restore' }>,
       signal: AbortSignal,
       codex: NativeMemoryCodexRoute | undefined,
-      start: (root: {
-        executionRef: string;
-        memoryIndexDocument: string;
-      }) => Promise<void> | void,
+      start: (
+        root: {
+          executionRef: string;
+          memoryIndexDocument: string;
+        },
+        tx: Sql,
+      ) => Promise<void> | void,
     ) {
       const { workspaceId, employeeInstanceId, threadId } = input;
       const runId = UuidSchema.parse(input.runId);
@@ -815,8 +818,8 @@ export function createNativeEmployeeMemoryHost() {
         workflowMemoryRuntime({ root: input }),
         {
           codex,
-          start: (memoryIndexDocument) =>
-            start({ executionRef: runId, memoryIndexDocument }),
+          start: (memoryIndexDocument, tx) =>
+            start({ executionRef: runId, memoryIndexDocument }, tx),
         },
       );
     },

@@ -228,7 +228,6 @@ export function createEnterpriseMaterialsPort(
         context,
         value.workspaceId,
         value.revisionId,
-        value.includeExcerpt,
       );
       await current(context, value.workspaceId, signal);
       return result;

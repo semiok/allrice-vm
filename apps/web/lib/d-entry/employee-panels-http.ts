@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import {
-  ChecksumSchema,
   MaterialsActionCommandProjectionSchema,
   MaterialsPublicationCommandProjectionSchema,
   PanelWriteReceiptQuerySchema,
@@ -127,11 +126,6 @@ export function createEmployeePanelsHandlers(
         kind,
       );
       const query = new URL(request.url).searchParams;
-      const expected = ChecksumSchema.optional().parse(
-        query.get('checksum') ?? undefined,
-      );
-      if (expected !== undefined && checksum !== expected)
-        throw new DataAccessError('not_found');
       const source =
         z.enum(['0', '1']).parse(query.get('source') ?? '0') === '1';
       const offset = z
@@ -212,12 +206,7 @@ export function createEmployeePanelsHandlers(
     selectMaterial: route(false, (scope, params, request) =>
       scope.materials.captureSelection(
         scope.context,
-        {
-          ...materialInput(scope, params),
-          ...(new URL(request.url).searchParams.get('excerpt') === '1' && {
-            includeExcerpt: true as const,
-          }),
-        },
+        materialInput(scope, params),
         request.signal,
       ),
     ),
@@ -288,6 +277,8 @@ export function createEmployeePanelsHandlers(
         ...catalog,
         quotableFileIds: catalog.files
           .filter((file) => {
+            if (params.get('mention') === '1')
+              return isIndexableReferenceSource(file);
             if (file.reference?.companyTemplate) return true;
             const current =
               file.reference?.checksum === file.checksum
@@ -302,11 +293,7 @@ export function createEmployeePanelsHandlers(
               )
             )
               return false;
-            return (
-              params.get('mention') === '1'
-                ? isIndexableReferenceSource
-                : isIndexableKnowledgeTextSource
-            )(file);
+            return isIndexableKnowledgeTextSource(file);
           })
           .map((file) => file.objectId),
       };

@@ -1,3 +1,4 @@
+import { createProductionFileMentionContext } from './production-file-mentions.js';
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -1162,6 +1163,7 @@ export function createProductionPersonVmHost(input: {
           ),
         readTrustedContext: memory && modelSource.readMemoryIndex,
         withTrustedContext: memory && modelSource.withMemoryIndex,
+        prepareReferences: createProductionFileMentionContext(),
         store: storeModel,
         confirmTransportStopped:
           modelSource.confirmTransportStopped ??

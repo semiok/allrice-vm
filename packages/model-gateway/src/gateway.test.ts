@@ -137,6 +137,47 @@ it.each([
     ]);
   },
 );
+it.each([false, true])(
+  'withholds the file excerpt until the owned dispatcher checks current authority (revoked %s)',
+  async (revoked) => {
+    const upstream = await upstreamFixture();
+    cleanup.push(() => upstream.close());
+    const provider = await memoryProvider(upstream.url);
+    const store = new FixtureStore();
+    const secret = 'isolated-file-excerpt-' + randomUUID();
+    let allowed = true;
+    store.beforeStart = async () => {
+      allowed = !revoked;
+    };
+    let sealed = false;
+    const f = await gatewayFixture({
+      provider,
+      store,
+      async prepareReferences(_binding, messages) {
+        sealed = true;
+        return {
+          messages: messages.map((message) => ({
+            ...message,
+            content: [
+              ...message.content,
+              { type: 'text' as const, text: secret },
+            ],
+          })),
+          async withCurrent(_active, _authority, dispatch) {
+            expect(sealed).toBe(true);
+            if (!allowed) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+            await dispatch();
+          },
+        };
+      },
+    });
+    cleanup.push(() => f.close());
+    await f.collect();
+    expect(upstream.requests).toHaveLength(revoked ? 0 : 1);
+    if (!revoked)
+      expect(JSON.stringify(upstream.requests[0]?.body)).toContain(secret);
+  },
+);
 it('does not send the sealed index if the selected route is revoked while waiting on recovery', async () => {
   const upstream = await upstreamFixture();
   cleanup.push(() => upstream.close());

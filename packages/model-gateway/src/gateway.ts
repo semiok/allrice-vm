@@ -1,3 +1,4 @@
+import type { Sql } from 'postgres';
 import { createHash, randomUUID } from 'node:crypto';
 import { LlmError } from '@deepseek-ai/dsh-llm';
 import type { StreamChunk } from '@deepseek-ai/dsh-llm';
@@ -214,6 +215,16 @@ async function send(
   });
 }
 
+export type PreparedModelReferences = {
+  messages: GatewayModelInput['messages'];
+  withCurrent(
+    signal: AbortSignal,
+    authority: ModelDispatchAuthority | void,
+    dispatch: () => Promise<void>,
+    transaction?: Sql,
+  ): Promise<void>;
+};
+
 /** Inert until a trusted host explicitly creates and mounts it. */
 export function createModelGateway(options: {
   ownerId: string;
@@ -231,8 +242,13 @@ export function createModelGateway(options: {
     binding: ModelCallBinding,
     signal: AbortSignal,
     authority: ModelDispatchAuthority | void,
-    dispatch: (document: string) => Promise<void>,
+    dispatch: (document: string, transaction?: Sql) => Promise<void>,
   ): Promise<void>;
+  prepareReferences?(
+    binding: ModelCallBinding,
+    messages: GatewayModelInput['messages'],
+    signal: AbortSignal,
+  ): Promise<PreparedModelReferences | undefined>;
   confirmTransportStopped?(
     ownerId: string,
     signal: AbortSignal,
@@ -423,8 +439,16 @@ export function createModelGateway(options: {
                 );
                 await assertDelivery(signal);
               }
+              const references = received.purpose
+                ? undefined
+                : await options.prepareReferences?.(
+                    binding,
+                    received.messages,
+                    signal,
+                  );
+              if (references) await assertDelivery(signal);
               signal.throwIfAborted();
-              const input = trustedContext
+              const withSystem = trustedContext
                 ? {
                     ...received,
                     system: received.system
@@ -432,9 +456,12 @@ export function createModelGateway(options: {
                       : trustedContext,
                   }
                 : received;
+              const input = references
+                ? { ...withSystem, messages: references.messages }
+                : withSystem;
               const serialized = JSON.stringify(input);
               if (
-                trustedContext &&
+                (trustedContext || references) &&
                 Buffer.byteLength(serialized) > maxModelInputBytes
               )
                 throw new ModelGatewayError('INPUT_TOO_LARGE');
@@ -455,21 +482,34 @@ export function createModelGateway(options: {
                 assertCurrent,
                 activate,
                 withContextCurrent:
-                  trustedContext === undefined
+                  trustedContext === undefined && !references
                     ? undefined
                     : async (active, authority, dispatch) => {
+                        const send = (transaction?: Sql) =>
+                          references
+                            ? references.withCurrent(
+                                active,
+                                authority,
+                                dispatch,
+                                transaction,
+                              )
+                            : dispatch();
+                        if (trustedContext === undefined) return send();
                         if (!options.withTrustedContext)
                           throw new ModelGatewayError('AUTHORIZATION_DENIED');
                         await options.withTrustedContext(
                           binding,
                           active,
                           authority,
-                          (document) => {
-                            if (document !== trustedContext)
+                          (document, transaction) => {
+                            if (
+                              document !== trustedContext ||
+                              (references && !transaction)
+                            )
                               throw new ModelGatewayError(
                                 'AUTHORIZATION_DENIED',
                               );
-                            return dispatch();
+                            return send(transaction);
                           },
                         );
                       },

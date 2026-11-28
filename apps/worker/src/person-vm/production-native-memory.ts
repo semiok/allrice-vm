@@ -1,3 +1,4 @@
+import type { getDatabase } from '@allrice/database';
 import { createHash } from 'node:crypto';
 import {
   MemoryOrdinalInputSchema,
@@ -65,10 +66,13 @@ export type MemoryHostPublication = Readonly<{
     input: Extract<MemoryRootObservation, { mode: 'restore' }>,
     signal: AbortSignal,
     codex: ModelDispatchAuthority['codex'],
-    start: (root: {
-      executionRef: string;
-      memoryIndexDocument: string;
-    }) => Promise<void>,
+    start: (
+      root: {
+        executionRef: string;
+        memoryIndexDocument: string;
+      },
+      tx: ReturnType<typeof getDatabase>,
+    ) => Promise<void>,
   ): Promise<void>;
   call(
     context: RequestContext,

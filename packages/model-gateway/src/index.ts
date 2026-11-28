@@ -24,7 +24,7 @@ export type {
   ModelGatewayPort,
   ModelGatewayErrorCode,
 } from './contract.ts';
-export { createModelGateway } from './gateway.ts';
+export { createModelGateway, type PreparedModelReferences } from './gateway.ts';
 export {
   createDshGatewayProvider,
   GatewayLlmAdapter,

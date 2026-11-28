@@ -98,7 +98,11 @@ const fixture = (deferred = false) => {
   apply({
     effect: native.effect,
     inject: (dependencies, ready) => {
-      if (dependencies.includes('remote.sessionReferenceResolver')) return;
+      if (
+        dependencies.includes('remote.sessionReferenceResolver') ||
+        dependencies.includes('uiConversation')
+      )
+        return;
       activate = () => ready(native as never);
       if (!deferred) activate();
     },

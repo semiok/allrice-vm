@@ -211,10 +211,6 @@ export const ReferenceInputSelectionResultSchema = z
     selection: ReferenceSelectionSchema,
     canReference: z.boolean().optional(),
     readCapabilities: ReferenceReadCapabilitiesSchema.optional(),
-    excerpt: z
-      .object({ text: z.string().min(1).max(8_000), truncated: z.boolean() })
-      .strict()
-      .optional(),
   })
   .strict();
 

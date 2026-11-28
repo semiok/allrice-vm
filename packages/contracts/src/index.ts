@@ -223,3 +223,4 @@ export {
   type PlatformPersonVmConfiguration,
 } from './platform-person-vm-configuration.ts';
 export * from './employee-memory-port.ts';
+export * from './employee-file-mention.ts';

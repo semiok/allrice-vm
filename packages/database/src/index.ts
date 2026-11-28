@@ -437,7 +437,10 @@ export {
 
 export { ReferenceArchiveInputError } from './reference-archive-read.ts';
 
-export { checkReferenceImageSignal } from './reference-image-read.ts';
+export {
+  checkReferenceImageSignal,
+  readReferenceBytes,
+} from './reference-image-read.ts';
 export * from './brand-media/server-wiring.ts';
 export * from './employees/employee-module-bindings.ts';
 
@@ -466,3 +469,4 @@ export {
   createPostgresPersonalSkillPackageSource,
   type PersonalSkillPackageRead,
 } from './capabilities/personal-skill-package-source.ts';
+export { withEmployeeFileMentions } from './employee-file-mention.ts';

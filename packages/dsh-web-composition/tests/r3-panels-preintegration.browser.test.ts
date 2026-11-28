@@ -1,3 +1,4 @@
+import { decodeEmployeeFileMention } from '@allrice/contracts';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -67,11 +68,7 @@ function employeeDocument() {
     <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory).replaceAll('<', '\\u003c')}</script>`;
 }
 
-async function fixtureApis(
-  page: Page,
-  requests: string[],
-  revoked = () => false,
-) {
+async function fixtureApis(page: Page, requests: string[]) {
   const sample = createSyntheticPanelsData();
   await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
@@ -140,39 +137,10 @@ async function fixtureApis(
           employees: [{ id: panelsEmployee, name: employeeName }],
         },
       });
-    if (key.startsWith('materials/revisions/') && key.endsWith('/selection')) {
-      if (revoked())
-        return route.fulfill({
-          status: 403,
-          json: {
-            error: { code: 'ACCESS_DENIED', message: '资料访问权限已失效。' },
-          },
-        });
+    if (key.startsWith('materials/revisions/') && key.endsWith('/selection'))
       return route.fulfill({
-        json: {
-          ...sample.selection(key.split('/')[2]!),
-          canReference: true,
-          ...(url.searchParams.get('excerpt') === '1' && {
-            excerpt: { text: '企业资料正文而非仅文件名', truncated: false },
-          }),
-        },
+        json: { ...sample.selection(key.split('/')[2]!), canReference: true },
       });
-    }
-    if (key === `deliverables/${sample.files.files[2]!.objectId}/preview`) {
-      expect(url.searchParams.get('checksum')).toBe(
-        sample.files.files[2]!.checksum,
-      );
-      return route.fulfill({
-        json: {
-          kind: 'text',
-          text: '交付成果正文而非仅文件名',
-          mediaType: 'text/markdown',
-          offset: 1,
-          lines: 1,
-          eof: true,
-        },
-      });
-    }
     if (
       key === `deliverables/${sample.files.files[1]!.objectId}/reference` &&
       method === 'POST'
@@ -255,8 +223,7 @@ suite('R3 preintegration through the installed workbench', () => {
           animations: 'disabled',
         });
       try {
-        let revoked = false;
-        const data = await fixtureApis(page, requests, () => revoked);
+        const data = await fixtureApis(page, requests);
         await page.goto(host.authUrl);
         const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
         await proceed.waitFor({ timeout: 5_000 }).catch(() => {});
@@ -323,23 +290,43 @@ suite('R3 preintegration through the installed workbench', () => {
         const references = await page.evaluate(() =>
           window.__allriceSettingsWorkbench!.references(),
         );
-        expect(references).toEqual([
+        expect(references.map(({ label }) => label)).toEqual([
+          material.fileName,
+          file.fileName,
+        ]);
+        expect(
+          references.map(({ text }) => decodeEmployeeFileMention(text.trim())),
+        ).toEqual([
           {
+            threadId,
             label: material.fileName,
-            text: expect.stringContaining('企业资料正文而非仅文件名'),
+            pin: {
+              kind: 'material',
+              sourceId: material.sourceId,
+              revisionId: material.revisionId,
+              revision: material.revision,
+              checksum: material.checksum,
+            },
           },
           {
+            threadId,
             label: file.fileName,
-            text: expect.stringContaining('交付成果正文而非仅文件名'),
+            pin: {
+              kind: 'deliverable',
+              objectId: file.objectId,
+              checksum: file.checksum,
+            },
           },
         ]);
-        expect(requests.every((entry) => entry.startsWith('GET '))).toBe(true);
+        expect(
+          requests.every(
+            (entry) =>
+              entry.startsWith('GET ') &&
+              !entry.endsWith('/preview') &&
+              !entry.endsWith('/selection'),
+          ),
+        ).toBe(true);
         await shot('references');
-        revoked = true;
-        await expect(
-          page.evaluate(() => window.__allriceSettingsWorkbench!.references()),
-        ).rejects.toThrow();
-        await editor.getByText(material.fileName, { exact: true }).waitFor();
       } catch (error) {
         await shot('first-failure');
         throw error;

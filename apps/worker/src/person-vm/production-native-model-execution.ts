@@ -1,3 +1,4 @@
+import type { getDatabase } from '@allrice/database';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
@@ -492,10 +493,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         phase: 'seal' | 'dispatch',
         dispatch?: {
           authority: ModelDispatchAuthority;
-          start(root: {
-            executionRef: string;
-            memoryIndexDocument: string;
-          }): Promise<void>;
+          start(
+            root: {
+              executionRef: string;
+              memoryIndexDocument: string;
+            },
+            transaction: ReturnType<typeof getDatabase>,
+          ): Promise<void>;
         },
       ) {
         if (
@@ -559,10 +563,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             original,
             active,
             authority.codex,
-            (issued) => {
+            (issued, transaction) => {
               scope.assertObservedNow();
               assertIssued(issued);
-              return start(issued);
+              return start(issued, transaction);
             },
           );
           return;
@@ -1947,7 +1951,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         phase: 'seal' | 'dispatch',
         dispatch?: {
           authority: ModelDispatchAuthority;
-          start(document: string): Promise<void>;
+          start(
+            document: string,
+            transaction: ReturnType<typeof getDatabase>,
+          ): Promise<void>;
         },
       ) {
         const entry = calls.get(call.native.callId);
@@ -1993,9 +2000,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             phase,
             {
               authority,
-              start(issued) {
+              start(issued, transaction) {
                 assertOriginal(issued.executionRef);
-                return start(issued.memoryIndexDocument);
+                return start(issued.memoryIndexDocument, transaction);
               },
             },
           );

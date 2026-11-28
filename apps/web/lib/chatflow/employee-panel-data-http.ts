@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import {
   ApiErrorSchema,
-  ChecksumSchema,
   DEntrySelectionInputSchema,
   DeliverableFavoriteResultProjectionSchema,
   DeliverableUploadResultProjectionSchema,
@@ -87,10 +86,7 @@ const page = {
   offset: z.number().int().positive().optional(),
 };
 const queryInput = workspace.extend({ query: ReferencePublicationQuerySchema });
-const materialPreview = material.extend({
-  ...page,
-  checksum: ChecksumSchema.optional(),
-});
+const materialPreview = material.extend(page);
 const catalog = ReferencePublicationQueryResultSchema.extend({
   viewerId: UuidSchema,
   options: ReferenceLibraryOptionsSchema,
@@ -188,7 +184,7 @@ export function createEmployeePanelsHttpClient(
     value: z.infer<typeof material> | z.infer<typeof file>,
     path: string,
     signal: AbortSignal,
-    options: { source?: boolean; offset?: number; checksum?: string },
+    options: { source?: boolean; offset?: number },
   ) =>
     parseArtifactPreview(
       await call(path, signal, value, {
@@ -196,7 +192,6 @@ export function createEmployeePanelsHttpClient(
           source:
             options.source === undefined ? undefined : options.source ? 1 : 0,
           offset: options.offset,
-          checksum: options.checksum,
         },
       }),
     );
@@ -231,23 +226,14 @@ export function createEmployeePanelsHttpClient(
         })
         .parse(await call('/materials/options', signal, value));
     },
-    async selectMaterial(
-      {
-        includeExcerpt,
-        ...input
-      }: z.input<typeof material> & { includeExcerpt?: true },
-      signal: AbortSignal,
-    ) {
+    async selectMaterial(input: z.input<typeof material>, signal: AbortSignal) {
       const value = material.parse(input);
       return ReferenceInputSelectionResultSchema.parse(
         await call(
           `/materials/revisions/${value.revisionId}/selection`,
           signal,
           value,
-          {
-            revisions: [value.revisionId],
-            query: { excerpt: includeExcerpt ? 1 : undefined },
-          },
+          { revisions: [value.revisionId] },
         ),
       );
     },
@@ -421,17 +407,10 @@ export function createEmployeePanelsHttpClient(
         fileName: string;
         source?: boolean;
         offset?: number;
-        checksum?: string;
       },
       signal: AbortSignal,
     ) {
-      const value = file
-        .extend({
-          ...page,
-          fileName: z.string(),
-          checksum: ChecksumSchema.optional(),
-        })
-        .parse(input);
+      const value = file.extend({ ...page, fileName: z.string() }).parse(input);
       return preview(
         value,
         `/deliverables/${value.objectId}/preview`,

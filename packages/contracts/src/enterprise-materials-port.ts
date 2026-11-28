@@ -33,7 +33,6 @@ export const MaterialsSelectionQueryProjectionSchema = z
   .object({
     workspaceId: UuidSchema,
     revisionId: UuidSchema,
-    includeExcerpt: z.literal(true).optional(),
   })
   .strict();
 /** A new file only. Source revision replacement is not a 4.0 public method.

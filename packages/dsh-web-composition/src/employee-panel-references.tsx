@@ -8,7 +8,13 @@ import type {
   PropsRuntime,
   SessionIdOf,
 } from '@deepseek-ai/dsh-client-ui-slots';
-import { ReferenceSelectionSchema } from '@allrice/contracts';
+import {
+  type ReferencePublicationQuerySchema,
+  decodeEmployeeFileMention,
+  employeeFileMentionPrefix,
+  encodeEmployeeFileMention,
+  ReferenceSelectionSchema,
+} from '@allrice/contracts';
 import {
   conversationCandidate,
   conversationPick,
@@ -18,8 +24,8 @@ import {
   materialPin as pin,
   materialTarget,
   mentionOccurrence,
+  mentionChoices,
   nativeReferenceSource,
-  readMention,
   type MentionTarget,
 } from './employee-mention-source';
 import { useEffect } from 'react';
@@ -148,6 +154,40 @@ export function apply(ctx: Context) {
     listeners.clear();
   });
 
+  ctx.inject(['uiConversation'], (native) => {
+    if (!native.uiConversation) return;
+    native.effect(() =>
+      native.uiConversation.userText.register({
+        id: 'allrice-file-mention',
+        order: 20,
+        match(text, from) {
+          let start = text.indexOf(employeeFileMentionPrefix, from);
+          while (start >= 0) {
+            const end = text.indexOf(']', start) + 1;
+            if (end > start) {
+              const raw = text.slice(start, end);
+              try {
+                const mention = decodeEmployeeFileMention(raw);
+                if (mention)
+                  return {
+                    id: 'text',
+                    start,
+                    end,
+                    data: { text: raw, display: '@' + mention.label },
+                  };
+              } catch {
+                // Ordinary user text that is not a valid fixed locator stays literal.
+              }
+            }
+            start = text.indexOf(
+              employeeFileMentionPrefix,
+              start + employeeFileMentionPrefix.length,
+            );
+          }
+        },
+      }),
+    );
+  });
   let lookupConversations:
     Context['remote']['sessionReferenceResolver']['candidates'] | undefined;
   ctx.inject(['remote', 'remote.sessionReferenceResolver'], (native) => {
@@ -268,51 +308,106 @@ export function apply(ctx: Context) {
               });
             if (inFolder) {
               if (!catalog || !target) return [];
-              const result = await catalog.queryMaterials(
-                {
-                  workspaceId,
-                  query: {
-                    category: 'all',
-                    query: query.slice(
-                      materialPath.length,
-                      materialPath.length + 200,
-                    ),
-                    limit: 50,
+              const choices = await mentionChoices<
+                InputTriggerCandidate,
+                NonNullable<
+                  z.input<typeof ReferencePublicationQuerySchema>['cursor']
+                >
+              >(async (cursor) => {
+                const result = await catalog.queryMaterials(
+                  {
+                    workspaceId,
+                    query: {
+                      category: 'all',
+                      query: query.slice(
+                        materialPath.length,
+                        materialPath.length + 200,
+                      ),
+                      limit: 50,
+                      cursor,
+                    },
                   },
-                },
-                attempt,
-              );
-              if (
-                attempt.aborted ||
-                current(id) !== binding ||
-                !sameOwner(id, target) ||
-                result.viewerId !== viewerId ||
-                result.options.workspaceId !== workspaceId
-              )
-                return [];
-              return result.references
-                .filter(
-                  (row) =>
-                    row.status === 'active' &&
-                    row.canReference === true &&
-                    (row.fullTextReady || row.readCapabilities?.text),
+                  attempt,
+                );
+                if (
+                  attempt.aborted ||
+                  current(id) !== binding ||
+                  !sameOwner(id, target) ||
+                  result.viewerId !== viewerId ||
+                  result.options.workspaceId !== workspaceId
                 )
-                .map((row) => ({
-                  name: row.fileName,
-                  icon: 'file',
-                  value: encode(materialTarget(row)),
-                }));
+                  return { choices: [], next: null };
+                return {
+                  choices: result.references
+                    .filter(
+                      (row) =>
+                        row.status === 'active' &&
+                        row.canReference === true &&
+                        (row.fullTextReady ||
+                          row.readCapabilities?.text ||
+                          row.readCapabilities?.archive),
+                    )
+                    .map((row) => ({
+                      name: row.fileName,
+                      icon: 'file',
+                      value: encode(materialTarget(row)),
+                    })),
+                  next: result.nextCursor,
+                };
+              }, attempt);
+              return current(id) === binding &&
+                sameOwner(id, target) &&
+                !attempt.aborted
+                ? choices
+                : [];
             }
             const [files, sessions] = await Promise.allSettled([
-              catalog?.listDeliverables(
-                {
-                  workspaceId,
-                  category: 'artifact',
-                  mention: true,
-                  query: query.slice(0, 200),
-                },
-                attempt,
-              ),
+              catalog && target
+                ? mentionChoices<InputTriggerCandidate, string>(
+                    async (cursor) => {
+                      const result = await catalog.listDeliverables(
+                        {
+                          workspaceId,
+                          category: 'artifact',
+                          mention: true,
+                          query: query.slice(0, 200),
+                          cursor,
+                        },
+                        attempt,
+                      );
+                      if (
+                        !sameOwner(id, target) ||
+                        result.viewerId !== viewerId
+                      )
+                        return { choices: [], next: null };
+                      const quotable = new Set(result.quotableFileIds);
+                      return {
+                        choices: result.files
+                          .filter(
+                            (file) =>
+                              file.ownedByMe &&
+                              file.origin === 'business-deliverable' &&
+                              quotable.has(file.objectId),
+                          )
+                          .map((file) => ({
+                            name: file.fileName,
+                            icon: 'file',
+                            section: filesSection,
+                            value: encode({
+                              fileName: file.fileName,
+                              pin: {
+                                kind: 'deliverable',
+                                objectId: file.objectId,
+                                checksum: file.checksum,
+                              },
+                            }),
+                          })),
+                        next: result.nextCursor,
+                      };
+                    },
+                    attempt,
+                  )
+                : undefined,
               quoted ? undefined : lookupConversations?.(id, query, attempt),
             ]);
             if (attempt.aborted || current(id) !== binding) return [];
@@ -325,32 +420,8 @@ export function apply(ctx: Context) {
                   drill: true,
                   value: quoted ? quotedFolderCrumb : folderCrumb,
                 });
-              if (
-                files.status === 'fulfilled' &&
-                files.value?.viewerId === viewerId
-              ) {
-                const quotable = new Set(files.value.quotableFileIds);
-                for (const file of files.value.files) {
-                  if (
-                    !file.ownedByMe ||
-                    file.origin !== 'business-deliverable' ||
-                    !quotable.has(file.objectId)
-                  )
-                    continue;
-                  candidates.push({
-                    name: file.fileName,
-                    icon: 'file',
-                    section: filesSection,
-                    value: encode({
-                      kind: 'deliverable',
-                      fileName: file.fileName,
-                      objectId: file.objectId,
-                      checksum: file.checksum,
-                      requestId: crypto.randomUUID(),
-                    }),
-                  });
-                }
-              }
+              if (files.status === 'fulfilled' && files.value)
+                candidates.push(...files.value);
             }
             if (sessions.status === 'fulfilled' && sessions.value?.ok) {
               const listed = native.sessions.list.getSnapshot().byId;
@@ -445,21 +516,8 @@ export function apply(ctx: Context) {
               attempt.throwIfAborted();
               const data = dataClient(threadId);
               if (selected.version === 2) {
-                const content = await readMention(
-                  data,
-                  workspaceId,
-                  viewerId,
-                  selected.target,
-                  attempt,
-                );
-                attempt.throwIfAborted();
-                if (current(id) !== binding || !sameOwner(id, target))
-                  throw unavailable();
-                return `\n引用文件 ${JSON.stringify({
-                  fileName: selected.target.fileName,
-                  checksum: selected.target.checksum,
-                  ...content,
-                })}\n`;
+                // The native journal and drafts retain a stable locator only.
+                return `\n${encodeEmployeeFileMention({ threadId, label: selected.target.fileName.slice(0, 160), pin: selected.target.pin })}\n`;
               }
               const result = await data.selectMaterial(
                 {
