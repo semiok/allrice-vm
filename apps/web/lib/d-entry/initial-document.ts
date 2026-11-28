@@ -4,6 +4,7 @@ import {
   pageDocumentReady,
   pageRevoked,
   pageStartupFailed,
+  readPageMessage,
 } from './page-messages.ts';
 
 import {
@@ -116,13 +117,18 @@ export const initialDocumentLifecycle = `(() => {
       if (document.readyState === 'complete') finish('closed');
     }
   };
+  const readMessage = (${readPageMessage.toString()});
   const received = (event) => {
-    if (event.source === parent && event.origin === location.origin &&
-        event.data?.scopeId === scopeId && event.data.type === protocol.revoke) stop();
+    if (readMessage(event, parent, scopeId)?.type === protocol.revoke) stop();
   };
   const error = (event) => {
-    const asset = event.target?.dataset?.allriceDocumentAsset;
-    if (!asset) return;
+    const asset = event.target;
+    if (!event.isTrusted || !(
+      (asset instanceof HTMLScriptElement && asset.type === 'module' &&
+        asset.dataset.allriceDocumentAsset === 'entry') ||
+      (asset instanceof HTMLLinkElement && asset.rel === 'stylesheet' &&
+        asset.dataset.allriceDocumentAsset === 'style')
+    )) return;
     send(protocol.fail);
     stop();
   };

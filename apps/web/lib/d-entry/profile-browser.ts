@@ -34,6 +34,7 @@ import {
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
   pageThreadSwitchPrepared,
+  readPageMessage,
   type PageNativeThreadRegistration,
   type PageThreadScope,
 } from './page-messages';
@@ -256,27 +257,25 @@ export function nativeProfileDocument(
   let closing: Promise<void> | undefined;
   let peer: NativePageSocket | undefined;
   const receive = (event: MessageEvent) => {
-    if (
-      event.origin !== location.origin ||
-      event.source !== parent ||
-      event.data?.scopeId !== scopeId
-    )
-      return;
-    if (event.data.type === pageRevoked && !lifetime.signal.aborted) {
+    const data = readPageMessage(event, parent, scopeId);
+    if (!data) return;
+    if (data.type === pageRevoked && !lifetime.signal.aborted) {
       lifetime.abort();
       onRevoked();
     }
-    if (event.data.type === pageCompletion) {
-      if (event.data.state === 'closed') done.resolve();
-      else done.reject(Error('Native page close is unconfirmed'));
+    if (data.type === pageCompletion) {
+      if (data.state === 'closed') done.resolve();
+      if (data.state === 'unknown')
+        done.reject(Error('Native page close is unconfirmed'));
     }
     if (
-      event.data.type === pageThreadSwitchPrepare &&
+      data.type === pageThreadSwitchPrepare &&
       !lifetime.signal.aborted &&
       !switching &&
-      UuidSchema.safeParse(event.data.requestId).success
+      typeof data.requestId === 'string' &&
+      UuidSchema.safeParse(data.requestId).success
     ) {
-      const { requestId } = event.data;
+      const { requestId } = data;
       const handoff = { requestId, drainsComplete: false };
       switching = handoff;
       // A native write stays owned through consumption of its registration
@@ -291,17 +290,18 @@ export function nativeProfileDocument(
       });
     }
     if (
-      event.data.type === pageThreadSwitchCancel &&
-      switching?.requestId === event.data.requestId
+      data.type === pageThreadSwitchCancel &&
+      switching &&
+      switching.requestId === data.requestId
     )
       switching = undefined;
     if (
-      event.data.type === pageThreadScope &&
+      data.type === pageThreadScope &&
       onThreadScope &&
       !lifetime.signal.aborted &&
       container.dataset.sharedMux === '1'
     ) {
-      const result = DEntryPageSwitchResultSchema.safeParse(event.data.issued);
+      const result = DEntryPageSwitchResultSchema.safeParse(data.issued);
       if (
         !result.success ||
         result.data.type !== 'switched' ||
@@ -577,6 +577,9 @@ export function nativeProfileDocument(
             }).decode(bytes);
             let registrationError: Error | undefined;
             const failed = (event: ErrorEvent) => {
+              // Inline registration errors belong to this document URL.
+              // An injected content script can report its own error here too.
+              if (!event.isTrusted || event.filename !== document.URL) return;
               registrationError =
                 event.error instanceof Error
                   ? event.error

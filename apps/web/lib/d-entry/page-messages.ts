@@ -33,3 +33,29 @@ export type PageNativeThreadRegistration = {
   nativeSessionId: string;
   thread: ReturnType<typeof ChatSessionSchema.parse>;
 };
+
+export function readPageMessage(
+  event: MessageEvent,
+  peer: Window | null | undefined,
+  scopeId: string | undefined,
+): (Record<string, unknown> & { type: string }) | undefined {
+  if (
+    !event.isTrusted ||
+    !peer ||
+    !scopeId ||
+    event.origin !== location.origin ||
+    event.source !== peer
+  )
+    return;
+  const data = event.data;
+  if (
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    Object.hasOwn(data, 'type') &&
+    typeof data.type === 'string' &&
+    Object.hasOwn(data, 'scopeId') &&
+    data.scopeId === scopeId
+  )
+    return data;
+}
