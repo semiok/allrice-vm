@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
           },
         });
         const test = {
+          officeUnavailable: () =>
+            ctx.locale.bind('sidebarOffice')('unavailable'),
           async startSession(cwd) {
             const { workspaceId } = await ctx.workspaces.create({ path: cwd });
             const id = await ctx.sessions.create({ workspaceId });

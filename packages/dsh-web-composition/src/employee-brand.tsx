@@ -17,6 +17,7 @@ const languages = {
     sessionInUse: '当前对话正在另一个工作台中使用。请关闭那个工作台后重试。',
     browserSelf: '不能在工作台的内嵌浏览器中打开当前应用。',
     modelAccount: '模型服务账号',
+    officeUnavailable: 'Office 文档暂时无法预览。请联系管理员。',
     chat: {
       'chat.deepDiving': '思考中',
       'chat.deepDivingFor': '思考中，用时 {duration} ···',
@@ -35,6 +36,8 @@ const languages = {
       'This conversation is open in another workbench. Close it there and try again.',
     browserSelf: 'The workbench browser cannot open this application.',
     modelAccount: 'Model service account',
+    officeUnavailable:
+      'Office previews are unavailable. Contact your administrator.',
     chat: {
       'chat.deepDiving': 'Thinking',
       'chat.deepDivingFor': 'Thinking for {duration} ···',
@@ -154,6 +157,9 @@ export function apply(ctx: Context) {
         }),
         locale.register('sidebarBrowser', pack.id, {
           'error.application-origin': pack.browserSelf,
+        }),
+        locale.register('sidebarOffice', pack.id, {
+          unavailable: pack.officeUnavailable,
         }),
       ]);
       const adoptPublishedPreference = () => {

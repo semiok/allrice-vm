@@ -14,6 +14,7 @@ declare global {
   interface Window {
     __allriceCompositionTest?: {
       openSession: (id: string) => void;
+      officeUnavailable: () => string;
       startSession: (cwd: string) => Promise<void>;
       selectFixtureEmployee: (id: 'gold' | 'orange') => void;
       setTheme: (mode: 'light' | 'dark') => void;
@@ -376,6 +377,11 @@ suite('installed AllRice native Web composition', () => {
     expect(await hero.innerText()).toContain('AllRice');
     expect(await hero.innerText()).toContain('Do it right. Make it nice.');
     expect(await hero.getByText('预览版').isVisible()).toBe(true);
+    expect(
+      await page.evaluate(() =>
+        window.__allriceCompositionTest!.officeUnavailable(),
+      ),
+    ).toBe('Office 文档暂时无法预览。请联系管理员。');
     expect(
       await hero
         .locator('img')
