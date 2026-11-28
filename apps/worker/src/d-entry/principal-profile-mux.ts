@@ -138,6 +138,7 @@ async function runOwner(
 ) {
   const send = sendTo(peer);
   let streamId: string | undefined;
+  let publishedScopeId: string | undefined;
   let current: OwnedPage | undefined;
   let staged: OwnedPage | undefined;
   let transport: OwnedPage | undefined;
@@ -294,6 +295,7 @@ async function runOwner(
             nativeSessionId: root.rootNativeSessionId,
           },
         });
+        publishedScopeId = page.scope.opened.scopeId;
       },
       previousPage,
     );
@@ -367,7 +369,9 @@ async function runOwner(
               void transport.operation.then(() => reject(denied()), reject);
             })
           : undefined;
-        void sharedPage?.catch(fail);
+        void sharedPage?.catch((error: unknown) => {
+          if (!requestedClose) fail(error);
+        });
         current = begin(input.selection, async (generation, page) => {
           if (sharedPage) {
             const employee = await sharedPage;
@@ -399,6 +403,7 @@ async function runOwner(
               bindingRef: page.bindingRef,
             },
           });
+          publishedScopeId = page.scope.opened.scopeId;
         });
         void current.operation.catch((error) => {
           if (!requestedClose) fail(error);
@@ -449,10 +454,10 @@ async function runOwner(
         );
       } else if (frame.type === 'end') {
         if (!requestedClose) break;
-        const scopeId = current?.page?.scope.opened.scopeId;
         try {
           await joinPages();
           connected.throwIfAborted();
+          const scopeId = publishedScopeId;
           if (!scopeId) {
             await send({
               type: 'error',

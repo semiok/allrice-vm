@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
@@ -100,15 +101,19 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       'http://127.0.0.1:' + (f.worker.address() as AddressInfo).port,
     );
 
+    const bytes = await readFile(join(release.directory, 'artifact.json'));
+    const stamp = createHash('sha256').update(bytes).digest('hex');
     const manifest: { files: { path: string }[] } = JSON.parse(
-      await readFile(join(release.directory, 'artifact.json'), 'utf8'),
+      bytes.toString(),
     );
     const files = new Set(manifest.files.map(({ path }) => path));
-    const assetRoot = '/_next/static/dsh-profile/' + '0'.repeat(64) + '/';
-    vi.spyOn(assets, 'readReleasedProfileAssets').mockResolvedValue({
+    const assetRoot = '/_next/static/dsh-profile/' + stamp + '/';
+    vi.spyOn(assets, 'readLocalProfileAssets').mockResolvedValue({
+      stamp,
       root: assetRoot,
       paths: files,
       bundles: [],
+      startup: [],
     });
     const require = createRequire(
       new URL(

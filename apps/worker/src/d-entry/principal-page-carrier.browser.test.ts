@@ -297,6 +297,7 @@ it
     const deliverCreatedResponse = deferred();
     let holdCreatedResponse = false;
     let switchProofRequests = 0;
+    let loseNextSwitchProofReply = false;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
       const nativeRoots = new Map<
@@ -745,15 +746,20 @@ it
               ?.split('; ')
               .find((part) => part.startsWith('allrice_session='))
               ?.slice('allrice_session='.length) ?? '';
-          return await copy(
-            await f.proveSwitch(
-              scopeId!,
-              url.searchParams.get('targetThreadId')!,
-              url.searchParams.get('requestId')!,
-              cookie,
-              Object.fromEntries(url.searchParams),
-            ),
+          const proof = await f.proveSwitch(
+            scopeId!,
+            url.searchParams.get('targetThreadId')!,
+            url.searchParams.get('requestId')!,
+            cookie,
+            Object.fromEntries(url.searchParams),
           );
+          if (loseNextSwitchProofReply) {
+            loseNextSwitchProofReply = false;
+            expect(proof.status).toBe(204);
+            response.destroy();
+            return;
+          }
+          return await copy(proof);
         }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           firstRpc ??= performance.now();
@@ -1538,6 +1544,7 @@ it
         expect(documentLoads).toBe(7);
         expect(socketCount).toBe(7);
       } else {
+        loseNextSwitchProofReply = true;
         await workbench
           .locator('[data-row-key="session:' + otherThread + '"]')
           .press('Enter');

@@ -281,6 +281,48 @@ it('replaces the borrowed root while keeping native employee events on the same 
   expect((await f.invokeThread(nextScope, target)).status).toBe(404);
 });
 
+it('joins both parts of an employee carrier cancelled before its opened frame', async () => {
+  const f = await fixture();
+  const employeeEntered = deferred<void>();
+  const releaseEmployee = deferred<void>();
+  const read = f.historyIdentity.getMockImplementation()!;
+  f.historyIdentity.mockImplementation(async (context, input) => {
+    if (!(input as { threadId?: string }).threadId) {
+      employeeEntered.resolve();
+      await releaseEmployee.promise;
+    }
+    return read(context, input);
+  });
+  const peer = f.connect();
+  const receive = messages(peer);
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'life',
+    endpoint: '$d-entry/page',
+    payload: { args: { reuseEmployee: true } },
+  });
+  try {
+    await employeeEntered.promise;
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(1));
+    closePage(peer);
+    await vi.waitFor(() =>
+      expect(
+        [...f.pageSignals.values()].every((signal) => signal.aborted),
+      ).toBe(true),
+    );
+  } finally {
+    releaseEmployee.resolve();
+  }
+  expect(await receive('life')).toMatchObject({
+    type: 'error',
+    error: { code: 'gateway/cancelled', message: 'Page closed during setup' },
+  });
+  expect([...f.pageSignals.values()].every((signal) => signal.aborted)).toBe(
+    true,
+  );
+});
+
 it('requires proof from the current browser login even while the original login remains active', async () => {
   const f = await fixture();
   const target = randomUUID();

@@ -277,6 +277,14 @@ export function openNativePageCarrier(
         })
         .catch((error: unknown) => {
           if (switching?.id !== requestId || requested) return;
+          // The Worker can commit the switch even when the HTTP reply is
+          // lost on its way back. Only an explicit denial settles this path;
+          // otherwise the socket receipt or its existing deadline owns it.
+          if (
+            !(error instanceof EmployeeEntryError) ||
+            ![400, 401, 403, 404].includes(error.status)
+          )
+            return;
           switching = undefined;
           // A check over HTTP does not report the health of the old socket.
           // The caller uses its existing explicit close-and-join protocol.
