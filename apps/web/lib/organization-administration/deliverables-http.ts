@@ -7,7 +7,7 @@ import {
   readArtifactBytes,
 } from '@allrice/database';
 import { requirePlatformAdminContext } from '../identity/platform-admin';
-import { executionErrorResponse } from '../execution/responses';
+import { administrationError } from '../identity/administration';
 import { getStorageAdapter } from '../storage/runtime';
 import { readStaticArtifactPreview } from '../runtime/static-artifact-preview';
 const headers = {
@@ -105,6 +105,6 @@ export async function companyDeliverablesHttp(
         },
         { status: e.code === 'artifact_not_found' ? 404 : 409, headers },
       );
-    return executionErrorResponse(e);
+    return administrationError(e);
   }
 }

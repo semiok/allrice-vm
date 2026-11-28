@@ -3,15 +3,17 @@ import { DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
 const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
+  session: vi.fn(),
   operations: vi.fn(),
   tenants: vi.fn(),
   runtimes: vi.fn(),
 }));
-vi.mock('../../../../../lib/identity/platform-admin', () => ({
-  requirePlatformAdminContext: mocks.auth,
+vi.mock('../../../../../lib/identity/session', () => ({
+  getRequestContext: mocks.session,
 }));
 vi.mock('@allrice/database', async (original) => ({
   ...(await original<typeof Database>()),
+  requireCurrentPlatformAdmin: mocks.auth,
   readOperationsInventory: mocks.operations,
   listTenantRuntimeInventory: mocks.tenants,
   listDshRuntimeInventory: mocks.runtimes,
@@ -22,7 +24,10 @@ const request = () =>
 describe('admin operational resources', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.auth.mockResolvedValue({});
+    mocks.session.mockResolvedValue({
+      actor: { type: 'user', id: 'operator' },
+    });
+    mocks.auth.mockResolvedValue('operator');
     mocks.tenants.mockResolvedValue([]);
     mocks.runtimes.mockResolvedValue([]);
     mocks.operations.mockResolvedValue({ workers: [] });
@@ -46,5 +51,13 @@ describe('admin operational resources', () => {
       tenants: [],
       runtimes: [],
     });
+  });
+  it('withholds the inventory after authority is revoked during collection', async () => {
+    mocks.auth
+      .mockResolvedValueOnce('operator')
+      .mockRejectedValueOnce(new DataAccessError('authorization_denied'));
+    const result = await GET(request());
+    expect(result.status).toBe(403);
+    expect(await result.text()).not.toContain('operations');
   });
 });

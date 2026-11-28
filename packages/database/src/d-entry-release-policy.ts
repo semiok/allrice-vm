@@ -1,8 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type postgres from 'postgres';
+import { z } from 'zod';
 import {
   DEntryRolloutPolicySchema,
+  hasDEntryPersonRelease,
   UuidSchema,
+  type DEntryRolloutPolicy,
   type RequestContext,
 } from '@allrice/contracts';
 import {
@@ -30,6 +33,31 @@ const disabledPolicy = {
   selections: [],
 };
 
+async function readStoredReleasePolicy(
+  sql: ReturnType<typeof getDatabase> | postgres.TransactionSql,
+  lock = false,
+) {
+  // A missing settings row cannot serialize with the first publication.
+  if (lock)
+    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
+  const [row] = await sql<
+    { value: string }[]
+  >`select value::text as value from allrice_settings
+    where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
+    ${lock ? sql`for share` : sql``}`;
+  return row?.value ?? JSON.stringify(disabledPolicy);
+}
+
+function parsePublishedPolicy(value: string) {
+  const parsed = DEntryRolloutPolicySchema.safeParse(JSON.parse(value));
+  if (parsed.success && parsed.data.defaultGeneration === '3.x')
+    return parsed.data;
+}
+
+function recoveryRevision(value: string) {
+  return `repair:${createHash('sha256').update(value).digest('hex')}`;
+}
+
 /** Internal host read; callers establish current session/employee authority.
  * Missing configuration is the explicitly approved default-off policy. Invalid
  * stored configuration fails closed rather than silently changing a thread. */
@@ -37,23 +65,19 @@ export async function readDEntryReleasePolicy(
   sql: ReturnType<typeof getDatabase> | postgres.TransactionSql = getDatabase(),
   lock = false,
 ) {
-  // A missing settings row cannot serialize with the first publication.
-  if (lock)
-    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
-  const [row] = await sql`select value from allrice_settings
-    where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
-    ${lock ? sql`for share` : sql``}`;
-  const parsed = DEntryRolloutPolicySchema.safeParse(
-    row?.value ?? disabledPolicy,
-  );
-  if (!parsed.success || parsed.data.defaultGeneration !== '3.x')
-    throw new Error('D entry published policy is unavailable');
-  return parsed.data;
+  const policy = parsePublishedPolicy(await readStoredReleasePolicy(sql, lock));
+  if (!policy) throw new Error('D entry published policy is unavailable');
+  return policy;
 }
 
 export async function getDEntryReleasePolicy(context: RequestContext) {
-  await requireCurrentPlatformAdmin(context, getDatabase(), false);
-  return readDEntryReleasePolicy();
+  const db = getDatabase();
+  await requireCurrentPlatformAdmin(context, db, false);
+  const stored = await readStoredReleasePolicy(db);
+  const policy = parsePublishedPolicy(stored);
+  await requireCurrentPlatformAdmin(context, db, false);
+  // The repair revision is only accepted by the full platform replacement.
+  return policy ?? { ...disabledPolicy, revision: recoveryRevision(stored) };
 }
 
 /** Published by the same platform-admin authority as native_question_mode.
@@ -61,6 +85,7 @@ export async function getDEntryReleasePolicy(context: RequestContext) {
 export async function updateDEntryReleasePolicy(
   context: RequestContext,
   input: unknown,
+  options: { compareRevision?: true } = {},
 ) {
   const parsed = DEntryRolloutPolicySchema.parse(input);
   if (parsed.defaultGeneration !== '3.x')
@@ -69,31 +94,148 @@ export async function updateDEntryReleasePolicy(
   await getDatabase().begin(async (tx) => {
     const actor = await requireCurrentPlatformAdmin(context, tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
-    const [stored] = await tx`select value from allrice_settings
-      where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}`;
-    const previous = DEntryRolloutPolicySchema.safeParse(stored?.value);
-    // A valid replacement can repair an unreadable policy. In that case every
-    // candidate selection must pass the capacity check as a new release.
-    await assertNativeWebRolloutCapacity(
+    await requireCurrentPlatformAdmin(context, tx, false);
+    const stored = await readStoredReleasePolicy(tx);
+    const current = parsePublishedPolicy(stored);
+    if (options.compareRevision) {
+      if ((current?.revision ?? recoveryRevision(stored)) !== parsed.revision)
+        throw new DEntryPersonRolloutConflict();
+    }
+    // An unreadable policy has no trusted selections to carry forward.
+    const settingId = await writeReleasePolicy(
       tx,
-      previous.success && previous.data.defaultGeneration === '3.x'
-        ? previous.data
-        : disabledPolicy,
+      actor,
+      current ?? disabledPolicy,
       policy,
     );
-    const [setting] =
-      await tx`insert into allrice_settings(scope_type,key,value,updated_by)
-      values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})
-      on conflict(scope_type,scope_id,key) do update
-      set value=excluded.value,updated_by=excluded.updated_by,updated_at=clock_timestamp()
-      returning id`;
     await tx`insert into allrice_audit_events
       (organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
       values(${context.organizationId},${context.workspaceId},${actor},'d_entry_release.update',
-        'setting',${setting!.id},'recorded','platform_admin',${context.requestId},
+        'setting',${settingId},'recorded','platform_admin',${context.requestId},
         ${tx.json({ revision: policy.revision })})`;
   });
   return policy;
+}
+
+async function writeReleasePolicy(
+  tx: postgres.TransactionSql,
+  actor: string,
+  previous: DEntryRolloutPolicy,
+  policy: DEntryRolloutPolicy,
+) {
+  await assertNativeWebRolloutCapacity(tx, previous, policy);
+  const [setting] = await tx<{ id: string }[]>`
+    insert into allrice_settings(scope_type,key,value,updated_by)
+    values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})
+    on conflict(scope_type,scope_id,key) do update
+    set value=excluded.value,updated_by=excluded.updated_by,updated_at=clock_timestamp()
+    returning id`;
+  if (!setting) throw new Error('Rollout publication missing receipt');
+  return setting.id;
+}
+
+const identifier = UuidSchema.transform((id) => id.toLowerCase());
+const rolloutTarget = z.strictObject({
+  organizationId: identifier,
+  personId: identifier,
+});
+const rolloutChange = rolloutTarget.extend({
+  enabled: z.boolean(),
+  expectedRevision: DEntryRolloutPolicySchema.shape.revision,
+});
+
+export class DEntryPersonRolloutConflict extends Error {}
+
+async function requireRolloutMember(
+  sql: ReturnType<typeof getDatabase> | postgres.TransactionSql,
+  target: z.infer<typeof rolloutTarget>,
+  lock = false,
+) {
+  if (lock)
+    await sql`select id from allrice_organizations where id=${target.organizationId} for share`;
+  const [member] = await sql`
+    select m.id from allrice_memberships m
+    join allrice_organizations o on o.id=m.organization_id and o.archived_at is null and o.slug<>'allrice-platform'
+    join allrice_users u on u.id=m.user_id and u.status='active'
+    where m.organization_id=${target.organizationId} and m.user_id=${target.personId} and m.active
+      and (m.workspace_id is null or exists (
+        select 1 from allrice_workspaces w
+        where w.id=m.workspace_id and w.organization_id=m.organization_id and w.archived_at is null
+        ${lock ? sql`for share` : sql``}
+      ))
+    order by m.id limit 1
+    ${lock ? sql`for share of o,u,m` : sql``}`;
+  if (!member) throw new DataAccessError('not_found');
+}
+
+export async function getDEntryPersonRollout(
+  context: RequestContext,
+  input: { organizationId: string; personId: string },
+) {
+  const target = rolloutTarget.parse(input);
+  const db = getDatabase();
+  await requireCurrentPlatformAdmin(context, db, false);
+  await requireRolloutMember(db, target);
+  const policy = await readDEntryReleasePolicy(db);
+  await requireRolloutMember(db, target);
+  await requireCurrentPlatformAdmin(context, db, false);
+  return {
+    ...target,
+    enabled: hasDEntryPersonRelease(policy, target),
+    revision: policy.revision,
+  };
+}
+
+/** Same setting and advisory lock as the existing platform publication. */
+export async function updateDEntryPersonRollout(
+  context: RequestContext,
+  input: unknown,
+) {
+  const { organizationId, personId, enabled, expectedRevision } =
+    rolloutChange.parse(input);
+  const target = { organizationId, personId };
+  return getDatabase().begin(async (tx) => {
+    const actor = await requireCurrentPlatformAdmin(context, tx);
+    // Native admission locks the subject before reading the rollout policy.
+    // Take the subject lock here before the exclusive policy lock as well.
+    if (enabled) await requireRolloutMember(tx, target, true);
+    await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
+    await requireCurrentPlatformAdmin(context, tx, false);
+    const current = await readDEntryReleasePolicy(tx);
+    if (current.revision !== expectedRevision)
+      throw new DEntryPersonRolloutConflict();
+    const wasEnabled = hasDEntryPersonRelease(current, target);
+    // A platform administrator may withdraw a stale selection after offboarding.
+    if (!enabled && !wasEnabled) await requireRolloutMember(tx, target);
+    let revision = current.revision;
+    if (enabled !== wasEnabled) {
+      revision = randomUUID();
+      await writeReleasePolicy(tx, actor, current, {
+        ...current,
+        revision,
+        selections: enabled
+          ? [...current.selections, target]
+          : current.selections.filter(
+              (s) =>
+                s.organizationId !== organizationId || s.personId !== personId,
+            ),
+      });
+    }
+    const [receipt] = await tx<{ id: string; occurred_at: Date }[]>`
+      insert into allrice_audit_events
+        (organization_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
+      values(${organizationId},${actor},'d_entry_release.person.update','user',${personId},
+        'recorded','platform_admin',${context.requestId},
+        ${tx.json({ previousRevision: current.revision, revision, previousEnabled: wasEnabled, enabled })})
+      returning id, occurred_at`;
+    if (!receipt) throw new Error('Rollout publication missing audit');
+    return {
+      ...target,
+      enabled,
+      revision,
+      audit: { id: receipt.id, occurredAt: receipt.occurred_at.toISOString() },
+    };
+  });
 }
 
 /** Preparation reads stay off the request pool. Cancellation closes only

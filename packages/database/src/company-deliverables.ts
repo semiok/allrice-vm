@@ -14,6 +14,7 @@ import {
   organizationWorkSource,
 } from './organization-dashboard.ts';
 import { diagnosticText } from './tenant-validation.ts';
+import { workbenchFileAccess } from './workbench-file-access.ts';
 
 export async function listCompanyDeliverables(
   context: RequestContext,
@@ -29,7 +30,7 @@ export async function listCompanyDeliverables(
   const eligible = db`select dv.*,o.size_bytes,
     case when o.deleted_at is not null then 'deleted' when o.retention_until<=clock_timestamp() then 'expired'
       when o.state='ready' and w.archived_at is null then 'ready' else 'unavailable' end as availability,
-    coalesce(person.display_name,u.display_name) as owner_name,s.title as session_title,
+    coalesce(person.display_name,u.display_name) as owner_name,
     a.run_id,origin.state as run_status,origin.employee_id,origin.employee_name,
     max(dv.version) over(partition by dv.organization_id,dv.workspace_id,dv.owner_id,dv.series_id) as latest_published_version
     from allrice_deliverable_versions dv
@@ -48,46 +49,63 @@ export async function listCompanyDeliverables(
     ? db`select * from eligible where series_id=${filter.seriesId}`
     : db`select distinct on(series_id) * from eligible order by series_id,(availability='ready') desc,version desc,id desc`;
   const cte = db`with scoped_runs as(select r.id,r.state,r.workspace_id,r.owner_id,er.session_id,coalesce(d.employee_id,e.id) as employee_id,v.name as employee_name ${source}),eligible as(${eligible}),candidates as(${candidates})`;
-  let before: Date | null = null;
+  let cursor: { id: string; cursor_at: string } | undefined;
   if (filter.before) {
-    const [cursor] = await db<
-      { created_at: Date }[]
-    >`${cte} select created_at from candidates where id=${filter.before}`;
-    if (!cursor) throw new DataAccessError('not_found');
-    before = cursor.created_at;
+    const [candidate] = await db<
+      { id: string; cursor_at: string; object_id: string }[]
+    >`
+      ${cte} select id,object_id,created_at::text as cursor_at from candidates where id=${filter.before}`;
+    if (!candidate) throw new DataAccessError('not_found');
+    const access = await workbenchFileAccess(context, candidate.object_id, db);
+    if (access && !access.canRead) throw new DataAccessError('not_found');
+    cursor = candidate;
   }
-  const rows = await db<
-    {
-      id: string;
-      series_id: string;
-      workspace_id: string;
-      owner_id: string;
-      owner_name: string;
-      session_id: string;
-      session_title: string;
-      run_id: string | null;
-      run_status: CompanyDeliverable['runStatus'];
-      employee_id: string | null;
-      employee_name: string | null;
-      file_name: string;
-      format: CompanyDeliverable['format'];
-      version: number;
-      latest_published_version: number;
-      created_at: Date;
-      size_bytes: string;
-      availability: CompanyDeliverable['state'];
-    }[]
-  >`${cte} select * from candidates
-    where (${filter.includeUnavailable} or availability='ready')
-      and (${filter.format ?? null}::text is null or format=${filter.format ?? null})
-      and (${!filter.periodOnly} or (created_at>=${period.from}::timestamptz and created_at<${period.to}::timestamptz))
-      and (${before}::timestamptz is null or (created_at,id)<(${before},${filter.before ?? null}::uuid))
-    order by created_at desc,id desc limit 51`;
-  const page = rows.slice(0, 50);
+  type Row = {
+    id: string;
+    series_id: string;
+    workspace_id: string;
+    owner_id: string;
+    owner_name: string;
+    object_id: string;
+    session_id: string;
+    run_id: string | null;
+    run_status: CompanyDeliverable['runStatus'];
+    employee_id: string | null;
+    employee_name: string | null;
+    file_name: string;
+    format: CompanyDeliverable['format'];
+    version: number;
+    latest_published_version: number;
+    created_at: Date;
+    size_bytes: string;
+    availability: CompanyDeliverable['state'];
+    cursor_at: string;
+  };
+  const visible: Row[] = [];
+  while (visible.length < 51) {
+    const batch = await db<
+      Row[]
+    >`${cte} select *,created_at::text as cursor_at from candidates
+      where (${filter.includeUnavailable} or availability='ready')
+        and (${filter.format ?? null}::text is null or format=${filter.format ?? null})
+        and (${!filter.periodOnly} or (created_at>=${period.from}::timestamptz and created_at<${period.to}::timestamptz))
+        and (${cursor?.cursor_at ?? null}::text::timestamptz is null or
+          (created_at,id)<(${cursor?.cursor_at ?? null}::text::timestamptz,${cursor?.id ?? null}::uuid))
+      order by created_at desc,id desc limit 51`;
+    for (const row of batch) {
+      const access = await workbenchFileAccess(context, row.object_id, db);
+      if (!access || access.canRead) visible.push(row);
+      if (visible.length === 51) break;
+    }
+    if (batch.length < 51) break;
+    cursor = batch.at(-1);
+  }
+  const page = visible.slice(0, 50);
+  await getManagedOrganization(context, organizationId);
   return {
     organizationId,
     seriesId: filter.seriesId ?? null,
-    nextCursor: rows.length > 50 ? page.at(-1)!.id : null,
+    nextCursor: visible.length > 50 ? page.at(-1)!.id : null,
     deliverables: page.map((r) => ({
       id: r.id,
       seriesId: r.series_id,
@@ -95,7 +113,7 @@ export async function listCompanyDeliverables(
       ownerId: r.owner_id,
       ownerName: diagnosticText(r.owner_name),
       sessionId: r.session_id,
-      sessionTitle: diagnosticText(r.session_title),
+      sessionTitle: '会话',
       runId: r.run_id,
       runStatus: r.run_status,
       employeeId: r.employee_id,

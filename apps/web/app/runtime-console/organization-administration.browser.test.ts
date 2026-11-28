@@ -409,7 +409,7 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
       const latestRun = randomUUID(),
         question = randomUUID(),
         answer = randomUUID();
-      await fixture.db`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec,input) values(${latestRun},${org},${workspace},${owner},'succeeded','{}','{}')`;
+      await fixture.db`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec,input) values(${latestRun},${org},${workspace},${owner},'running','{}','{}')`;
       await fixture.db`insert into allrice_messages(id,organization_id,workspace_id,session_id,owner_id,role,content) values(${question},${org},${workspace},${a.task.chatSessionId},${owner},'user','{"text":"最新问题","citations":[]}'),(${answer},${org},${workspace},${a.task.chatSessionId},${owner},'assistant','{"text":"最新回复","citations":[]}')`;
       await fixture.db`insert into allrice_employee_runs(run_id,organization_id,workspace_id,owner_id,employee_assignment_id,employee_version_id,session_id,user_message_id,assistant_message_id,provider_snapshot,prompt_snapshot) select ${latestRun},organization_id,workspace_id,owner_id,employee_assignment_id,employee_version_id,session_id,${question},${answer},provider_snapshot,prompt_snapshot from allrice_employee_runs where run_id=${a.task.runId}`;
       const context = await browser.newContext({
@@ -427,11 +427,14 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
         );
         expect(scoped.status()).toBe(200);
         const projection = await scoped.json();
-        expect(
-          projection.runtimes.map(
-            (r: { session: { id: string } }) => r.session.id,
-          ),
-        ).toEqual([peerSession]);
+        expect(projection.runtimes).toEqual([
+          expect.objectContaining({
+            session: expect.objectContaining({
+              id: peerSession,
+              title: '会话',
+            }),
+          }),
+        ]);
         expect(
           projection.employeeTenants.find((t: { bridge: unknown }) => t.bridge)
             .bridge.name,
@@ -447,11 +450,31 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
               !t.bridge && t.sessions.total === 0,
           ),
         ).toBe(true);
+        await page.clock.install();
         await page.goto(`${origin}/runtime-console?view=runtimes`);
         const companies = page.locator('[aria-label="选择公司"]'),
           people = page.locator('[aria-label="选择员工"]'),
           list = page.locator('[aria-label="员工 Session Runtime"]'),
           status = page.getByLabel('员工运行概况');
+        const runtimeRows = list.locator('[data-session-id]');
+        const title = page.getByRole('heading', { name: '会话', exact: true });
+        const expectSession = async (sessionId: string) => {
+          const row = list.locator(`[data-session-id="${sessionId}"]`);
+          await row.getByText('会话', { exact: true }).waitFor();
+          await title.waitFor();
+          await page
+            .locator('dd')
+            .and(page.getByText(sessionId, { exact: true }))
+            .waitFor();
+          expect(
+            await runtimeRows.evaluateAll((rows) =>
+              rows.map((item) => item.getAttribute('data-session-id')),
+            ),
+          ).toEqual([sessionId]);
+          expect(await list.innerText()).not.toMatch(
+            /甲员工任务|乙员工任务|另一公司任务/,
+          );
+        };
         await companies
           .getByRole('button', { name: company, exact: true })
           .click();
@@ -461,11 +484,7 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
             .count(),
         ).toBe(1);
         await people.getByRole('button', { name: /甲员工/ }).click();
-        await page
-          .getByRole('heading', { name: '甲员工任务', exact: true })
-          .waitFor();
-        expect(await list.innerText()).not.toContain('乙员工任务');
-        expect(await list.innerText()).not.toContain('另一公司任务');
+        await expectSession(a.task.chatSessionId);
         await status.getByText(/甲的电脑/).waitFor();
         const turns = page.locator('details[data-run-id]');
         await expect.poll(() => turns.count()).toBe(2);
@@ -477,12 +496,17 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
         expect(await turns.nth(1).getAttribute('open')).toBeNull();
         await turns.nth(1).locator('summary').first().click();
         await turns.first().locator('summary').first().click();
-        await page.clock.install();
+        await fixture.db`update allrice_runs set state='succeeded',completed_at=clock_timestamp() where id=${latestRun}`;
         const refreshed = page.waitForResponse((r) =>
           r.url().endsWith(`/${a.task.chatSessionId}/events`),
         );
         await page.clock.runFor(1600);
-        await refreshed;
+        expect((await refreshed).ok()).toBe(true);
+        await turns
+          .first()
+          .locator('summary')
+          .getByText('succeeded', { exact: true })
+          .waitFor();
         expect(await turns.first().getAttribute('open')).toBeNull();
         expect(await turns.nth(1).getAttribute('open')).not.toBeNull();
 
@@ -499,9 +523,7 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
           ),
         ).toBe(true);
         await people.getByRole('button', { name: /乙员工/ }).click();
-        await page
-          .getByRole('heading', { name: '乙员工任务', exact: true })
-          .waitFor();
+        await expectSession(peerSession);
         await status.getByText(/乙的电脑/).waitFor();
         expect(await status.innerText()).not.toContain('甲的电脑');
         await page.clock.runFor(15001);
@@ -510,27 +532,21 @@ integration('company administration UI -> HTTP -> isolated PostgreSQL', () => {
             .getByRole('button', { name: /乙员工/ })
             .getAttribute('aria-pressed'),
         ).toBe('true');
-        expect(await list.innerText()).not.toContain('甲员工任务');
+        await expectSession(peerSession);
         await people.getByRole('button', { name: /暂无会话员工/ }).click();
         await list
           .getByText('这位员工还没有绑定 DSH Runtime 的 Session。')
           .waitFor();
-        expect(
-          await page
-            .getByRole('heading', { name: '乙员工任务', exact: true })
-            .count(),
-        ).toBe(0);
+        expect(await runtimeRows.count()).toBe(0);
+        expect(await title.count()).toBe(0);
         await status
           .getByText('未配置 AllRice 助手 · 可使用云端 Runtime')
           .waitFor();
         await companies
           .getByRole('button', { name: otherCompany, exact: true })
           .click();
-        await page
-          .getByRole('heading', { name: '另一公司任务', exact: true })
-          .waitFor();
+        await expectSession(b.task.chatSessionId);
         expect(await people.innerText()).not.toContain('暂无会话员工');
-        expect(await list.innerText()).not.toContain('甲员工任务');
         expect(errors).toEqual([]);
         expect(failures).toEqual([]);
       } finally {

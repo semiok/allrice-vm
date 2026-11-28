@@ -1,7 +1,9 @@
-import { listDshRuntimeEventTimeline } from '@allrice/database';
-
-import { executionErrorResponse } from '../../../../../../../lib/execution/responses';
-import { requirePlatformAdminContext } from '../../../../../../../lib/identity/platform-admin';
+import { readAdministrationRuntimeTimeline } from '@allrice/database';
+import {
+  administrationError,
+  administrationHeaders,
+  requireAdministrationLogin,
+} from '../../../../../../../lib/identity/administration';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,12 +13,22 @@ export async function GET(
   route: { params: Promise<{ sessionId: string }> },
 ) {
   try {
-    await requirePlatformAdminContext(request);
+    const context = await requireAdministrationLogin(request);
     const { sessionId } = await route.params;
-    return Response.json({
-      timeline: await listDshRuntimeEventTimeline(sessionId),
-    });
+    const organizationId = new URL(request.url).searchParams.get(
+      'organizationId',
+    );
+    return Response.json(
+      {
+        timeline: await readAdministrationRuntimeTimeline(
+          context,
+          sessionId,
+          organizationId,
+        ),
+      },
+      { headers: administrationHeaders },
+    );
   } catch (error) {
-    return executionErrorResponse(error);
+    return administrationError(error);
   }
 }

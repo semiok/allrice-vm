@@ -94,6 +94,7 @@ import {
   GET as getReleasePolicy,
   PUT as publishReleasePolicy,
 } from '../../app/api/v1/admin/d-entry-release-policy/route';
+import { PUT as publishPersonReleasePolicy } from '../../app/api/v1/admin/d-entry-release-policy/person/route';
 import { resolveDEntryAdmission } from '../d-entry/admission';
 import { resolveDEntryIdentity } from '../d-entry/identity';
 import {
@@ -2683,57 +2684,73 @@ suite(
       });
     }
 
-    it('keeps the first rollout off when the pending and materialized roster is over capacity', async () => {
-      const f = await setup(),
-        admin = await setup();
-      await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+    it.each(['bulk', 'person'] as const)(
+      'keeps the first %s rollout off when the pending and materialized roster is over capacity',
+      async (mode) => {
+        const f = await setup(),
+          admin = await setup();
+        await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
         values(${f.org},${f.workspace},${admin.user},'member')`;
-      // The second source is selected through the real admin writer and has yet
-      // to be materialized into a general instance.
-      const source = await secondAssignmentSource(f);
-      await authorizeFixturePlatformAdministrator(fixture.db, admin.user);
-      await clearPublished();
-      const configured = vi
-        .spyOn(serviceBuild, 'readServicePersonVmEmployeePortSlots')
-        .mockResolvedValue(1);
-      try {
-        const scope = { workspaceId: f.workspace, userIds: [f.user] };
-        expect(
-          (
-            await assignEmployees(
-              rosterWrite(f, 'PUT', `employees/${source}/assignments`, scope),
-              route(source),
-            )
-          ).status,
-        ).toBe(200);
-        const response = await publishReleasePolicy(
-          rosterWrite(f, 'PUT', 'admin/d-entry-release-policy', {
-            revision: 'initial',
-            defaultGeneration: '3.x',
-            selections: [{ organizationId: f.org, personId: f.user }],
-          }),
-        );
-        expect(response.status).toBe(409);
-        expect(await response.json()).toMatchObject({
-          error: { code: 'QUOTA_EXCEEDED', message: '每人最多 1 个员工' },
-        });
-        expect((await readDEntryReleasePolicy()).revision).toBe('unpublished');
-        expect(configured).toHaveBeenCalledOnce();
-        expect(
-          await fixture.db`select id from allrice_audit_events
-          where actor_id=${admin.user} and action='d_entry_release.update'`,
-        ).toEqual([]);
-        expect(
-          await fixture.db`select i.id from allrice_employee_instances i
+        // The second source is selected through the real admin writer and has yet
+        // to be materialized into a general instance.
+        const source = await secondAssignmentSource(f);
+        await authorizeFixturePlatformAdministrator(fixture.db, admin.user);
+        await clearPublished();
+        const configured = vi
+          .spyOn(serviceBuild, 'readServicePersonVmEmployeePortSlots')
+          .mockResolvedValue(1);
+        try {
+          const scope = { workspaceId: f.workspace, userIds: [f.user] };
+          expect(
+            (
+              await assignEmployees(
+                rosterWrite(f, 'PUT', `employees/${source}/assignments`, scope),
+                route(source),
+              )
+            ).status,
+          ).toBe(200);
+          const target = { organizationId: f.org, personId: f.user };
+          const { revision } = await readDEntryReleasePolicy();
+          const response =
+            mode === 'bulk'
+              ? await publishReleasePolicy(
+                  rosterWrite(f, 'PUT', 'admin/d-entry-release-policy', {
+                    revision,
+                    defaultGeneration: '3.x',
+                    selections: [target],
+                  }),
+                )
+              : await publishPersonReleasePolicy(
+                  rosterWrite(f, 'PUT', 'admin/d-entry-release-policy/person', {
+                    ...target,
+                    enabled: true,
+                    expectedRevision: revision,
+                  }),
+                );
+          expect(response.status).toBe(409);
+          expect(await response.json()).toMatchObject({
+            error: { code: 'QUOTA_EXCEEDED', message: '每人最多 1 个员工' },
+          });
+          expect((await readDEntryReleasePolicy()).revision).toBe(
+            'unpublished',
+          );
+          expect(configured).toHaveBeenCalledOnce();
+          expect(
+            await fixture.db`select id from allrice_audit_events
+          where actor_id=${admin.user} and action in ('d_entry_release.update','d_entry_release.person.update')`,
+          ).toEqual([]);
+          expect(
+            await fixture.db`select i.id from allrice_employee_instances i
           join allrice_employee_assignments a on a.id=i.assignment_id
           where a.employee_id=${source}`,
-        ).toEqual([]);
-      } finally {
-        configured.mockRestore();
-        await clearPublished();
-        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
-      }
-    });
+          ).toEqual([]);
+        } finally {
+          configured.mockRestore();
+          await clearPublished();
+          vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+        }
+      },
+    );
 
     async function secondAssignmentSource(f: Fixture) {
       const id = randomUUID(),

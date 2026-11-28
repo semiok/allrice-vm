@@ -204,7 +204,6 @@ export async function listOrganizationActivityRuns(
       session_archived: boolean;
       workspace_id: string;
       session_id: string;
-      title: string;
       employee_id: string;
       employee_name: string;
       status: keyof ActivityCounts;
@@ -213,19 +212,19 @@ export async function listOrganizationActivityRuns(
       question: boolean;
       paused: boolean;
       device_wait: boolean;
-      last_label: string | null;
+      last_stage: string | null;
     }[]
   >`
     select r.id,r.owner_id,coalesce(person.display_name,u.display_name) as owner_name,coalesce(person.job_title,'') as job_title,
-      s.archived_at is not null as session_archived,r.workspace_id,er.session_id,left(s.title,250) as title,coalesce(d.employee_id,e.id) as employee_id,v.name as employee_name,
+      s.archived_at is not null as session_archived,r.workspace_id,er.session_id,coalesce(d.employee_id,e.id) as employee_id,v.name as employee_name,
       ${state(db)} as status,r.created_at,r.completed_at,
       exists(select 1 from allrice_task_questions q where q.run_id=r.id and q.pending) as question,
       exists(select 1 from allrice_task_progress p where p.run_id=r.id and p.pause_id is not null) as paused,
       exists(select 1 from allrice_runtime_operations op where op.root_run_id=r.id and op.snapshot->>'status'='waiting_device') as device_wait,
-      (select left(ev.payload->>'label',240) from allrice_run_events ev where ev.run_id=r.id and ev.organization_id=r.organization_id
+      (select ev.payload->>'presentation' from allrice_run_events ev where ev.run_id=r.id and ev.organization_id=r.organization_id
         and ev.workspace_id=r.workspace_id and ev.event_type='harness.native' and ev.payload->>'source'='dsh'
         and ev.payload->>'presentation' in ('tool','todo','search','compaction','context','lifecycle')
-        and ev.payload->>'label' is not null order by ev.sequence desc limit 1) as last_label
+        order by ev.sequence desc limit 1) as last_stage
     ${source}
       and (${period !== null} or s.archived_at is null)
       and (${window})
@@ -247,6 +246,18 @@ export async function listOrganizationActivityRuns(
     succeeded: '已完成',
     canceled: '已取消',
   };
+  const stages = new Map([
+    ['tool', '正在使用工具'],
+    ['todo', '正在更新任务'],
+    ['search', '正在搜索'],
+    ['compaction', '正在整理上下文'],
+    ['context', '正在读取上下文'],
+    ['lifecycle', '正在处理'],
+  ]);
+  const runningStage = (stage: string | null) => {
+    // r1-exempt(display): SQL 只投影固定事件类别，这里仅选择后台显示文案。
+    return stages.get(stage ?? '') ?? labels.running;
+  };
   return {
     organizationId,
     userId,
@@ -260,7 +271,7 @@ export async function listOrganizationActivityRuns(
       sessionArchived: r.session_archived,
       workspaceId: r.workspace_id,
       sessionId: r.session_id,
-      title: diagnosticText(r.title),
+      title: '会话',
       employeeId: r.employee_id,
       employeeName: r.employee_name,
       status: r.status,
@@ -277,9 +288,7 @@ export async function listOrganizationActivityRuns(
                 ? '等待电脑连接'
                 : '等待确认或外部操作'
           : r.status === 'running'
-            ? r.last_label
-              ? diagnosticText(r.last_label)
-              : labels.running
+            ? runningStage(r.last_stage)
             : labels[r.status],
     })),
   };

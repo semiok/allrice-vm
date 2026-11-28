@@ -262,7 +262,7 @@ async function artifactRows(
       and (${includeToolResults} or coalesce(a.provenance->>'kind','') <> 'project_snapshot')
       -- Oversized tool responses are stored for model paging, not delivered
       -- files. Match both writer metadata and its exact object-bound filename.
-      -- Keep explicit reads and administrator inspection available.
+      -- Explicit owner reads keep their existing tool-result behavior.
       and (${includeToolResults} or not (
         a.version_id is null
         and coalesce(v.change_summary, '') like 'Tool result %; Run %; call %'
@@ -1006,26 +1006,59 @@ export async function inspectTenantRunArtifacts(
       join allrice_chat_sessions s on s.id=e.session_id and s.organization_id=e.organization_id and s.workspace_id=e.workspace_id and s.owner_id=e.owner_id
       where e.run_id=${runId} and e.organization_id=${target.organizationId} and e.workspace_id=${target.workspaceId} and e.owner_id=${target.subjectId}`;
     if (!run) fail('artifact_not_found');
-    const rows = await artifactRows(
-      tx,
-      {
-        organizationId: target.organizationId,
-        workspaceId: target.workspaceId,
-        ownerId: target.subjectId,
-      },
-      run.session_id,
-      artifactId,
-      51,
-      undefined,
-      runId,
-    );
-    if (artifactId && !rows.length) fail('artifact_not_found');
+    const scope = {
+      organizationId: target.organizationId,
+      workspaceId: target.workspaceId,
+      ownerId: target.subjectId,
+    };
+    const visible = [];
+    let before: { createdAt: string; id: string } | undefined;
+    while (visible.length < 51) {
+      const rows = await artifactRows(
+        tx,
+        scope,
+        run.session_id,
+        artifactId,
+        artifactId ? 1 : 51,
+        before,
+        runId,
+        false,
+        { businessOnly: true, lockObjects: false },
+      );
+      for (const row of rows) {
+        const artifact = mapArtifact(row);
+        if (!isBusinessDeliverable(artifact.kind, artifact.provenance.kind))
+          continue;
+        const access = await workbenchFileAccess(
+          issuer,
+          artifact.object.id,
+          tx,
+        );
+        if (!access || access.canRead)
+          visible.push({
+            ...artifact,
+            version: { ...artifact.version, changeSummary: null },
+            provenance: {
+              kind: artifact.provenance.kind,
+              runId: artifact.provenance.runId,
+              operationId: artifact.provenance.operationId,
+              stepId: artifact.provenance.stepId,
+            },
+          });
+        if (visible.length === 51) break;
+      }
+      const last = rows.at(-1);
+      if (artifactId || rows.length < 51 || !last) break;
+      before = { createdAt: last.cursor_created_at, id: last.id };
+    }
+    if (artifactId && !visible.length) fail('artifact_not_found');
+    await requireTenantInspectionScope(issuer, target, tx);
     if (artifactId)
       await tx`insert into allrice_audit_events(organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,metadata)
       values(${target.organizationId},${target.workspaceId},${issuer.actor.id},'tenant.artifact.access_checked','artifact',${artifactId},'recorded','read_only_preview_authorization',${tx.json({ subjectId: target.subjectId, runId, readOnly: true })})`;
     return {
-      artifacts: rows.slice(0, 50).map(mapArtifact),
-      truncated: rows.length > 50,
+      artifacts: visible.slice(0, 50),
+      truncated: visible.length > 50,
     };
   });
 }
@@ -1070,6 +1103,12 @@ export async function inspectCompanyDeliverable(
     );
     if (!artifactRow) fail('artifact_not_found');
     const artifact = mapArtifact(artifactRow);
+    const fileAccess = await workbenchFileAccess(
+      issuer,
+      artifact.object.id,
+      tx,
+    );
+    if (fileAccess && !fileAccess.canRead) fail('artifact_not_found');
     await tx`insert into allrice_audit_events(organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,metadata)
       values(${organizationId},${row.workspace_id},${issuer.actor.id},'company.deliverable.inspected','artifact',${artifactId},'recorded','read_only_company_delivery',${tx.json({ subjectId: row.owner_id, sessionId: row.session_id, readOnly: true })})`;
     const sourceRows =
