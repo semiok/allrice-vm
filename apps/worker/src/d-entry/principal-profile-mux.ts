@@ -351,29 +351,25 @@ async function runOwner(
         const { args } = pageOpenPayload.parse(frame.payload);
         const id = (streamId = frame.streamId);
         const sharedPage = args.reuseEmployee
-          ? Promise.withResolvers<DEntryPageHandle>()
+          ? new Promise<DEntryPageHandle>((resolve, reject) => {
+              transport = begin(
+                {
+                  workspaceId: input.selection.workspaceId,
+                  employeeInstanceId: input.selection.employeeInstanceId,
+                },
+                async (_generation, page) => {
+                  resolve(page);
+                },
+                undefined,
+                false,
+              );
+              void transport.operation.then(() => reject(denied()), reject);
+            })
           : undefined;
-        if (sharedPage) {
-          transport = begin(
-            {
-              workspaceId: input.selection.workspaceId,
-              employeeInstanceId: input.selection.employeeInstanceId,
-            },
-            async (_generation, page) => {
-              sharedPage.resolve(page);
-            },
-            undefined,
-            false,
-          );
-          void transport.operation.then(
-            () => sharedPage.reject(denied()),
-            sharedPage.reject,
-          );
-          void sharedPage.promise.catch(fail);
-        }
+        void sharedPage?.catch(fail);
         current = begin(input.selection, async (generation, page) => {
           if (sharedPage) {
-            const employee = await sharedPage.promise;
+            const employee = await sharedPage;
             if (
               !sameDEntryIdentity(employee.identity, {
                 ...page.identity,
