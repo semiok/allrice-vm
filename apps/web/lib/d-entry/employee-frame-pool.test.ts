@@ -10,11 +10,12 @@ function journey() {
     employeeInstanceId: string,
     workspaceId = 'workspace',
     threadId?: string,
+    query = employeeInstanceId,
   ) {
     pool = updateEmployeeFramePool(pool, {
       type: 'select',
       request: {
-        query: employeeInstanceId,
+        query,
         selection: { workspaceId, employeeInstanceId, threadId },
       },
     });
@@ -92,6 +93,20 @@ describe('employee workbench frame pool', () => {
     state.apply({ type: 'ready', id: latest.id });
     expect(state.pool.visible).toBe(latest.id);
     expect(state.pool.wanted).toBeUndefined();
+  });
+
+  it('starts the explicit new conversation only after the default opening has joined', () => {
+    const state = journey();
+    state.open('a');
+    const opening = state.select('b')!;
+    state.select('b', 'workspace', undefined, 'new=explicit-operation');
+    expect(state.pool.frames.find(({ id }) => id === opening.id)?.phase).toBe(
+      'closing',
+    );
+    state.apply({ type: 'joined', id: opening.id, confirmed: true });
+    expect(
+      state.pool.frames.find(({ phase }) => phase === 'opening')?.query,
+    ).toBe('new=explicit-operation');
   });
 
   it('immediately fences revoked and old-workspace frames and awaits joined proof', () => {

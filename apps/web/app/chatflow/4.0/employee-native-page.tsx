@@ -802,22 +802,25 @@ function EmployeeNativePane({
           detached ||
           navigationClosed ||
           remoteRevoked ||
-          superseded ||
-          switching ||
-          (navigating && !pendingNavigation)
+          superseded
         )
           return;
         const selection = next.data;
         const crossEmployee =
           selection.workspaceId !== selectedEmployee?.workspaceId ||
           selection.employeeInstanceId !== selectedEmployee?.employeeInstanceId;
-        if (owner && (crossEmployee || event.data.resumeEmployee === true))
+        if (owner && (crossEmployee || event.data.resumeEmployee === true)) {
+          // The frame pool owns this intent even while this employee's thread
+          // is waiting for its own original in-document handoff.
           owner.navigate(
             selection,
             event.data.reopen === true,
             event.data.resumeEmployee === true,
           );
-        else requestNavigation(selection, event.data.reopen === true);
+          return;
+        }
+        if (!switching && (!navigating || pendingNavigation))
+          requestNavigation(selection, event.data.reopen === true);
       }
     };
     function requestNavigation(
