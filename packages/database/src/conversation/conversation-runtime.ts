@@ -121,6 +121,57 @@ const runtimeEventKinds = new Set([
   'compaction',
   'lifecycle',
 ]);
+const diagnosticStatuses = new Set([
+  'started',
+  'completed',
+  'failed',
+  'canceled',
+  'running',
+  'info',
+]);
+
+function mapAdministrativeRuntimeEvent(row: DshRuntimeEventRow) {
+  if (row.sequence === null || row.event_type === null) return null;
+  const payload = safeRecord(row.payload);
+  if (payload.source !== 'dsh' && payload.source !== 'tool_broker') return null;
+  const kind =
+    row.event_type === 'harness.native' &&
+    runtimeEventKinds.has(String(payload.presentation))
+      ? String(payload.presentation)
+      : row.event_type.startsWith('tool.')
+        ? 'tool'
+        : row.event_type === 'assistant.text.completed'
+          ? 'answer'
+          : null;
+  if (!kind) return null;
+  const status = row.event_type.endsWith('.started')
+    ? 'started'
+    : row.event_type.endsWith('.failed')
+      ? 'failed'
+      : row.event_type.endsWith('.completed')
+        ? 'completed'
+        : diagnosticStatuses.has(String(payload.status))
+          ? String(payload.status)
+          : 'info';
+  const id = `${row.run_id}:${row.sequence}`;
+  const toolKey = safeText(payload.toolKey, 64);
+  return {
+    id,
+    key: toolKey ? `${row.run_id}:tool:${toolKey}` : id,
+    runId: row.run_id,
+    sequence: row.sequence,
+    kind,
+    status,
+    title:
+      kind === 'compaction' &&
+      status === 'completed' &&
+      payload.compactionEnded === true
+        ? '上下文已整理'
+        : kind,
+    detail: null,
+    occurredAt: timestamp(row.occurred_at),
+  };
+}
 
 function safeText(value: unknown, maximum = 4_000) {
   return typeof value === 'string' && value.trim()
@@ -271,7 +322,7 @@ export async function listDshRuntimeInventory(
     select runtime.*, organization.slug as organization_slug,
       organization.name as organization_name,
       workspace.slug as workspace_slug, workspace.name as workspace_name,
-      session.title as session_title, owner.email as owner_email,
+      '会话' as session_title, owner.email as owner_email,
       employee.name as employee_name,
       latest_run.provider_snapshot,
       runtime_process.id as process_id,
@@ -557,27 +608,53 @@ export async function listTenantRuntimeInventory(
  */
 export async function listDshRuntimeEventTimeline(
   sessionIdInput: string,
-  options: { runId?: string; database?: ReturnType<typeof getDatabase> } = {},
+  options: {
+    runId?: string;
+    database?: ReturnType<typeof getDatabase>;
+    administrationScope?: {
+      organizationId: string;
+      workspaceId: string;
+      ownerId: string;
+    };
+  } = {},
 ) {
   const sessionId = UuidSchema.parse(sessionIdInput);
   const sql = options.database ?? getDatabase(),
     selectedRun = options.runId ? UuidSchema.parse(options.runId) : null;
+  const admin = options.administrationScope;
   const rows = await sql<DshRuntimeEventRow[]>`
     select employee_run.run_id, run.state as run_state,
       employee_run.created_at as run_created_at,
       employee_run.completed_at as run_completed_at,
-      user_message.content as user_content,
+      ${admin ? sql`null::jsonb` : sql`user_message.content`} as user_content,
       user_message.created_at as user_created_at,
-      assistant_message.content as assistant_content,
+      ${admin ? sql`null::jsonb` : sql`assistant_message.content`} as assistant_content,
       assistant_message.status as assistant_status,
       assistant_message.created_at as assistant_created_at,
       assistant_message.completed_at as assistant_completed_at,
-      event.sequence, event.event_type, event.payload, event.occurred_at
+      event.sequence, event.event_type,
+      ${
+        admin
+          ? sql`jsonb_build_object(
+          'source',event.payload->>'source',
+          'presentation',event.payload->>'presentation',
+          'status',event.payload->>'status',
+          'compactionEnded',event.payload->>'sourceEventType'='compaction/end',
+          'toolKey',case when jsonb_typeof(diagnostic.call_id)='string'
+                       and btrim(diagnostic.call_id #>> '{}') <> ''
+            then encode(sha256(convert_to(jsonb_build_array(
+              employee_run.run_id,event.payload->>'source',diagnostic.call_id
+            )::text,'UTF8')),'hex')
+          end)`
+          : sql`event.payload`
+      } as payload,
+      event.occurred_at
     from allrice_employee_runs employee_run
     join allrice_runs run
       on run.id = employee_run.run_id
       and run.organization_id = employee_run.organization_id
       and run.workspace_id = employee_run.workspace_id
+      ${admin ? sql`and run.owner_id=${admin.ownerId}` : sql``}
     join allrice_messages user_message
       on user_message.id = employee_run.user_message_id
       and user_message.organization_id = employee_run.organization_id
@@ -594,7 +671,25 @@ export async function listDshRuntimeEventTimeline(
         and event.payload->>'source' is distinct from ${nativeModelReceiptSource}
       order by event.sequence desc limit ${selectedRun ? 150 : null}::int
     ) event on true
+    ${
+      admin
+        ? sql`left join lateral (
+          select case
+            when event.event_type='harness.native'
+              and event.payload->>'presentation' in ('tool','search')
+              then event.payload #> '{nativePayload,callId}'
+            when event.event_type like 'tool.%' then event.payload->'toolCallId'
+          end as call_id
+        ) diagnostic on true`
+        : sql``
+    }
     where employee_run.session_id = ${sessionId}
+      ${
+        admin
+          ? sql`and employee_run.organization_id=${admin.organizationId}
+        and employee_run.workspace_id=${admin.workspaceId} and employee_run.owner_id=${admin.ownerId}`
+          : sql``
+      }
       and (${selectedRun}::uuid is null or employee_run.run_id=${selectedRun}::uuid)
     order by employee_run.created_at, event.sequence nulls first
   `;
@@ -625,6 +720,15 @@ export async function listDshRuntimeEventTimeline(
     left join allrice_model_usage_ledger l on l.route_decision_id=d.id
       and l.organization_id=er.organization_id and l.workspace_id=er.workspace_id
     where er.session_id=${sessionId}
+      ${
+        admin
+          ? sql`and er.organization_id=${admin.organizationId}
+        and er.workspace_id=${admin.workspaceId} and er.owner_id=${admin.ownerId}
+        and exists (select 1 from allrice_runs r where r.id=er.run_id
+          and r.organization_id=er.organization_id and r.workspace_id=er.workspace_id
+          and r.owner_id=er.owner_id)`
+          : sql``
+      }
       and (${selectedRun}::uuid is null or er.run_id=${selectedRun}::uuid)
     group by er.run_id
   `;
@@ -711,7 +815,9 @@ export async function listDshRuntimeEventTimeline(
       };
       turns.set(row.run_id, turn);
     }
-    const event = mapDshRuntimeEvent(row);
+    const event = admin
+      ? mapAdministrativeRuntimeEvent(row)
+      : mapDshRuntimeEvent(row);
     if (event) turn.events.push(event);
   }
   const orderedTurns = [...turns.values()];

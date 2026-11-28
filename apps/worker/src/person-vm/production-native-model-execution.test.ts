@@ -301,6 +301,7 @@ function nativeFacts() {
 async function setup(
   nativeMemory?: Parameters<Attach>[0]['nativeMemory'],
   withWebSearch = false,
+  scopedRouting = false,
 ) {
   const lifetime = new AbortController();
   let observed!: Observer;
@@ -358,6 +359,7 @@ async function setup(
       assertRouteCurrent: async () => lifetime.signal,
       route: { provider: 'openai-codex', model },
       bindReference,
+      ...(scopedRouting && { scoped: { applies: () => true } }),
       ...(withWebSearch && {
         webSearch: { provider: { search: vi.fn() }, bind: bindWebSearch },
       }),
@@ -570,6 +572,26 @@ it('in a new Host, selects the persisted B only after a newly adopted steer prov
     expect(publication.root).not.toHaveBeenCalled();
   } finally {
     uninstall();
+    await f.close();
+  }
+});
+
+it('keeps standalone R2 Search closed for a scoped VM even when the Host configured its provider', async () => {
+  const f = await setup(undefined, true, true);
+  try {
+    const resolve = f.resolveSearch;
+    if (!resolve) throw Error('Native Search service unavailable');
+    await expect(
+      resolve(
+        {} as IncomingMessage,
+        f.profile.receipt.binding,
+        new AbortController().signal,
+        vi.fn(),
+      ),
+    ).rejects.toMatchObject({ code: 'DENIED' });
+    expect(f.observeNativeSearchCallFor).not.toHaveBeenCalled();
+    expect(f.bindWebSearch).not.toHaveBeenCalled();
+  } finally {
     await f.close();
   }
 });

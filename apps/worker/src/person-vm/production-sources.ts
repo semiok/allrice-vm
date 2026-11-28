@@ -1,6 +1,7 @@
 import {
   createNativeModelCallReferences,
   ModelGatewayError,
+  sameModelRoute,
   type ModelGatewayAuthority,
 } from '@allrice/model-gateway';
 import type { PersonVmRuntimePort } from '@allrice/person-vm';
@@ -12,18 +13,22 @@ import {
   type ResolveProductionDEntrySendRoute,
 } from './production-dentry-source.js';
 import { createProductionEgressAuthority } from './production-egress-authority.js';
+import {
+  createProductionModelRouting,
+  type ProductionModelRouting,
+} from './production-model-routing.js';
 import { createHostSearchProvider } from './production-web-search.js';
-import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
 import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
 import {
   DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  assertCompleteNativeActivityCensus,
   createProductionNativeActivity,
   getIdleScheduleGuardMs,
 } from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
-type CodexRuntime = Awaited<ReturnType<typeof createProductionCodexRuntime>>;
+type ModelRuntime = ProductionModelRouting['fallback'];
 type CallReferences = ReturnType<typeof createNativeModelCallReferences>;
 
 async function closeSources(
@@ -45,11 +50,15 @@ export interface ProductionNativeModelExecution {
   attach(
     host: HostInput,
     input: {
-      route: CodexRuntime['route'];
+      route: ModelRuntime['route'];
       routeRevoked: AbortSignal;
-      readModelMetadata: CodexRuntime['readModelMetadata'];
-      assertRouteCurrent: CodexRuntime['assertCurrent'];
-      confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
+      readModelMetadata: ModelRuntime['readModelMetadata'];
+      assertRouteCurrent: ModelRuntime['assertCurrent'];
+      confirmTransportStopped: ModelRuntime['confirmTransportStopped'];
+      scoped?: Pick<
+        ProductionModelRouting,
+        'select' | 'assertCurrent' | 'guestCatalog' | 'applies'
+      >;
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
       webSearch?: {
@@ -84,7 +93,7 @@ export function createProductionPersonVmSources(
       let native:
         | Awaited<ReturnType<ProductionNativeModelExecution['attach']>>
         | undefined;
-      const codex = await createProductionCodexRuntime(
+      const routing = await createProductionModelRouting(
         lifetime,
         host.modelOwnerId,
         (...args) => {
@@ -93,23 +102,29 @@ export function createProductionPersonVmSources(
           return native.readModelImage(...args);
         },
       );
+      const modelRuntime = routing.fallback;
+      const modelLifetime = routing.scoped ? lifetime : modelRuntime.revoked;
       const authority = execution.authority;
-      const calls = createNativeModelCallReferences(authority, codex.revoked);
+      const calls = createNativeModelCallReferences(authority, modelLifetime);
       let entry: ReturnType<typeof installProductionDEntrySource> | undefined;
       try {
         const egress = createProductionEgressAuthority({
           startup,
           modelAuthority: authority,
-          modelRoute: codex.route,
+          modelRoute: routing.scoped
+            ? (call) =>
+                sameModelRoute(call, routing.select(call.vm, call.native))
+            : modelRuntime.route,
           lifetime,
         });
         const provider = createHostSearchProvider(process.env.DEEPSEEK_API_KEY);
         native = await execution.attach(host, {
-          route: codex.route,
-          routeRevoked: codex.revoked,
-          readModelMetadata: codex.readModelMetadata,
-          assertRouteCurrent: codex.assertCurrent,
-          confirmTransportStopped: codex.confirmTransportStopped,
+          route: modelRuntime.route,
+          routeRevoked: modelLifetime,
+          readModelMetadata: modelRuntime.readModelMetadata,
+          assertRouteCurrent: modelRuntime.assertCurrent,
+          confirmTransportStopped: routing.confirmTransportStopped,
+          scoped: routing.scoped ? routing : undefined,
           bindReference: (call, signal) =>
             egress.bindModelCall(call, signal, 'model-reference'),
           issueCall: calls.issue,
@@ -124,6 +139,7 @@ export function createProductionPersonVmSources(
           vm: host.vm,
           admission,
           lifetime,
+          hasScopedRoutes: routing.applies,
           confirmPhysical: (context, identity, binding, active) =>
             host.current.withCurrentSelection(context, identity, active, () =>
               host.vm.assertRunningReadiness(
@@ -134,21 +150,38 @@ export function createProductionPersonVmSources(
               ),
             ),
           async resolveSendRoute(input, signal) {
-            const active = AbortSignal.any([lifetime, codex.revoked, signal]);
-            const generation = await codex.assertCurrent(active);
+            const active = AbortSignal.any([lifetime, modelLifetime, signal]);
+            const startupRoute = routing.rootRoute(
+              input.binding,
+              input.rootNativeSessionId,
+            );
+            const generation = await routing.assertRootCurrent(
+              input.binding,
+              active,
+              input.rootNativeSessionId,
+            );
             const guest = await owned.resolveSendRoute(input, active);
-            await codex.assertCurrent(active);
+            await routing.assertRootCurrent(
+              input.binding,
+              active,
+              input.rootNativeSessionId,
+            );
             active.throwIfAborted();
             generation.throwIfAborted();
             guest.revoked.throwIfAborted();
-            if (
-              guest.provider !== codex.route.provider ||
-              guest.model !== codex.route.model
-            )
+            if (!sameModelRoute(guest, modelRuntime.route))
               throw new ModelGatewayError('BINDING_INVALID');
             return {
-              provider: guest.provider,
-              model: guest.model,
+              provider: startupRoute.provider,
+              model: startupRoute.model,
+              ...(sameModelRoute(startupRoute, modelRuntime.route)
+                ? {}
+                : {
+                    catalogDefault: {
+                      provider: modelRuntime.route.provider,
+                      model: modelRuntime.route.model,
+                    },
+                  }),
               revoked: AbortSignal.any([guest.revoked, generation, lifetime]),
             };
           },
@@ -156,8 +189,13 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
-          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          scheduledWake: createProductionScheduledWakeSource(
+            host.vm,
+            host.providers.employeeRuntimeSettings.employeeMaxRunning,
+          ),
           nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            assertCompleteCensus: (binding, signal) =>
+              assertCompleteNativeActivityCensus(startup, binding, signal),
             sampleIntervalMs:
               host.providers.configuration.lifecycle.idleSampleIntervalMs ??
               DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
@@ -166,9 +204,38 @@ export function createProductionPersonVmSources(
             ),
           }),
           runtime: {
-            async readiness(binding, signal) {
-              await codex.assertCurrent(signal);
-              return installed.readiness(binding, signal);
+            async readiness(binding, signal, context, editor) {
+              if (context && editor) {
+                if (routing.applies(binding)) {
+                  const proof = editor.starting
+                    ? startup.assertStartingEditor(
+                        binding,
+                        context,
+                        editor,
+                        signal,
+                      )
+                    : await startup.ensureVerifiedEditor(
+                        context,
+                        binding,
+                        editor.employee.employeeInstanceId,
+                        signal,
+                        editor.threadId,
+                      );
+                  signal.throwIfAborted();
+                  proof.throwIfAborted();
+                  return {
+                    binding,
+                    authenticated: true,
+                    editorReady: true,
+                    canSend: true,
+                  };
+                }
+                await startup.prepareForegroundEditor(binding, context, signal);
+              }
+              const ready = await installed.readiness(binding, signal);
+              const route = await routing.assertRootCurrent(binding, signal);
+              route.throwIfAborted();
+              return ready;
             },
             activity: owned.activity.bind(owned),
             async close() {
@@ -188,18 +255,25 @@ export function createProductionPersonVmSources(
             bindModelCall: egress.bindModelCall,
             policy: { routes: [] },
             services: owned.references ?? [],
-            close: codex.close,
+            close: routing.close,
           },
           model: {
             authority,
-            llm: codex.llm,
-            route: codex.route,
-            transport: codex.transport,
-            scopeStream: codex.scopeStream,
+            llm: modelRuntime.llm,
+            route: modelRuntime.route,
+            transport: modelRuntime.transport,
+            scopeStream: modelRuntime.scopeStream,
+            ...(routing.scoped
+              ? {
+                  selectProvider: routing.provider,
+                  closeTransport: routing.close,
+                  confirmTransportStopped: routing.confirmTransportStopped,
+                }
+              : {}),
             readMemoryIndex: owned.readMemoryIndex,
             async resolveCall(headers, binding, signal) {
-              await codex.assertCurrent(signal);
               const call = await calls.resolveCall(headers, binding, signal);
+              await routing.assertCurrent(call, signal);
               owned.redeem?.(call, signal);
               return call;
             },
@@ -209,7 +283,7 @@ export function createProductionPersonVmSources(
         const failures = await closeSources([
           () => entry?.close(),
           () => native?.close(),
-          codex.close,
+          routing.close,
         ]);
         if (failures.length)
           throw new AggregateError(

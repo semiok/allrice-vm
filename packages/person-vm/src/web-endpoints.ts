@@ -14,6 +14,7 @@ import {
   type PersonVmBinding,
   type PersonVmEmployeeSelection,
 } from './contract.ts';
+import type { PersonVmGuestLaunchDispatch } from './guest-bootstrap.ts';
 
 export type PersonVmWebRoster = Readonly<{
   personId: string;
@@ -26,6 +27,14 @@ export type PersonVmWebRoster = Readonly<{
   }>[];
   digest: string;
 }>;
+/** Current authority for the full census and the active native work it covers. */
+export type PersonVmWakeStartup = Readonly<{
+  planId: string;
+  roster: PersonVmWebRoster;
+  employeeInstanceIds: readonly string[];
+  digest: string;
+}>;
+export const PERSON_VM_WAKE_RESUME_AUDIT = 'scheduled-wake.resume';
 type WebPort = Readonly<{ hostPort: number; guestPort: number }>;
 type WebUpgrade = 'pending' | 'complete';
 
@@ -48,7 +57,9 @@ export type NativeWebSetupFailure = Readonly<{
 export type PersonVmWebStartup = Readonly<
   {
     receipt: PersonVmWebEndpointReceipt;
+    dispatchScheduledLaunch?: PersonVmGuestLaunchDispatch;
     selectedEmployee?: PersonVmEmployeeSelection;
+    editorThreadId?: string;
     /** Proven on this start lease before guest profile staging. */
     unusedEmployeeHomes?: true;
     recordNativeFailure?(
@@ -56,8 +67,16 @@ export type PersonVmWebStartup = Readonly<
       signal: AbortSignal,
     ): Promise<void>;
   } & (
-    | { context: RequestContext; purpose?: never }
-    | { context?: never; purpose: 'scheduled-wake' }
+    | {
+        context: RequestContext;
+        purpose?: never;
+        scheduledEmployeeIds?: readonly string[];
+      }
+    | {
+        context?: never;
+        purpose: 'scheduled-wake';
+        scheduledEmployeeIds: readonly string[];
+      }
   )
 >;
 export interface PersonVmWebRosterPort {

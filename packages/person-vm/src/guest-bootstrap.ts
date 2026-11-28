@@ -23,6 +23,10 @@ export type PersonVmGuestCommand = Readonly<{
   workdir?: string;
 }>;
 export type PersonVmJobExit = Readonly<{ exitCode: number; timedOut: boolean }>;
+export type PersonVmGuestLaunchDispatch = (
+  signal: AbortSignal,
+  dispatch: (signal: AbortSignal) => Promise<string>,
+) => Promise<string>;
 declare const nativeWebGuestAddress: unique symbol;
 export type PersonVmNativeWebGuestAddress = string & {
   readonly [nativeWebGuestAddress]: true;
@@ -43,7 +47,12 @@ export interface PersonVmStartingScope {
 export interface PersonVmBootstrapScope extends PersonVmStartingScope {
   /** Only after person memory init; always prepends the installed native launcher.
    * The runtime owner retains the returned job, not this expiring startup scope. */
-  launch(command: PersonVmGuestCommand): Promise<PersonVmManagedJob>;
+  launch(
+    command: PersonVmGuestCommand,
+    dispatch?: PersonVmGuestLaunchDispatch,
+    /** Accept the exact job before the closing startup authority check. */
+    ownJob?: (job: PersonVmManagedJob) => void,
+  ): Promise<PersonVmManagedJob>;
   /** Fixed native probe of the current sandbox's assigned Web interface. */
   readNativeWebGuestAddress?(
     signal?: AbortSignal,
@@ -127,8 +136,18 @@ export async function bootstrapPersonVm(input: {
     });
     const bootstrapScope = Object.freeze({
       ...scope,
-      launch: (command: PersonVmGuestCommand) =>
-        track(() => launcher.launch(command)),
+      launch: (
+        command: PersonVmGuestCommand,
+        dispatch?: PersonVmGuestLaunchDispatch,
+        ownJob?: (job: PersonVmManagedJob) => void,
+      ) =>
+        track(async () => {
+          const job = await (dispatch
+            ? launcher.launch(command, dispatch)
+            : launcher.launch(command));
+          ownJob?.(job);
+          return job;
+        }),
       ...(launcher.readNativeWebGuestAddress
         ? {
             readNativeWebGuestAddress: (signal?: AbortSignal) =>

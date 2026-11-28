@@ -24,6 +24,7 @@ import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
 import type * as ScheduledWake from './production-scheduled-wake.js';
 import type * as ReleasedProfile from '../d-entry/released-profile.js';
+import * as EmployeeRuntime from './production-employee-runtime.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -55,7 +56,11 @@ const io = vi.hoisted(() => ({
         options: Parameters<typeof Model.createModelGateway>[0],
       ) => Pick<
         Model.ModelGatewayPort,
-        'handle' | 'revoke' | 'reconcileOwner' | 'close'
+        | 'handle'
+        | 'revoke'
+        | 'reconcileOwner'
+        | 'reconcileClosedOwner'
+        | 'close'
       >
     >(),
   authority: vi.fn<() => PersonVmAuthority | undefined>(),
@@ -242,6 +247,8 @@ function fixture() {
         throw Error('no model recovery in this fixture');
       },
     ),
+    reconcileClosedOwner:
+      vi.fn<NonNullable<Model.ModelGatewayPort['reconcileClosedOwner']>>(),
     close: vi.fn(async () => {}),
   };
   io.model.mockReturnValue(model);
@@ -707,6 +714,14 @@ it('constructs the real store/service/admission/startup with one SQL factory and
     'assertAdmissionFactory',
   );
   const admission = vi.spyOn(PersonVmService.prototype, 'createAdmissionHost');
+  const employeeRuntime = vi.spyOn(
+    EmployeeRuntime,
+    'createProductionEmployeeRuntime',
+  );
+  const settings = Object.freeze({
+    employeeMaxRunning: 2,
+    employeeIdleMs: 180_000,
+  });
   const platform = Object.freeze({
     ...f.loaded.platform,
     memoryMiB: 3072,
@@ -715,6 +730,7 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   io.read.mockResolvedValue({
     ...f.loaded,
     platform,
+    employeeRuntimeSettings: settings,
     configuration: {
       ...f.loaded.configuration,
       memory: {
@@ -733,6 +749,10 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   expect(actual.providers.native).toBeInstanceOf(MicrosandboxPersonVm);
   expect(actual.providers.disk).toBeInstanceOf(ApfsPersonVmDisk);
   expect(actual.providers.platform).toBe(platform);
+  expect(employeeRuntime).toHaveBeenCalledExactlyOnceWith(
+    settings,
+    platform.employeePortSlots,
+  );
   expect(admission).toHaveBeenCalledExactlyOnceWith({
     openSql: expect.any(Function),
     idleMs: platform.idleMs,
@@ -1588,6 +1608,28 @@ it('close fences the native ports and joins source work; repeated close has one 
     released.release();
     await outcome;
   }
+});
+
+it('joins all scoped transport owners before asking for the combined ledger recovery proof', async () => {
+  const value = fixture();
+  const secondPool = gate();
+  const entered = gate();
+  value.bound.model.closeTransport = vi.fn(async () => {
+    entered.release();
+    await secondPool.promise;
+  });
+  value.model.reconcileClosedOwner.mockResolvedValue(0);
+  const { host } = await open(value);
+  const closing = host.close();
+  try {
+    await entered.promise;
+    expect(value.model.reconcileClosedOwner).not.toHaveBeenCalled();
+  } finally {
+    secondPool.release();
+    await closing;
+  }
+  expect(value.model.reconcileClosedOwner).toHaveBeenCalledOnce();
+  expect(host.modelOwnerMaintenancePending()).toBe(false);
 });
 
 it('retains the provider owner when the model gateway cannot prove its join', async () => {

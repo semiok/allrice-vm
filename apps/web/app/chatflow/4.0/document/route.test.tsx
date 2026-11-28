@@ -46,6 +46,11 @@ vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
 }));
 vi.mock('../../../../lib/d-entry/released-profile-assets', () => ({
   readReleasedProfileAssets: releasedAssets,
+  readStartupProfileAssetUrls: async () => [
+    '/_next/static/dsh-profile/' +
+      'a'.repeat(64) +
+      '/managed/employee-web-entry.js',
+  ],
 }));
 vi.mock('../../../../lib/d-entry/identity', () => ({
   resolveDEntryIdentity: historyIdentity,
@@ -78,6 +83,15 @@ beforeEach(() => {
 it('the Next product page preserves selection before the client opens its long-lived owner', async () => {
   const page = await EntryPage({ searchParams: Promise.resolve(selection) });
   const html = renderToStaticMarkup(page);
+  expect(page).toMatchObject({
+    props: {
+      startupAssetUrls: [
+        '/_next/static/dsh-profile/' +
+          'a'.repeat(64) +
+          '/managed/employee-web-entry.js',
+      ],
+    },
+  });
   expect(html).toContain('data-employee-selection=');
   expect(html).not.toContain('<iframe');
   expect(html).toContain('workspaceId=');

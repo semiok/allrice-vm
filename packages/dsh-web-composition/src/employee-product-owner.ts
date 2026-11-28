@@ -75,6 +75,7 @@ export function installEmployeeProductOwner(ctx: Context) {
 
   const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);
   let openRegisteredSession: ((thread: string) => boolean) | undefined;
+  let startNativeSession: ((onError: () => void) => boolean) | undefined;
   let activeNativeSession: string | undefined;
   let resourceScopeId = scopeId;
   let switchingScope = false;
@@ -105,12 +106,17 @@ export function installEmployeeProductOwner(ctx: Context) {
     'x-allrice-workspace-id': selection.workspaceId,
     'x-allrice-organization-id': organizationId,
   };
-  function navigate(employeeInstanceId: string, target?: string) {
+  function navigate(
+    employeeInstanceId: string,
+    target?: string,
+    reopen = false,
+  ) {
     signal!.throwIfAborted();
     parent.postMessage(
       {
         type: pageNavigate,
         scopeId,
+        ...(reopen && { reopen }),
         selection: {
           workspaceId: selection.workspaceId,
           employeeInstanceId,
@@ -203,7 +209,7 @@ export function installEmployeeProductOwner(ctx: Context) {
     document.removeEventListener(pageNativeThreadRegistered, registerThread);
     clear();
   });
-  ctx.inject(['uiWorkspace', 'sessions'], (native) => {
+  ctx.inject(['uiWorkspace', 'sessions', 'workspaces', 'layout'], (native) => {
     native.effect(() => {
       const list = native.sessions.list;
       const select = (thread: string) => {
@@ -216,7 +222,45 @@ export function installEmployeeProductOwner(ctx: Context) {
         native.uiWorkspace.openSession(session);
         return true;
       };
+      let disposed = false;
+      let creating = false;
+      const start = (onError: () => void) => {
+        const source = activeNativeSession;
+        const sourceScope = resourceScopeId;
+        if (signal.aborted || switchingScope || !source) return false;
+        if (registered.get(source)?.scopeId !== sourceScope) return false;
+        const workspace = native.workspaces.list
+          .getSnapshot()
+          .items.find((item) => item.sessionIds.some((id) => id === source));
+        if (!workspace) return false;
+        if (creating) return true;
+        creating = true;
+        const current = () =>
+          !disposed &&
+          !signal.aborted &&
+          !switchingScope &&
+          activeNativeSession === source &&
+          resourceScopeId === sourceScope;
+        // Register through the native create RPC, then let the parent
+        // authorize the new thread before opening its conversation.
+        void native.sessions
+          .create({ workspaceId: workspace.workspaceId })
+          .then((id) => {
+            if (!current()) return;
+            const root = registered.get(id);
+            if (root?.scopeId !== sourceScope) return onError();
+            navigate(selection.employeeInstanceId, root.threadId);
+          })
+          .catch(() => {
+            if (current()) onError();
+          })
+          .finally(() => {
+            creating = false;
+          });
+        return true;
+      };
       openRegisteredSession = select;
+      startNativeSession = start;
       const open = () => {
         if (signal.aborted) return;
         // rc.2 cannot retain a Session until its native summary has arrived.
@@ -225,12 +269,20 @@ export function installEmployeeProductOwner(ctx: Context) {
           .ids.find((id) => id === nativeSessionId);
         if (root === undefined) return;
         unsubscribe();
-        native.uiWorkspace.openSession(root);
+        // rc.2 restores its last selection during the same catalog update.
+        // Let those subscribers finish, then supersede any pending restore.
+        queueMicrotask(() => {
+          if (disposed || signal.aborted || switchingScope) return;
+          native.layout.beginNavigation();
+          native.uiWorkspace.openSession(root);
+        });
       };
       const unsubscribe = list.subscribe(open);
       open();
       return () => {
+        disposed = true;
         if (openRegisteredSession === select) openRegisteredSession = undefined;
+        if (startNativeSession === start) startNativeSession = undefined;
         unsubscribe();
       };
     }, 'AllRice employee native root');
@@ -417,19 +469,24 @@ export function installEmployeeProductOwner(ctx: Context) {
               navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
-            if (
-              !employeeChoice(workspace, id) ||
-              id === selection.employeeInstanceId
-            )
+            if (!employeeChoice(workspace, id)) return;
+            if (id === selection.employeeInstanceId) {
+              navigate(id, activeThreadId);
               return;
+            }
             const session = sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
-            if (session) navigate(id, session.id);
-            else notice('此员工暂没有可打开的工作。');
+            navigate(id, session?.id, !session);
           },
           onNewSession(id) {
-            if (employeeChoice(workspace, id)) navigate(id);
+            if (!employeeChoice(workspace, id) || switchingScope) return;
+            if (
+              id === selection.employeeInstanceId &&
+              startNativeSession?.(() => notice('暂时无法新建会话。'))
+            )
+              return;
+            navigate(id);
           },
           onDetails: () => notice('当前入口暂无法打开员工详情。'),
         },
@@ -450,7 +507,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             viewerId,
           },
           headers: requestHeaders,
-          onCreated: (instance) => navigate(instance.id),
+          onCreated: (instance) => navigate(instance.id, undefined, true),
         },
         openArchive: () => notice('当前入口暂无法打开归档。'),
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),

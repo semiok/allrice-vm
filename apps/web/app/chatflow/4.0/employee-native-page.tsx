@@ -29,6 +29,7 @@ import {
   pageStartupFailed,
 } from '../../../lib/d-entry/page-messages';
 import {
+  cancelEmployeeCapacityWait,
   EmployeeEntryError,
   employeeEntryQuery,
   prepareEmployeeEntry,
@@ -36,14 +37,18 @@ import {
   readEmployeeEntryIdentity,
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
+import { warmPublicProfileAssets } from '../../../lib/d-entry/public-profile-warmup';
 import { createEmployeeMemoryPageWrites } from '../../../lib/memory/employee-memory-page-writes';
 import styles from './employee-native-page.module.css';
+
+const noStartupAssets: readonly string[] = [];
 
 type Status =
   | 'warming'
   | 'accepted'
   | 'starting'
   | 'restarting'
+  | 'waiting-for-capacity'
   | 'restart-confirmation'
   | 'opening'
   | 'ready'
@@ -71,23 +76,27 @@ type ThreadHandoff = {
 };
 
 type EntryWarmup = {
+  selection: DEntrySelectionInput;
   lifetime: AbortController;
   result: Promise<void>;
+  stopAssetDownloads(): void;
   readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
   progress: {
-    current?: EmployeePrewarmProgress;
+    current?: { state: EmployeePrewarmProgress; activeLimit?: number };
     ticket?: DEntryNativePrewarmTicket;
-    show?(state: EmployeePrewarmProgress): void;
+    show?(state: EmployeePrewarmProgress, activeLimit?: number): void;
   };
 };
 
 function startEntryWarmup(
   selection: DEntrySelectionInput,
   lifetime: AbortController,
+  startupAssetUrls: readonly string[],
   ticket?: DEntryNativePrewarmTicket,
   foregroundOpen?: boolean,
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
+  const assets = new AbortController();
   let lookup:
     | {
         read: ReturnType<typeof readEmployeeEntryIdentity>;
@@ -102,10 +111,14 @@ function startEntryWarmup(
       lookup?.cancel.abort();
       lookup = undefined;
       progress.ticket = accepted;
+      void warmPublicProfileAssets(
+        startupAssetUrls,
+        AbortSignal.any([lifetime.signal, assets.signal]),
+      );
     },
-    progress(state) {
-      progress.current = state;
-      progress.show?.(state);
+    progress(state, activeLimit) {
+      progress.current = { state, activeLimit };
+      progress.show?.(state, activeLimit);
     },
   });
   void result.catch(() => {}); // setup reports the result for this selection.
@@ -118,7 +131,14 @@ function startEntryWarmup(
     void read.catch(() => {}); // hot ready can retry an earlier miss.
     lookup = { read, cancel };
   }
-  return { lifetime, result, progress, readIdentity: () => lookup?.read };
+  return {
+    selection,
+    lifetime,
+    result,
+    progress,
+    stopAssetDownloads: () => assets.abort(),
+    readIdentity: () => lookup?.read,
+  };
 }
 
 async function waitForVisibleEntry(signal: AbortSignal) {
@@ -141,11 +161,14 @@ export function EmployeeNativePage({
   query,
   prepare = false,
   initialUnavailable = false,
+  startupAssetUrls = noStartupAssets,
 }: {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
+  startupAssetUrls?: readonly string[];
 }) {
+  const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
   const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
@@ -155,6 +178,7 @@ export function EmployeeNativePage({
     initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
   );
   const [settled, setSettled] = useState(false);
+  const [activeLimit, setActiveLimit] = useState<number>();
   const [activation, setActivation] = useState<{
     query: string;
     confirmedQuery?: string;
@@ -180,6 +204,10 @@ export function EmployeeNativePage({
     lastPropQuery.current = query;
     nextQuery.current = query;
   }
+
+  useEffect(() => {
+    assetUrls.current = startupAssetUrls;
+  }, [startupAssetUrls]);
 
   useEffect(() => {
     const discardPending = () => pendingWarmup.current?.lifetime.abort();
@@ -211,6 +239,8 @@ export function EmployeeNativePage({
     let unbindMemoryWrites: (() => void) | undefined;
     let resourceScopeId: string | undefined;
     let navigating = false;
+    let navigationClosed = false;
+    let pendingNavigation: { target: string; query: string } | undefined;
     let retired = false;
     let mounted = false;
     let documentStarted = false;
@@ -220,6 +250,7 @@ export function EmployeeNativePage({
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
     let warmup = activation.warmup;
+    const capacityCancellation = new AbortController();
     let ticket = activation.ticket;
     let resumable = false;
     let superseded = false;
@@ -274,6 +305,7 @@ export function EmployeeNativePage({
     }
     function retire() {
       if (replacing) return replacing;
+      warmup?.stopAssetDownloads();
       if (prepare) {
         closingNotice = window.setTimeout(
           () => setStatus('closing'),
@@ -342,13 +374,14 @@ export function EmployeeNativePage({
         | 'sign-in'
         | 'restart-confirmation',
       retainTicket = status === 'cancelled',
+      join?: Promise<void>,
     ) {
       if (navigating || replace.current !== applyQuery) return;
       navigating = true;
       resumable = retainTicket;
       window.clearTimeout(timer);
       setStatus(status);
-      void retire().then((closed) => {
+      void Promise.all([retire(), join]).then(([closed]) => {
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
@@ -422,8 +455,8 @@ export function EmployeeNativePage({
     }
     const applyQuery = () => {
       if (navigating) {
-        if (nextWarmup && nextQuery.current !== displayedQuery.current) {
-          nextWarmup.lifetime.abort();
+        if (nextQuery.current !== displayedQuery.current) {
+          nextWarmup?.lifetime.abort();
           nextWarmup = undefined;
           superseded = true;
         }
@@ -441,7 +474,34 @@ export function EmployeeNativePage({
       });
     };
     replace.current = applyQuery;
-    cancel.current = () => finish('cancelled');
+    cancel.current = () => {
+      if (navigating) return;
+      const current = warmup;
+      const pendingTicket = current?.progress.ticket;
+      if (
+        !current ||
+        !pendingTicket ||
+        current.progress.current?.activeLimit === undefined
+      )
+        return finish('cancelled');
+      const joined = cancelEmployeeCapacityWait(
+        current.selection,
+        pendingTicket,
+        capacityCancellation.signal,
+      ).then(
+        (expired) => {
+          if (expired) {
+            ticket = undefined;
+            current.progress.ticket = undefined;
+          }
+        },
+        () => {
+          // The local wait is cancelled. Explicit continuation can check the
+          // same ticket if the remote cancellation had no confirmed outcome.
+        },
+      );
+      finish('cancelled', true, joined);
+    };
     resume.current = (foregroundOpen) => {
       const query = nextQuery.current;
       setActivation({
@@ -455,40 +515,54 @@ export function EmployeeNativePage({
             : undefined,
       });
     };
-    function navigate(selection: DEntrySelectionInput) {
-      if (navigating || detached || remoteRevoked) return;
-      navigating = true;
-      window.clearTimeout(timer);
+    function navigate(selection: DEntrySelectionInput, reopen = false) {
       const params = new URLSearchParams(
         Object.entries(selection).filter(
           (entry): entry is [string, string] => typeof entry[1] === 'string',
         ),
       );
-      if (prepare && !selection.threadId)
-        params.set('new', crypto.randomUUID());
+      const newThread = prepare && !selection.threadId && !reopen;
+      const target = params.toString() + (newThread ? '&new' : '');
+      if (pendingNavigation?.target === target) return;
+      if (newThread) params.set('new', crypto.randomUUID());
+      const joining = !!pendingNavigation;
+      pendingNavigation = { target, query: params.toString() };
+      if (joining) {
+        nextWarmup?.lifetime.abort();
+        nextWarmup = undefined;
+        return;
+      }
+      navigating = true;
+      window.clearTimeout(timer);
       const sameEmployee =
         prepare &&
         location.pathname === '/chatflow/4.0' &&
         selectedEmployee?.workspaceId === selection.workspaceId &&
         selectedEmployee.employeeInstanceId === selection.employeeInstanceId;
       if (sameEmployee && !document.hidden) {
-        nextWarmup = startEntryWarmup(selection, new AbortController());
+        nextWarmup = startEntryWarmup(
+          selection,
+          new AbortController(),
+          assetUrls.current,
+        );
       }
       void retire().then((closed) => {
         if (replace.current !== applyQuery || detached) return;
+        const query = pendingNavigation!.query;
+        pendingNavigation = undefined;
         const warmup = nextWarmup;
         nextWarmup = undefined;
         if (closed) {
           if (superseded || nextQuery.current !== displayedQuery.current) {
             warmup?.lifetime.abort();
             activateSelection(nextQuery.current);
-          } else if (sameEmployee) {
-            const query = params.toString();
+          } else if (prepare && location.pathname === '/chatflow/4.0') {
             nextQuery.current = query;
             pendingWarmup.current = warmup;
-            history.pushState(null, '', '/chatflow/4.0?' + query);
+            if (location.search !== '?' + query)
+              history.pushState(null, '', '/chatflow/4.0?' + query);
             activateSelection(query, warmup);
-          } else location.assign('/chatflow/4.0?' + params);
+          } else location.assign('/chatflow/4.0?' + query);
         } else {
           warmup?.lifetime.abort();
           if (prepare) setStatus('unknown');
@@ -587,6 +661,7 @@ export function EmployeeNativePage({
         history.pushState(history.state, '', '/chatflow/4.0?' + query);
       }
       if (event.data.type === pageClosing) {
+        navigationClosed = true;
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
@@ -616,18 +691,22 @@ export function EmployeeNativePage({
           selectedQuery &&
           location.pathname === '/chatflow/4.0' &&
           nextQuery.current === displayedQuery.current
-        )
+        ) {
+          nextQuery.current = displayedQuery.current = selectedQuery;
           history.replaceState(
             history.state,
             '',
             '/chatflow/4.0?' + selectedQuery,
           );
+        }
       }
       if (
         event.data.type === pageCompletion &&
         ['closed', 'unknown'].includes(event.data.state)
-      )
+      ) {
+        navigationClosed = true;
         local.resolve(event.data.state);
+      }
       if (event.data.type === pageNativeThreadSelected) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (
@@ -663,10 +742,29 @@ export function EmployeeNativePage({
       }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
-        if (!next.success || !carrier || navigating || switching) return;
+        if (
+          !next.success ||
+          !carrier ||
+          detached ||
+          navigationClosed ||
+          remoteRevoked ||
+          superseded ||
+          switching ||
+          (navigating && !pendingNavigation)
+        )
+          return;
         const selection = next.data;
         if (
+          !pendingNavigation &&
+          selection.threadId &&
+          selectedEmployee?.threadId === selection.threadId &&
+          selectedEmployee.workspaceId === selection.workspaceId &&
+          selectedEmployee.employeeInstanceId === selection.employeeInstanceId
+        )
+          return;
+        if (
           prepare &&
+          !navigating &&
           switchReady &&
           selection.threadId &&
           !document.hidden &&
@@ -694,13 +792,14 @@ export function EmployeeNativePage({
             },
             location.origin,
           );
-        } else navigate(selection);
+        } else navigate(selection, event.data.reopen === true);
       }
     };
     window.addEventListener('message', receive);
     const leaving = () => {
       if (detached) return;
       detached = true;
+      capacityCancellation.abort();
       nextWarmup?.lifetime.abort();
       lifetime.abort();
       send(pageRevoked);
@@ -719,9 +818,16 @@ export function EmployeeNativePage({
       employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
     );
     // The shell owns only its wait; the Worker owns an accepted cold start.
-    const showPrewarm = (state: EmployeePrewarmProgress) => {
-      if (!lifetime.signal.aborted && !navigating)
-        setStatus(activation.retainFrame ? 'warming' : state);
+    const showPrewarm = (state: EmployeePrewarmProgress, limit?: number) => {
+      if (lifetime.signal.aborted || navigating) return;
+      setActiveLimit(limit);
+      setStatus(
+        limit !== undefined
+          ? 'waiting-for-capacity'
+          : activation.retainFrame
+            ? 'warming'
+            : state,
+      );
     };
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
@@ -730,11 +836,13 @@ export function EmployeeNativePage({
           warmup ??= startEntryWarmup(
             selection,
             lifetime,
+            assetUrls.current,
             ticket,
             activation.foregroundOpen,
           );
           warmup.progress.show = showPrewarm;
-          if (warmup.progress.current) showPrewarm(warmup.progress.current);
+          const progress = warmup.progress.current;
+          if (progress) showPrewarm(progress.state, progress.activeLimit);
           await warmup.result;
         })
       : undefined;
@@ -755,10 +863,9 @@ export function EmployeeNativePage({
           )
         : entry.selection;
       const { params } = entry;
-      if (selection.threadId && !entry.selection.threadId) {
+      if (selection.threadId && !entry.selection.threadId)
         params.set('threadId', selection.threadId);
-        selectedQuery = params.toString();
-      }
+      if (prepare && selection.threadId) selectedQuery = params.toString();
       const speculative = await warmup?.readIdentity()?.catch(() => undefined);
       const identity =
         speculative ??
@@ -870,6 +977,7 @@ export function EmployeeNativePage({
       {prepare && status !== 'ready' && (
         <EntryStatus
           status={status}
+          activeLimit={activeLimit}
           settled={initialUnavailable || settled}
           stop={() => cancel.current?.()}
           retry={() => {
@@ -887,6 +995,10 @@ const messages = {
   warming: ['正在打开对话', '马上就好。'],
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  'waiting-for-capacity': [
+    '正在等待工作台名额',
+    '有空位会自动继续，也可以取消等待。',
+  ],
   restarting: ['版本已更新，正在重新启动员工', '重启后会继续打开工作台。'],
   'restart-confirmation': ['版本已更新', '打开员工工作台需要先重启员工。'],
   opening: ['工作台已就绪', '正在打开对话。'],
@@ -906,11 +1018,13 @@ const messages = {
 
 function EntryStatus({
   status,
+  activeLimit,
   settled,
   stop,
   retry,
 }: {
   status: Exclude<Status, 'ready'>;
+  activeLimit?: number;
   settled: boolean;
   stop(): void;
   retry(): void;
@@ -920,6 +1034,7 @@ function EntryStatus({
     'warming',
     'accepted',
     'starting',
+    'waiting-for-capacity',
     'restarting',
     'opening',
   ].includes(status);
@@ -944,7 +1059,12 @@ function EntryStatus({
         <div role={attention ? 'alert' : 'status'} aria-atomic="true">
           {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
-          <p>{description}</p>
+          <p>
+            {status === 'waiting-for-capacity' &&
+              activeLimit !== undefined &&
+              `当前工作台的 ${activeLimit} 个运行名额已占用。`}
+            {description}
+          </p>
           {failedOpening && (
             <p>如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试</p>
           )}

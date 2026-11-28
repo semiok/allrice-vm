@@ -173,6 +173,7 @@ export function readNativeModelAttempt(
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
 export async function openNativeWebOwner(input: {
   scope: PersonVmBootstrapScope;
+  dispatchLaunch?: Parameters<PersonVmBootstrapScope['launch']>[1];
   launch: NativeWebLaunch;
   context?: RequestContext;
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
@@ -685,7 +686,19 @@ export async function openNativeWebOwner(input: {
     stage('launch');
     starting = setup(async () => {
       try {
-        job = await input.scope.launch(input.launch.command);
+        const dispatch = input.dispatchLaunch;
+        job = await input.scope.launch(
+          input.launch.command,
+          dispatch
+            ? (active, issue) =>
+                dispatch(AbortSignal.any([active, signal]), issue)
+            : undefined,
+          (launched) => {
+            if (!sameVmBinding(launched.binding, binding))
+              throw new PersonVmError('LEASE_LOST');
+            job = launched;
+          },
+        );
         return job;
       } catch (error) {
         if (

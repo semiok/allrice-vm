@@ -1516,6 +1516,50 @@ export function observeDelegatedInputs(scope, observedClaim = () => false) {
   return { root, claimed, rootWake, searchOrigin };
 }
 
+function managedModelRoute(select, rules, fallback, session) {
+  return select(
+    rules,
+    {
+      sessionId: session.id,
+      parentSessionId:
+        session.header.origin === 'subagent'
+          ? (session.header.parentSession ?? null)
+          : null,
+      attemptKind: 'assistant',
+    },
+    fallback,
+  );
+}
+
+export function managedModelRequest(select, rules, fallback, lifetime) {
+  return async ({ agent, signal }, next) => {
+    const config = await next();
+    signal.throwIfAborted();
+    lifetime.throwIfAborted();
+    const route = managedModelRoute(select, rules, fallback, agent.session);
+    // Controls chosen for an unrelated model are not portable.
+    return config.provider === route.provider && config.model === route.model
+      ? config
+      : route;
+  };
+}
+
+export function managedModelPrompt(select, rules, fallback, lifetime) {
+  return async (_assembly, context, next) => {
+    const prompt = await next();
+    context.signal?.throwIfAborted();
+    lifetime.throwIfAborted();
+    if (!context.agent) return prompt;
+    const route = managedModelRoute(
+      select,
+      rules,
+      fallback,
+      context.agent.session,
+    );
+    return { ...prompt, variables: { ...prompt.variables, ...route } };
+  };
+}
+
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config);
 }
@@ -1717,6 +1761,7 @@ export function applyNativeWebOwner(
         model,
         modelInfo,
         historicalModels,
+        scoped,
       } = modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
@@ -1735,6 +1780,9 @@ export function applyNativeWebOwner(
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
+          const select = managedSearch?.selectScopedModel;
+          if (scoped && typeof select !== 'function')
+            throw Error('Native managed model policy is unavailable');
           const promptFacts = observeNativePrompts(scope, signal, current);
           const delegations = observeDelegatedInputs(
             scope,
@@ -1922,80 +1970,135 @@ export function applyNativeWebOwner(
                 : new globalThis.Response(null, { status: 404 });
             },
           });
-          const dispose = registerManagedGatewayAdapter(scope.llm, {
-            origin,
-            capability,
-            route: {
-              provider,
-              model,
-              modelInfo,
-              historicalModels,
-              lifetime: signal,
-              async resolveCallReference(selection, active, purpose) {
-                const key = JSON.stringify([
-                  selection.sessionId,
-                  purpose ?? 'assistant',
-                ]);
-                if (modelCalls.has(key))
-                  throw Error('Concurrent native model ownership is ambiguous');
-                const session = scope.sessions.get(selection.sessionId);
-                if (!session)
-                  throw Error('Native model session is unavailable');
-                const owned = {
-                  id: randomUUID(),
-                  recipient: randomBytes(32).toString('base64url'),
-                  session,
-                  signal: active,
-                };
-                modelCalls.set(key, owned);
-                const release = () => {
-                  active.removeEventListener('abort', release);
-                  if (modelCalls.get(key) === owned) modelCalls.delete(key);
-                };
-                active.addEventListener('abort', release, { once: true });
-                try {
-                  active.throwIfAborted();
-                  const endpoint = new URL(
-                    purpose ? '/v1/reference/' + purpose : '/v1/reference',
-                    origin,
-                  );
-                  const response = await globalThis.fetch(endpoint, {
-                    method: 'POST',
-                    redirect: 'error',
-                    signal: active,
-                    headers: {
-                      authorization: 'Bearer ' + capability,
-                      'content-type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                      ...selection,
-                      adapterId: id,
-                      recipient: owned.recipient,
-                    }),
-                  });
-                  if (!response.ok) {
-                    await response.body?.cancel();
-                    throw Error('Native managed model call was denied');
-                  }
-                  return {
-                    reference: (await response.json()).reference,
-                    recipient: owned.recipient,
-                    release,
-                  };
-                } catch (error) {
-                  release();
-                  throw error;
-                }
-              },
+          async function resolveCallReference(selection, active, purpose) {
+            const key = JSON.stringify([
+              selection.sessionId,
+              purpose ?? 'assistant',
+            ]);
+            if (modelCalls.has(key))
+              throw Error('Concurrent native model ownership is ambiguous');
+            const session = scope.sessions.get(selection.sessionId);
+            if (!session) throw Error('Native model session is unavailable');
+            const owned = {
+              id: randomUUID(),
+              recipient: randomBytes(32).toString('base64url'),
+              session,
+              signal: active,
+            };
+            modelCalls.set(key, owned);
+            const release = () => {
+              active.removeEventListener('abort', release);
+              if (modelCalls.get(key) === owned) modelCalls.delete(key);
+            };
+            active.addEventListener('abort', release, { once: true });
+            try {
+              active.throwIfAborted();
+              const endpoint = new URL(
+                purpose ? '/v1/reference/' + purpose : '/v1/reference',
+                origin,
+              );
+              const response = await globalThis.fetch(endpoint, {
+                method: 'POST',
+                redirect: 'error',
+                signal: active,
+                headers: {
+                  authorization: 'Bearer ' + capability,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({
+                  ...selection,
+                  adapterId: id,
+                  recipient: owned.recipient,
+                }),
+              });
+              if (!response.ok) {
+                await response.body?.cancel();
+                throw Error('Native managed model call was denied');
+              }
+              return {
+                reference: (await response.json()).reference,
+                recipient: owned.recipient,
+                release,
+              };
+            } catch (error) {
+              release();
+              throw error;
+            }
+          }
+          const groups = new Map([[provider, [{ model, modelInfo }]]]);
+          for (const definition of scoped?.models ?? []) {
+            const models = groups.get(definition.provider) ?? [];
+            if (models.some(({ model }) => model === definition.model))
+              throw Error('Duplicate native managed model');
+            models.push(definition);
+            groups.set(definition.provider, models);
+          }
+          const disposers = [];
+          registeredModel = {
+            dispose: () => {
+              for (const dispose of disposers.reverse()) dispose();
             },
-          });
-          const listeners = [];
-          if (modelInfo.reasoning?.defaultEffort !== undefined) {
+            llm: original(scope.llm),
+            id,
+          };
+          for (const [provider, models] of groups) {
+            disposers.push(
+              registerManagedGatewayAdapter(scope.llm, {
+                origin,
+                capability,
+                route: {
+                  provider,
+                  model: models[0].model,
+                  modelInfo: models[0].modelInfo,
+                  ...(scoped ? { models } : {}),
+                  ...(provider === modelAdapter.provider
+                    ? { historicalModels }
+                    : {}),
+                  lifetime: signal,
+                  resolveCallReference,
+                },
+              }),
+            );
+            const actual = await scope.llm.listModels(provider);
+            if (
+              actual.length !== models.length ||
+              !models.every(({ model }) =>
+                actual.some(({ id }) => id === model),
+              )
+            )
+              throw Error('Native managed model was not registered');
+          }
+          if (scoped) {
+            const outer = { global: true, prepend: true };
+            disposers.push(
+              scope.on(
+                'system-prompt/assemble',
+                managedModelPrompt(
+                  select,
+                  scoped.rules,
+                  { provider, model },
+                  signal,
+                ),
+                outer,
+              ),
+              scope.on(
+                'agent/request',
+                managedModelRequest(
+                  select,
+                  scoped.rules,
+                  { provider, model },
+                  signal,
+                ),
+                outer,
+              ),
+            );
+          }
+          if (!scoped && modelInfo.reasoning?.defaultEffort !== undefined) {
             // A retained session can propose its previous route. Use the
             // current Host route for new requests, preserving explicit effort
             // choices on that route and leaving the journal intact.
             const outer = { global: true, prepend: true };
-            listeners.push(
+            disposers.push(
               scope.on(
                 'system-prompt/assemble',
                 async (_assembly, _context, next) => {
@@ -2027,17 +2130,6 @@ export function applyNativeWebOwner(
               ),
             );
           }
-          registeredModel = {
-            dispose() {
-              for (const off of listeners) off();
-              dispose();
-            },
-            llm: original(scope.llm),
-            id,
-          };
-          const models = await scope.llm.listModels(provider);
-          if (models.length !== 1 || models[0].id !== model)
-            throw Error('Native managed model was not registered');
         },
       );
       if (

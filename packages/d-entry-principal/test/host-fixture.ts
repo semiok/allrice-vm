@@ -37,6 +37,7 @@ import type {
   SessionControlFrame,
   SessionPage,
   SessionPageRequest,
+  SessionPromptRequest,
   SessionCreateRequest,
   SessionForkRequest,
   SessionSearchRequest,
@@ -154,6 +155,9 @@ class Catalog extends TypertRemoteService {
   beforeList?: (signal: AbortSignal, scoped: boolean) => Promise<void>;
   beforeFollow?: () => Promise<void>;
   beforeCreate?: () => Promise<void>;
+  allocateSessionId?: () => SessionId;
+  onPrompt?: (request: SessionPromptRequest) => void;
+  snapshotRecords?: (sessionId: SessionId) => SessionPage['records'];
   afterFollowSnapshot?: () => Promise<void>;
   followFrames?: (sessionId: SessionId) => AsyncIterable<SessionFollowFrame>;
   finishFollow?: SessionId;
@@ -200,9 +204,26 @@ class Catalog extends TypertRemoteService {
   async create(request: SessionCreateRequest) {
     this.creationRequests.push(request);
     await this.beforeCreate?.();
-    const sessionId = request.sessionId ?? SessionId('native-created');
+    const sessionId =
+      request.sessionId ??
+      this.allocateSessionId?.() ??
+      SessionId('native-created');
     this.items.push(summary(sessionId));
     return { sessionId };
+  }
+  @Remote({
+    name: 'prompt',
+    resources: {
+      session: (request: SessionPromptRequest) => request.sessionId,
+    },
+  })
+  prompt(request: SessionPromptRequest) {
+    if (!this.onPrompt)
+      throw new RemoteError('session/not-found', 'No fixture agent', {
+        sessionId: request.sessionId,
+      });
+    this.onPrompt(request);
+    return { accepted: true as const };
   }
   @Remote('fork')
   fork(request: SessionForkRequest) {
@@ -286,14 +307,15 @@ class Catalog extends TypertRemoteService {
       signal.throwIfAborted();
       // Session content is fixture data; the descriptor, resource guard,
       // cancellableStream and codec are the actual public native path.
+      const records = this.snapshotRecords?.(sessionId) ?? [];
+      const cursor = records.at(-1)?.event.seq ?? -1;
       yield {
         type: 'snapshot',
         header: { version: 1, id: sessionId, createdAt: 1, isSeeded: false },
-        // rc.2 defines the tail of an empty Session journal as -1.
-        cursor: -1,
-        records: [],
+        cursor,
+        records,
         hasMore: false,
-        projections: { asOfSeq: 0, values: {} },
+        projections: { asOfSeq: cursor, values: {} },
         ...(request.assistantStream && { assistantStream: { revision: 0 } }),
       };
       await this.afterFollowSnapshot?.();

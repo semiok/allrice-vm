@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { getDatabase, readCompletePersonVmWakeRoster } from '@allrice/database';
 import {
   PersonVmError,
   sameVmBinding,
@@ -61,12 +62,37 @@ export function getIdleScheduleGuardMs(config: {
   );
 }
 
+export async function assertCompleteNativeActivityCensus(
+  startup: Pick<NativeStartup, 'activityCatalogs'>,
+  binding: PersonVmBinding,
+  signal: AbortSignal,
+  db = getDatabase(),
+) {
+  signal.throwIfAborted();
+  const catalogs = startup.activityCatalogs(binding, signal);
+  const current = await db.begin(
+    'isolation level repeatable read read only',
+    (tx) =>
+      readCompletePersonVmWakeRoster(
+        tx,
+        binding,
+        catalogs.map(({ endpoint }) => endpoint),
+      ),
+  );
+  signal.throwIfAborted();
+  if (!current) throw new PersonVmError('ACTIVITY_UNKNOWN');
+}
+
 export function createProductionNativeActivity(
   startup: Startup,
   lifetime: AbortSignal,
   options: {
     sampleIntervalMs: number;
     scheduleGuardMs: number;
+    assertCompleteCensus?(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): Promise<void>;
     now?: () => number;
     monotonic?: () => number;
   },
@@ -176,6 +202,8 @@ export function createProductionNativeActivity(
         scope.reading = reading = true;
         scope.interrupted = false;
 
+        if (options.assertCompleteCensus)
+          await options.assertCompleteCensus(binding, active);
         const start = clock();
         const revisions = catalogs.map(({ owner }) =>
           owner.nativeActivityRevision(),
@@ -203,6 +231,8 @@ export function createProductionNativeActivity(
             owner.readNativeActivity(guard, AbortSignal.any([active, revoked])),
           ),
         );
+        if (options.assertCompleteCensus)
+          await options.assertCompleteCensus(binding, active);
         active.throwIfAborted();
         if (
           scope.interrupted ||

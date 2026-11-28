@@ -261,6 +261,7 @@ suite(
         binding: current,
         rosterDigest: expected.digest,
         endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
+        slots: [{ hostPort: 24444, guestPort: 24445 }],
       });
       h.native.assertWebEndpoints = async () => {};
       const scheduled = new PersonVmService({
@@ -274,7 +275,12 @@ suite(
           binding,
           randomUUID(),
           {
-            readRoster: async () => roster,
+            readStartup: async () => ({
+              planId: randomUUID(),
+              roster,
+              employeeInstanceIds: [endpoint.employeeInstanceId],
+              digest: roster.digest,
+            }),
             withCurrentAuthority: async () => {
               throw new PersonVmError('AUTHORIZATION_DENIED');
             },

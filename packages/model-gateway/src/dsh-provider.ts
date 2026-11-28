@@ -17,6 +17,10 @@ type ManagedGuestModelCall = {
   readonly provider: string;
   readonly model: string;
   readonly modelInfo?: LlmResolvedModelInfo;
+  readonly models?: readonly {
+    model: string;
+    modelInfo: LlmResolvedModelInfo;
+  }[];
   readonly historicalModels?: readonly LlmResolvedModelInfo[];
   readonly lifetime?: AbortSignal;
   /** The authorized native invocation delivers a reference for this call
@@ -34,7 +38,7 @@ type ManagedGuestModelCall = {
   >;
 };
 import type {
-  GatewayFetchClassification,
+  DshGatewayRoute,
   GatewayProvider,
   ModelCallBinding,
 } from './contract.ts';
@@ -50,23 +54,26 @@ export type DshGatewayStreamScope = (
  * The loader's pinned provider profile must use HTTP SSE, not websocket/auto. */
 export function createDshGatewayProvider(
   llm: Pick<LlmRuntime, 'prepareCall'>,
-  route: {
-    provider: string;
-    model: string;
-    transport: 'sse';
-    classify(
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ): GatewayFetchClassification | null;
-  },
+  route: DshGatewayRoute,
   fetchOwned?: GatewayProvider['fetchOwned'],
   assertDispatchCurrent?: GatewayProvider['assertDispatchCurrent'],
   scopeStream?: DshGatewayStreamScope,
+  confirmTransportClosed?: GatewayProvider['confirmTransportClosed'],
 ): GatewayProvider {
   return {
     classify: route.classify,
+    ...(route.hostedWebSearch
+      ? {
+          hostedWebSearch: Object.freeze({
+            provider: route.provider,
+            model: route.model,
+          }),
+        }
+      : {}),
+    ...(confirmTransportClosed ? { requireTransportProof: true as const } : {}),
     fetchOwned,
     assertDispatchCurrent,
+    confirmTransportClosed,
     async *stream(binding, input, signal) {
       if (
         binding.provider !== route.provider ||
@@ -94,6 +101,19 @@ export function createDshGatewayProvider(
       const stream = () =>
         prepared.stream({
           ...input,
+          // Guest replay metadata is never authority to replay native OpenAI
+          // items under a shared Host credential. Use DSH's normal neutral
+          // history conversion on this route, retaining text and tool history.
+          ...(route.provider === 'openai' || route.provider === 'deepseek'
+            ? {
+                messages: input.messages.map((message) => {
+                  if (message.role !== 'assistant') return message;
+                  const source = { ...message.source };
+                  delete source.replayState;
+                  return { ...message, source };
+                }),
+              }
+            : {}),
           ...prepared.config,
           signal,
           sessionId: binding.native.sessionId as GenerateOptions['sessionId'],
@@ -120,7 +140,9 @@ export class GatewayLlmAdapter extends LlmAdapter {
     if (!route || route.provider !== provider)
       return super.listModels(provider);
     route.lifetime?.throwIfAborted();
-    return [await this.resolveModel(provider, route.model)];
+    return route.models
+      ? route.models.map(({ modelInfo }) => modelInfo)
+      : [await this.resolveModel(provider, route.model)];
   }
   override async resolveModel(
     provider: string,
@@ -133,8 +155,12 @@ export class GatewayLlmAdapter extends LlmAdapter {
     route.lifetime?.throwIfAborted();
     if (route.provider !== provider)
       throw new ModelGatewayError('BINDING_INVALID');
-    if (route.model === model)
+    if (route.models) {
+      const found = route.models.find((value) => value.model === model);
+      if (found) return found.modelInfo;
+    } else if (route.model === model) {
       return route.modelInfo ?? super.resolveModel(provider, model, signal);
+    }
     // Native image admission and compaction size retained history from its
     // recorded model. Historical descriptors never appear in listModels or
     // confer authority to stream against that model.
@@ -160,7 +186,9 @@ export class GatewayLlmAdapter extends LlmAdapter {
         const { provider, model, sessionId } = options;
         if (
           provider !== this.managed.provider ||
-          model !== this.managed.model ||
+          (this.managed.models
+            ? !this.managed.models.some((value) => value.model === model)
+            : model !== this.managed.model) ||
           !sessionId ||
           !signal
         )

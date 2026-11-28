@@ -3,9 +3,10 @@ import {
   listOrganizationActivityPeople,
   listOrganizationActivityRuns,
   readOrganizationDashboard,
+  requireCurrentPlatformAdmin,
 } from '@allrice/database';
 import { requirePlatformAdminContext } from '../identity/platform-admin';
-import { executionErrorResponse } from '../execution/responses';
+import { administrationError } from '../identity/administration';
 export async function organizationActivityHttp(request: Request) {
   try {
     const context = await requirePlatformAdminContext(request),
@@ -46,6 +47,7 @@ export async function organizationActivityHttp(request: Request) {
                   status: p.get('status') ?? 'all',
                   before: p.get('before') ?? undefined,
                 });
+    await requireCurrentPlatformAdmin(context, undefined, false);
     return Response.json(result, {
       headers: {
         'Cache-Control': 'private, no-store',
@@ -53,6 +55,6 @@ export async function organizationActivityHttp(request: Request) {
       },
     });
   } catch (e) {
-    return executionErrorResponse(e);
+    return administrationError(e);
   }
 }

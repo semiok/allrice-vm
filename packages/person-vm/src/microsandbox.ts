@@ -190,9 +190,12 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
       'binding' | 'probes' | 'native' | 'cleanupSignal'
     >,
   ): ReturnType<typeof createPersonVmCommandMemoryObserver>;
+  /** True when both start operations report the physical dispatch boundary. */
+  readonly observesStartDispatch?: true;
   start(
     binding: PersonVmBinding,
     signal: AbortSignal,
+    onDispatch?: () => void,
   ): Promise<NativeStartFence | void>;
   /** Optional retained-start operation. It must verify both the artifact and
    * Web endpoints against the same fresh, post-start native inspection. */
@@ -200,6 +203,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
     egress?: PersonVmEgressReceipt,
+    onDispatch?: () => void,
   ): Promise<NativeStartFence | void>;
   stop(
     binding: PersonVmBinding,
@@ -224,6 +228,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
 
 /** Uses only the pinned public CLI. Does not edit Microsandbox's private DB. */
 export class MicrosandboxPersonVm implements PersonVmNativePort {
+  readonly observesStartDispatch = true;
   private readonly run: CommandRunner;
   private readonly memoryMiB: number;
   private readonly homes = new Map<string, NativePaths>();
@@ -345,6 +350,18 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const paths = this.homes.get(binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     return this.runWithPaths(paths, args, signal, readNonzeroExit);
+  }
+  private dispatchStart(
+    binding: PersonVmBinding,
+    args: string[],
+    signal: AbortSignal,
+    onDispatch?: () => void,
+  ) {
+    const paths = this.homes.get(binding.vmId);
+    if (!paths) throw new PersonVmError('PROVIDER_FAILED');
+    signal.throwIfAborted();
+    onDispatch?.();
+    return this.runWithPaths(paths, args, signal);
   }
   private runWithPaths(
     paths: NativePaths,
@@ -1105,6 +1122,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     web?: PersonVmWebEndpointReceipt,
+    onDispatch?: () => void,
   ): Promise<NativeStartFence | void> {
     const policy = this.options.restartMemory;
     if (policy === undefined) {
@@ -1124,7 +1142,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         !matchesNativeMemory(saved.config, this.memoryMiB)
       )
         throw new PersonVmError('PROVIDER_FAILED');
-      await this.command(binding, ['start', this.name(binding)], signal);
+      await this.dispatchStart(
+        binding,
+        ['start', this.name(binding)],
+        signal,
+        onDispatch,
+      );
       await this.assertArtifact(binding, signal, true, web);
       return;
     }
@@ -1199,7 +1222,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         throw new PersonVmError('PROVIDER_FAILED');
     }
     await assertCapacity();
-    await this.command(binding, ['start', name], active);
+    await this.dispatchStart(binding, ['start', name], active, onDispatch);
     await assertCapacity();
     const started = await inspect(active, true);
     if (
@@ -1248,24 +1271,30 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       },
     });
   }
-  async start(binding: PersonVmBinding, signal: AbortSignal) {
-    return this.startNative(binding, signal);
+  async start(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    onDispatch?: () => void,
+  ) {
+    return this.startNative(binding, signal, undefined, onDispatch);
   }
   async startWithWebEndpoints(
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
     egress?: PersonVmEgressReceipt,
+    onDispatch?: () => void,
   ) {
     if (receipt.upgrade === 'pending') {
       if (!egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
-      return this.restoreWebUpgrade(receipt, egress, signal);
+      return this.restoreWebUpgrade(receipt, egress, signal, onDispatch);
     }
-    return this.startNative(receipt.binding, signal, receipt);
+    return this.startNative(receipt.binding, signal, receipt, onDispatch);
   }
   private async restoreWebUpgrade(
     web: PersonVmWebEndpointReceipt,
     egress: PersonVmEgressReceipt,
     signal: AbortSignal,
+    onDispatch?: () => void,
   ) {
     const { binding } = web;
     const memory = this.options.restartMemory
@@ -1310,7 +1339,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       const active = capacity?.signal ?? signal;
       await capacity?.assertCurrent();
       active.throwIfAborted();
-      await this.command(
+      await this.dispatchStart(
         binding,
         [
           'restore',
@@ -1327,6 +1356,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
           ...this.networkArguments(egress, web),
         ],
         active,
+        onDispatch,
       );
       const [, raw] = await this.inspectAndAssertArtifact(
         binding,
@@ -1351,7 +1381,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         ),
       );
       assertWebEndpointInspection(inspection, target, web, false);
-      capacity = await this.startNative(binding, signal, web);
+      capacity = await this.startNative(binding, signal, web, onDispatch);
     } else throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
     await capacity?.assertCurrent();
     (capacity?.signal ?? signal).throwIfAborted();

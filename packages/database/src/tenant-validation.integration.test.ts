@@ -69,6 +69,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
     ).toBe('member');
   });
   it('projects run, operation, usage and artifact with real-issuer audit; no raw snapshot or common credentials', async () => {
+    const resourceId = randomUUID();
+    await f.db`insert into allrice_task_resource_waits
+      (id,run_id,job_id,organization_id,workspace_id,worker_id,lease_token,call_id,state,reason)
+      values(${resourceId},${a.task.runId},${a.worker.jobId},${a.target.organizationId},${a.target.workspaceId},
+        ${a.worker.workerId},${a.worker.leaseToken},'PRIVATE_TOOL_CALL','waiting','sandbox_capacity')`;
     const result = await inspectTenantRun(admin, a.target, a.task.runId, f.db);
     expect(result.operations[0]).toMatchObject({
       id: a.operation,
@@ -79,8 +84,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
     expect(result.artifacts[0]?.id).toBe(a.artifact.artifactId);
     expect(result.usage?.receiptCount).toBe(0);
     expect(result.usage?.totalTokens).toBeNull();
+    expect(result.executionDiagnostics?.resources).toMatchObject([
+      { id: resourceId, callId: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    ]);
     expect(JSON.stringify(result)).not.toMatch(
-      /PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT/,
+      /PRIVATE_TOOL_CALL|PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT|Synthetic research goal|Synthetic finished report|Synthetic OK/,
     );
     const [audit] =
       await f.db`select actor_id,metadata from allrice_audit_events where action='tenant.run.inspected' and resource_id=${a.task.runId}`;
@@ -177,11 +185,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
       spy.mockRestore();
     }
   });
-  it('keeps long output bounded and identifies omitted chunks', async () => {
+  it('omits tool output while identifying that it exceeded the diagnostic cap', async () => {
     await f.db`insert into allrice_runtime_operation_output(operation_id,sequence,stream,content) select ${a.operation},n,'stdout','x' from generate_series(1,80) n`;
     const result = await inspectTenantRun(admin, a.target, a.task.runId, f.db);
     expect(result.operations[0]?.outputTruncated).toBe(true);
-    expect(result.operations[0]!.output.length).toBeLessThanOrEqual(16000);
+    expect(result.operations[0]!.output).toBe('');
   });
   it('projects expired approval without changing it or executing anything', async () => {
     const id = randomUUID();

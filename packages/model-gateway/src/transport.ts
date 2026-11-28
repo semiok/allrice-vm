@@ -1,3 +1,8 @@
+import {
+  DEEPSEEK_CHAT_URL,
+  DEEPSEEK_RESPONSES_URL,
+  prepareDeepSeekChatRequest,
+} from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
@@ -12,6 +17,11 @@ import {
   installNativeCloseObserver,
   observeNativeClose,
 } from './native-close.ts';
+import {
+  OPENAI_RESPONSES_URL,
+  OpenAiCitationProjection,
+  prepareOpenAiResponsesRequest,
+} from './openai-responses.ts';
 import { createOwnedModelTransport } from './owned-transport.ts';
 
 type Fetch = typeof globalThis.fetch;
@@ -226,6 +236,10 @@ export function createMeteredTransport(options: {
       };
       const observer = new WireUsageObserver(classification.protocol);
       const nativeClose = observeNativeClose();
+      const confirmedClose = async () =>
+        (await nativeClose.confirmed()) ||
+        (!refreshing &&
+          (await options.provider.confirmTransportClosed?.()) === true);
       let started = false;
       let dispatched = false;
       let transportJoined = false;
@@ -294,7 +308,39 @@ export function createMeteredTransport(options: {
           redirect: 'manual',
           duplex: 'half',
         };
-        const request = new Request(input, requestInit);
+        let request = new Request(input, requestInit);
+        const approved = options.provider.hostedWebSearch;
+        const publicResponses =
+          ((options.binding.provider === 'openai' &&
+            request.url === OPENAI_RESPONSES_URL) ||
+            (options.binding.provider === 'deepseek' &&
+              request.url === DEEPSEEK_RESPONSES_URL)) &&
+          request.method === 'POST' &&
+          classification.kind === 'model' &&
+          classification.protocol === 'openai-responses';
+        const requireCloseProof =
+          publicResponses || options.provider.requireTransportProof;
+        const hostedSearch =
+          publicResponses &&
+          options.binding.native.attemptKind === 'assistant' &&
+          approved?.provider === options.binding.provider &&
+          approved.model === options.binding.model;
+        if (publicResponses)
+          request = await prepareOpenAiResponsesRequest(
+            request,
+            options.binding.model,
+            hostedSearch,
+            options.binding.provider === 'deepseek',
+          );
+        else if (
+          options.binding.provider === 'deepseek' &&
+          request.url === DEEPSEEK_CHAT_URL &&
+          classification.protocol === 'openai-chat-completions'
+        )
+          request = await prepareDeepSeekChatRequest(
+            request,
+            options.binding.model,
+          );
         const dispatchInit: RequestInit & { duplex: 'half' } = {
           body:
             request.body ??
@@ -321,11 +367,24 @@ export function createMeteredTransport(options: {
         );
         status = response.status;
         if (!response.body) {
+          if (
+            requireCloseProof &&
+            !(await nativeClose.waitForSettlement(requestSignal))
+          )
+            throw new ModelGatewayError('LEDGER_UNAVAILABLE');
           transportJoined = true;
           await finish('closed');
           return response;
         }
         const reader = response.body.getReader();
+        const projection =
+          hostedSearch &&
+          response.ok &&
+          /^text\/event-stream(?:\s*;|$)/i.test(
+            response.headers.get('content-type') ?? '',
+          )
+            ? new OpenAiCitationProjection()
+            : undefined;
         let canceled: Promise<void> | undefined;
         let target: ReadableStreamDefaultController<Uint8Array> | undefined;
         const cleanup = () => {
@@ -334,12 +393,15 @@ export function createMeteredTransport(options: {
         };
         const cancel = () =>
           (canceled ??= (async () => {
+            projection?.finish();
             // reader.cancel is awaited; an abort request alone never releases a slot.
             try {
               await reader.cancel(requestSignal.reason);
+              if (requireCloseProof && !(await confirmedClose()))
+                throw new ModelGatewayError('LEDGER_UNAVAILABLE');
               transportJoined = true;
             } catch (error) {
-              if (await nativeClose.confirmed()) {
+              if (await confirmedClose()) {
                 transportJoined = true;
                 cleanup();
                 await finish(
@@ -398,18 +460,29 @@ export function createMeteredTransport(options: {
             },
             async pull(value) {
               try {
-                const result = await reader.read();
-                if (requestSignal.aborted) {
-                  await cancel();
-                  value.error(requestSignal.reason);
-                } else if (result.done) {
-                  transportJoined = true;
-                  cleanup();
-                  await finish('closed');
-                  value.close();
-                } else {
+                for (;;) {
+                  const result = await reader.read();
+                  if (requestSignal.aborted) {
+                    await cancel();
+                    value.error(requestSignal.reason);
+                    return;
+                  }
+                  if (result.done) {
+                    transportJoined = true;
+                    cleanup();
+                    await finish('closed');
+                    requestSignal.throwIfAborted();
+                    const remaining = projection?.finish();
+                    if (remaining?.byteLength) value.enqueue(remaining);
+                    value.close();
+                    return;
+                  }
                   observer.push(result.value);
-                  value.enqueue(result.value);
+                  const output = projection?.push(result.value) ?? result.value;
+                  if (output.byteLength) {
+                    value.enqueue(output);
+                    return;
+                  }
                 }
               } catch (error) {
                 try {
@@ -427,17 +500,19 @@ export function createMeteredTransport(options: {
           },
           { highWaterMark: 0 },
         );
+        const headers = new Headers(response.headers);
+        if (projection) headers.delete('content-length');
         return new Response(body, {
           status: response.status,
           statusText: response.statusText,
-          headers: response.headers,
+          headers,
         });
       } catch (error) {
         // A rejected fetch before response headers is not itself proof that
         // the dispatched request stopped. Use the same real native close facts
         // as the reader path; keep unknown wire facts and its exact slot.
         if (dispatched && !transportJoined) {
-          transportJoined = await nativeClose.confirmed();
+          transportJoined = await confirmedClose();
           if (!transportJoined) {
             closureKnown = false;
             ledgerFailure ??= error;

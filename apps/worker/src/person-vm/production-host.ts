@@ -91,6 +91,7 @@ import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 import {
   createProductionScheduledWake,
+  createProductionRetainedWake,
   type PersonVmWakePreparation,
   type ProductionScheduledWakeSource,
 } from './production-scheduled-wake.js';
@@ -100,6 +101,7 @@ import {
   IDLE_RECONCILE_TIMEOUT_MS,
 } from './production-native-activity.js';
 import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -166,6 +168,12 @@ export type ProductionPersonVmHostSources = Readonly<{
       llm: Parameters<typeof createDshGatewayProvider>[0];
       route: Parameters<typeof createDshGatewayProvider>[1];
       scopeStream?: DshGatewayStreamScope;
+      selectProvider?(binding: ModelCallBinding): GatewayProvider;
+      closeTransport?(): Promise<void>;
+      confirmTransportStopped?(
+        ownerId: string,
+        signal: AbortSignal,
+      ): Promise<string>;
       readMemoryIndex?(
         call: ModelCallBinding,
         signal: AbortSignal,
@@ -540,9 +548,11 @@ export function createProductionPersonVmHost(input: {
       let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      const transport = sourceOwner?.model.transport;
-      if (transport) await settle([transport.close]);
-      if (transport && modelOwner?.reconcileClosedOwner && providers) {
+      const closeTransport =
+        sourceOwner?.model.closeTransport ??
+        sourceOwner?.model.transport?.close;
+      if (closeTransport) await settle([closeTransport]);
+      if (closeTransport && modelOwner?.reconcileClosedOwner && providers) {
         const cleanup = AbortSignal.timeout(
           providers.configuration.lifecycle.cleanupTimeoutMs,
         );
@@ -752,6 +762,10 @@ export function createProductionPersonVmHost(input: {
               Math.floor(budget / (4096 + 512)),
             );
       if (budget !== undefined) capacityStore = store;
+      const employeeRuntime = createProductionEmployeeRuntime(
+        providers.employeeRuntimeSettings,
+        providers.platform.employeePortSlots,
+      );
       const diskRoot = providers.configuration.disk.root;
       const diskPool = new PersonVmDiskPool(
         diskRoot,
@@ -767,17 +781,18 @@ export function createProductionPersonVmHost(input: {
         assertScheduledReady: async (binding, signal) => {
           requireStartup().assertAuthenticatedGroup(binding, signal);
         },
-        readiness: (binding, signal, context) =>
+        readiness: (binding, signal, context, editor) =>
           own(() =>
             currentWork(signal, async (active) => {
               const native = requireStartup();
               native.assertAuthenticatedGroup(binding, active);
-              if (context)
+              if (context && !editor)
                 await native.prepareForegroundEditor(binding, context, active);
-              const readiness = await requireRuntime().readiness(
-                binding,
-                active,
-              );
+              const runtime = requireRuntime();
+              const readiness =
+                context && editor
+                  ? await runtime.readiness(binding, active, context, editor)
+                  : await runtime.readiness(binding, active);
               native.assertAuthenticatedGroup(binding, active);
               return readiness;
             }),
@@ -798,6 +813,8 @@ export function createProductionPersonVmHost(input: {
         disk: providers.disk,
         diskPool,
         nativeWeb: personNativeWebRoster,
+        employeeMaxRunning: employeeRuntime?.maxRunning,
+        retainedWake: createProductionRetainedWake(wakeStore),
         runtime,
         egress,
         observeOwnedStart(binding, context) {
@@ -914,6 +931,7 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
+        employeeRuntime,
         archive: {
           subscribe: subscribeDEntryEmployeeArchive,
           confirm: confirmDEntryEmployeeArchive,
@@ -1106,20 +1124,23 @@ export function createProductionPersonVmHost(input: {
       const modelSource = bound.model;
       const egressSource = bound.egress;
       const modelRoute = Object.freeze({ ...modelSource.route });
-      const provider = createDshGatewayProvider(
-        modelSource.llm,
-        modelRoute,
-        modelSource.transport?.fetchOwned,
-        modelSource.transport?.beforeDispatch,
-        modelSource.scopeStream,
-      );
       const modelOwner = createModelGateway({
         ownerId: modelOwnerId,
         authority: modelSource.authority,
-        provider,
+        provider:
+          modelSource.selectProvider ??
+          createDshGatewayProvider(
+            modelSource.llm,
+            modelRoute,
+            modelSource.transport?.fetchOwned,
+            modelSource.transport?.beforeDispatch,
+            modelSource.scopeStream,
+          ),
         readTrustedContext: memory && modelSource.readMemoryIndex,
         store: storeModel,
-        confirmTransportStopped: modelSource.transport?.stoppedEvidence,
+        confirmTransportStopped:
+          modelSource.confirmTransportStopped ??
+          modelSource.transport?.stoppedEvidence,
         admission: {
           boundary: admission,
           participant: admission.participant('gateway'),
@@ -1141,8 +1162,9 @@ export function createProductionPersonVmHost(input: {
           signal.throwIfAborted();
           if (
             !sameVmBinding(call.vm, binding) ||
-            call.provider !== modelRoute.provider ||
-            call.model !== modelRoute.model ||
+            (!modelSource.selectProvider &&
+              (call.provider !== modelRoute.provider ||
+                call.model !== modelRoute.model)) ||
             call.context.actor.type !== 'user' ||
             call.context.actor.id !== binding.personId ||
             call.context.organizationId !== binding.organizationId

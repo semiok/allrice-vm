@@ -2,17 +2,22 @@ import {
   listDshRuntimeInventory,
   readOperationsInventory,
   listTenantRuntimeInventory,
+  requireCurrentPlatformAdmin,
 } from '@allrice/database';
 
-import { executionErrorResponse } from '../../../../../lib/execution/responses';
-import { requirePlatformAdminContext } from '../../../../../lib/identity/platform-admin';
+import {
+  administrationError,
+  administrationHeaders,
+  requireAdministrationLogin,
+} from '../../../../../lib/identity/administration';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function GET(request: Request) {
   try {
-    await requirePlatformAdminContext(request);
+    const context = await requireAdministrationLogin(request);
+    await requireCurrentPlatformAdmin(context, undefined, false);
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get('limit') ?? 100);
     const limit = Number.isFinite(requestedLimit) ? requestedLimit : 100;
@@ -28,6 +33,7 @@ export async function GET(request: Request) {
         : Promise.resolve([]),
       readOperationsInventory().catch(() => null),
     ]);
+    await requireCurrentPlatformAdmin(context, undefined, false);
     return Response.json(
       {
         console: {
@@ -43,9 +49,9 @@ export async function GET(request: Request) {
         operations,
         scope,
       },
-      { headers: { 'Cache-Control': 'private, no-store' } },
+      { headers: administrationHeaders },
     );
   } catch (error) {
-    return executionErrorResponse(error);
+    return administrationError(error);
   }
 }

@@ -12,7 +12,10 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
-import { readReleasedProfileAssets } from '../../apps/web/lib/d-entry/released-profile-assets.ts';
+import {
+  readReleasedProfileAssets,
+  readStartupProfileAssetUrls,
+} from '../../apps/web/lib/d-entry/released-profile-assets.ts';
 import { stageDshProfileAssets } from './stage-dsh-profile-assets.mjs';
 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -20,12 +23,20 @@ const head = '1'.repeat(40);
 const application = 'plugins/' + '2'.repeat(64) + '.js';
 const artifact = 'apps/worker/dist/d-entry-web';
 const next = 'apps/web/.next';
-const reference = 'plugins/??application/client.js&rev=build';
+const moduleId = '@fixture/client.js-app';
+const reference = `plugins/??${moduleId}/client.js&rev=build`;
+const singleReference = `plugins/??${moduleId}/client.js&rev=single`;
+const single = 'plugins/' + '3'.repeat(64) + '.js';
+const script = (body, rev) =>
+  body + `\n//# sourceMappingURL=??${moduleId}/client.js.map&rev=${rev}\n`;
 const paths = {
   'managed/employee-web-entry.js': 'export const runtime = 1;',
   'managed/employee-web-entry.css': '.entry {color: black}',
+  'managed/chunk-startup.js': 'export const dependency = 1;',
+  'managed/lazy-language.js': 'export const language = 1;',
   'managed/entry.js.map': '{"privateSource":true}',
   'native/index.html': '<div>Do not publish HTML</div>',
+  'native/assets/index-unused.js': 'export const unused = 1;',
   'native/assets/vendor-aaaaaaaa.css':
     "@font-face {src:url('./fonts/native-AbCd.woff2')}",
   'native/assets/fonts/native-AbCd.woff2': 'test font payload',
@@ -39,11 +50,12 @@ async function fixture(op) {
   try {
     await mkdir(join(root, next, 'static'), { recursive: true });
     await mkdir(join(root, next, 'server'), { recursive: true });
-    const build = async (body) => {
+    const build = async (body, singleton = body) => {
       const files = [];
       for (const [path, contents] of Object.entries({
         ...paths,
-        [application]: body,
+        [application]: script(body, 'build'),
+        [single]: script(singleton, 'single'),
       })) {
         const filename = join(root, artifact, path);
         await mkdir(dirname(filename), { recursive: true });
@@ -61,13 +73,46 @@ async function fixture(op) {
         files,
         profile: {
           graph: {
-            batches: [{ url: reference, rev: 'build', phase: 'application' }],
+            entries: [{ id: moduleId, rev: 'single', url: singleReference }],
+            batches: [
+              {
+                url: reference,
+                rev: 'build',
+                phase: 'application',
+                entries: [moduleId],
+              },
+            ],
           },
           files: [
             { ...files.find((item) => item.path === application), reference },
+            {
+              ...files.find((item) => item.path === single),
+              reference: singleReference,
+            },
           ],
         },
       });
+      await writeFile(
+        join(root, artifact, 'kernel-inputs.json'),
+        JSON.stringify({
+          outputs: {
+            '../fixture/managed/employee-web-entry.js': {
+              imports: [
+                {
+                  path: '../fixture/managed/chunk-startup.js',
+                  kind: 'import-statement',
+                },
+                {
+                  path: '../fixture/managed/lazy-language.js',
+                  kind: 'dynamic-import',
+                },
+              ],
+            },
+            '../fixture/managed/chunk-startup.js': { imports: [] },
+            '../fixture/managed/lazy-language.js': { imports: [] },
+          },
+        }),
+      );
       await writeFile(join(root, artifact, 'artifact.json'), manifest);
       return digest(manifest);
     };
@@ -87,32 +132,61 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
     expect(await readdir(directory)).toEqual(['bundles', 'managed', 'native']);
     expect(await readdir(join(directory, 'native'))).toEqual(['assets']);
     expect(
+      await readFile(join(directory, 'native/assets/index-unused.js'), 'utf8'),
+    ).toBe(paths['native/assets/index-unused.js']);
+    expect(
       await readFile(
         join(directory, 'native/assets/fonts/native-AbCd.woff2'),
         'utf8',
       ),
     ).toBe('test font payload');
     expect(await readdir(join(directory, 'managed'))).toEqual([
+      'chunk-startup.js',
       'employee-web-entry.css',
       'employee-web-entry.js',
+      'lazy-language.js',
     ]);
-    const bundle = 'bundles/' + digest(body) + '.js';
-    expect(await readFile(join(directory, bundle), 'utf8')).toBe(body);
+    const bytes = script(body, 'build');
+    const bundle = 'bundles/' + digest(bytes) + '.js';
+    expect(await readFile(join(directory, bundle), 'utf8')).toBe(bytes);
     expect(
       JSON.parse(
-        await readFile(
-          join(root, next, 'server/dsh-profile-' + first + '.json'),
-          'utf8',
-        ),
+        await readFile(join(root, next, 'server/dsh-profile.json'), 'utf8'),
       ),
     ).toMatchObject({
       stamp: first,
       paths: expect.arrayContaining([bundle]),
-      bundles: [{ reference, revision: 'build', sha256: digest(body) }],
+      bundles: [
+        {
+          reference,
+          revision: 'build',
+          sha256: digest(bytes),
+          layout: {
+            phase: 'application',
+            byteLength: Buffer.byteLength(bytes),
+            entries: [
+              {
+                id: moduleId,
+                offset: 0,
+                length: Buffer.byteLength(body + '\n'),
+              },
+            ],
+          },
+        },
+      ],
     });
     const entrypoint = join(root, 'apps/web/server.mjs');
     const released = await readReleasedProfileAssets(first, entrypoint);
     expect(released.root).toBe('/_next/static/dsh-profile/' + first + '/');
+    expect(await readStartupProfileAssetUrls(entrypoint)).toEqual(
+      [
+        bundle,
+        'managed/employee-web-entry.js',
+        'managed/chunk-startup.js',
+        'managed/employee-web-entry.css',
+        'native/assets/vendor-aaaaaaaa.css',
+      ].map((path) => released.root + path),
+    );
     await expect(
       readReleasedProfileAssets('0'.repeat(64), entrypoint),
     ).resolves.toBeUndefined();
@@ -125,7 +199,7 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
       );
       expect(upgraded.root).not.toBe(released.root);
     });
-    expect(await readFile(join(directory, bundle), 'utf8')).toBe(body);
+    expect(await readFile(join(directory, bundle), 'utf8')).toBe(bytes);
   });
 });
 
@@ -159,6 +233,17 @@ test('refuses symlinks and mismatched bytes before publishing', async () => {
     await expect(stageDshProfileAssets(root, head)).rejects.toThrow(
       /Untrusted/,
     );
+    expect(await readdir(join(root, next, 'server'))).toEqual([]);
+  });
+});
+
+test('refuses an aggregate that does not match the individually sealed registration', async () => {
+  await fixture(async (root, build) => {
+    await build('first factory', 'other factory');
+    await expect(stageDshProfileAssets(root, head)).rejects.toThrow(
+      /batch differs from sealed module registrations/,
+    );
+    expect(await readdir(join(root, next, 'static/dsh-profile'))).toEqual([]);
     expect(await readdir(join(root, next, 'server'))).toEqual([]);
   });
 });

@@ -2383,8 +2383,9 @@ fs.writeFileSync(f,JSON.stringify(v));
           dispatch?: Parameters<typeof provider.stopIdle>[3],
         ) => provider.stopIdle(binding, signal(), assertCurrent, dispatch),
         assertStopped: () => provider.assertStopped(binding, signal()),
-        start: () => provider.start(binding, signal()),
-        startWithWeb: () =>
+        start: (onDispatch?: () => void) =>
+          provider.start(binding, signal(), onDispatch),
+        startWithWeb: (onDispatch?: () => void) =>
           provider.startWithWebEndpoints(
             {
               binding,
@@ -2401,6 +2402,8 @@ fs.writeFileSync(f,JSON.stringify(v));
               ],
             },
             signal(),
+            undefined,
+            onDispatch,
           ),
         commands: () => runner.mock.calls.map(([{ args }]) => args),
         name,
@@ -2511,7 +2514,17 @@ fs.writeFileSync(f,JSON.stringify(v));
       'persists %i MiB through %s and reads both saved and running fields',
       async (memoryMiB, operation) => {
         const f = await fixture(memoryMiB);
-        const capacity = await f[operation]();
+        const onDispatch = vi.fn(() => {
+          expect(f.commands().at(-1)).toEqual([
+            'inspect',
+            f.name,
+            '--format',
+            'json',
+          ]);
+          expect(f.commands().some(([verb]) => verb === 'start')).toBe(false);
+        });
+        const capacity = await f[operation](onDispatch);
+        expect(onDispatch).toHaveBeenCalledOnce();
         expect(f.reserve).toHaveBeenCalledOnce();
         expect(f.reserve).toHaveBeenCalledWith(
           { binding: f.binding, memoryMiB },
@@ -2551,10 +2564,12 @@ fs.writeFileSync(f,JSON.stringify(v));
       'rejects raw %s before making a reservation or mutating the sandbox',
       async (status) => {
         const f = await fixture();
+        const onDispatch = vi.fn();
         f.state.status = status;
-        await expect(f.start()).rejects.toMatchObject({
+        await expect(f.start(onDispatch)).rejects.toMatchObject({
           code: 'PROVIDER_FAILED',
         });
+        expect(onDispatch).not.toHaveBeenCalled();
         expect(f.reserve).not.toHaveBeenCalled();
         expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
       },

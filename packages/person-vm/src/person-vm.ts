@@ -16,6 +16,7 @@ import {
   type PersonVmBinding,
   type PersonVmDiskPreparationPort,
   type PersonVmEmployeeSelection,
+  type PersonVmEditorSelection,
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
@@ -59,6 +60,8 @@ import type {
 } from './platform-deletion.ts';
 import {
   checkedWebRoster,
+  PERSON_VM_WAKE_RESUME_AUDIT,
+  type PersonVmWakeStartup,
   type PersonVmWebRoster,
   type PersonVmWebEndpointReceipt,
   type PersonVmWebRosterPort,
@@ -123,13 +126,31 @@ type PrepareUpgradeWake = (
 type ScheduledStart = Readonly<{
   purpose: 'scheduled-wake';
   requestId: string;
-  readRoster(signal: AbortSignal): Promise<PersonVmWebRoster>;
+  readStartup(signal: AbortSignal): Promise<PersonVmWakeStartup>;
   withCurrentAuthority<T>(
     rosterDigest: string,
     signal: AbortSignal,
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T>;
 }>;
+type RetainedWakeClaim = Pick<
+  ScheduledStart,
+  'readStartup' | 'withCurrentAuthority'
+> & {
+  finish(result: 'ready' | 'not-started' | 'unknown'): Promise<void>;
+};
+
+function sameWebEmployee(
+  left: PersonVmWebRoster['entries'][number],
+  right: PersonVmWebRoster['entries'][number],
+) {
+  return (
+    left.workspaceId === right.workspaceId &&
+    left.employeeInstanceId === right.employeeInstanceId &&
+    left.employeeRevision === right.employeeRevision &&
+    left.employeeVersionId === right.employeeVersionId
+  );
+}
 
 function isAuthorizationFailure(error: unknown) {
   return (
@@ -170,6 +191,7 @@ type FirstPrewarmDisk = Readonly<{
 }>;
 type SelectedStartup = Readonly<{
   employee: PersonVmEmployeeSelection;
+  editor?: PersonVmEditorSelection;
   firstDisk?: FirstPrewarmDisk;
 }>;
 type UpgradePrewarm = {
@@ -216,6 +238,19 @@ export class PersonVmService
       egress?: PersonVmEgressPort;
       runtime?: PersonVmRuntimePort;
       nativeWeb?: PersonVmWebRosterPort;
+      employeeMaxRunning?: number;
+      retainedWake?: {
+        read(
+          binding: PersonVmBinding,
+          signal: AbortSignal,
+        ): Promise<PersonVmWakeStartup | null>;
+        claim(
+          binding: PersonVmBinding,
+          digest: string,
+          ownerToken: string,
+          signal: AbortSignal,
+        ): Promise<RetainedWakeClaim>;
+      };
       nativeCapacityAccounting?: boolean;
       /** Register the exact saved epoch before a start can touch its disk. */
       observeOwnedStart?: (
@@ -1005,6 +1040,7 @@ export class PersonVmService
     signal: AbortSignal,
     context?: RequestContext,
     scheduled = false,
+    editor?: PersonVmEditorSelection,
   ) {
     if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
     const binding = await this.pingRunning(row, signal);
@@ -1014,7 +1050,14 @@ export class PersonVmService
       return this.options.runtime.assertScheduledReady(binding, signal);
     }
     const result = context
-      ? await this.options.runtime.readiness(binding, signal, context)
+      ? await this.options.runtime.readiness(
+          binding,
+          signal,
+          context,
+          ...(editor
+            ? [{ ...editor, starting: row.phase === 'starting' }]
+            : []),
+        )
       : await this.options.runtime.readiness(binding, signal);
     if (
       !result ||
@@ -1120,14 +1163,14 @@ export class PersonVmService
   async startRetainedForSchedule(
     previous: PersonVmBinding,
     requestId: string,
-    authority: Pick<ScheduledStart, 'readRoster' | 'withCurrentAuthority'>,
+    authority: Pick<ScheduledStart, 'readStartup' | 'withCurrentAuthority'>,
     signal: AbortSignal,
   ) {
     UuidSchema.parse(requestId);
     const intent: ScheduledStart = {
       purpose: 'scheduled-wake',
       requestId,
-      readRoster: authority.readRoster,
+      readStartup: authority.readStartup,
       withCurrentAuthority: authority.withCurrentAuthority,
     };
     return this.options.store.withLease(
@@ -1220,16 +1263,15 @@ export class PersonVmService
       throw new PersonVmError('RUNTIME_NOT_READY');
     if (row.phase !== 'running')
       await this.admissionHost?.recoverStoppedEntryPermits(lease, signal);
-    const readRoster = (active: AbortSignal) =>
-      scheduled
-        ? scheduled.readRoster(active).then(checkedWebRoster)
-        : this.webRoster(context!, active);
     if (
       scheduled &&
       (!this.options.nativeWeb || !this.options.runtime.assertScheduledReady)
     )
       throw new PersonVmError('RUNTIME_NOT_READY');
-    const roster = await readRoster(signal);
+    const scheduledStartup = await scheduled?.readStartup(signal);
+    const roster = scheduledStartup
+      ? checkedWebRoster(scheduledStartup.roster)
+      : await this.webRoster(context!, signal);
     if (
       roster &&
       (roster.personId !== row.personId ||
@@ -1240,12 +1282,8 @@ export class PersonVmService
     if (
       roster &&
       selectedEmployee &&
-      !roster.entries.some(
-        (employee) =>
-          selectedEmployee.workspaceId === employee.workspaceId &&
-          selectedEmployee.employeeInstanceId === employee.employeeInstanceId &&
-          selectedEmployee.employeeRevision === employee.employeeRevision &&
-          selectedEmployee.employeeVersionId === employee.employeeVersionId,
+      !roster.entries.some((employee) =>
+        sameWebEmployee(selectedEmployee, employee),
       )
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
@@ -1285,8 +1323,11 @@ export class PersonVmService
         );
         await lease.guard();
       }
-      await this.ready(row, signal, context);
-      if (roster && (await readRoster(signal))?.digest !== roster.digest)
+      await this.ready(row, signal, context, false, selectedStartup?.editor);
+      if (
+        roster &&
+        (await this.webRoster(context, signal))?.digest !== roster.digest
+      )
         throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
       if (this.options.diskPool && assertAuthority)
         await assertAuthority(signal);
@@ -1318,28 +1359,117 @@ export class PersonVmService
     if (assertAuthority) await assertAuthority(signal);
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const previousBinding = row.instanceId ? bindingOf(row) : undefined;
-    row.leaseEpoch += 1;
-    row.instanceId = randomUUID();
-    row.phase = 'starting';
-    row.stoppedAt = null;
-    row.idleSince = null;
-    row.activityObservedAt = null;
-    row.lastActivityAt = this.now().toISOString();
-    target?.orphanedStart?.observeInstance(bindingOf(row));
+    const retained =
+      !scheduled &&
+      row.diskRetained &&
+      row.nativeCreated &&
+      (row.phase === 'stopped' || row.phase === 'cold')
+        ? this.options.retainedWake
+        : undefined;
+    const retainedStartup =
+      retained && previousBinding
+        ? await retained.read(previousBinding, signal)
+        : undefined;
+    const wake = scheduledStartup ?? retainedStartup ?? undefined;
+    const wakeEmployees = wake ? new Set(wake.employeeInstanceIds) : undefined;
+    const maxRunning = this.options.employeeMaxRunning ?? 4;
+    const launchCount = wakeEmployees
+      ? wakeEmployees.size +
+        Number(
+          !!selectedEmployee &&
+            !wakeEmployees.has(selectedEmployee.employeeInstanceId),
+        )
+      : 0;
+    if (wake && wakeEmployees) {
+      if (
+        !roster ||
+        !wakeEmployees.size ||
+        wakeEmployees.size !== wake.employeeInstanceIds.length ||
+        (retainedStartup && !selectedEmployee) ||
+        [...wakeEmployees].some((id) => {
+          const employee = wake.roster.entries.find(
+            (entry) => entry.employeeInstanceId === id,
+          );
+          return (
+            !employee ||
+            !roster.entries.some((entry) => sameWebEmployee(entry, employee))
+          );
+        })
+      )
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      if (
+        launchCount >
+        Math.min(maxRunning, row.verifiedWebSlotCapacity ?? maxRunning)
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY');
+    }
+    signal.throwIfAborted();
+    const retainedClaim =
+      retained && retainedStartup && previousBinding
+        ? await retained.claim(
+            previousBinding,
+            retainedStartup.digest,
+            lease.ownerToken!,
+            signal,
+          )
+        : undefined;
+    async function withWakeAuthority<T>(
+      active: AbortSignal,
+      work: (active: AbortSignal) => Promise<T>,
+    ) {
+      if (scheduled && scheduledStartup)
+        return scheduled.withCurrentAuthority(
+          scheduledStartup.digest,
+          active,
+          work,
+        );
+      if (retainedClaim && retainedStartup)
+        return retainedClaim.withCurrentAuthority(
+          retainedStartup.digest,
+          active,
+          work,
+        );
+      return work(active);
+    }
+    let reserved = false;
     let previousCapacityReleased = false;
-    if (lease.reserveStartup)
-      previousCapacityReleased = await lease.reserveStartup(row);
-    else await lease.save(row);
-    observer?.observeVmStart?.(bindingOf(row));
-    if (previousBinding)
-      this.admissionHost?.forgetStoppedEntryRecovery(previousBinding);
-    await lease.audit(row, {
-      requestId: intent.requestId,
-      action,
-      result: 'started',
-    });
     let nativeStartAttempted = false;
+    const observeNativeStart = () => {
+      nativeStartAttempted = true;
+    };
     try {
+      const reserve = async (active: AbortSignal) => {
+        active.throwIfAborted();
+        row.leaseEpoch += 1;
+        row.instanceId = randomUUID();
+        row.phase = 'starting';
+        row.stoppedAt = null;
+        row.idleSince = null;
+        row.activityObservedAt = null;
+        row.lastActivityAt = this.now().toISOString();
+        target?.orphanedStart?.observeInstance(bindingOf(row));
+        const adoption = wake && {
+          requestId: wake.planId,
+          action: PERSON_VM_WAKE_RESUME_AUDIT,
+          result: 'started' as const,
+          // The existing audit payload makes the new instance part of the proof.
+          errorCode: row.instanceId,
+        };
+        if (lease.reserveStartup)
+          previousCapacityReleased = await lease.reserveStartup(row, adoption);
+        else await lease.save(row, adoption && { audit: adoption });
+        reserved = true;
+      };
+      if (retainedStartup) await withWakeAuthority(signal, reserve);
+      else await reserve(signal);
+      observer?.observeVmStart?.(bindingOf(row));
+      if (previousBinding)
+        this.admissionHost?.forgetStoppedEntryRecovery(previousBinding);
+      await lease.audit(row, {
+        requestId: intent.requestId,
+        action,
+        result: 'started',
+      });
       const binding = bindingOf(row);
       this.options.observeOwnedStart?.(binding, context);
       signal.throwIfAborted();
@@ -1425,10 +1555,19 @@ export class PersonVmService
           )
             throw new PersonVmError('PROVIDER_FAILED');
         }
+        if (wake && (!endpoints.slots || launchCount > endpoints.slots.length))
+          throw new PersonVmError('RUNTIME_NOT_READY');
         web = Object.freeze({
-          ...(scheduled
-            ? { purpose: 'scheduled-wake' as const }
-            : { context: context! }),
+          ...(wake && { dispatchScheduledLaunch: withWakeAuthority }),
+          ...(scheduledStartup
+            ? {
+                purpose: 'scheduled-wake' as const,
+                scheduledEmployeeIds: scheduledStartup.employeeInstanceIds,
+              }
+            : {
+                context: context!,
+                scheduledEmployeeIds: retainedStartup?.employeeInstanceIds,
+              }),
           receipt: endpoints,
           recordNativeFailure: (
             failure: NativeWebSetupFailure,
@@ -1470,26 +1609,23 @@ export class PersonVmService
         const start = async (active: AbortSignal) => {
           await lease.guard();
           active.throwIfAborted();
-          nativeStartAttempted = true;
+          if (!native.observesStartDispatch) observeNativeStart();
           if (web && native.startWithWebEndpoints) {
             const fence = await native.startWithWebEndpoints(
               web.receipt,
               active,
               receipt,
+              observeNativeStart,
             );
+            observeNativeStart();
             checkedWebAfterStart = true;
             return fence;
           }
-          return native.start(binding, active);
+          const fence = await native.start(binding, active, observeNativeStart);
+          observeNativeStart();
+          return fence;
         };
-        if (scheduled) {
-          if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
-          capacity = await scheduled.withCurrentAuthority(
-            roster.digest,
-            signal,
-            start,
-          );
-        } else capacity = await start(signal);
+        capacity = await withWakeAuthority(signal, start);
       } else throw new PersonVmError('PROVIDER_FAILED');
       const startingSignal = capacity
         ? AbortSignal.any([signal, capacity.signal])
@@ -1515,10 +1651,19 @@ export class PersonVmService
           throw new PersonVmError('LEASE_LOST');
         await lease.assertAdmissionOpen(true);
         await this.options.egress!.assertActive(receipt, active);
+        if (wake) {
+          const current = scheduled
+            ? await scheduled.readStartup(active)
+            : await retainedClaim!.readStartup(active);
+          if (current?.digest !== wake.digest)
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+        }
         if (roster) {
-          const current = (await readRoster(active))!;
+          const current =
+            scheduledStartup?.roster ??
+            (await this.webRoster(context!, active));
           if (
-            current.personId !== binding.personId ||
+            current?.personId !== binding.personId ||
             current.organizationId !== binding.organizationId ||
             current.digest !== roster.digest
           )
@@ -1563,6 +1708,9 @@ export class PersonVmService
         web = Object.freeze({
           ...web,
           selectedEmployee,
+          ...(selectedStartup?.editor && {
+            editorThreadId: selectedStartup.editor.threadId,
+          }),
           ...(unusedEmployeeHomes && { unusedEmployeeHomes: true as const }),
         });
       }
@@ -1575,7 +1723,13 @@ export class PersonVmService
         web,
       });
       await assertStarting();
-      await this.ready(row, startingSignal, context, !!scheduled);
+      await this.ready(
+        row,
+        startingSignal,
+        context,
+        !!scheduled,
+        selectedStartup?.editor,
+      );
       await assertStarting();
       const publish = async (active: AbortSignal) => {
         await assertStartupAuthority(active);
@@ -1585,29 +1739,57 @@ export class PersonVmService
           await capacity.commitRunning();
           await assertStartupAuthority(active);
         }
-        active.throwIfAborted();
-        row.phase = 'running';
-        row.verifiedWebSlotCapacity =
-          web?.receipt.slots?.length ?? row.verifiedWebSlotCapacity;
-        await lease.save(row, {
-          audit: {
-            requestId: intent.requestId,
-            action,
-            result: 'succeeded',
-          },
-        });
+        const saveRunning = async (current: AbortSignal) => {
+          current.throwIfAborted();
+          row.phase = 'running';
+          row.verifiedWebSlotCapacity =
+            web?.receipt.slots?.length ?? row.verifiedWebSlotCapacity;
+          await lease.save(row, {
+            audit: {
+              requestId: intent.requestId,
+              action,
+              result: 'succeeded',
+            },
+          });
+        };
+        // Foreground roster reads take authority row locks. Join them before
+        // locking the prior plan, whose invalidation may come from those rows.
+        if (retainedStartup) await withWakeAuthority(active, saveRunning);
+        else await saveRunning(active);
         // The row remains owned by this lease until the accepted prewarm
         // authority is confirmed after saving it.
         if (assertAuthority) await assertAuthority(active);
         active.throwIfAborted();
       };
       if (scheduled) {
-        if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
-        await scheduled.withCurrentAuthority(roster.digest, signal, publish);
-        this.options.observeScheduledStart?.(binding, roster);
+        await withWakeAuthority(signal, publish);
+        this.options.observeScheduledStart?.(binding, roster!);
       } else await publish(signal);
+      await retainedClaim?.finish('ready');
       return view(row, !scheduled);
     } catch (error) {
+      const settleFailure = async (
+        result: 'not-started' | 'unknown',
+        cleanupErrors: unknown[] = [],
+      ) => {
+        try {
+          await retainedClaim?.finish(result);
+        } catch (settlementError) {
+          cleanupErrors.push(settlementError);
+        }
+        if (cleanupErrors.length)
+          throw new PersonVmError('CLEANUP_INCOMPLETE', {
+            cause: new AggregateError(
+              [error, ...cleanupErrors],
+              'VM startup and cleanup failed',
+              { cause: error },
+            ),
+          });
+      };
+      if (!reserved) {
+        await settleFailure('not-started');
+        throw error;
+      }
       const failure = safeError(error);
       try {
         await lease.audit(row, {
@@ -1619,20 +1801,37 @@ export class PersonVmService
       } catch {
         /* Failure audit cannot prevent physical cleanup after a lost DB connection. */
       }
+      const carryWake =
+        wake &&
+        !nativeStartAttempted &&
+        failure.code !== 'LEASE_LOST' &&
+        (retainedClaim || failure.code !== 'AUTHORIZATION_DENIED')
+          ? { planId: wake.planId, recorded: false }
+          : undefined;
+      const cleanupErrors: unknown[] = [];
       try {
         await this.cleanup(
           row,
           lease,
           'failure',
-          !scheduled || nativeStartAttempted,
+          !wake || nativeStartAttempted,
           {
             unstartedCapacity:
-              scheduled && !nativeStartAttempted && previousCapacityReleased,
+              !!wake && !nativeStartAttempted && previousCapacityReleased,
+            carryWake,
           },
         );
-      } catch {
-        throw new PersonVmError('CLEANUP_INCOMPLETE', { cause: failure });
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
       }
+      await settleFailure(
+        carryWake?.recorded && !cleanupErrors.length
+          ? 'not-started'
+          : 'unknown',
+        cleanupErrors,
+      );
+      if (scheduled && carryWake?.recorded)
+        throw new PersonVmError('RUNTIME_NOT_READY', { cause: failure });
       throw failure;
     }
   }
@@ -1642,6 +1841,7 @@ export class PersonVmService
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
     prepareEditor = false,
+    editor?: PersonVmEditorSelection,
   ) {
     await this.assertNoPendingDisk(row, signal);
     if (target) await target.assertAuthority(signal);
@@ -1669,7 +1869,13 @@ export class PersonVmService
       )
         throw new PersonVmError('LEASE_LOST');
     }
-    await this.ready(row, signal, prepareEditor ? context : undefined);
+    await this.ready(
+      row,
+      signal,
+      prepareEditor ? context : undefined,
+      false,
+      editor,
+    );
     if (
       roster &&
       (await this.webRoster(context, signal))?.digest !== roster.digest
@@ -1730,6 +1936,7 @@ export class PersonVmService
         input.observer,
         input.selectedEmployee,
         input.trigger === 'open',
+        input.editorThreadId,
       );
     return this.options.diskPool
       ? this.options.diskPool.inForeground(work)
@@ -1742,6 +1949,7 @@ export class PersonVmService
     observer?: PersonVmPrewarmObserver,
     selectedEmployee?: PersonVmEmployeeSelection,
     foregroundOpen = false,
+    editorThreadId?: string,
   ): Promise<PersonVmView> {
     const identity = await this.identity(context, 'start', signal);
     if (
@@ -1752,6 +1960,10 @@ export class PersonVmService
           context.workspaceId !== selectedEmployee.workspaceId))
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    const editor =
+      selectedEmployee && editorThreadId
+        ? { employee: selectedEmployee, threadId: editorThreadId }
+        : undefined;
     const start = (
       nextTarget?: PersonVmPrewarmFence,
       firstDisk?: FirstPrewarmDisk,
@@ -1762,7 +1974,7 @@ export class PersonVmService
         signal,
         nextTarget,
         startupObserver,
-        selectedEmployee && { employee: selectedEmployee, firstDisk },
+        selectedEmployee && { employee: selectedEmployee, editor, firstDisk },
         foregroundOpen,
       );
     const row = await this.options.store.read(identity.personId);
@@ -1803,7 +2015,14 @@ export class PersonVmService
           !sameVmBinding(bindingOf(current), exact)
         )
           throw new PersonVmError('LEASE_LOST');
-        await this.confirmRunning(current, context, signal, joinedTarget, true);
+        await this.confirmRunning(
+          current,
+          context,
+          signal,
+          joinedTarget,
+          true,
+          editor,
+        );
         takeover.signal.throwIfAborted();
         (observer ?? target).observeVmStart?.(exact);
         return view(current, true);
@@ -1815,6 +2034,7 @@ export class PersonVmService
         observer,
         selectedEmployee,
         foregroundOpen,
+        editorThreadId,
       );
     }
     this.assertPrewarmTarget(row, target, true);
@@ -1859,7 +2079,7 @@ export class PersonVmService
     // the start directly so a no-op create does not acquire a separate lease.
     if (target?.orphanedStart) return start(target);
     if (row?.phase === 'running') {
-      await this.confirmRunning(row, context, signal, target, true);
+      await this.confirmRunning(row, context, signal, target, true, editor);
       return view(row, true);
     }
 
@@ -1956,6 +2176,7 @@ export class PersonVmService
       requireNativeStopped?: boolean;
       /** This attempt never dispatched, and the prior epoch already released. */
       unstartedCapacity?: boolean;
+      carryWake?: { planId: string; recorded: boolean };
       onDetached?: (mount: string, signal: AbortSignal) => Promise<void>;
     },
   ) {
@@ -1965,6 +2186,8 @@ export class PersonVmService
     let failed = false;
     let egressJoined = true;
     let stopped: 'stopped' | 'absent' | undefined;
+    let canCarryWake = false;
+    let failedCarryStop: ErrorOptions | undefined;
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
       if (stopNative && !completion?.nativeAlreadyJoined) {
@@ -2068,15 +2291,33 @@ export class PersonVmService
       const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
       try {
         if (row.instanceId) {
-          await this.mounted(row, signal, lease);
-          stopped = await stopAndConfirm(signal);
+          const mount = await this.mounted(row, signal, lease);
+          if (completion?.carryWake) {
+            const native = this.options.native;
+            if (!row.diskRetained || !native.assertStopped)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            await lease.guard();
+            const binding = bindingOf(row);
+            await native.stop(binding, signal, { requireStopped: true });
+            await native.assertStopped(binding, signal);
+            await lease.guard();
+            stopped = 'stopped';
+            try {
+              await native.assertRetainedStartup?.(binding, mount, signal);
+              signal.throwIfAborted();
+              canCarryWake = true;
+            } catch {
+              // Physical cleanup can still finish without a reusable wake proof.
+            }
+          } else stopped = await stopAndConfirm(signal);
         } else {
           const inspected = await this.reconcileDisk(row, signal, lease);
           if (!row.nativeCreated && inspected.state === 'ready')
             stopped = 'absent';
         }
-      } catch {
+      } catch (error) {
         failed = true;
+        if (completion?.carryWake) failedCarryStop = { cause: error };
       }
     }
     if (stopped) {
@@ -2107,15 +2348,26 @@ export class PersonVmService
       }
     } else failed = true;
     row.phase = failed ? 'failed' : retainedDeletion ? 'deleted' : 'stopped';
+    const carry = !failed && canCarryWake && completion?.carryWake;
     await lease.save(row, {
-      audit: failed ? undefined : completion?.audit,
+      audit: carry
+        ? {
+            requestId: carry.planId,
+            action: PERSON_VM_WAKE_RESUME_AUDIT,
+            result: 'succeeded',
+            errorCode: row.instanceId!,
+          }
+        : failed
+          ? undefined
+          : completion?.audit,
       capacityReleased:
         (platformDetach || this.options.nativeCapacityAccounting === true) &&
         !failed &&
         (stopNative || completion?.unstartedCapacity === true) &&
         Boolean(row.instanceId),
     });
-    if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (carry) carry.recorded = true;
+    if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE', failedCarryStop);
     if (row.instanceId) {
       const binding = bindingOf(row);
       this.admissionHost?.forgetStoppedEntryRecovery(binding);

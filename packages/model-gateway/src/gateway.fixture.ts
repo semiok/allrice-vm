@@ -26,7 +26,6 @@ import type {
   ModelGatewayAuthority,
   ModelGatewayAdmission,
   ModelGatewayStore,
-  GatewayProvider,
 } from './contract.ts';
 import { createModelGateway } from './gateway.ts';
 import { createDshGatewayProvider, GatewayLlmAdapter } from './dsh-provider.ts';
@@ -667,7 +666,7 @@ export async function nativeProviderFixture(
 }
 
 export async function gatewayFixture(options: {
-  provider: GatewayProvider;
+  provider: Parameters<typeof createModelGateway>[0]['provider'];
   store?: FixtureStore;
   binding?: ModelCallBinding;
   authority?: ModelGatewayAuthority;

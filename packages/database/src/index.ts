@@ -30,6 +30,8 @@ export {
 export * from './d-entry-authority.ts';
 export { requireEmployeePanelsAccess } from './employee-panels-access.ts';
 export { requireCurrentPlatformAdmin } from './platform-authority.ts';
+export { readAdministrationRuntimeTimeline } from './administration-runtime.ts';
+export { readPersonVmAdministrationSummary } from './person-vm-administration.ts';
 export * from './user-preferences.ts';
 export * from './tenant-administration.ts';
 export * from './organization-administration.ts';
@@ -454,6 +456,8 @@ export * from './employee-memory-port.ts';
 export * from './capabilities/native-schedule-observation-ledger.ts';
 export {
   createPostgresPersonVmScheduledWakeStore,
+  PERSON_VM_WAKE_CLAIM_MS,
+  readCompletePersonVmWakeRoster,
   readPersonVmWakeRoster,
   withOwnedPersonVmAuthorityTransaction,
   type ScheduledWakeClaim,

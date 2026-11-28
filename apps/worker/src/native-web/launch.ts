@@ -1,3 +1,5 @@
+import { nativeScopedModelPatches } from './model-task-presets.js';
+import type { ModelRouteKey, ScopedModelRule } from '@allrice/model-gateway';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -57,6 +59,16 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  scoped?: Readonly<{
+    rules: readonly ScopedModelRule[];
+    compaction?: ModelRouteKey;
+    title?: ModelRouteKey;
+    models: readonly {
+      provider: string;
+      model: string;
+      modelInfo: LlmResolvedModelInfo;
+    }[];
+  }>;
   historicalModels?: readonly LlmResolvedModelInfo[];
   webSearchEnabled?: boolean;
 }>;
@@ -65,11 +77,13 @@ async function managedModelFiles(directory: string, cliPath: string) {
   const resolve = createRequire(import.meta.url);
   const dist = dirname(resolve.resolve('@allrice/model-gateway'));
   const modules = await Promise.all(
-    ['dsh-provider.js', 'contract.js'].map(async (name) => ({
-      path: posix.join(directory, name),
-      contents: await readFile(join(dist, name), 'utf8'),
-      mode: 0o600,
-    })),
+    ['dsh-provider.js', 'contract.js', 'scoped-routes.js'].map(
+      async (name) => ({
+        path: posix.join(directory, name),
+        contents: await readFile(join(dist, name), 'utf8'),
+        mode: 0o600,
+      }),
+    ),
   );
   return [
     ...modules,
@@ -218,6 +232,7 @@ export async function prepareNativeWebLaunch(
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+import { selectScopedModel } from './model-gateway/scoped-routes.js';
 import { apply as applyManagedSearch, observeManagedSearchCalls } from './allrice-managed-web-search.mjs';
 export { inject, name } from './owner.mjs';
 export function apply(ctx, config) {
@@ -228,6 +243,7 @@ export function apply(ctx, config) {
       return applyManagedSearch(scope, settings, WebError);
     },
     observeManagedSearchCalls,
+    selectScopedModel,
   });
 }
 `,
@@ -298,9 +314,11 @@ export function apply(ctx, config) {
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                ...nativeSearchToolPatches(
-                  modelAdapter.webSearchEnabled === true,
-                ),
+                ...(modelAdapter.scoped
+                  ? nativeScopedModelPatches(modelAdapter.scoped)
+                  : nativeSearchToolPatches(
+                      modelAdapter.webSearchEnabled === true,
+                    )),
                 {
                   id: 'agent-default-model',
                   config: {

@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
+import type { SessionHistoryRecord } from '@deepseek-ai/dsh-api-session-controller/types';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
@@ -18,12 +20,16 @@ import {
   ReferenceLibraryOptionsSchema,
   ReferenceRevisionSchema,
 } from '@allrice/contracts';
-import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import {
+  deferred,
+  summary,
+} from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { skillTestCatalog } from '../../../web/test/employee-skills-host-data.js';
 import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
+import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
 import {
   fixture,
   buildProfileFixture,
@@ -40,29 +46,39 @@ it
   .skipIf(!browserExecutable)
   .each([
     'refresh',
+    'cold-assets',
     'stall',
     'switch',
     'baseline',
     'attached',
     'unattached',
     'native-create',
+    'outer-create',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
   ] as const)(
   'rc.2 workbench composer (%s)',
-  { timeout: 120_000 },
+  { timeout: process.env.ALLRICE_RUN_ASSET_BENCH ? 200_000 : 120_000 },
   async (scenario) => {
+    const coldAssets = scenario === 'cold-assets';
+    const bench = coldAssets && process.env.ALLRICE_RUN_ASSET_BENCH;
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
-    const nativeCreate = scenario.startsWith('native-create');
+    const outerCreate = scenario === 'outer-create';
+    const nativeCreate = outerCreate || scenario.startsWith('native-create');
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
-      (nativeCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate;
+      (nativeCreate && !outerCreate && process.platform !== 'darwin');
+    const realShell = switching || nativeCreate || coldAssets;
     const release = await buildProfileFixture();
+    // The production pack and guest materialize the same code separately.
+    // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
+    const independentlyInstalled = coldAssets || scenario === 'refresh';
+    const live = independentlyInstalled ? await buildProfileFixture() : release;
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
+      source: { head: string };
       files: { path: string }[];
       source: { contributionInputs: { path: string; sha256: string }[] };
       profile: { files: { reference: string; sha256: string }[] };
@@ -81,8 +97,9 @@ it
       '.css': 'text/css',
       '.wasm': 'application/wasm',
     };
-    const f = await fixture(release);
-    const otherThread = randomUUID();
+    const f = await fixture({ ...live, directory: release.directory });
+    let otherThread = randomUUID();
+    let outerCreated = false;
     const revokeOther =
       switching || createAfterSwitch
         ? f.registerThread(otherThread)
@@ -167,7 +184,12 @@ it
     );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       ['root', 'root-' + otherThread].includes(String(row.sessionId))
-        ? { ...row, blank: !nativeCreate, cwd: '/work' }
+        ? {
+            ...row,
+            blank: !nativeCreate,
+            cwd: '/work',
+            ...(outerCreate && { agentAvailable: true }),
+          }
         : row,
     );
     const require = createRequire(
@@ -192,7 +214,8 @@ it
             contents: `import { createRoot } from 'react-dom/client';
               import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
               createRoot(document.getElementById('root')).render(
-                <EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+                <EmployeeNativePage prepare query={location.search.slice(1)}
+                  startupAssetUrls={JSON.parse(document.getElementById('startup-assets')?.textContent ?? '[]')} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
           },
@@ -200,6 +223,7 @@ it
           write: false,
           outdir: '/fixture-dsh-switch',
           jsx: 'automatic',
+          minify: coldAssets,
           loader: {
             '.woff': 'dataurl',
             '.woff2': 'dataurl',
@@ -210,38 +234,102 @@ it
       : undefined;
     const createdThread = randomUUID();
     const createdNativeId = 'native-created';
+    const outerNativeId = 'native-outer-created';
+    let expectedNativeId: string | undefined;
+    if (outerCreate) {
+      let records: readonly SessionHistoryRecord[] = [];
+      f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
+      f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
+        expect(sessionId).toBe('root');
+        expect(content).toEqual([{ type: 'text', text: '你好' }]);
+        const message = {
+          role: 'user',
+          id: randomUUID(),
+          source: { kind: 'user', rpcId: requestId },
+          content: [{ type: 'text', text: '你好' }],
+        };
+        const assistant = {
+          role: 'assistant',
+          id: randomUUID(),
+          source: { kind: 'model', provider: 'fixture', model: 'fixture' },
+          content: [{ type: 'text', text: '隔离会话的首条回复' }],
+        };
+        const events: Omit<SessionHistoryRecord['event'], 'seq' | 'time'>[] = [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'user/message', data: message, surfaceOp: 'append' },
+          { type: 'step/start', data: { turn: 1, step: 1 } },
+          {
+            type: 'assistant/message',
+            data: {
+              turn: 1,
+              step: 1,
+              message: assistant,
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              stream: [],
+            },
+            surfaceOp: 'append',
+          },
+          { type: 'step/end', data: { turn: 1, step: 1 } },
+          {
+            type: 'turn/end',
+            data: { turn: 1, reason: { kind: 'completed' } },
+          },
+        ];
+        records = events.map((event, index) => ({
+          type: 'event',
+          event: { ...event, seq: index + 1, time: Date.now() },
+        }));
+      };
+      f.host.catalog.allocateSessionId = () =>
+        summary(expectedNativeId ?? randomUUID()).sessionId;
+    }
+    const nativeIdsByThread = new Map<string, string>();
     let registered = false;
     const createReplies: unknown[] = [];
+    const promptReplies: unknown[] = [];
     const createdResponse = deferred();
     const deliverCreatedResponse = deferred();
     let holdCreatedResponse = false;
     let switchProofRequests = 0;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
+      const nativeRoots = new Map<
+        string,
+        Awaited<ReturnType<typeof registerFixture>>
+      >();
+      f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+        nativeRoots.get(id),
+      );
       f.registerRoot.mockImplementation(
         async (context, identity, receipt, active) => {
-          expect(receipt.nativeSessionId).toBe(createdNativeId);
+          const nativeId = receipt.nativeSessionId;
+          const isOuter = outerCreate && nativeId === outerNativeId;
           const registeredFixture = await registerFixture(
             context,
             identity,
             receipt,
             active,
           );
+          const threadId = isOuter
+            ? otherThread
+            : nativeId === createdNativeId
+              ? createdThread
+              : registeredFixture.thread.id;
+          if (isOuter) outerCreated = true;
           const root = {
             ...registeredFixture,
-            identity: { ...identity, threadId: createdThread },
-            thread: { ...registeredFixture.thread, id: createdThread },
+            identity: { ...identity, threadId },
+            thread: { ...registeredFixture.thread, id: threadId },
           };
           registered = true;
           f.rememberRoot(root);
-          f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
-            id === createdNativeId ? root : undefined,
-          );
+          nativeRoots.set(nativeId, root);
+          nativeIdsByThread.set(threadId, nativeId);
           const created = f.host.catalog.items.find(
-            ({ sessionId }) => sessionId === createdNativeId,
+            ({ sessionId }) => sessionId === nativeId,
           );
           if (created) Object.assign(created, { cwd: '/work', blank: true });
-          nativeWorkspace.sessionIds.push(createdNativeId);
+          nativeWorkspace.sessionIds.push(nativeId);
           f.host.host.emit('domain/changed', {
             domain: 'workspace',
             table: 'workspaces',
@@ -267,9 +355,14 @@ it
       'dynamicCordisRunner/syncInspectManifest',
     ]);
     const graph = DEntryProfileGraphSchema.parse(release.graph);
-    const application = graph.batches.find(
+    const liveGraph = DEntryProfileGraphSchema.parse(live.graph);
+    const application = liveGraph.batches.find(
       ({ phase }) => phase === 'application',
     )!;
+    if (independentlyInstalled)
+      expect(application.rev).not.toBe(
+        graph.batches.find(({ phase }) => phase === 'application')?.rev,
+      );
     const publicRoot =
       '/_next/static/dsh-profile/' +
       createHash('sha256').update(sealed).digest('hex') +
@@ -288,6 +381,100 @@ it
         bundle,
       ]),
     );
+    const applicationPath = [...publicBundles].find(
+      ([, bundle]) => bundle.phase === 'application',
+    )![0];
+    let publicIndex = publicProfileBundles.parse(
+      bundles.map(({ reference, revision, sha256 }) => ({
+        reference,
+        revision,
+        sha256,
+      })),
+    );
+    const publicEntry = publicRoot + 'managed/employee-web-entry.js';
+    const publicStyle = publicRoot + 'managed/employee-web-entry.css';
+    const nativeStyles = manifest.files
+      .filter(({ path }) =>
+        /^native\/assets\/(index|vendor)-[\w-]+\.css$/.test(path),
+      )
+      .map(
+        ({ path }) =>
+          '<link rel="stylesheet" href="' + publicRoot + path + '">',
+      )
+      .join('');
+    let coldPaths: string[] = [];
+    let stagedPaths: Set<string> | undefined;
+    if (independentlyInstalled) {
+      const root = await realpath(
+        await mkdtemp(join(tmpdir(), 'd-entry-warm-')),
+      );
+      closes.push(() => rm(root, { recursive: true, force: true }));
+      await mkdir(join(root, 'apps/worker/dist'), { recursive: true });
+      await mkdir(join(root, 'apps/web/.next/server'), { recursive: true });
+      await mkdir(join(root, 'apps/web/.next/static'), { recursive: true });
+      await cp(release.directory, join(root, 'apps/worker/dist/d-entry-web'), {
+        recursive: true,
+      });
+      const stageModule = new URL(
+        '../../../../scripts/dev-release/stage-dsh-profile-assets.mjs',
+        import.meta.url,
+      );
+      const {
+        stageDshProfileAssets,
+      }: {
+        stageDshProfileAssets(root: string, sourceSha: string): Promise<void>;
+      } = await import(stageModule.href);
+      await stageDshProfileAssets(root, manifest.source.head);
+      const index: { paths: string[]; startup: string[]; bundles: unknown } =
+        JSON.parse(
+          await readFile(
+            join(root, 'apps/web/.next/server/dsh-profile.json'),
+            'utf8',
+          ),
+        );
+      publicIndex = publicProfileBundles.parse(index.bundles);
+      if (coldAssets && bench !== 'baseline')
+        coldPaths = index.startup.map((path) => publicRoot + path);
+      stagedPaths = new Set(index.paths);
+    }
+    const coldRequests = new Map<string, number>();
+    const coldFinished = new Map<string, number>();
+    let readyAt: number | undefined;
+    let prewarmAt: number | undefined;
+    let frameApplicationAt: number | undefined;
+    const operationId = randomUUID();
+    const coldWindow = bench === 'overlap' ? 3_000 : bench ? 60_000 : 1_500;
+    const applicationTransfers: {
+      start: number;
+      end?: number;
+      bytes: number;
+    }[] = [];
+    async function sendColdApplication(
+      response: ServerResponse,
+      bytes: Buffer,
+    ) {
+      const transfer: (typeof applicationTransfers)[number] = {
+        start: performance.now(),
+        bytes: 0,
+      };
+      applicationTransfers.push(transfer);
+      const client = new AbortController();
+      response.once('close', () => client.abort());
+      try {
+        const chunkSize = Math.ceil(bytes.length / 100);
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          const chunk = bytes.subarray(offset, offset + chunkSize);
+          response.write(chunk);
+          transfer.bytes += chunk.byteLength;
+          if (offset + chunk.byteLength < bytes.length)
+            await delay(400, undefined, { signal: client.signal });
+        }
+        transfer.end = performance.now();
+        response.end();
+      } catch (error) {
+        if (!client.signal.aborted) throw error;
+      }
+    }
     let earlyUrls: string[] = [];
     const seenEarly = new Set<string>();
     const earlyBootstrapSeen = deferred<void>();
@@ -455,13 +642,60 @@ it
           }
           if (url.pathname === '/api/v1/d-entry/native-prewarm') {
             request.resume();
-            return response.writeHead(204).end();
+            if (!coldAssets) return response.writeHead(204).end();
+            prewarmAt = performance.now();
+            return await copy(
+              new Response(
+                JSON.stringify({
+                  operationId,
+                  pollAfterMs: 1000,
+                  expiresAt: new Date(Date.now() + 180_000).toISOString(),
+                }),
+                {
+                  status: 202,
+                  headers: { 'content-type': 'application/json' },
+                },
+              ),
+            );
+          }
+          if (
+            coldAssets &&
+            url.pathname === '/api/v1/d-entry/native-prewarm/status'
+          ) {
+            const ready = performance.now() - prewarmAt! >= coldWindow;
+            if (ready) readyAt ??= performance.now();
+            return await copy(
+              Response.json({ state: ready ? 'ready' : 'starting' }),
+            );
+          }
+          if (outerCreate && url.pathname === '/api/v1/sessions') {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request) chunks.push(chunk);
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            otherThread = body.operationId;
+            f.registerThread(otherThread);
+            const nativeId = 'root-' + otherThread;
+            const row = f.host.catalog.items.find(
+              (item) => item.sessionId === nativeId,
+            );
+            Object.assign(row!, { cwd: '/work', blank: true });
+            nativeWorkspace.sessionIds.push(nativeId);
+            outerCreated = true;
+            return await copy(
+              Response.json({ ...f.selection, threadId: otherThread }),
+            );
           }
           if (url.pathname === '/chatflow/4.0') {
             return response
               .writeHead(200, { 'content-type': 'text/html' })
               .end(
-                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
+                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
+                  (coldAssets && bench !== 'progress'
+                    ? '<script id="startup-assets" type="application/json">' +
+                      JSON.stringify(coldPaths) +
+                      '</script>'
+                    : '') +
+                  '<script src="/outer.js"></script>',
               );
           }
           if (url.pathname === '/outer.js' || url.pathname === '/outer.css') {
@@ -501,6 +735,11 @@ it
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
+          if (outerCreate && input.endpoint === 'session/prompt')
+            promptReplies.push({
+              status: result.status,
+              ...(await result.clone().json()),
+            });
           if (nativeCreate && input.endpoint === 'session/create')
             createReplies.push({
               status: result.status,
@@ -535,18 +774,40 @@ it
           }
           const timing = { kind, start: performance.now(), end: 0 };
           traffic.push(timing);
-          await copy(
-            await f.publish(
-              kind,
-              scopeId!,
-              Object.fromEntries(url.searchParams),
-            ),
+          const result = await f.publish(
+            kind,
+            scopeId!,
+            Object.fromEntries(url.searchParams),
           );
+          if (
+            bench &&
+            kind === 'assets' &&
+            result.ok &&
+            url.searchParams.get('reference') === application.url
+          ) {
+            const bytes = gzipSync(Buffer.from(await result.arrayBuffer()));
+            response.writeHead(200, {
+              'content-type': 'text/javascript',
+              'content-encoding': 'gzip',
+              'content-length': bytes.length,
+              'cache-control': 'no-store',
+            });
+            await sendColdApplication(response, bytes);
+          } else await copy(result);
           timing.end = performance.now();
           return;
         }
         const publicBundle = !stall && publicBundles.get(url.pathname);
         if (publicBundle) {
+          if (coldAssets) {
+            coldRequests.set(
+              url.pathname,
+              (coldRequests.get(url.pathname) ?? 0) + 1,
+            );
+            response.once('finish', () =>
+              coldFinished.set(url.pathname, performance.now()),
+            );
+          }
           if (earlyUrls.includes(url.pathname)) {
             seenEarly.add(url.pathname);
             if (seenEarly.size === earlyUrls.length)
@@ -559,6 +820,8 @@ it
           };
           traffic.push(timing);
           expect(request.headers.cookie).toBeUndefined();
+          if (coldAssets && readyAt === undefined)
+            expect(request.headers.referer).toBeUndefined();
           const bytes = await release.read(
             publicBundle.reference,
             new AbortController().signal,
@@ -569,16 +832,49 @@ it
           const encoded = gzipSync(bytes);
           await delay(180);
           timing.end = performance.now();
-          response
+          response.writeHead(200, {
+            'content-type': 'text/javascript',
+            'cache-control': 'public, max-age=31536000, immutable',
+            'content-encoding': 'gzip',
+            'content-length': encoded.length,
+            vary: 'accept-encoding',
+          });
+          if (bench && publicBundle.phase === 'application')
+            await sendColdApplication(response, encoded);
+          else response.end(encoded);
+          return;
+        }
+        if (coldAssets && url.pathname.startsWith(publicRoot)) {
+          const file = url.pathname.slice(publicRoot.length);
+          if (
+            !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
+          )
+            return response.writeHead(404).end();
+          if (coldPaths.includes(url.pathname)) {
+            coldRequests.set(
+              url.pathname,
+              (coldRequests.get(url.pathname) ?? 0) + 1,
+            );
+            response.once('finish', () =>
+              coldFinished.set(url.pathname, performance.now()),
+            );
+            if (readyAt === undefined) {
+              expect(request.headers.cookie).toBeUndefined();
+              expect(request.headers.referer).toBeUndefined();
+            }
+          }
+          const encoded = gzipSync(
+            await readFile(join(release.directory, file)),
+          );
+          return response
             .writeHead(200, {
-              'content-type': 'text/javascript',
-              'cache-control': 'public, max-age=31536000, immutable',
+              'content-type': mime[extname(file)] ?? 'application/octet-stream',
               'content-encoding': 'gzip',
               'content-length': encoded.length,
+              'cache-control': 'public, max-age=31536000, immutable',
               vary: 'accept-encoding',
             })
             .end(encoded);
-          return;
         }
         if (staticFiles.has(url.pathname)) {
           if (
@@ -647,7 +943,8 @@ it
         };
         const identity = f.selectionIdentity(selection);
         const nativeId =
-          selection.threadId === otherThread ? 'root-' + otherThread : 'root';
+          nativeIdsByThread.get(selection.threadId) ??
+          (selection.threadId === otherThread ? 'root-' + otherThread : 'root');
         const version = {
           id: identity.employeeVersionId,
           manifest: { name: 'Fixture employee' },
@@ -665,7 +962,7 @@ it
             currentVersion: version,
             versions: [version],
           })),
-          sessions: (switching || createAfterSwitch
+          sessions: (switching || createAfterSwitch || outerCreated
             ? [
                 f.selection.threadId,
                 otherThread,
@@ -697,22 +994,23 @@ it
           ? []
           : publicStartupBundleUrls(published, {
               root: publicRoot,
-              bundles,
+              bundles: publicIndex,
             });
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          <link rel="stylesheet" href="/managed/employee-web-entry.css">
+          ${coldAssets ? nativeStyles : ''}
+          <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-login-session-id="${f.context.sessionId}"
-            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${graph.rev}"
-            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
+            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${published.graph.rev}"
+            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="/managed/employee-web-entry.js"></script>`);
+          <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
       } catch {
         response.writeHead(500).end();
       }
@@ -728,6 +1026,23 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (bench === 'overlap') {
+      const href = f.origin + applicationPath;
+      page.on('request', (request) => {
+        if (request.url() === href && request.frame() !== page.mainFrame())
+          frameApplicationAt ??= performance.now();
+      });
+    }
+    if (bench) {
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false,
+        latency: 200,
+        downloadThroughput: 228_000,
+        uploadThroughput: 228_000,
+      });
+    }
     // Keep the first test response deliverable after abort so we exercise the
     // Reader's late-result guard, independently of browser fetch cancellation.
     if (scenario === 'attached')
@@ -761,32 +1076,36 @@ it
       }, skillsPath);
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
-      await page.addInitScript((linuxProfile) => {
-        if (linuxProfile)
-          Object.defineProperty(navigator, 'platform', {
-            value: 'Linux x86_64',
-          });
-        localStorage.setItem(
-          'dsh.sessions.current',
-          JSON.stringify({ sessionId: 'root' }),
-        );
-        // rc.2 defines this native command on every platform but provides no
-        // default binding for web:linux. Use its own per-profile preferences.
-        localStorage.setItem(
-          'dsh.keybindings.v1',
-          JSON.stringify({
-            schemaVersion: 1,
-            profiles: {
-              'web:linux': {
-                'session.new': {
-                  code: 'Period',
-                  modifiers: ['primary', 'shift'],
+      await page.addInitScript(
+        ({ linuxProfile, outerCreate }) => {
+          if (linuxProfile || outerCreate)
+            Object.defineProperty(navigator, 'platform', {
+              value: 'Linux x86_64',
+            });
+          if (!outerCreate)
+            localStorage.setItem(
+              'dsh.sessions.current',
+              JSON.stringify({ sessionId: 'root' }),
+            );
+          // rc.2 defines this native command on every platform but provides no
+          // default binding for web:linux. Use its own per-profile preferences.
+          localStorage.setItem(
+            'dsh.keybindings.v1',
+            JSON.stringify({
+              schemaVersion: 1,
+              profiles: {
+                'web:linux': {
+                  'session.new': {
+                    code: 'Period',
+                    modifiers: ['primary', 'shift'],
+                  },
                 },
               },
-            },
-          }),
-        );
-      }, scenario === 'native-create-linux');
+            }),
+          );
+        },
+        { linuxProfile: scenario === 'native-create-linux', outerCreate },
+      );
     }
     const streams = new Map<string, string>();
     let socketCount = 0;
@@ -853,6 +1172,7 @@ it
       realShell
         ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
         : f.origin,
+      coldAssets ? { waitUntil: 'commit' } : undefined,
     );
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
@@ -871,6 +1191,78 @@ it
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
+    if (coldAssets) {
+      const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
+      await expect
+        .poll(() => readyAt ?? 0, { timeout: bench ? 105_000 : 20_000 })
+        .toBeGreaterThan(0);
+      const elapsed = bench ? 82_000 : 20_000;
+      const outcome = await Promise.race([
+        alert.waitFor({ timeout: elapsed }).then(() => 'timeout'),
+        editor.waitFor({ timeout: elapsed }).then(() => 'editable'),
+      ]).catch(
+        async () =>
+          'missing: ' + (await page.locator('body').innerText()).slice(0, 300),
+      );
+      console.info(
+        'COLD_ASSET_BENCH ' +
+          JSON.stringify({
+            mode: bench || 'warming-test',
+            outcome,
+            errors,
+            scopedBundleReads,
+            readyToOutcomeMs: Math.round(performance.now() - readyAt!),
+            prewarmToReadyMs: Math.round(readyAt! - prewarmAt!),
+            browser: browser.version(),
+            applicationStartsRelativeToReadyMs: applicationTransfers.map(
+              ({ start }) => Math.round(start - readyAt!),
+            ),
+            iframeApplicationRelativeToReadyMs:
+              frameApplicationAt === undefined
+                ? null
+                : Math.round(frameApplicationAt - readyAt!),
+            initialTransferMs: applicationTransfers.map(({ start, end }) =>
+              end === undefined ? null : Math.round(end - start),
+            ),
+            originApplicationBytes: applicationTransfers.map(
+              ({ bytes }) => bytes,
+            ),
+            requests: Object.fromEntries(coldRequests),
+            completedBeforeReady: coldPaths.filter(
+              (url) => (coldFinished.get(url) ?? Infinity) < readyAt!,
+            ).length,
+          }),
+      );
+      if (bench === 'baseline') {
+        expect(outcome).toBe('timeout');
+        expect(applicationTransfers).toHaveLength(2);
+        expect(
+          applicationTransfers.every(({ bytes, end }) => bytes > 0 && !end),
+        ).toBe(true);
+        expect(scopedBundleReads).toBe(1);
+      } else {
+        expect(outcome).toBe('editable');
+        await editor.fill('冷启动后的草稿');
+        expect(await editor.isEditable()).toBe(true);
+        expect(scopedBundleReads).toBe(0);
+        if (bench === 'overlap') {
+          expect(applicationTransfers).toHaveLength(1);
+          expect(applicationTransfers[0]!.start).toBeLessThan(readyAt!);
+          expect(frameApplicationAt).toBeGreaterThan(readyAt!);
+          expect(frameApplicationAt).toBeLessThan(
+            applicationTransfers[0]!.end!,
+          );
+        }
+        if (bench !== 'progress')
+          for (const url of coldPaths) {
+            if (bench !== 'overlap')
+              expect(coldFinished.get(url)).toBeLessThan(readyAt!);
+            expect(coldRequests.get(url)).toBe(1);
+          }
+      }
+      await context.close();
+      return;
+    }
     try {
       // The iframe loads its native bundles before opening workspace/follow.
       // Navigation alone does not mean the browser has even sent that open.
@@ -1225,10 +1617,94 @@ it
           })),
         }),
     );
+    const nativeSession = () =>
+      editor.evaluate((node) =>
+        node
+          .closest('[data-conversation-session]')
+          ?.getAttribute('data-conversation-session'),
+      );
+    if (outerCreate) {
+      const firstThread = f.selection.threadId;
+      const firstReply = workbench.getByText('隔离会话的首条回复', {
+        exact: true,
+      });
+      await expect.poll(nativeSession).toBe('root');
+      await editor.fill('你好');
+      await editor.press('Enter');
+      await expect
+        .poll(() => promptReplies)
+        .toMatchObject([
+          { status: 200, result: { ok: true, value: { accepted: true } } },
+        ]);
+      await page.reload();
+      try {
+        await firstReply.waitFor({ timeout: 10_000 });
+      } catch (cause) {
+        throw Error(
+          JSON.stringify({
+            errors,
+            firstItems,
+            displayed: await nativeSession(),
+          }),
+          {
+            cause,
+          },
+        );
+      }
+      await expect.poll(nativeSession).toBe('root');
+
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((node, value) => {
+        node.dataset.fixtureDocument = value;
+      }, mark);
+      const before = { documentLoads, socketCount };
+      const initialProofs = switchProofRequests;
+      const initialRegistrations = f.registerRoot.mock.calls.length;
+      expectedNativeId = outerNativeId;
+      await workbench
+        .getByRole('button', {
+          name: '和 Fixture employee 开新会话',
+          exact: true,
+        })
+        .click();
+      await page.waitForURL(
+        (url) => url.searchParams.get('threadId') === otherThread,
+        { timeout: 20_000 },
+      );
+      await expect.poll(nativeSession).toBe(outerNativeId);
+      expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
+      expect(switchProofRequests).toBe(initialProofs + 1);
+      expect(await editor.textContent()).toBe('');
+      expect(await firstReply.count()).toBe(0);
+      for (const [thread, nativeId] of [
+        [firstThread, 'root'],
+        [otherThread, outerNativeId],
+        [firstThread, 'root'],
+      ]) {
+        await workbench
+          .locator('[data-row-key="session:' + thread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === thread,
+        );
+        await expect.poll(nativeSession).toBe(nativeId);
+        if (thread === firstThread)
+          await firstReply.waitFor({ timeout: 10_000 });
+        else expect(await firstReply.count()).toBe(0);
+      }
+      expect({ documentLoads, socketCount }).toEqual(before);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+
+      expectedNativeId = createdNativeId;
+    }
     if (nativeCreate) {
       const mark = randomUUID();
       const frame = page.locator('iframe');
       const initialSockets = socketCount;
+      const initialDocuments = documentLoads;
+      const initialRegistrations = f.registerRoot.mock.calls.length;
       await frame.evaluate((node, mark) => {
         node.dataset.fixtureIdentity = mark;
       }, mark);
@@ -1374,7 +1850,7 @@ it
       expect(
         await workbench.locator('#app').getAttribute('data-fixture-document'),
       ).toBe(mark);
-      expect(documentLoads).toBe(1);
+      expect(documentLoads).toBe(initialDocuments);
       expect(socketCount).toBe(initialSockets);
       if (createAfterSwitch) {
         await workbench
@@ -1396,8 +1872,36 @@ it
           await workbench.locator('#app').getAttribute('data-fixture-document'),
         ).toBe(mark);
       }
-      expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
       await checkR3SelectedRoot(createdNativeId, createdThread);
+      if (outerCreate) {
+        await workbench
+          .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await expect.poll(nativeSession).toBe('root');
+
+        // Reopening the second thread must win over rc.2's saved first
+        // selection, even though both roots are in the catalog.
+        const secondUrl = new URL(page.url());
+        secondUrl.searchParams.set('threadId', otherThread);
+        await page.goto(secondUrl.href);
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-native-session-id'),
+        ).toBe(outerNativeId);
+        await expect
+          .poll(nativeSession, { timeout: 10_000 })
+          .toBe(outerNativeId);
+        expect(
+          await workbench
+            .getByText('隔离会话的首条回复', { exact: true })
+            .count(),
+        ).toBe(0);
+      }
       await context.close();
       return;
     }
@@ -1601,6 +2105,24 @@ it
     const refreshedAt = performance.now();
     await page.reload();
     await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
+    const cached = await workbench.locator('#app').evaluate(
+      (_, url) =>
+        performance
+          .getEntriesByName(url)
+          .filter(
+            (entry): entry is PerformanceResourceTiming =>
+              entry instanceof PerformanceResourceTiming,
+          )
+          .map(({ transferSize, decodedBodySize }) => ({
+            transferSize,
+            decodedBodySize,
+          })),
+      f.origin + applicationPath,
+    );
+    expect(cached).toEqual([
+      { transferSize: 0, decodedBodySize: expect.any(Number) },
+    ]);
+    expect(cached[0]!.decodedBodySize).toBeGreaterThan(1_000_000);
     expect(
       downloaded()
         .map(({ kind }) => kind)
@@ -1615,6 +2137,11 @@ it
           browser: browser.version(),
           sealedBundleRequests: downloaded().length - 2,
           scopedBundleRequests: scopedBundleReads,
+          applicationTransferBytes: cached[0]!.transferSize,
+          sealedApplicationRevision: graph.batches.find(
+            ({ phase }) => phase === 'application',
+          )!.rev,
+          liveApplicationRevision: application.rev,
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
     );

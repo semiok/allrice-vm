@@ -218,7 +218,7 @@ export function createModelGateway(options: {
   ownerId: string;
   authority: ModelGatewayAuthority;
   store: ModelGatewayStore;
-  provider: GatewayProvider;
+  provider: GatewayProvider | ((binding: ModelCallBinding) => GatewayProvider);
   admission: ModelGatewayAdmission;
   /** Host-owned context selected for the authenticated, redeemed attempt. */
   readTrustedContext?(
@@ -434,9 +434,14 @@ export function createModelGateway(options: {
               const digest =
                 'sha256:' +
                 createHash('sha256').update(serialized).digest('hex');
+              const provider =
+                typeof options.provider === 'function'
+                  ? options.provider(binding)
+                  : options.provider;
               const callId = await options.store.claimCall(binding, digest);
               transport = createMeteredTransport({
                 ...options,
+                provider,
                 binding,
                 callId,
                 signal,
@@ -458,7 +463,7 @@ export function createModelGateway(options: {
                       },
               });
               iterator = transport.run(() => {
-                const source = options.provider.stream(binding, input, signal);
+                const source = provider.stream(binding, input, signal);
                 return source[Symbol.asyncIterator]();
               });
               response.writeHead(200, {
