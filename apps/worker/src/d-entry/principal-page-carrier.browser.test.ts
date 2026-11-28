@@ -1374,6 +1374,11 @@ it
       const scroll = workbench.locator('[data-conversation-scroll]');
       const readingTop = await scroll.evaluate((node) => {
         // Make the real native scrollport scrollable without generating model work.
+        Object.assign(node.style, {
+          maxHeight: '400px',
+          overflowY: 'auto',
+          scrollBehavior: 'auto',
+        });
         const filler = document.createElement('div');
         filler.style.height = '1800px';
         filler.style.flexShrink = '0';
