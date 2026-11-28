@@ -42,7 +42,11 @@ window.__ModuleLoader__.load({
           },
         });
         const test = {
-          startSession: () => ctx.uiWorkspace.startSession(),
+          async startSession(cwd) {
+            const { workspaceId } = await ctx.workspaces.create({ path: cwd });
+            const id = await ctx.sessions.create({ workspaceId });
+            ctx.uiWorkspace.openSession(id);
+          },
           selectFixtureEmployee(id) {
             snapshot = {
               settingsOpen: false,

@@ -61,7 +61,10 @@ import {
   encodePageNativeResult,
   requirePageNativeMethod,
 } from './page-native-method.js';
-import { pageSettingsNamespaces } from './page-capability-policy.js';
+import {
+  pageSettingsNamespaces,
+  projectEmployeePageCatalog,
+} from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
 const terminalId = z.string().min(1).max(128);
@@ -1292,7 +1295,7 @@ class PrincipalService extends TypertRemoteService {
         const visible =
           endpoint === 'settings/describe'
             ? { ...object.parse(value), hasDocument: false }
-            : value;
+            : projectEmployeePageCatalog(endpoint, value);
         return {
           kind: 'page',
           endpoint,

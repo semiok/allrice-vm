@@ -14,7 +14,7 @@ declare global {
   interface Window {
     __allriceCompositionTest?: {
       openSession: (id: string) => void;
-      startSession: () => void;
+      startSession: (cwd: string) => Promise<void>;
       selectFixtureEmployee: (id: 'gold' | 'orange') => void;
       setTheme: (mode: 'light' | 'dark') => void;
     };
@@ -367,7 +367,10 @@ suite('installed AllRice native Web composition', () => {
     }
   }, 60_000);
   it('renders AllRice on an actual new native conversation without the two workspace controls', async () => {
-    await page.evaluate(() => window.__allriceCompositionTest!.startSession());
+    await page.evaluate(
+      (cwd) => window.__allriceCompositionTest!.startSession(cwd),
+      join(host.root, 'workspace'),
+    );
     const hero = page.locator('[data-allrice-hero-brand]');
     await hero.waitFor();
     expect(await hero.innerText()).toContain('AllRice');

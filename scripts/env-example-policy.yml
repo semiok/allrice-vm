@@ -95,7 +95,7 @@ auditSources:
   apps/worker/src/harness/dsh-egress-environment.ts: 315fc969e7e880f139ea06e3be3c8208e0f411fb6fa760e583bbccb6aefa5594
   apps/worker/src/harness/dsh-native-artifact.ts: ffe6bdf780cf13b1cc40666a5233d2a3e8b18df657195e9492a0bba56f5f71fe
   apps/worker/src/index.ts: 4b6ee3ce935a85ee4f183ca03d989f3892b794f7ea2653269080b0817a11e957
-  packages/dsh-web-composition/build.mjs: 62b0f774edffee5a5310ac465603165447931da8bf21e54498d6fa0856a30eb9
+  packages/dsh-web-composition/build.mjs: 3d419ef87468aeec37f04ce057659c3e995cb1a2d7708d167c72db56a321f74f
   packages/dsh-web-composition/build-web-entry.mjs: 6858ff9e9a02772a4782eb05a89be4c059eb521ed026b08c3a18acb7acb4a0d3
   packages/contracts/src/project-resolution-script.ts: d4261249ef18115e6293d804a0d14a770e2c0df5b14a5a6db133444dd76ff9ee
   packages/contracts/src/runtime-feature-flags.ts: 9545293314ee45ed2d42dd9393a50123fad67250c4454346c341d0955bb200f9

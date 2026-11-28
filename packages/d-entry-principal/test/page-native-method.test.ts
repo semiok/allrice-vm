@@ -1,7 +1,10 @@
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
 import { expect, it } from 'vitest';
 import { z } from 'zod';
-import { pageSettingsNamespaces } from '../src/page-capability-policy.js';
+import {
+  pageSettingsNamespaces,
+  projectEmployeePageCatalog,
+} from '../src/page-capability-policy.js';
 import {
   encodePageNativeResult,
   requirePageNativeMethod,
@@ -65,6 +68,26 @@ it('keeps Standard managed while allowing the native preset and language reads',
   ).toThrow('此操作由平台管理');
   expect(require('agentPresets/list').method).toBe('list');
   expect(require('settings/update', { ns: 'locale' }).method).toBe('update');
+});
+
+it('limits the employee menu and native execution to the approved commands', () => {
+  const commands = ['file', 'plan', 'goal', 'compact', 'model'];
+  const removed = ['permission', 'export', 'feedback', 'other-command'];
+  const list = [...commands, ...removed].map((name) => ({ name }));
+  expect(projectEmployeePageCatalog('commands/list', list)).toEqual(
+    commands.map((name) => ({ name })),
+  );
+  const invoke = (name: string) =>
+    requirePageNativeMethod(
+      { get: () => descriptor('commands', 'execute') },
+      'commands/execute',
+      'unary',
+      { line: `/${name} details` },
+      new Set(),
+    );
+  for (const name of commands) expect(invoke(name).method).toBe('execute');
+  for (const name of removed)
+    expect(() => invoke(name)).toThrow('此操作由平台管理');
 });
 
 it('admits native terminal methods with their ordinary stream uplink descriptor', () => {

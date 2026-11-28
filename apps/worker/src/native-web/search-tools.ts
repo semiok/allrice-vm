@@ -48,3 +48,37 @@ export function nativeSearchToolPatches(webSearchEnabled: boolean) {
   if (!patches.length) throw new PersonVmError('PROVIDER_FAILED');
   return patches;
 }
+
+/** Only authenticated AllRice providers may publish employee Skills. Keep
+ * the native skill service/tool, and remove its filesystem discovery sources
+ * from all presets including retained sessions with a previous mode. */
+export function nativeEmployeeSkillPatches(
+  overlays: ReturnType<typeof nativeSearchToolPatches>,
+) {
+  return composeEntries([...nativeWebBundlePatches(), overlays]).flatMap(
+    (entry) => {
+      if (entry.name !== '@deepseek-ai/dsh-agent-preset') return [];
+      const plugins = entry.config?.plugins as
+        { name: string; disabled?: boolean }[] | undefined;
+      if (
+        !plugins?.some(
+          ({ name }) => name === '@deepseek-ai/dsh-skill-filesystem',
+        )
+      )
+        return [];
+      return [
+        {
+          id: entry.id,
+          config: {
+            ...entry.config,
+            plugins: plugins.map((plugin) =>
+              plugin.name === '@deepseek-ai/dsh-skill-filesystem'
+                ? { ...plugin, disabled: true }
+                : plugin,
+            ),
+          },
+        },
+      ];
+    },
+  );
+}

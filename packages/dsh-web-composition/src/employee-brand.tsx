@@ -55,9 +55,11 @@ function bindAccent(ctx: Context) {
         ? employeeChoice(tree.workspace, sessionEmployeeKey(session))
         : undefined;
     const accent = employee?.currentVersion.manifest.appearance?.accentColor;
-    const color =
-      employeeColorPalette[accent === 'indigo' ? 'blue' : (accent ?? 'amber')]
-        .value;
+    const color = (
+      employeeColorPalette[
+        accent === 'indigo' ? 'blue' : (accent ?? 'amber')
+      ] ?? employeeColorPalette.amber
+    ).value;
     if (color === previous) return;
     release?.();
     previous = color;
@@ -115,22 +117,26 @@ export function apply(ctx: Context) {
     ),
   );
 
-  ctx.inject(['locale'], (scope) => {
+  ctx.inject(['locale', 'configForms'], (scope) => {
     scope.effect(() => {
       const locale = scope.locale;
+      const form = scope.configForms.get<{ preference?: string }>('locale');
       const dispose = Object.entries(languages).flatMap(([fallback, pack]) => [
         locale.addLanguage({ id: pack.id, label: pack.label, fallback }),
         locale.register('chat', pack.id, pack.chat),
       ]);
-      const applyLocale = () => {
-        // Preserve the user's underlying language when upgrading a stock
-        // rc.2 preference. All other dictionaries still use native fallback.
-        const { active } = locale.getSnapshot();
-        if (active === 'zh' || active === 'en')
-          locale.setLocale(languages[active].id);
+      const adoptPublishedPreference = () => {
+        // The native runtime's interim browser language has no saved
+        // preference. Upgrade only a real stock preference after it arrives.
+        const preference = form.getSnapshot().value?.preference;
+        if (
+          (preference === 'zh' || preference === 'en') &&
+          locale.getSnapshot().active === preference
+        )
+          locale.setLocale(languages[preference].id);
       };
-      const unsubscribe = locale.subscribe(applyLocale);
-      applyLocale();
+      const unsubscribe = form.subscribe(adoptPublishedPreference);
+      adoptPublishedPreference();
       return () => {
         unsubscribe();
         dispose.reverse().forEach((remove) => remove());
@@ -142,7 +148,7 @@ export function apply(ctx: Context) {
   });
 
   ctx.effect(() => {
-    const title = document.querySelector('title');
+    const title = document.querySelector?.('title');
     if (!title) return () => {};
     // rc.2's native layout has no product-title input. Preserve its session
     // title and replace only its own suffix in this document.
