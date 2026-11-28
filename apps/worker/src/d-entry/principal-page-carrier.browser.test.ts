@@ -112,6 +112,12 @@ it
       scenario === 'switch' || crossRetain
         ? await f.registerOtherEmployee()
         : undefined;
+    const employees = cross ? [cross] : [];
+    if (crossRetain)
+      employees.push(
+        await f.registerOtherEmployee(),
+        await f.registerOtherEmployee(),
+      );
     const fromComposition = createRequire(
       new URL(
         '../../../../packages/dsh-web-composition/package.json',
@@ -637,6 +643,19 @@ it
           );
         }
         if (realShell) {
+          if (url.pathname === '/api/v1/auth/session') {
+            const token =
+              request.headers.cookie
+                ?.split('; ')
+                .find((part) => part.startsWith('allrice_session='))
+                ?.slice('allrice_session='.length) ?? '';
+            const current = await f.authenticate(token);
+            return await copy(
+              current
+                ? Response.json({ context: current })
+                : new Response(null, { status: 401 }),
+            );
+          }
           if (url.pathname === '/api/v1/d-entry/identity') {
             return await copy(
               Response.json({
@@ -960,7 +979,7 @@ it
           viewerId: identity.personId,
           employees: [
             f.selection.employeeInstanceId,
-            ...(cross ? [cross.identity.employeeInstanceId] : []),
+            ...employees.map(({ identity }) => identity.employeeInstanceId),
           ].map((id) => ({
             id,
             employeeId: id,
@@ -975,15 +994,14 @@ it
             ? [
                 f.selection.threadId,
                 ...(crossRetain ? [] : [otherThread]),
-                ...(cross ? [cross.identity.threadId!] : []),
+                ...employees.map(({ identity }) => identity.threadId!),
               ]
             : [selection.threadId]
           ).map((id) => ({
             id,
             employeeInstanceId:
-              id === cross?.identity.threadId
-                ? cross.identity.employeeInstanceId
-                : f.selection.employeeInstanceId,
+              employees.find(({ identity }) => identity.threadId === id)
+                ?.identity.employeeInstanceId ?? f.selection.employeeInstanceId,
             ownerId: identity.personId,
             updatedAt: '2026-01-01T00:00:00.000Z',
             createdAt: '2026-01-01T00:00:00.000Z',
@@ -1197,7 +1215,7 @@ it
       return;
     }
     const workbench = page.frameLocator(
-      crossRetain ? 'iframe:visible' : 'iframe',
+      crossRetain || scenario === 'switch' ? 'iframe:visible' : 'iframe',
     );
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
@@ -1330,13 +1348,45 @@ it
     }
     expect(await editor.isEditable()).toBe(true);
     if (crossRetain) {
+      const [second, third, fourth] = employees;
+      const a = f.selection.employeeInstanceId;
+      const b = second!.identity.employeeInstanceId;
+      const c = third!.identity.employeeInstanceId;
+      const d = fourth!.identity.employeeInstanceId;
       const app = workbench.locator('#app');
-      const firstScope = await app.getAttribute('data-scope-id');
-      expect(firstScope).toBeTruthy();
+      const scope = async () => (await app.getAttribute('data-scope-id'))!;
+      const firstScope = await scope();
+      const scroll = workbench.locator('[data-conversation-scroll]');
+      const readingTop = await scroll.evaluate((node) => {
+        // Make the real native scrollport scrollable without generating model work.
+        const filler = document.createElement('div');
+        filler.style.height = '1800px';
+        filler.style.flexShrink = '0';
+        node.append(filler);
+        node.scrollTop = 173;
+        return node.scrollTop;
+      });
+      expect(readingTop).toBe(173);
       await app.evaluate((node) => {
         node.dataset.testOriginalDocument = 'first';
       });
-      const open = async (employeeInstanceId: string) => {
+      await page.evaluate(() => {
+        const update = () => {
+          const root = document.documentElement;
+          root.dataset.testPeakFrames = String(
+            Math.max(
+              Number(root.dataset.testPeakFrames ?? 0),
+              document.querySelectorAll('iframe').length,
+            ),
+          );
+        };
+        new MutationObserver(update).observe(document.body, {
+          childList: true,
+          subtree: true,
+        });
+        update();
+      });
+      const choose = async (employeeInstanceId: string) => {
         const row = workbench.locator(
           '[data-row-key="workspace:' + employeeInstanceId + '"]',
         );
@@ -1344,13 +1394,13 @@ it
           node.addEventListener(
             'click',
             () => parent.performance.mark('cross-employee-click'),
-            {
-              capture: true,
-              once: true,
-            },
+            { capture: true, once: true },
           );
         });
         await row.click();
+      };
+      const open = async (employeeInstanceId: string) => {
+        await choose(employeeInstanceId);
         await page.waitForURL(
           (url) =>
             url.searchParams.get('employeeInstanceId') === employeeInstanceId,
@@ -1375,28 +1425,141 @@ it
             ),
         );
       };
-      await open(cross!.identity.employeeInstanceId);
+      const bDocument = (url: URL) =>
+        url.pathname === '/chatflow/4.0/document' &&
+        url.searchParams.get('employeeInstanceId') === b;
+      const reachDocument = deferred<string>();
+      const resumeDocument = deferred<void>();
+      await page.route(
+        bDocument,
+        async (route) => {
+          reachDocument.resolve(
+            new URL(route.request().url()).searchParams.get('scopeId')!,
+          );
+          await resumeDocument.promise;
+          await route.abort();
+        },
+        { times: 1 },
+      );
+      await choose(b);
+      const cancelledScope = await reachDocument.promise;
+      const pending = workbench.locator('[data-employee-transition]');
+      await pending.getByText('正在打开工作台', { exact: true }).waitFor();
+      expect(await workbench.locator('#chat-sidebar').isVisible()).toBe(true);
+      expect(
+        await workbench
+          .locator('[data-conversation-header-leading]')
+          .isVisible(),
+      ).toBe(true);
+      await choose(a);
+      resumeDocument.resolve();
+      await pending.waitFor({ state: 'detached' });
+      await expect.poll(() => page.locator('iframe').count()).toBe(1);
+      expect((await f.invoke(cancelledScope)).status).toBe(404);
+      expect(await scope()).toBe(firstScope);
+
+      await open(b);
       await editor.fill('第二位员工的独立草稿');
-      const secondScope = await app.getAttribute('data-scope-id');
+      const secondScope = await scope();
       expect(secondScope).not.toBe(firstScope);
-      const warm = await open(f.selection.employeeInstanceId);
+      const first = page
+        .frames()
+        .find((frame) => frame.url().includes(firstScope))!;
+      await first.locator('#app').evaluate((node, selection) => {
+        document.querySelector<HTMLElement>('[data-composer-input]')?.focus();
+        parent.postMessage(
+          {
+            type: 'allrice:d-entry:navigate',
+            scopeId: node.dataset.scopeId,
+            selection,
+          },
+          location.origin,
+        );
+      }, fourth!.identity);
+      const activeAfterBackground = await page.evaluate(
+        () =>
+          new Promise<string>((resolve) =>
+            requestAnimationFrame(() => {
+              const frame = document.activeElement as HTMLIFrameElement | null;
+              resolve(
+                frame?.contentDocument?.querySelector<HTMLElement>('#app')
+                  ?.dataset.employeeInstanceId ?? '',
+              );
+            }),
+          ),
+      );
+      expect(activeAfterBackground).toBe(b);
+      expect(new URL(page.url()).searchParams.get('employeeInstanceId')).toBe(
+        b,
+      );
+
+      const network = { documentLoads, socketCount };
+      const samples = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        samples.push({ employee: 'A', elapsedMs: await open(a) });
+        expect(await app.getAttribute('data-test-original-document')).toBe(
+          'first',
+        );
+        expect(await scope()).toBe(firstScope);
+        expect(await editor.innerText()).toBe('未发送的原生草稿');
+        expect(await scroll.evaluate((node) => node.scrollTop)).toBe(
+          readingTop,
+        );
+        expect(
+          await editor.evaluate((node) => node === document.activeElement),
+        ).toBe(true);
+        samples.push({ employee: 'B', elapsedMs: await open(b) });
+        expect(await scope()).toBe(secondScope);
+        expect(await editor.innerText()).toBe('第二位员工的独立草稿');
+      }
+      expect(await pending.count()).toBe(0);
+      expect({ documentLoads, socketCount }).toEqual(network);
       console.info(
         'CROSS_EMPLOYEE_NATIVE_RETURN ' +
           JSON.stringify({
-            warm,
+            browser: browser.version(),
+            samples,
             documentLoads,
             socketCount,
-            originalScopeRetained:
-              (await app.getAttribute('data-scope-id')) === firstScope,
           }),
       );
-      expect(await app.getAttribute('data-test-original-document')).toBe(
-        'first',
+
+      await open(c);
+      const thirdScope = await scope();
+      await open(a);
+      await open(d);
+      const fourthScope = await scope();
+      expect(
+        page.frames().some((frame) => frame.url().includes(secondScope)),
+      ).toBe(false);
+      expect((await f.invoke(secondScope)).status).toBe(404);
+      expect(f.pageSignals.get(secondScope)?.aborted).toBe(true);
+      expect(
+        await page.locator('html').getAttribute('data-test-peak-frames'),
+      ).toBe('3');
+
+      third!.revoked.abort();
+      await expect
+        .poll(() =>
+          page.frames().some((frame) => frame.url().includes(thirdScope)),
+        )
+        .toBe(false);
+      expect((await f.invoke(thirdScope)).status).toBe(404);
+      expect(await scope()).toBe(fourthScope);
+      expect(await editor.isEditable()).toBe(true);
+
+      await context.addCookies([
+        { name: 'allrice_session', value: otherToken, url: f.origin },
+      ]);
+      f.loginRevoked.abort();
+      await page.waitForURL(
+        (url) => url.pathname === '/chatflow/4.0' && !url.search,
       );
-      expect(await app.getAttribute('data-scope-id')).toBe(firstScope);
-      expect(await editor.innerText()).toBe('未发送的原生草稿');
-      expect(documentLoads).toBe(2);
-      expect(socketCount).toBe(2);
+      await expect.poll(() => page.locator('iframe').count()).toBe(0);
+      expect(f.pageSignals.get(firstScope)?.aborted).toBe(true);
+      expect(f.pageSignals.get(fourthScope)?.aborted).toBe(true);
+      expect((await f.invoke(firstScope)).status).toBe(404);
+      expect((await f.invoke(fourthScope)).status).toBe(404);
       await context.close();
       return;
     }
@@ -1627,10 +1790,7 @@ it
         expect(await editor.innerText()).not.toContain('未发送的原生草稿');
         expect(documentLoads).toBe(before.documentLoads + 1);
         expect(socketCount).toBe(before.socketCount + 1);
-        expect((await f.invokeThread(original!, otherThread)).status).toBe(404);
-        console.info(
-          'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
-        );
+        expect((await f.invokeThread(original!, otherThread)).status).toBe(200);
         await page.goto(
           f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
         );

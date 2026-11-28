@@ -102,6 +102,7 @@ export async function fixture(
     { identity: typeof f.identity; owner: typeof f.owner }
   >();
   const threadRevocations = new Map<string, AbortController>();
+  const loginRevoked = new AbortController();
   const pageSelection = rootless
     ? {
         workspaceId: f.selection.workspaceId,
@@ -230,7 +231,7 @@ export async function fixture(
     const owner = {
       ...f.owner,
       endpoint,
-      bindingRef: f.owner.bindingRef + '-other',
+      bindingRef: f.owner.bindingRef + '-' + identity.employeeInstanceId,
       receipt: { ...f.owner.receipt, endpoints: [endpoint] },
       acquirePrincipal: (
         _context: unknown,
@@ -255,11 +256,13 @@ export async function fixture(
       }),
     } satisfies typeof f.owner;
     otherEmployees.set(identity.threadId, { identity, owner });
-    return { identity, bindingRef: owner.bindingRef };
+    const revoked = new AbortController();
+    threadRevocations.set(identity.threadId, revoked);
+    return { identity, bindingRef: owner.bindingRef, revoked };
   }
   const otherSession = { ...f.context, sessionId: randomUUID() };
   const authenticate = vi.fn(async (token: string) =>
-    token === sessionToken
+    token === sessionToken && !loginRevoked.signal.aborted
       ? f.context
       : token === otherToken
         ? otherSession
@@ -346,12 +349,11 @@ export async function fixture(
       const authority = await f.deps.watch();
       const { threadId } = DEntrySelectionInputSchema.parse(selection);
       const revoked = threadId && threadRevocations.get(threadId);
-      return revoked
-        ? {
-            ...authority,
-            revoked: AbortSignal.any([authority.revoked, revoked.signal]),
-          }
-        : authority;
+      const signals = [authority.revoked];
+      if (_context.sessionId === f.context.sessionId)
+        signals.push(loginRevoked.signal);
+      if (revoked) signals.push(revoked.signal);
+      return { ...authority, revoked: AbortSignal.any(signals) };
     },
     async identity(_context, selection) {
       return selectionIdentity(selection);
@@ -611,6 +613,7 @@ export async function fixture(
     publish,
     registerThread,
     registerOtherEmployee,
+    loginRevoked,
     selectionIdentity,
     invokeThread,
     profileBorrows,

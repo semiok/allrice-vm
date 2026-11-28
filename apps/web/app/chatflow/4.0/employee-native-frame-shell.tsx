@@ -95,6 +95,7 @@ export function EmployeeNativeFrameShell({
   const verifyLogin = useRef<Promise<void> | undefined>(undefined);
   const loginSessionId = useRef<string | undefined>(undefined);
   const replacingLogin = useRef(false);
+  const shownBefore = useRef(new Set<number>());
 
   const update = useCallback(
     (action: Parameters<typeof updateEmployeeFramePool>[1]) => {
@@ -269,6 +270,7 @@ export function EmployeeNativeFrameShell({
         });
       },
       joined(id: number, confirmed: boolean) {
+        shownBefore.current.delete(id);
         if (!confirmed) setUnavailable('unknown');
         update({ type: 'joined', id, confirmed });
       },
@@ -336,11 +338,18 @@ export function EmployeeNativeFrameShell({
   }, [pending, pool.visible]);
 
   useLayoutEffect(() => {
-    if (pool.visible !== undefined) {
-      const frame = directory.current.get(pool.visible)?.controller.element();
-      if (frame && document.activeElement !== frame)
-        frame.focus({ preventScroll: true });
+    if (pool.visible === undefined) return;
+    const frame = directory.current.get(pool.visible)?.controller.element();
+    if (!frame) return;
+    if (shownBefore.current.has(pool.visible)) {
+      frame.contentDocument
+        ?.querySelector<HTMLElement>(
+          '[data-composer-input][contenteditable="true"]',
+        )
+        ?.focus({ preventScroll: true });
     }
+    if (document.activeElement !== frame) frame.focus({ preventScroll: true });
+    shownBefore.current.add(pool.visible);
   }, [pool.visible]);
 
   return (
