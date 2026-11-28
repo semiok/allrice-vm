@@ -46,6 +46,8 @@ export function openDatabaseNotifications(
     !port[0] ||
     ssl ||
     target_session_attrs ||
+    (!connection.options && process.env.PGOPTIONS) ||
+    process.env.PGREPLICATION ||
     typeof password !== 'string' ||
     Object.keys(connection).some(
       (key) => key !== 'application_name' && key !== 'options',
