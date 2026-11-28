@@ -319,6 +319,8 @@ export function apply(ctx, config) {
             : []),
           ...(commandMemory ?? []),
           ...modelPatches,
+          // Compose filesystem Skill removal after model/search, before the
+          // employee persona consumes the full preset in the batch merge.
           ...nativeEmployeeSkillPatches(modelPatches),
           ...(modelAdapter
             ? [

@@ -33,3 +33,5 @@ export type PageNativeThreadRegistration = {
   nativeSessionId: string;
   thread: ReturnType<typeof ChatSessionSchema.parse>;
 };
+
+export const pageSkillsRefreshed = 'allrice:d-entry:skills-refreshed';

@@ -25,6 +25,8 @@ import {
   type DEntryScopedUnaryCall,
   type InputOf,
   type ScopeFrame,
+  type PrincipalSkillRead,
+  type PrincipalSkillResult,
 } from '@allrice/d-entry-principal/types';
 
 type StreamFrame =
@@ -135,7 +137,8 @@ class Relay<T extends ScopeFrame | StreamFrame> {
   private failure: unknown;
   readonly done: Promise<void>;
   constructor(
-    private readonly handle: RemoteStreamHandle<T, 'close'>,
+    private readonly handle: AsyncIterable<T> &
+      Pick<RemoteStreamHandle<T, 'close'>, 'send' | 'end' | 'dispose'>,
     private readonly scopeId: string,
     private readonly timeoutMs: number,
     parser: TypertSchema<T>,
@@ -293,6 +296,17 @@ export function createDEntryPrincipalControl(
         call: PrincipalInvocationCall,
         signal: AbortSignal,
       ) => Promise<PrincipalInvocationObservation | undefined>,
+      skillSource?: {
+        read(
+          read: PrincipalSkillRead,
+          signal: AbortSignal,
+        ): Promise<PrincipalSkillResult>;
+        watch(
+          signal: AbortSignal,
+          changed: () => void,
+          lost: (error: unknown) => void,
+        ): Promise<() => void>;
+      },
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -306,6 +320,9 @@ export function createDEntryPrincipalControl(
       const children = new Set<Relay<StreamFrame>>();
       const operations = new Set<Promise<unknown>>();
       const follows = new Map<string, AbortController>();
+      const skillReads = new Map<string, AbortController>();
+      const skillListeners = new Set<() => void>();
+      let detachSkills: (() => void) | undefined;
       let detachRun = () => {};
       let published = false;
       let terminalDispatched = false;
@@ -335,6 +352,64 @@ export function createDEntryPrincipalControl(
             const handle = TYPERT_REMOTE.methods[
               'allricePrincipal/openScope'
             ].invoke(root.remote, { issue }, input.carrier);
+            let skillWatch: Promise<void> | undefined;
+            let catalog: string | undefined;
+            let skillGeneration = 0;
+            let feedLost = false;
+            const trackSkill = (task: Promise<void>) => {
+              operations.add(task);
+              void task.then(
+                () => operations.delete(task),
+                (error) => {
+                  operations.delete(task);
+                  if (!business.aborted) revoked.abort(error);
+                },
+              );
+            };
+            const skillChanged = () => {
+              if (business.aborted) return;
+              const generation = ++skillGeneration;
+              try {
+                handle.send({ type: 'skills-changed' });
+              } catch (error) {
+                revoked.abort(error);
+                return;
+              }
+              if (!skillSource || catalog === undefined || !skillListeners.size)
+                return;
+              trackSkill(
+                (async () => {
+                  let next;
+                  try {
+                    next = feedLost
+                      ? undefined
+                      : await skillSource.read({ kind: 'list' }, business);
+                  } catch {
+                    // A failed recheck cannot leave a previously granted catalog visible.
+                  }
+                  if (business.aborted || generation !== skillGeneration)
+                    return;
+                  const digest =
+                    next?.kind === 'catalog'
+                      ? JSON.stringify(next.entries)
+                      : '[]';
+                  if (catalog === digest) return;
+                  catalog = digest;
+                  for (const listener of skillListeners) listener();
+                })(),
+              );
+            };
+            const watchSkills = () =>
+              (skillWatch ??=
+                skillSource
+                  ?.watch(business, skillChanged, () => {
+                    feedLost = true;
+                    skillChanged();
+                  })
+                  .then((stop) => {
+                    if (business.aborted) stop();
+                    else detachSkills = stop;
+                  }) ?? Promise.resolve());
             relay = new Relay(
               handle,
               issue.scopeId,
@@ -343,6 +418,48 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'skill-cancel') {
+                  skillReads.get(frame.id)?.abort();
+                  return false;
+                }
+                if (frame.type === 'skill-read') {
+                  if (!published || skillReads.has(frame.id)) throw unknown();
+                  if (business.aborted) return false;
+                  const stop = new AbortController();
+                  const active = AbortSignal.any([business, stop.signal]);
+                  const { id, read } = frame;
+                  skillReads.set(id, stop);
+                  const task = Promise.resolve()
+                    .then(async () => {
+                      let result: PrincipalSkillResult = {
+                        kind: 'unavailable',
+                      };
+                      try {
+                        if (skillSource) {
+                          await watchSkills();
+                          const generation = skillGeneration;
+                          if (!feedLost) {
+                            const readResult = await skillSource.read(
+                              read,
+                              active,
+                            );
+                            if (generation === skillGeneration)
+                              result = readResult;
+                          }
+                        }
+                      } catch {
+                        // Only the fixed unavailable result crosses the owner wire.
+                      }
+                      if (!active.aborted) {
+                        if (result.kind === 'catalog')
+                          catalog = JSON.stringify(result.entries);
+                        handle.send({ type: 'skill-result', id, result });
+                      }
+                    })
+                    .finally(() => skillReads.delete(id));
+                  trackSkill(task);
+                  return false;
+                }
                 if (frame.type === 'follow-revoked' && published) {
                   follows.get(frame.followId)?.abort(
                     new RemoteError(
@@ -624,6 +741,10 @@ export function createDEntryPrincipalControl(
                   },
                 };
               },
+              subscribeSkillChanges(listener: () => void) {
+                skillListeners.add(listener);
+                return () => skillListeners.delete(listener);
+              },
               close: activity.close,
             } satisfies DEntryPrincipalControlScope;
           });
@@ -646,6 +767,8 @@ export function createDEntryPrincipalControl(
               return;
             }
             if (!relay) throw unknown();
+            detachSkills?.();
+            skillListeners.clear();
             const results = await Promise.allSettled(
               [...children]
                 .map((child) => child.close())

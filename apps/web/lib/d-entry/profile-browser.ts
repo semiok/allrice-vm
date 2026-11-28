@@ -30,6 +30,7 @@ import {
 } from './page-carrier';
 import {
   pageNativeThreadRegistered,
+  pageSkillsRefreshed,
   pageThreadScope,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
@@ -60,6 +61,8 @@ function publishNativeThread(
   resourceScopeId: string,
   rpcId: string,
   onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+  onSkillsRefreshed?: () => void,
+  onSkillsRefreshed?: () => void,
 ) {
   const thread = decodeDEntryRegisteredThread(
     reply.headers.get(dEntryRegisteredThreadHeader),
@@ -265,6 +268,18 @@ export function nativeProfileDocument(
     if (event.data.type === pageRevoked && !lifetime.signal.aborted) {
       lifetime.abort();
       onRevoked();
+    }
+    if (
+      event.data.type === pageSkillsRefreshed &&
+      onSkillsRefreshed &&
+      !lifetime.signal.aborted &&
+      authority.scopeId === event.data.resourceScopeId &&
+      container.dataset.sharedMux === '1'
+    ) {
+      const old = peer;
+      peer = undefined;
+      old?.close();
+      onSkillsRefreshed();
     }
     if (event.data.type === pageCompletion) {
       if (event.data.state === 'closed') done.resolve();

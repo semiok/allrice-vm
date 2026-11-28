@@ -12,6 +12,7 @@ import {
 } from './employee-web-entry';
 import {
   pageEditorMounted,
+  pageSkillsRefreshed,
   pageStartupFailed,
   pageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
@@ -100,6 +101,8 @@ function boot(
         );
       },
       drafts.registerDraft,
+      () =>
+        container.ownerDocument.dispatchEvent(new Event(pageSkillsRefreshed)),
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;

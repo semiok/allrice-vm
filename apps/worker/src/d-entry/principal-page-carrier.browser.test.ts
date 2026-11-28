@@ -49,6 +49,7 @@ it
     'cold-assets',
     'stall',
     'switch',
+    'skills-refresh',
     'baseline',
     'attached',
     'unattached',
@@ -70,7 +71,8 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const skillsRefresh = scenario === 'skills-refresh';
+    const realShell = switching || nativeCreate || coldAssets || skillsRefresh;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -100,6 +102,14 @@ it
       '.wasm': 'application/wasm',
     };
     const f = await fixture({ ...live, directory: release.directory });
+    if (skillsRefresh)
+      f.setFixtureSkills([
+        {
+          name: 'bound-qa-skill',
+          description: 'QA only',
+          modelInvocable: true,
+        },
+      ]);
     let otherThread = randomUUID();
     let outerCreated = false;
     const revokeOther =
@@ -1193,6 +1203,45 @@ it
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
+    if (skillsRefresh) {
+      await editor.waitFor({ timeout: 15_000 });
+      const originalCarrier = socketCount;
+      const originalDocument = documentLoads;
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((element, id) => {
+        element.dataset.fixtureDocument = id;
+      }, mark);
+      await editor.click();
+      await editor.press('/');
+      await workbench
+        .getByText('bound-qa-skill', { exact: false })
+        .first()
+        .waitFor();
+      const originalReads = unary.filter(
+        (method) => method === 'skills/list',
+      ).length;
+      expect(originalReads).toBeGreaterThan(0);
+      f.setFixtureSkills([]);
+      await expect
+        .poll(() => unary.filter((method) => method === 'skills/list').length, {
+          timeout: 12_000,
+        })
+        .toBeGreaterThan(originalReads);
+      await editor.waitFor();
+      await editor.press('Escape');
+      await editor.fill('');
+      await editor.press('/');
+      expect(
+        await workbench.getByText('bound-qa-skill', { exact: false }).count(),
+      ).toBe(0);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+      expect(documentLoads).toBe(originalDocument);
+      expect(socketCount).toBe(originalCarrier);
+      await context.close();
+      return;
+    }
     if (coldAssets) {
       const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
       await expect

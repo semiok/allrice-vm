@@ -47,6 +47,27 @@ export type DEntryScopeIssue =
       terminalOwner?: true;
     }>;
 export type CloseCommand = 'close';
+/** Only the authenticated Node owner exchanges these frames. A browser
+ * principal never receives a locator, body or capability credential. */
+export type PrincipalSkillRead =
+  | Readonly<{ kind: 'list' }>
+  | Readonly<{ kind: 'body'; name: string; revision: string }>;
+export type PrincipalSkillSummary = Readonly<{
+  name: string;
+  description: string;
+  revision: string;
+  userInvocable: boolean;
+  modelInvocable: boolean;
+}>;
+export type PrincipalSkillResult =
+  | Readonly<{ kind: 'catalog'; entries: readonly PrincipalSkillSummary[] }>
+  | Readonly<{ kind: 'body'; content: string }>
+  | Readonly<{ kind: 'unavailable' }>;
+export type PrincipalScopeCommand =
+  | CloseCommand
+  | Readonly<{ type: 'skill-result'; id: string; result: PrincipalSkillResult }>
+  | Readonly<{ type: 'skills-changed' }>;
+
 export const D_ENTRY_PAGE_UPLINK_BYTES = 262_144;
 export type DEntryPageInput =
   | Readonly<{ type: 'input'; value?: JsonValue }>
@@ -62,6 +83,13 @@ export type ScopeFrame =
     }>
   | Readonly<{ type: 'revoked'; scopeId: string }>
   | Readonly<{ type: 'follow-revoked'; scopeId: string; followId: string }>
+  | Readonly<{
+      type: 'skill-read';
+      scopeId: string;
+      id: string;
+      read: PrincipalSkillRead;
+    }>
+  | Readonly<{ type: 'skill-cancel'; scopeId: string; id: string }>
   | Readonly<{ type: 'closed'; scopeId: string }>;
 export type InputOf<M> = M extends {
   input(options?: TypertRemoteInputOptions): TypertRemoteValue<infer I>;
@@ -164,6 +192,7 @@ export type DEntryPrincipalStream = AsyncIterable<StreamItem> & {
 export interface DEntryPrincipalControlScope {
   readonly opened: Extract<ScopeFrame, { type: 'opened' }>;
   readonly revoked: AbortSignal;
+  subscribeSkillChanges?(changed: () => void): () => void;
   invoke(
     call: DEntryScopedUnaryCall,
     signal: AbortSignal,

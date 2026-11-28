@@ -18,6 +18,7 @@ import {
   DEntryPageRpcRequestSchema,
   DEntryPageUnarySchema,
   DEntryPageSwitchSchema,
+  DEntryPageSkillRefreshSchema,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
@@ -110,6 +111,8 @@ type OwnedPage = {
   stop: AbortController;
   page?: DEntryPageHandle;
   resources?: ReturnType<typeof pageStreams>;
+  stopSkillChanges?: () => void;
+  skillsChanged?: boolean;
   operation: Promise<void>;
 };
 
@@ -177,6 +180,7 @@ async function runOwner(
   }
 
   function endPage(generation: OwnedPage | undefined, reason?: unknown) {
+    generation?.stopSkillChanges?.();
     generation?.stop.abort(reason);
     if (!generation?.page) generation?.setup.abort(reason);
   }
@@ -205,6 +209,22 @@ async function runOwner(
       AbortSignal.any([connected, generation.stop.signal, page.signal]),
     );
     current = generation;
+    generation.stopSkillChanges = page.scope.subscribeSkillChanges?.(() => {
+      if (
+        !streamId ||
+        generation !== current ||
+        requestedClose ||
+        generation.stop.signal.aborted ||
+        generation.skillsChanged
+      )
+        return;
+      generation.skillsChanged = true;
+      void send({
+        type: 'item',
+        streamId,
+        value: { type: 'skills-changed', scopeId: page.scope.opened.scopeId },
+      }).catch(fail);
+    });
   }
 
   function switchThread(
@@ -329,6 +349,31 @@ async function runOwner(
         endPage(current, reason);
         endPage(staged, reason);
       } else if (frame.type === 'item' && !requestedClose) {
+        const refresh = DEntryPageSkillRefreshSchema.safeParse(frame.value);
+        if (refresh.success && refresh.data.type === 'refresh-skills') {
+          const generation = current;
+          const page = generation?.page;
+          if (
+            !generation?.skillsChanged ||
+            !page ||
+            refresh.data.scopeId !== page.scope.opened.scopeId
+          )
+            continue; // An in-place thread handoff can supersede the notice.
+          await generation.resources?.close();
+          page.signal.throwIfAborted();
+          generation.skillsChanged = false;
+          generation.resources = pageStreams(
+            page,
+            send,
+            AbortSignal.any([connected, generation.stop.signal, page.signal]),
+          );
+          await send({
+            type: 'item',
+            streamId: frame.streamId,
+            value: { type: 'skills-refreshed', scopeId: refresh.data.scopeId },
+          });
+          continue;
+        }
         await switchThread(
           DEntryPageSwitchSchema.parse(frame.value),
           frame.streamId,

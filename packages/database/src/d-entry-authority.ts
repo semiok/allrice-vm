@@ -167,6 +167,45 @@ function defaultFeed() {
   }
   return currentFeed;
 }
+/** Hint only. The production owner compares its own exact catalog before
+ * resetting the retained browser connection. */
+export async function subscribeDEntrySkillChanges(
+  identity: Pick<DEntryIdentity, 'organizationId' | 'workspaceId' | 'personId'>,
+  signal: AbortSignal,
+  changed: () => void,
+  lost: (error: unknown) => void,
+) {
+  const [row] = await getDatabase()<
+    { schema: string }[]
+  >`select current_schema() schema`;
+  signal.throwIfAborted();
+  if (!row?.schema) throw new DataAccessError('authorization_denied');
+  const { schema } = row;
+  return defaultFeed().subscribe(
+    {
+      changed(change) {
+        if (
+          signal.aborted ||
+          change.schema !== schema ||
+          change.organizationId !== identity.organizationId ||
+          (change.workspaceId && change.workspaceId !== identity.workspaceId) ||
+          (change.personId && change.personId !== identity.personId)
+        )
+          return;
+        if (
+          change.table === 'allrice_personal_skill_bindings' ||
+          change.table === 'allrice_personal_skill_installations' ||
+          change.table === 'allrice_employee_dsh_skill_bindings' ||
+          change.table === 'allrice_dsh_skills'
+        )
+          changed();
+      },
+      lost,
+    },
+    signal,
+  );
+}
+
 export async function closeDEntryAuthorityFeeds() {
   const results = await Promise.allSettled(
     [...feeds].map((feed) => feed.close()),
@@ -508,6 +547,13 @@ async function watchDEntryAuthority(
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
           // current SQL decides, including a permission change during setup.
           if (schema && change.schema !== schema) return;
+          if (
+            change.table === 'allrice_personal_skill_bindings' ||
+            change.table === 'allrice_personal_skill_installations' ||
+            change.table === 'allrice_employee_dsh_skill_bindings' ||
+            change.table === 'allrice_dsh_skills'
+          )
+            return;
           if (
             ticketThread &&
             change.table === 'allrice_chat_sessions' &&

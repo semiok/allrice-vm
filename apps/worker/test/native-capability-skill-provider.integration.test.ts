@@ -9,6 +9,8 @@ import {
   createBuiltinSkillSourcesPort,
   createPostgresPersonalSkillPackageSource,
   requireEmployeePanelsAccess,
+  requireDEntryNativeIdentity,
+  closeDEntryAuthorityFeeds,
   runtimePolicyDigest,
 } from '@allrice/database';
 import { createFileArchive } from '@allrice/file-archives';
@@ -24,6 +26,10 @@ import {
   it,
   vi,
 } from 'vitest';
+import { nativeWebSkillSource } from '../src/native-web/skill-source.js';
+import { setupNativeWebFixture } from '../src/native-web/owner.native.fixture.js';
+import { EventEmitter, once } from 'node:events';
+import { rm } from 'node:fs/promises';
 import type * as DatabaseClient from '../../../packages/database/src/core/client.ts';
 import {
   createRuntimeFixtureDatabase,
@@ -101,6 +107,7 @@ suite(
       });
       return {
         context,
+        assignment,
         scope: {
           workspaceId: publication.workspaceId,
           instanceId: instance.id,
@@ -139,7 +146,7 @@ suite(
         client.db = undefined;
       }
     });
-    async function install() {
+    async function install(userInvocable = false) {
       const installationId = randomUUID(),
         versionId = randomUUID();
       const definition: PersonalSkillDefinition = {
@@ -147,7 +154,7 @@ suite(
         description: 'Use my installed weekly Skill.',
         content: '# 周报\n精确保留本人正文。\n',
         checksum: hash('# 周报\n精确保留本人正文。\n'),
-        invocation: { modelInvocable: true, userInvocable: false },
+        invocation: { modelInvocable: true, userInvocable },
         whenToUse: 'When summarizing a week.',
         metadata: { displayName: '周报' },
       };
@@ -205,6 +212,185 @@ suite(
         },
       };
     }
+
+    async function prepareProduction() {
+      const { context } = host;
+      await f.db`insert into allrice_settings(scope_type,key,value)
+        values ('system','d_entry_rollout_policy',${f.db.json({
+          revision: randomUUID(),
+          defaultGeneration: '3.x',
+          selections: [
+            {
+              organizationId: context.organizationId,
+              personId: context.actor.id,
+            },
+          ],
+        })})
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+      const instance = await createEmployeeInstance(context, {
+        workspaceId: host.scope.workspaceId,
+        assignmentId: host.assignment.id,
+        requestId: randomUUID(),
+        profile: { name: 'Other Skill fixture' },
+      });
+      const identity = await requireDEntryNativeIdentity(context, {
+        workspaceId: host.scope.workspaceId,
+        employeeInstanceId: host.scope.instanceId,
+      });
+      const otherIdentity = await requireDEntryNativeIdentity(context, {
+        workspaceId: host.scope.workspaceId,
+        employeeInstanceId: instance.id,
+      });
+      const installed = await install(true);
+      return { context, identity, otherIdentity, installed };
+    }
+
+    it('rechecks production Skill reads against the exact login, employee, organization and VM lease', async () => {
+      const { context, identity, otherIdentity, installed } =
+        await prepareProduction();
+      const signal = AbortSignal.timeout(20_000);
+      const binding = {
+        vmId: randomUUID(),
+        instanceId: randomUUID(),
+        leaseEpoch: 1,
+        organizationId: identity.organizationId,
+        personId: identity.personId,
+      };
+      function scope(expected: typeof identity) {
+        return {
+          scopeId: randomUUID(),
+          identity: expected,
+          access: 'page' as const,
+        };
+      }
+      const vm = { assertCurrentBinding: vi.fn(async () => {}) };
+      const first = nativeWebSkillSource(
+        context,
+        scope(identity),
+        binding,
+        vm,
+      )!;
+      const second = nativeWebSkillSource(
+        context,
+        scope(otherIdentity),
+        binding,
+        vm,
+      )!;
+      const catalog = await first.read({ kind: 'list' }, signal);
+      expect(catalog).toEqual({
+        kind: 'catalog',
+        entries: [expect.objectContaining({ name: installed.definition.name })],
+      });
+      if (catalog.kind !== 'catalog') throw Error('Missing Skill catalog');
+      const body = {
+        kind: 'body' as const,
+        name: catalog.entries[0]!.name,
+        revision: catalog.entries[0]!.revision,
+      };
+      expect(await first.read(body, signal)).toEqual({
+        kind: 'body',
+        content: installed.definition.content,
+      });
+      expect(await second.read({ kind: 'list' }, signal)).toEqual({
+        kind: 'catalog',
+        entries: [],
+      });
+      expect(await second.read(body, signal)).toEqual({ kind: 'unavailable' });
+      expect(
+        nativeWebSkillSource(
+          { ...context, organizationId: randomUUID() },
+          scope(identity),
+          binding,
+          vm,
+        ),
+      ).toBeUndefined();
+      const otherLogin = nativeWebSkillSource(
+        { ...context, sessionId: randomUUID() },
+        scope(identity),
+        binding,
+        vm,
+      )!;
+      await expect(otherLogin.read(body, signal)).rejects.toBeDefined();
+      vm.assertCurrentBinding.mockRejectedValueOnce(Error('old epoch'));
+      await expect(first.read(body, signal)).rejects.toThrow('old epoch');
+
+      // Withdraw after a source read while the Worker is still awaiting the
+      // authenticated VM check. Its post-read pin check must see the change.
+      let checks = 0;
+      vm.assertCurrentBinding.mockImplementation(async () => {
+        if (++checks === 3)
+          await f.db`update allrice_personal_skill_bindings set enabled=false,epoch=epoch+1
+            where installation_id=${installed.installationId}`;
+      });
+      await expect(first.read(body, signal)).rejects.toBeDefined();
+      expect(await first.read(body, signal)).toEqual({ kind: 'unavailable' });
+    }, 28_000);
+
+    it.skipIf(!process.env.ALLRICE_NATIVE_WEB_TEST_CLI)(
+      'lists a real PG binding over the locked CLI owner duplex and observes a committed withdrawal',
+      { timeout: 120_000, tags: ['manual:ALLRICE_NATIVE_WEB_TEST_CLI'] },
+      async () => {
+        const { context, identity, installed } = await prepareProduction();
+        const roots: string[] = [],
+          close: (() => Promise<void>)[] = [];
+        vi.stubEnv('DATABASE_URL', process.env.ALLRICE_TEST_DATABASE_URL);
+        const signal = AbortSignal.timeout(45_000);
+        try {
+          const guest = await setupNativeWebFixture(
+            process.env.ALLRICE_NATIVE_WEB_TEST_CLI,
+            roots,
+            close,
+            undefined,
+            { identity, loginSessionId: context.sessionId! },
+          );
+          const session = await guest.owner.createRootFor(context, {}, signal);
+          const scopeId = randomUUID();
+          const activity = guest.owner.acquirePrincipal(
+            { scopeId, identity, access: 'page' },
+            signal,
+            context,
+          );
+          close.push(() => activity.close());
+          const page = await activity.run(signal);
+          const list = () =>
+            page.invokePage(
+              {
+                kind: 'page',
+                scopeId,
+                endpoint: 'skills/list',
+                args: { request: { sessionId: session.value.sessionId } },
+              },
+              signal,
+            );
+          const visible = installed.definition;
+          expect(await list()).toMatchObject({
+            value: {
+              skills: [expect.objectContaining({ name: visible.name })],
+            },
+          });
+          const changes = new EventEmitter();
+          const off = page.subscribeSkillChanges?.(() =>
+            changes.emit('changed'),
+          );
+          close.push(async () => off?.());
+          const changed = once(changes, 'changed', { signal });
+          await f.db`update allrice_personal_skill_bindings set enabled=false,epoch=epoch+1
+            where installation_id=${installed.installationId}`;
+          await changed;
+          expect(await list()).toMatchObject({ value: { skills: [] } });
+        } finally {
+          try {
+            for (const release of close.reverse()) await release();
+          } finally {
+            await closeDEntryAuthorityFeeds();
+            vi.unstubAllEnvs();
+            await Promise.all(
+              roots.map((root) => rm(root, { recursive: true, force: true })),
+            );
+          }
+        }
+      },
+    );
 
     it('loads the published browser package in DSH and refuses its exact pin after an employee disable', async () => {
       const abort = new AbortController();
