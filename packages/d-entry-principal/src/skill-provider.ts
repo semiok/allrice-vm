@@ -144,7 +144,7 @@ export function installPrincipalSkillProvider(
     signal: AbortSignal,
     next: () => T,
     page = false,
-  ) => {
+  ): Promise<Awaited<T>> => {
     // rc.2 reuses a catalog by cwd and native scope, which can be shared by
     // multiple logins to the same conversation. Serialize its native list,
     // pre-step and skill tool entry points. Discard the cache before giving
