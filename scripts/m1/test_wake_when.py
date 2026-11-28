@@ -108,23 +108,115 @@ sys.exit(int(os.environ.get('QUEUE_EXIT', '0')))
         args = self.notifications()[0]
         self.assertEqual(args[:3], ['queue', '--thread', THREAD])
         self.assertIn('CI check 结束：成功（真实结论 exit 0；等待命令退出码 0）', args[4])
-        self.assertNotIn('最后 30 行', args[4])
+        self.assertNotIn('诊断摘要', args[4])
         self.assertEqual(len(self.notifications()), 1)
         self.assertIn(str(self.home), Path(item['log']).read_text())
         self.assertIn('$(false); keep literal', Path(item['log']).read_text())
         self.assertEqual(Path(item['log']).stat().st_mode & 0o777, 0o600)
         self.assert_released(item)
 
-    def test_failure_notifies_exit_code_and_only_last_30_lines(self):
+    def test_failure_notifies_exit_code_and_only_recent_context(self):
         item = self.start('import sys; [print("L"+str(i)) for i in range(40)]; sys.exit(7)')
         state = self.finished(item)
         self.assertEqual((state['outcome'], state['commandExitCode']), ('等待失败，任务状态未知', 7))
         message = self.notifications()[0][4]
         self.assertIn('退出码 7', message)
-        self.assertIn('\nL10\n', message)
-        self.assertNotIn('\nL9\n', message)
+        self.assertIn('\nL34\n', message)
+        self.assertNotIn('\nL33\n', message)
         self.assertTrue(message.endswith('L39'))
         self.assertIn('L0\n', Path(item['log']).read_text())
+        self.assert_released(item)
+
+    def test_failure_prioritizes_vitest_and_folds_repeated_payload(self):
+        failure = ('\x1b[31m apps/web test: FAIL  ' + '/deep-directory' * 30
+                   + '/example.test.ts > rejects input ' + 'A' * 4096 + '\x1b[0m\n'
+                   'AssertionError: expected false to be true\n'
+                   + '/deep-directory' * 30 + '/source.ts(14,2): error TS2322: invalid assignment\n'
+                   'apps/web lint:   14:2  error  unexpected value\n'
+                   '✖ 1 problem (1 error, 0 warnings)\n'
+                   ' Test Files  1 failed | 1 passed (2)\n'
+                   '      Tests  1 failed | 3 passed (4)\n')
+        passing = ''.join(f' ✓ test {i} checks AssertionError\n' for i in range(12))
+        passing += ''.join(f'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL: package {i}\n' for i in range(12))
+        passing += ''.join(f'Error: command failed with exit code 1 in package {i}\n' for i in range(12))
+        passing += '✖ 1 problem (0 errors, 1 warning)\n' + 'cleanup progress\n' * 8
+        payload = 'A' * 170 + '\n'
+        # Place the actual diagnostic outside the old 64 KiB tail.
+        closing = ('xy' * 40 + '==\nError: ' + 'A' * 600 + ' at column 4\nError: '
+                   + 'AAAABBBB' * 4 + ' invalid pattern\nError: downloaded data:image/png;base64,'
+                   + 'A' * 4096 + '\nrunner exit 1\n')
+        source = (f'import sys; sys.stdout.write({failure + passing!r}); '
+                  f'sys.stdout.write({payload!r} * 8000); '
+                  f'sys.stdout.write({closing!r}); sys.exit(1)')
+        item = self.start(source)
+        self.finished(item)
+        message = self.notifications()[0][4]
+        summary = message.split('诊断摘要', 1)[1].split('\n', 1)[1]
+        for line in ('/example.test.ts > rejects input [已折叠重复字符 x4096]',
+                     'AssertionError: expected false to be true',
+                     'error TS2322', '14:2  error', '✖ 1 problem',
+                     'Test Files  1 failed', 'Tests  1 failed'):
+            self.assertIn(line, summary)
+        self.assertLess(summary.index('FAIL '), summary.index('runner exit 1'))
+        self.assertEqual(summary.count('[已折叠重复字符 x1360080]'), 1)
+        self.assertIn('Error: [已折叠重复字符 x600] at column 4', summary)
+        self.assertIn('Error: [已折叠重复字符 x32] invalid pattern', summary)
+        self.assertIn('data:image/png;base64,[已折叠重复字符 x4096]', summary)
+        self.assertNotIn('checks AssertionError', summary)
+        self.assertNotIn('ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL', summary)
+        self.assertNotIn('command failed with exit code', summary)
+        self.assertNotIn('0 errors', summary)
+        self.assertNotIn('A' * 32, summary)
+        self.assertNotIn('xy' * 16, summary)
+        self.assertNotIn('\x1b', summary)
+        self.assertTrue(summary.endswith('runner exit 1'))
+        self.assertIn(item['log'], message)
+        self.assertEqual(Path(item['log']).read_text(), failure + passing + payload * 8000 + closing)
+        self.assert_released(item)
+
+    def test_repeat_starting_near_cutoff_has_complete_fold_marker(self):
+        prefix = 'Error: ' + ''.join(str(i) for i in range(106))
+        item = self.start(f'import sys; print({prefix!r} + "A" * 600); sys.exit(1)')
+        self.finished(item)
+        summary = self.notifications()[0][4].split('诊断摘要', 1)[1].split('\n', 1)[1]
+        self.assertNotIn('A' * 16, summary)
+        self.assertLessEqual(len(summary), 220)
+        self.assertTrue(summary.endswith('[已折叠重复字符 x600]'))
+        self.assert_released(item)
+
+    def test_failure_preserves_short_readable_tail_and_ignores_binary(self):
+        output = (b'\x1b]8;;https://example.invalid\x1b\\first line\x1b]8;;\x1b\\\n'
+                  b'\x00\xffxx\n  indented detail\nlast line \xef\xbf\xbd\n')
+        item = self.start(f'import os,sys; os.write(1, {output!r}); sys.exit(1)')
+        self.finished(item)
+        message = self.notifications()[0][4]
+        self.assertEqual(message.split('诊断摘要', 1)[1].split('\n', 1)[1],
+                         'first line\n  indented detail\nlast line \ufffd')
+        self.assert_released(item)
+
+    def test_failure_with_no_text_has_fallback_and_keeps_raw_log(self):
+        for output in (b'', b'\x00\xff\x1f\n'):
+            with self.subTest(output=output):
+                item = self.start(f'import os,sys; os.write(1, {output!r}); sys.exit(1)')
+                self.finished(item)
+                message = self.notifications()[-1][4]
+                self.assertTrue(message.endswith('[无可显示的诊断日志]'))
+                self.assertIn(item['log'], message)
+                self.assertEqual(Path(item['log']).read_bytes(), output)
+                self.assert_released(item)
+
+    def test_failure_summary_bounds_lines_and_characters(self):
+        item = self.start('import sys; detail = "".join(f"{i:03x}" for i in range(500)); '
+                          '[print("FAIL", i, detail) for i in range(50)]; '
+                          '[print("context", i, detail) for i in range(50)]; sys.exit(1)')
+        self.finished(item)
+        message = self.notifications()[0][4]
+        summary = message.split('诊断摘要', 1)[1].split('\n', 1)[1]
+        self.assertLessEqual(len(summary.splitlines()), 16)
+        self.assertLessEqual(len(summary), 3535)
+        self.assertIn('FAIL 49', summary)
+        self.assertIn('context 49', summary)
+        self.assertTrue(summary.endswith('…'))
         self.assert_released(item)
 
     def test_timeout_stops_term_ignoring_command_and_child(self):

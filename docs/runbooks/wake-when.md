@@ -4,7 +4,7 @@
 
 仓库 Skill 在 [`.agents/skills/wait-and-wake/SKILL.md`](../../.agents/skills/wait-and-wake/SKILL.md)，在任务 worktree 中可用 `$wait-and-wake`。从仓库外启动的旧会话需显式读取这份文件；不安装到 `~/.codex/skills`，不修改 Codex 配置。
 
-在 M1 运行，等待过程中不占 Codex 回合，也不依赖 M5。工具通过 `~/.local/bin/codex queue` 给指定本线发一次回执，区分任务真实结论与等待命令退出码；等待失败／任务失败附最后 30 行诊断日志（长行截断）。回执不是新增业务、合并或部署授权。
+在 M1 运行，等待过程中不占 Codex 回合，也不依赖 M5。工具通过 `~/.local/bin/codex queue` 给指定本线发一次回执，区分任务真实结论与等待命令退出码。等待失败或任务失败时附精简诊断。回执不是新增业务、合并或部署授权。
 
 ```bash
 ~/allrice40-dev/bin/wake-when \
@@ -58,6 +58,8 @@ EOF、5xx、超时等导致 watch／查询不能确认终态时，按 5、15、3
 ## 日志、失败与资源
 
 启动回执给出后台 PID、日志与结果路径。文件均在 `~/allrice40-dev/qa/wake-when/<时间-随机ID>/`，目录 700、文件 600。`command.log` 是命令原始输出，`notification.log` 是 queue 回执，`result.json` 中 `task` 是已核实结论或 `unknown`，`commandExitCode` 是等待命令退出码；还记录核验次数、超时与通知结果。记录工作目录、固定 CI 仓库/run 或终态文件路径，不另存完整 argv 或读取凭据。
+
+失败诊断在 `command.log` 最后 4 MiB 内最多选 10 行失败摘要，再补最多 6 行尾部上下文。每行最多 220 字符，合计最多 3,535 字符（含换行）。重复字符或短模式形成的长行折叠为 `[已折叠重复字符 xN]`，二进制噪音略去。没有可显示的内容时依旧发送失败结论和原始路径。完整输出仍可从回执里的 `command.log` 路径回查。
 
 `notification=sent` 只说明 queue 已接收，不等于本线已执行后续。queue 每次最多30秒；失败按1/2/4秒退避再试，累计最多4次，不重跑原命令。delivery.json 记录投递过程；线程不存在/归档/不在白名单立即升级TG，其他失败耗尽后升级TG。TG失败有持久化退避，交看门狗续送。正常结束／超时／TERM 会退出后台进程并删除任务锁。M1 重启或 supervisor 被 SIGKILL 时不自动恢复任务；看门狗启动补扫并通知核对，清理内核已解锁的任务锁。日志作为证据保留，不占实例名额。
 
