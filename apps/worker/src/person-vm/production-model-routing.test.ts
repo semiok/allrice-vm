@@ -9,6 +9,7 @@ import {
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
+import type * as Database from '@allrice/database';
 import {
   classifyDeepSeek,
   selectScopedModel,
@@ -26,7 +27,7 @@ import { createProductionModelRouting } from './production-model-routing.js';
 import { createProductionOpenAiRuntime } from './production-openai-runtime.js';
 
 vi.mock('@allrice/database', async (original) => ({
-  ...(await original<typeof import('@allrice/database')>()),
+  ...(await original<typeof Database>()),
   readPlatformModelSettings: async () => ({
     revision: 1,
     configuration: {
