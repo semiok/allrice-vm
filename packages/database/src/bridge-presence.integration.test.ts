@@ -5,6 +5,7 @@ import {
 } from './bridge-settings.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
@@ -164,58 +165,73 @@ suite(
       }
     });
 
-    it('closes the replacement Bridge LISTEN socket without closing the Web business pool', async () => {
-      const applicationName = 'bridge-close-' + randomUUID();
-      const web = postgres(process.env.ALLRICE_TEST_DATABASE_URL!, {
-        max: 1,
-        connection: { application_name: applicationName },
-      });
-      const notify = vi.fn();
-      const channel = 'allrice_bridge_workspace_selection';
-      const subscriptionPids = () => admin<{ pid: number }[]>`
+    it.each(['after reconnect', 'during backoff'] as const)(
+      'closes the Bridge LISTEN socket %s without closing the Web business pool',
+      async (timing) => {
+        const applicationName = 'bridge-close-' + randomUUID();
+        const web = postgres(process.env.ALLRICE_TEST_DATABASE_URL!, {
+          max: 1,
+          connection: { application_name: applicationName },
+        });
+        const notify = vi.fn();
+        const channel = 'allrice_bridge_workspace_selection';
+        const subscriptionPids = () => admin<{ pid: number }[]>`
         select pid from pg_stat_activity
         where application_name = ${applicationName}
-          and query = ${`listen "${channel}"`}
+          and lower(query) = ${`listen "${channel}"`}
       `;
-      let close: (() => Promise<void>) | undefined;
-      try {
-        close = await createBridgeConnectionAuthority(web).subscribe(notify);
-        const [first] = await subscriptionPids();
-        expect(first).toBeDefined();
-        const device = randomUUID();
-        await web.notify(channel, device);
-        await vi.waitFor(() =>
-          expect(notify).toHaveBeenCalledWith(device, 'work'),
-        );
-        await admin`select pg_terminate_backend(${first!.pid})`;
-        const replacementPid = await vi.waitFor(
-          async () => {
-            const [replacement] = await subscriptionPids();
-            expect(replacement?.pid).toBeDefined();
-            expect(replacement?.pid).not.toBe(first!.pid);
-            return replacement!.pid;
-          },
-          { timeout: 5000 },
-        );
-        await close();
-        await vi.waitFor(async () => {
-          expect(
-            await admin`
-            select pid from pg_stat_activity where pid = ${replacementPid}
-          `,
-          ).toEqual([]);
-        });
-        await expect(web`select 1 as healthy`).resolves.toMatchObject([
-          { healthy: 1 },
-        ]);
-      } finally {
+        let close: (() => Promise<void>) | undefined;
         try {
-          await close?.();
+          const [business] = await web<
+            { pid: number }[]
+          >`select pg_backend_pid() as pid`;
+          close = await createBridgeConnectionAuthority(web, {
+            notificationDatabaseUrl: process.env.ALLRICE_TEST_DATABASE_URL,
+          }).subscribe(notify);
+          const [first] = await subscriptionPids();
+          expect(first).toBeDefined();
+          const device = randomUUID();
+          await web.notify(channel, device);
+          await vi.waitFor(() =>
+            expect(notify).toHaveBeenCalledWith(device, 'work'),
+          );
+          await admin`select pg_terminate_backend(${first!.pid})`;
+          await vi.waitFor(
+            async () => {
+              const connections = await subscriptionPids();
+              expect(connections.map(({ pid }) => pid)).not.toContain(
+                first!.pid,
+              );
+              if (timing === 'after reconnect')
+                expect(connections).toHaveLength(1);
+              else expect(connections).toHaveLength(0);
+            },
+            { timeout: 5000, interval: 10 },
+          );
+          await close();
+          // Cross a full retry interval; a reconnect scheduled before close
+          // must not authenticate a second backend.
+          await delay(400);
+          await vi.waitFor(async () => {
+            expect(
+              await admin`
+              select pid from pg_stat_activity where application_name=${applicationName}
+            `,
+            ).toEqual([{ pid: business!.pid }]);
+          });
+          await expect(web`select 1 as healthy`).resolves.toMatchObject([
+            { healthy: 1 },
+          ]);
         } finally {
-          await web.end({ timeout: 5 });
+          try {
+            await close?.();
+          } finally {
+            await web.end({ timeout: 5 });
+          }
         }
-      }
-    }, 10000);
+      },
+      10000,
+    );
 
     it('human terminal authority binds the actual login, private chat and grant generation without mutating presence', async () => {
       const f = await terminalFixture();

@@ -191,7 +191,9 @@ suite('project service first complete native chain', () => {
           suffix = `preview.allrice.test:${port}`;
         vi.stubEnv('ALLRICE_PROJECT_PREVIEW_SUFFIX', suffix);
         server.bridgeGateway = await createBridgeSocketGateway({
-          authority: createBridgeConnectionAuthority(database),
+          authority: createBridgeConnectionAuthority(database, {
+            notificationDatabaseUrl: process.env.ALLRICE_TEST_DATABASE_URL,
+          }),
           enabled: () => true,
           dispatch: createBridgeLoopbackDispatch(port),
         });

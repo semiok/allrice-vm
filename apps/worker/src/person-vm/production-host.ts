@@ -8,6 +8,7 @@ import {
   createDEntryAuthorityFeed,
   createPostgresPersonVmScheduledWakeStore,
   getDatabase,
+  openDatabaseNotifications,
   readContentPrincipal,
   readPersonNativeWebRoster,
   readPersonVmDiskPreparationForegroundBusy,
@@ -276,8 +277,8 @@ export function createProductionPersonVmHost(input: {
     bound: BoundSources | undefined,
     gateway: ReturnType<typeof createEgressGateway> | undefined,
     model: ModelGatewayPort | undefined,
-    modelCapacityDatabase:
-      ReturnType<typeof createDedicatedDatabase> | undefined,
+    modelCapacityNotifications:
+      ReturnType<typeof openDatabaseNotifications> | undefined,
     scheduledWake: ReturnType<typeof createProductionScheduledWake> | undefined,
     installed:
       ReturnType<typeof installAssignedDEntryNativeRuntime> | undefined,
@@ -515,10 +516,9 @@ export function createProductionPersonVmHost(input: {
       let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      const capacityDatabase = modelCapacityDatabase;
-      if (capacityDatabase)
+      if (modelCapacityNotifications)
         await settle('model_capacity_listener', [
-          () => capacityDatabase.end({ timeout: 5 }),
+          modelCapacityNotifications.close,
         ]);
       const closeTransport =
         sourceOwner?.model.closeTransport ??
@@ -544,8 +544,9 @@ export function createProductionPersonVmHost(input: {
       }
       // The lifetime drain may have started before an exact stop. Verify the
       // remaining owners after every stop/receipt retry has joined.
-      if (startupOwner)
-        await settle('native_startup', [() => startupOwner.close()]);
+      const nativeStartupFailures = startupOwner
+        ? await collectFailures([() => startupOwner.close()])
+        : [];
       const providerOwner = providers;
       const installationFailures = providerOwner
         ? await collectFailures([
@@ -556,6 +557,7 @@ export function createProductionPersonVmHost(input: {
       // lease. Keep that maintenance path available when either is unresolved.
       if (
         modelFailures.length ||
+        nativeStartupFailures.length ||
         vmFailures.length ||
         receiptFailures.length ||
         installationFailures.length ||
@@ -567,6 +569,7 @@ export function createProductionPersonVmHost(input: {
       input.lifetime.removeEventListener('abort', aborted);
       const errors = [
         ...independentCloseFailures,
+        ...nativeStartupFailures,
         ...uncertainPreparation.values(),
         ...vmFailures,
         ...receiptFailures,
@@ -580,6 +583,7 @@ export function createProductionPersonVmHost(input: {
           failedStages: [
             ...failedStages,
             ...(uncertainPreparation.size ? ['egress_preparation'] : []),
+            ...(nativeStartupFailures.length ? ['native_startup'] : []),
             ...(vmFailures.length ? ['vm_readback'] : []),
             ...(receiptFailures.length ? ['egress_receipts'] : []),
             ...(installationFailures.length ? ['egress_installation'] : []),
@@ -627,6 +631,10 @@ export function createProductionPersonVmHost(input: {
       const prepareFailures = await retireFailedPreparations();
       const vmFailures = await stopOwnedVms({ deferUnconfirmedEgress: true });
       const receiptFailures = await retireReceipts();
+      const startupOwner = startup;
+      const nativeStartupFailures = startupOwner
+        ? await collectFailures([() => startupOwner.close()])
+        : [];
       const providerOwner = providers;
       const installationFailures = providerOwner
         ? await collectFailures([
@@ -643,6 +651,7 @@ export function createProductionPersonVmHost(input: {
           ]);
       const errors = [
         ...independentCloseFailures,
+        ...nativeStartupFailures,
         ...uncertainPreparation.values(),
         ...prepareFailures,
         ...vmFailures,
@@ -654,6 +663,7 @@ export function createProductionPersonVmHost(input: {
         !uncertainPreparation.size &&
         !prepareFailures.length &&
         !vmFailures.length &&
+        !nativeStartupFailures.length &&
         !receiptFailures.length &&
         !installationFailures.length &&
         !sourceFailures.length
@@ -738,8 +748,16 @@ export function createProductionPersonVmHost(input: {
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(
         trustedDatabase,
-        () =>
-          (modelCapacityDatabase ??= createDedicatedDatabase(trustedDatabase)),
+        (notify, onListen) => {
+          const owner = (modelCapacityNotifications ??=
+            openDatabaseNotifications(
+              trustedDatabase,
+              ['allrice_model_gateway_capacity'],
+              (_channel, personId) => notify(personId),
+              { onListen },
+            ));
+          return owner.ready;
+        },
       );
       const budget = providers.configuration.lifecycle.hostVmBudgetMiB;
       if (budget !== undefined && budget * 1024 ** 2 > totalmem())

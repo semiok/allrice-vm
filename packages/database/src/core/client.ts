@@ -1,6 +1,8 @@
 import postgres from 'postgres';
+import { openPostgresNotifications } from './notification-client.ts';
 
 let client: ReturnType<typeof postgres> | undefined;
+let clientUrl: string | undefined;
 let diagnostics: ReturnType<typeof postgres> | undefined;
 const closeHooks = new Set<() => Promise<void>>();
 
@@ -15,16 +17,34 @@ export function getDatabase() {
     throw new Error('DATABASE_URL is required');
   }
 
-  client ??= postgres(databaseUrl, {
-    connect_timeout: 5,
-    idle_timeout: 20,
-    max: process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 10 : 5,
-    connection: {
-      application_name: `allrice-${process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 'worker' : 'app'}`,
-    },
-  });
+  if (!client) {
+    client = postgres(databaseUrl, {
+      connect_timeout: 5,
+      idle_timeout: 20,
+      max: process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 10 : 5,
+      connection: {
+        application_name: `allrice-${process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 'worker' : 'app'}`,
+      },
+    });
+    clientUrl = databaseUrl;
+  }
 
   return client;
+}
+
+export function openDatabaseNotifications(
+  database: ReturnType<typeof postgres>,
+  channels: readonly string[],
+  receive: (channel: string, payload: string) => void,
+  options: { databaseUrl?: string; onListen?(): void } = {},
+) {
+  const url =
+    options.databaseUrl ?? (database === client ? clientUrl : undefined);
+  if (!url) throw Error('Dedicated notification connection URL required');
+  return openPostgresNotifications(url, channels, receive, {
+    applicationName: database.options.connection.application_name,
+    onListen: options.onListen,
+  });
 }
 
 /** A caller-owned client from the trusted client's entire public configuration.
@@ -82,4 +102,5 @@ export async function closeDatabase() {
   for (const hook of closeHooks) await hook();
   await client.end({ timeout: 5 });
   client = undefined;
+  clientUrl = undefined;
 }

@@ -42,6 +42,7 @@ const io = vi.hoisted(() => ({
   read: vi.fn(),
   database: vi.fn(),
   dedicated: vi.fn(),
+  notifications: vi.fn<typeof Database.openDatabaseNotifications>(),
   upgradeOperator: vi.fn<typeof Database.requireCurrentPlatformAdmin>(),
   upgradeWake:
     vi.fn<
@@ -123,6 +124,7 @@ vi.mock('@allrice/database', async (original) => ({
   ...(await original<typeof Database>()),
   getDatabase: io.database,
   createDedicatedDatabase: io.dedicated,
+  openDatabaseNotifications: io.notifications,
   requireCurrentPlatformAdmin: io.upgradeOperator,
 }));
 vi.mock('./production-scheduled-wake.js', async (original) => {
@@ -1018,9 +1020,14 @@ it('a failed actual service revoke retains the receipt for the real Host.close r
   expect(value.model.revoke).toHaveBeenCalledTimes(2);
 });
 
-it('retains maintenance after VM stop is unconfirmed even when model close succeeded', async () => {
+it('rechecks native startup close after authenticated recovery proves a prior unknown VM stop', async () => {
   const value = await receiptFixture();
-  const { vm, providers } = value.input();
+  const { vm, providers, startup } = value.input();
+  const nativeFailure = new PersonVmError('CLEANUP_INCOMPLETE');
+  const nativeClose = vi
+    .spyOn(startup, 'close')
+    .mockRejectedValueOnce(nativeFailure)
+    .mockResolvedValue(undefined);
   const context = value.entry.context;
   const stop = vi.mocked(providers.native.stop);
   const stopNormally = stop.getMockImplementation()!;
@@ -1031,7 +1038,10 @@ it('retains maintenance after VM stop is unconfirmed even when model close succe
   });
   const originalClose = value.host.close();
   await expect(originalClose).rejects.toMatchObject({
-    errors: [expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' })],
+    errors: [
+      nativeFailure,
+      expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' }),
+    ],
   });
   expect(value.model.close).toHaveBeenCalledOnce();
   expect(value.host.modelOwnerMaintenancePending()).toBe(true);
@@ -1052,6 +1062,7 @@ it('retains maintenance after VM stop is unconfirmed even when model close succe
     0,
   );
   expect(detach).toHaveBeenCalledOnce();
+  expect(nativeClose).toHaveBeenCalledTimes(2);
   expect(value.host.modelOwnerMaintenancePending()).toBe(false);
   await expect(value.host.close()).resolves.toBeUndefined();
 });
@@ -1635,38 +1646,39 @@ it('joins all scoped transport owners before asking for the combined ledger reco
 it('joins the independent capacity listener during zero-VM shutdown', async () => {
   const entered = gate(),
     released = gate();
-  const database = {
-    listen: vi.fn(async (_channel, _notify, onListen: () => void) => {
-      onListen();
-    }),
-    end: vi.fn(async () => {
+  const notifications = {
+    ready: Promise.resolve(),
+    close: vi.fn(async () => {
       entered.release();
       await released.promise;
     }),
   };
   const value = await open();
-  io.dedicated.mockReturnValue(database);
+  io.notifications.mockImplementation((_db, _channels, _receive, options) => {
+    options?.onListen?.();
+    return notifications;
+  });
   const store = io.model.mock.calls[0]![0].store;
   const watch = await store.watchCapacity(randomUUID(), signal());
   value.model.close.mockImplementation(() => watch.close());
   const close = value.host.close();
   try {
     await entered.promise;
-    expect(database.listen).toHaveBeenCalledWith(
-      'allrice_model_gateway_capacity',
+    expect(io.notifications).toHaveBeenCalledExactlyOnceWith(
+      trustedDatabase,
+      ['allrice_model_gateway_capacity'],
       expect.any(Function),
-      expect.any(Function),
+      { onListen: expect.any(Function) },
     );
     await expect(watch.wait()).rejects.toMatchObject({
       code: 'ADMISSION_CLOSED',
     });
-    expect(io.dedicated).toHaveBeenCalledExactlyOnceWith(trustedDatabase);
     expect(value.bound.egress.close).not.toHaveBeenCalled();
   } finally {
     released.release();
     await close;
   }
-  expect(database.end).toHaveBeenCalledExactlyOnceWith({ timeout: 5 });
+  expect(notifications.close).toHaveBeenCalledOnce();
   expect(value.host.modelOwnerMaintenancePending()).toBe(false);
 });
 

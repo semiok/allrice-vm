@@ -416,6 +416,9 @@ it('advertises public model metadata and keeps a healthy route usable when a pee
     },
   );
   cleanups.push(routing.close);
+  // Another rule still needs the static Codex fallback catalog after this
+  // runtime's execution route has stopped.
+  await routing.fallback.close();
   const catalog = await routing.guestCatalog(root.vm, signal);
   expect(catalog?.defaultModelInfo).toMatchObject({
     provider: 'openai-codex',
@@ -428,6 +431,8 @@ it('advertises public model metadata and keeps a healthy route usable when a pee
   await expect(routing.assertCurrent(root, signal)).resolves.toMatchObject({
     aborted: false,
   });
+  await routing.close();
+  await expect(routing.guestCatalog(root.vm, signal)).rejects.toBeDefined();
 });
 
 it('uses native Chat and Responses adapters with one metering owner and joins only the revoked route', async () => {

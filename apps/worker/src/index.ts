@@ -1211,7 +1211,7 @@ const stopWorker = (signal: string) => {
           error instanceof WorkerShutdownError
             ? error.failures.map(({ name }) => name)
             : ['shutdown_setup'],
-        databaseRetained:
+        databaseRetainedForMaintenance:
           error instanceof WorkerShutdownError &&
           error.failures.some(
             ({ name, error }) =>

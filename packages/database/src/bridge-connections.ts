@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { UuidSchema } from '@allrice/contracts';
 
-import { createDedicatedDatabase, getDatabase } from './core/client.ts';
+import { getDatabase, openDatabaseNotifications } from './core/client.ts';
 
 export interface BridgeSocketConnection {
   deviceId: string;
@@ -22,7 +22,11 @@ export class BridgeConnectionError extends Error {
 /** PostgreSQL authority for a transport connection; never authorizes tool execution. */
 export function createBridgeConnectionAuthority(
   database = getDatabase(),
-  options: { serverId?: string; leaseMs?: number } = {},
+  options: {
+    serverId?: string;
+    leaseMs?: number;
+    notificationDatabaseUrl?: string;
+  } = {},
 ) {
   const serverId = UuidSchema.parse(options.serverId ?? randomUUID());
   const leaseMs = options.leaseMs ?? 30_000;
@@ -84,31 +88,29 @@ export function createBridgeConnectionAuthority(
     async subscribe(
       listener: (deviceId: string, kind: 'connection' | 'work') => void,
     ) {
-      // postgres.js rebuilds listener handles on reconnect. End this
-      // subscription's client so the reconnected listener closes as well.
-      const subscription = createDedicatedDatabase(database);
-      let closing: Promise<void> | undefined;
-      const close = () => (closing ??= subscription.end({ timeout: 5 }));
-      try {
-        for (const channel of [
+      const subscription = openDatabaseNotifications(
+        database,
+        [
           'allrice_bridge_connection',
           'allrice_bridge_runtime_operation',
           'allrice_bridge_commands',
           'allrice_bridge_workspace_selection',
-        ]) {
-          await subscription.listen(channel, (payload) => {
-            if (closing) return;
-            const id = UuidSchema.safeParse(payload);
-            if (id.success)
-              listener(
-                id.data,
-                channel === 'allrice_bridge_connection' ? 'connection' : 'work',
-              );
-          });
-        }
+        ],
+        (channel, payload) => {
+          const id = UuidSchema.safeParse(payload);
+          if (id.success)
+            listener(
+              id.data,
+              channel === 'allrice_bridge_connection' ? 'connection' : 'work',
+            );
+        },
+        { databaseUrl: options.notificationDatabaseUrl },
+      );
+      try {
+        await subscription.ready;
       } catch (error) {
         try {
-          await close();
+          await subscription.close();
         } catch (cleanup) {
           throw new AggregateError(
             [error, cleanup],
@@ -117,7 +119,7 @@ export function createBridgeConnectionAuthority(
         }
         throw error;
       }
-      return close;
+      return subscription.close;
     },
   };
 }

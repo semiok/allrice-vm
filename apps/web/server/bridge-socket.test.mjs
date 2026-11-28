@@ -46,6 +46,11 @@ const suite =
 const schema = `bridge_wss_test_${randomUUID().replaceAll('-', '')}`;
 let admin, database, isolatedDatabaseUrl;
 const cleanups = [];
+const bridgeAuthority = () =>
+  createBridgeConnectionAuthority(database, {
+    leaseMs: 2000,
+    notificationDatabaseUrl: isolatedDatabaseUrl,
+  });
 vi.mock('../../../packages/database/src/core/client.ts', async (original) => ({
   ...(await original()),
   getDatabase: () => database,
@@ -117,9 +122,7 @@ async function gateway(options = {}) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const port = server.address().port;
-  const authority =
-    options.authority ??
-    createBridgeConnectionAuthority(database, { leaseMs: 2000 });
+  const authority = options.authority ?? bridgeAuthority();
   server.bridgeGateway = await createBridgeSocketGateway({
     authority,
     enabled: options.enabled ?? (() => true),
@@ -350,9 +353,7 @@ suite(
 
     it('missed NOTIFY still rejects old owner at the next frame/heartbeat', async () => {
       const d = await device();
-      const authority = createBridgeConnectionAuthority(database, {
-        leaseMs: 2000,
-      });
+      const authority = bridgeAuthority();
       const oldGateway = await gateway({
         authority: { ...authority, subscribe: async () => async () => {} },
       });
@@ -375,9 +376,7 @@ suite(
 
     it('an outbound preview chunk checks the PG epoch even when NOTIFY and heartbeat have not run', async () => {
       const d = await device();
-      const authority = createBridgeConnectionAuthority(database, {
-        leaseMs: 2000,
-      });
+      const authority = bridgeAuthority();
       const g = await gateway({
         authority: { ...authority, subscribe: async () => async () => {} },
         heartbeatMs: 10000,
@@ -530,7 +529,7 @@ suite(
       await waitUntil(() => c.closed() !== null);
       expect(calls).toBe(1);
       expect(c.closed()).toBe(4011);
-      const real = createBridgeConnectionAuthority(database, { leaseMs: 2000 });
+      const real = bridgeAuthority();
       let unavailable = false;
       const dbGateway = await gateway({
         authority: {
@@ -583,8 +582,8 @@ suite(
 
     it('concurrent registrations are serialized to one owner and an expired lease cannot renew', async () => {
       const d = await device();
-      const one = createBridgeConnectionAuthority(database, { leaseMs: 2000 });
-      const two = createBridgeConnectionAuthority(database, { leaseMs: 2000 });
+      const one = bridgeAuthority();
+      const two = bridgeAuthority();
       const [a, b] = await Promise.all([
         one.register(d.token),
         two.register(d.token),

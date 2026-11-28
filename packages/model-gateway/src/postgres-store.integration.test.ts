@@ -200,7 +200,9 @@ integration(
           };
         },
       }) as postgres.Sql;
-      const store = createPostgresModelGatewayStore(firstDb, () => observed);
+      const store = createPostgresModelGatewayStore(firstDb, (notify, ready) =>
+        observed.listen('allrice_model_gateway_capacity', notify, ready),
+      );
       const person = randomUUID();
       const signal = new AbortController().signal;
       const watch = await store.watchCapacity(person, signal);
