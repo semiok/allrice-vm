@@ -506,7 +506,7 @@ export async function bootstrapMicrosandbox(input: {
     // The state job has already created and verified its own directory.
     // Other parents still require a separate current check before mkdir.
     if (diskProof) parents.delete(COMMAND_MEMORY_STATE_ROOT);
-    if (parents.size)
+    if (!diskProof || parents.size)
       await run({
         executable: '/bin/mkdir',
         args: ['-p', '--', ...parents],
