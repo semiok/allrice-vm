@@ -1,5 +1,12 @@
 import { spawnSync } from 'node:child_process';
-import { access, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -252,6 +259,12 @@ it(
   'runs native bash without prompting after loading a persisted ask policy',
   { timeout: 45_000 },
   async () => {
+    const local = join(process.cwd(), '.local');
+    await mkdir(local, { recursive: true });
+    // rc.2 intentionally grants platform temporary directories in workspace-write.
+    const outsideRoot = await mkdtemp(join(local, 'native-permissions-'));
+    roots.push(outsideRoot);
+    const outside = join(outsideRoot, 'outside');
     const f = await setupNativeWebFixture(
       releasedCli(),
       roots,
@@ -269,7 +282,7 @@ it(
           export function apply(ctx) {
             const root = fileURLToPath(new URL('../../', import.meta.url));
             const workspace = resolve(root, 'workspace');
-            const outside = resolve(root, 'outside');
+            const outside = ${JSON.stringify(outside)};
             const receipt = resolve(root, 'permissions.json');
             let prompts = 0;
             ctx.on('approval/request', () => { prompts++; return 'rejected'; });
@@ -374,7 +387,7 @@ it(
     });
     expect(receipt.outsideWrite.exitCode).not.toBe(0);
     expect(await read('workspace/inside')).toBe('ok');
-    expect(await read('outside')).toBe('unchanged');
+    expect(await readFile(outside, 'utf8')).toBe('unchanged');
   },
 );
 
