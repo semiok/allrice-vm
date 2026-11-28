@@ -372,6 +372,8 @@ export async function createProductionModelRouting(
         return authorisedRuntime(call).assertCurrent(signal);
       },
       async guestCatalog(binding: VmOwner, signal: AbortSignal) {
+        const active = AbortSignal.any([signal, lifetime, watchStop.signal]);
+        active.throwIfAborted();
         const rules = rulesFor(binding);
         if (!rules.length) return;
         const models = await Promise.all(
@@ -384,7 +386,7 @@ export async function createProductionModelRouting(
             .map(async (runtime) => ({
               provider: runtime.route.provider,
               model: runtime.route.model,
-              modelInfo: (await runtime.readCatalogModelMetadata(signal))
+              modelInfo: (await runtime.readCatalogModelMetadata(active))
                 .modelInfo,
             })),
         );
@@ -393,7 +395,7 @@ export async function createProductionModelRouting(
           return rule && { provider: rule.provider, model: rule.model };
         };
         const { modelInfo, historicalModels } =
-          await fallback.readCatalogModelMetadata(signal);
+          await fallback.readCatalogModelMetadata(active);
         return {
           defaultModelInfo: modelInfo,
           historicalModels,

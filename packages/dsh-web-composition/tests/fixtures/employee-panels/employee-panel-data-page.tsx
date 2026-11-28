@@ -56,7 +56,8 @@ let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
 let publicationReplyLost = false;
-let publicationRejected = false;
+let publicationRejected: number | undefined;
+let publicationGate: PromiseWithResolvers<void> | undefined;
 let receiptReady = false;
 let receiptGate: PromiseWithResolvers<void> | undefined;
 let serial = 850;
@@ -241,10 +242,15 @@ const bound = createEmployeePanelDataClient({
   },
   async publishUpload(input, signal) {
     await call('publishUpload', input, signal);
-    if (publicationRejected) {
-      publicationRejected = false;
-      throw new EmployeePanelsWriteRejectedError(409, '发布被明确拒绝。');
-    }
+    const rejection = publicationRejected;
+    publicationRejected = undefined;
+    if (rejection)
+      throw new EmployeePanelsWriteRejectedError(
+        rejection,
+        'fixture rejection',
+      );
+    await publicationGate?.promise;
+    signal.throwIfAborted();
     const saved = { sourceId: uid(serial++), revisionId: uid(serial++) };
     references.push({
       ...sample.references[0]!,
@@ -389,8 +395,15 @@ function Fixture() {
       losePublicationReply() {
         publicationReplyLost = true;
       },
-      rejectNextPublication() {
-        publicationRejected = true;
+      rejectNextPublication(status = 409) {
+        publicationRejected = status;
+      },
+      holdPublication() {
+        publicationGate = Promise.withResolvers<void>();
+      },
+      finishPublication() {
+        publicationGate?.resolve();
+        publicationGate = undefined;
       },
       finishReceipt() {
         receiptReady = true;

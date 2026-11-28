@@ -24,6 +24,7 @@ import {
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import { nativeSearchToolPatches } from './search-tools.js';
+import { nativeEmployeePersonaPatches } from './employee-instructions.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -37,6 +38,7 @@ export type NativeWebConfiguration = Readonly<{
   cliPath: string;
   startupTimeoutMs: number;
   terminalEnabled?: boolean;
+  employeeInstructions?: string;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -213,11 +215,25 @@ export async function prepareNativeWebLaunch(
         'utf8',
       )
     : undefined;
+  const modelPatches = modelAdapter
+    ? modelAdapter.scoped
+      ? nativeScopedModelPatches(modelAdapter.scoped)
+      : nativeSearchToolPatches(modelAdapter.webSearchEnabled === true)
+    : [];
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
     files: Object.freeze([
       { path: plugin, contents: ownerSource, mode: 0o600 },
+      ...(config.employeeInstructions !== undefined
+        ? [
+            {
+              path: `${config.dshHome}/AGENTS.md`,
+              contents: config.employeeInstructions,
+              mode: 0o600,
+            },
+          ]
+        : []),
       {
         path: `${directory}/allrice-native-run-journal.mjs`,
         contents: journalSource,
@@ -258,13 +274,22 @@ export function apply(ctx, config) {
       {
         path: patch,
         contents: JSON.stringify([
+          ...(config.employeeInstructions !== undefined
+            ? [
+                {
+                  id: 'system-prompt',
+                  config: { includeHarnessIdentity: false, personaPrefix: '' },
+                },
+                { id: 'harness-dev-context', disabled: true },
+              ]
+            : []),
           {
             id: 'web-runtime',
             // rc.2 replaces config as a whole; CLI webStartup values are not merged.
             config: {
               openBrowser: false,
               publicUrl: publicUrl.href,
-              surfaceContext: true,
+              surfaceContext: config.employeeInstructions === undefined,
               printUrl: false,
             },
           },
@@ -314,11 +339,7 @@ export function apply(ctx, config) {
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                ...(modelAdapter.scoped
-                  ? nativeScopedModelPatches(modelAdapter.scoped)
-                  : nativeSearchToolPatches(
-                      modelAdapter.webSearchEnabled === true,
-                    )),
+                ...modelPatches,
                 {
                   id: 'agent-default-model',
                   config: {
@@ -327,6 +348,9 @@ export function apply(ctx, config) {
                   },
                 },
               ]
+            : []),
+          ...(config.employeeInstructions !== undefined
+            ? nativeEmployeePersonaPatches(modelPatches)
             : []),
         ]),
         mode: 0o600,

@@ -84,6 +84,7 @@ export function EnterpriseMaterialsPanel(props: {
   const data = useEmployeePanelData(props);
   const identity = `${props.ownerKey}/${props.workspaceId}/${props.viewerId}/${props.sessionId ?? 'draft'}`;
   const download = useEmployeePanelDownload(data, identity, props.active);
+  const scopedDownload = !!props.dataClient || !!props.initialReference;
   const downloadFile = (r: ReferenceRevision) =>
     void download.download(
       (signal) =>
@@ -345,7 +346,12 @@ export function EnterpriseMaterialsPanel(props: {
   async function copy(r: ReferenceRevision) {
     try {
       await navigator.clipboard.writeText(
-        referencePublicationLink(props.workspaceId, r.sourceId, r.revisionId),
+        referencePublicationLink(
+          props.workspaceId,
+          r.sourceId,
+          r.revisionId,
+          props.headers['x-allrice-organization-id'],
+        ),
       );
       if (current.current === identity && active.current) {
         const notice = '链接已复制，查看仍需资料访问权限';
@@ -368,6 +374,7 @@ export function EnterpriseMaterialsPanel(props: {
     }
   }
   async function retry(r: ReferenceRevision) {
+    if (props.readOnly) return;
     if (
       r.canRetryProcessing !== true ||
       r.processing !== 'failed' ||
@@ -502,6 +509,7 @@ export function EnterpriseMaterialsPanel(props: {
             headers={props.headers}
             active={props.active}
             dataClient={props.dataClient}
+            scopedDownload={scopedDownload}
             material={{
               purpose: reference.purpose,
               quickActions: iconAction(
@@ -545,15 +553,16 @@ export function EnterpriseMaterialsPanel(props: {
                 reference.processing === 'failed' ? (
                   <div className={`${files.error} ${css.failure}`} role="alert">
                     <span>读取失败：Rice 暂时无法读取这份资料的内容</span>
-                    {reference.canRetryProcessing === true && (
-                      <button
-                        type="button"
-                        disabled={!!activeAction?.busy}
-                        onClick={() => void retry(reference)}
-                      >
-                        重新处理
-                      </button>
-                    )}
+                    {!props.readOnly &&
+                      reference.canRetryProcessing === true && (
+                        <button
+                          type="button"
+                          disabled={!!activeAction?.busy}
+                          onClick={() => void retry(reference)}
+                        >
+                          重新处理
+                        </button>
+                      )}
                   </div>
                 ) : null,
               footer: (
@@ -578,7 +587,7 @@ export function EnterpriseMaterialsPanel(props: {
                       <IconPlusOutlineRegular size={18} />
                       引用到对话
                     </button>
-                    {props.dataClient ? (
+                    {scopedDownload ? (
                       <button
                         type="button"
                         onClick={() => downloadFile(reference)}
@@ -727,9 +736,7 @@ export function EnterpriseMaterialsPanel(props: {
                             reference={r}
                             downloadUrl={downloadUrl(r)}
                             onDownload={
-                              props.dataClient
-                                ? () => downloadFile(r)
-                                : undefined
+                              scopedDownload ? () => downloadFile(r) : undefined
                             }
                             onCopy={() => void copy(r)}
                             onManage={

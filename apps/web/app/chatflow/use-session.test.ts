@@ -58,6 +58,7 @@ const hooks = vi.hoisted(() => {
   };
 });
 vi.mock('react', () => hooks);
+import { referencePublicationLink } from './reference-publication-link';
 import { useSession } from './use-session';
 
 function deferred<T>() {
@@ -138,7 +139,13 @@ describe('P26 History selection async control flow (synthetic fetch, explicit ho
     hooks.reset();
     requests = [];
     vi.clearAllMocks();
-    vi.stubGlobal('window', { location: { search: '', assign: vi.fn() } });
+    vi.stubGlobal('window', {
+      location: {
+        search: '',
+        origin: 'https://allricevm.bplabs.xyz',
+        assign: vi.fn(),
+      },
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn((url: string, init?: RequestInit) => {
@@ -151,6 +158,39 @@ describe('P26 History selection async control flow (synthetic fetch, explicit ho
   afterEach(() => {
     vi.unstubAllGlobals();
   });
+
+  it.each([false, true])(
+    'selects a publication workspace only for an unambiguous 4.0 material link (%s)',
+    async (ambiguous) => {
+      const workspaceId = '10000000-0000-4000-8000-000000000001';
+      const sourceId = '10000000-0000-4000-8000-000000000002';
+      const revisionId = '10000000-0000-4000-8000-000000000003';
+      const organizationId = '10000000-0000-4000-8000-000000000004';
+      const link = new URL(
+        referencePublicationLink(
+          workspaceId,
+          sourceId,
+          revisionId,
+          organizationId,
+        ),
+      );
+      expect(link.pathname).toBe('/chatflow');
+      if (ambiguous) link.searchParams.append('workspaceId', sourceId);
+      window.location.search = link.search;
+      const loading = render().loadWorkspace();
+      expect(requests[0]?.url).toBe(
+        ambiguous
+          ? '/api/v1/workspace'
+          : `/api/v1/workspace?workspaceId=${workspaceId}`,
+      );
+      expect(requests[0]?.init?.headers).toEqual(
+        ambiguous ? undefined : { 'x-allrice-organization-id': organizationId },
+      );
+      requests[0]?.result.resolve(Response.json({ workspace }));
+      requests[1]?.result.resolve(Response.json({ capabilities: {} }));
+      await loading;
+    },
+  );
 
   it('opens the default employee draft from the return link even with existing conversations', async () => {
     window.location.search = '?employee=';

@@ -11,7 +11,11 @@ import type {
   DEntryScopedUnaryCall,
 } from '@allrice/d-entry-principal/types';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
-import { DataAccessError, type DEntryPageForkSource } from '@allrice/database';
+import {
+  DataAccessError,
+  isDEntryNativeTitleRetryable,
+  type DEntryPageForkSource,
+} from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { rpcIdSchema } from '@deepseek-ai/dsh-client-connection';
 import {
@@ -210,6 +214,28 @@ export function createDEntryPageRpc(
                         .create()
                         .parse(result.value).sessionId;
                     }
+                    if (endpoint === 'session/rename') {
+                      // The native journal already owns the rename. Join the
+                      // directory projection even if no control stream is open.
+                      const {
+                        request: { sessionId },
+                      } = TYPERT_REMOTE.methods[endpoint]
+                        .input({ strict: true })
+                        .create()
+                        .parse(args);
+                      await page
+                        .syncNativeTitle(sessionId, active)
+                        .catch((error: unknown) => {
+                          if (!active.aborted) {
+                            if (isDEntryNativeTitleRetryable(error))
+                              page.requestNativeTitle(sessionId);
+                            else
+                              console.error(
+                                '[d-entry] native session title projection failed',
+                              );
+                          }
+                        });
+                    }
                     native = encodeResult(
                       rpcId,
                       result.value,
@@ -264,7 +290,11 @@ export function createDEntryPageRpc(
                   },
                 );
               };
-              if (endpoint === 'session/create' || endpoint === 'session/fork')
+              if (
+                endpoint === 'session/create' ||
+                endpoint === 'session/fork' ||
+                endpoint === 'session/rename'
+              )
                 await page.runThreadWrite(invoke);
               else await invoke();
             },
