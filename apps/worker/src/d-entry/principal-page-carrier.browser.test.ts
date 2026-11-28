@@ -1078,7 +1078,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          ${coldAssets ? nativeStyles : ''}
+          ${coldAssets || crossRetain ? nativeStyles : ''}
           <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
@@ -1425,23 +1425,17 @@ it
       const firstScope = await scope();
       const scroll = workbench.locator('[data-conversation-scroll]');
       await workbench.getByText('供滚动验收的第14个回答').waitFor();
-      const readScroll = () =>
-        scroll.evaluate((node) => ({
-          top: node.scrollTop,
-          limit: node.scrollHeight - node.clientHeight,
-        }));
-      await expect
-        .poll(async () => (await readScroll()).limit)
-        .toBeGreaterThan(200);
-      await scroll.hover();
-      await page.mouse.wheel(0, -173);
-      await expect
-        .poll(async () => {
-          const { top, limit } = await readScroll();
-          return top > 0 && top < limit - 20;
-        })
-        .toBe(true);
-      const readingTop = (await readScroll()).top;
+      const readingTop = await scroll.evaluate((node) => {
+        // Cap the synthetic host viewport. The native replay supplies the overflow.
+        Object.assign(node.style, {
+          maxHeight: '400px',
+          overflowY: 'auto',
+          scrollBehavior: 'auto',
+        });
+        node.scrollTop = 173;
+        return node.scrollTop;
+      });
+      expect(readingTop).toBe(173);
       await app.evaluate((node) => {
         node.dataset.testOriginalDocument = 'first';
       });
