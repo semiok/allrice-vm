@@ -22,6 +22,7 @@ import {
   OpenAiCitationProjection,
   prepareOpenAiResponsesRequest,
 } from './openai-responses.ts';
+import { createOwnedModelTransport } from './owned-transport.ts';
 
 type Fetch = typeof globalThis.fetch;
 type FetchScope = {
@@ -77,6 +78,79 @@ export function installScopedFetch(): () => void {
       if (globalThis.fetch === wrapper) globalThis.fetch = original;
     }
   };
+}
+
+/** One bounded native provider POST, with its own actual dispatcher lifetime.
+ * A returned outcome certifies join; rejection means the caller cannot release
+ * a durable reservation on the assumption that the socket is gone. */
+export async function runWithOwnedNativeFetch<T>(
+  endpoint: URL,
+  maxBytes: number,
+  signal: AbortSignal,
+  operation: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+  const owner = createOwnedModelTransport(randomUUID());
+  const release = installScopedFetch();
+  let closed = false;
+  let pending: Promise<Response> | undefined;
+  const scope: FetchScope = {
+    async authTransaction() {
+      throw new ModelGatewayError('AUTH_TRANSACTION_REQUIRED');
+    },
+    async fetch(nativeFetch, input, init) {
+      if (closed || pending) throw new ModelGatewayError('ADMISSION_CLOSED');
+      const request = new Request(input, { ...init, redirect: 'error' });
+      const body = request.body;
+      if (request.method !== 'POST' || request.url !== endpoint.href || !body)
+        throw new ModelGatewayError('UNCLASSIFIED_UPSTREAM');
+      const active = AbortSignal.any([signal, request.signal]);
+      active.throwIfAborted();
+      pending = (async () => {
+        const dispatch: RequestInit & { duplex: 'half' } = {
+          signal: active,
+          body,
+          duplex: 'half',
+        };
+        const response = await owner.fetchOwned(nativeFetch, request, dispatch);
+        if (!response.body) return response;
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        try {
+          for (;;) {
+            active.throwIfAborted();
+            const { done, value } = await reader.read();
+            if (done) break;
+            bytes += value.byteLength;
+            if (bytes > maxBytes)
+              throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+            chunks.push(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        return new Response(Buffer.concat(chunks), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      })();
+      return pending;
+    },
+  };
+  try {
+    return { ok: true, value: await scopes.run(scope, operation) };
+  } catch (error) {
+    return { ok: false, error };
+  } finally {
+    closed = true;
+    try {
+      await owner.close();
+      await pending?.catch(() => {});
+    } finally {
+      release();
+    }
+  }
 }
 
 export function createMeteredTransport(options: {

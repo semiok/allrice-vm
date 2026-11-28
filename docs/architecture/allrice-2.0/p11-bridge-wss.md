@@ -4,7 +4,7 @@
 
 ## 运行方式与灰度
 
-`apps/web/server.mjs` 是同端口 Next custom server；`pnpm --filter @allrice/web start` 使用它，仍支持 `--hostname` / `--port`。`start:http` 保留旧 `next start`，关闭新传输即可回滚到纯 HTTP。`dev` 同样经过 wrapper，其余 upgrade 事件仍交 Next。
+`apps/web/server.mjs` 是同端口 Next custom server。`pnpm --filter @allrice/web start` 支持 `--hostname` / `--port`。`start:http` 用同一个入口的 `--http-only` 模式，监听前校验同一发布封存，只提供 Next HTTP 请求，关闭 Upgrade 和 AllRice 的 Bridge、终端、原生工作台、子智能体跟随及预览网关。`dev` 同样经过 wrapper，其余 upgrade 事件仍交 Next。
 
 默认 `ALLRICE_BRIDGE_WSS_ENABLED=0`。只有 WSS 与 `ALLRICE_BRIDGE_OPERATION_LEDGER_ENABLED` 均为 `1` 才接受新连接。关闭时 upgrade 返回 404，不要求创建数据库连接，更不自动开启本地 Runner、安全策略或权限。
 

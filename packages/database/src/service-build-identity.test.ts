@@ -10,14 +10,17 @@ import {
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import {
   prepareServiceBuildManifest,
+  readSealedPersonVmHostConfiguration,
+  readServicePersonVmEmployeePortSlots,
   verifyServiceBuildIdentity,
 } from './service-build-identity.ts';
 
 const roots: string[] = [];
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
@@ -328,10 +331,12 @@ it('MET195 diagnostic failure cannot affect successful verification or conceal c
   );
 });
 
-it('seals the exact optional private Host file with the original service manifest', async () => {
+it('gives Web and Worker the same sealed slot count and only Worker the private Host fields', async () => {
   const f = await fixture(),
     path = '.local/person-vm-host.json';
-  await writeFile(join(f.root, path), '{"synthetic":"host configuration"}', {
+  const configuration =
+    '{"synthetic":"host configuration","employeePortSlots":7}';
+  await writeFile(join(f.root, path), configuration, {
     mode: 0o600,
   });
   const sealed = await prepareServiceBuildManifest({
@@ -342,29 +347,96 @@ it('seals the exact optional private Host file with the original service manifes
   expect(sealed.files.filter((file) => file.path === path)).toMatchObject([
     {
       scope: 'worker',
-      bytes: Buffer.byteLength('{"synthetic":"host configuration"}'),
+      bytes: Buffer.byteLength(configuration),
     },
   ]);
   await writeFile(
     join(f.root, '.local/dev-build-identity.json'),
     JSON.stringify(sealed),
   );
-  expect((await f.verify('worker'))?.manifestDigest).toBe(
-    sealed.manifestDigest,
-  );
-  await writeFile(join(f.root, path), '{"synthetic":"changed configuration"}');
-  await expect(f.verify('worker')).rejects.toThrow(
-    'DEV_BUILD_IDENTITY_INVALID',
-  );
+  vi.stubEnv('ALLRICE_RELEASE_SHA', sealed.sourceSha);
+  const argv = process.argv;
+  const cacheKey = Symbol.for('allrice.dev.service-build-identity.v1');
+  const cache = Reflect.get(globalThis, cacheKey);
+  Reflect.deleteProperty(globalThis, cacheKey);
+  try {
+    const worker = await f.verify('worker');
+    if (!worker) throw Error('Missing verified Worker fixture');
+    for (const [service, entrypoint] of [
+      ['web', 'apps/web/server.mjs'],
+      ['worker', 'apps/worker/dist/index.js'],
+    ] as const) {
+      const verified = await f.verify(service);
+      if (!verified) throw Error('Missing verified fixture');
+      expect(verified.manifestDigest).toBe(sealed.manifestDigest);
+      process.argv = [
+        argv[0]!,
+        join(f.root, entrypoint),
+        ...(service === 'web' ? ['--http-only'] : []),
+      ];
+      expect(await readServicePersonVmEmployeePortSlots()).toBe(7);
+      if (service === 'web') {
+        await expect(
+          readSealedPersonVmHostConfiguration(verified),
+        ).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
+        await expect(
+          readSealedPersonVmHostConfiguration(worker),
+        ).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
+        const mutable = { ...worker };
+        const reading = readSealedPersonVmHostConfiguration(mutable);
+        mutable.service = 'web';
+        await expect(reading).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
+      } else {
+        const mutable = { ...verified };
+        const reading = readSealedPersonVmHostConfiguration(mutable);
+        mutable.sourceSha = 'c'.repeat(40);
+        mutable.sourceTree = 'c'.repeat(40);
+        mutable.manifestDigest = 'sha256:' + '0'.repeat(64);
+        expect(await reading).toEqual({
+          configuration: { synthetic: 'host configuration' },
+          employeePortSlots: 7,
+          manifestDigest: sealed.manifestDigest,
+        });
+      }
+      await writeFile(join(f.root, path), configuration.replace('7', '9'));
+      await expect(readServicePersonVmEmployeePortSlots()).rejects.toThrow(
+        'DEV_BUILD_IDENTITY_INVALID',
+      );
+      if (service === 'worker')
+        await expect(
+          readSealedPersonVmHostConfiguration(verified),
+        ).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
+      await expect(f.verify(service)).rejects.toThrow(
+        'DEV_BUILD_IDENTITY_INVALID',
+      );
+      await writeFile(join(f.root, path), configuration);
+    }
+  } finally {
+    process.argv = argv;
+    if (cache) Reflect.set(globalThis, cacheKey, cache);
+    else Reflect.deleteProperty(globalThis, cacheKey);
+  }
 });
 it('invalidates an old seal when a private Host configuration is added later', async () => {
   const f = await fixture();
-  await writeFile(join(f.root, '.local/person-vm-host.json'), '{}', {
-    mode: 0o600,
-  });
+  const verified = await f.verify('worker');
+  await writeFile(
+    join(f.root, '.local/person-vm-host.json'),
+    '{"employeePortSlots":2}',
+    {
+      mode: 0o600,
+    },
+  );
   await expect(f.verify('worker')).rejects.toThrow(
     'DEV_BUILD_IDENTITY_INVALID',
   );
+  const argv = process.argv;
+  try {
+    process.argv = [argv[0]!, join(f.root, 'apps/worker/dist/index.js')];
+    expect(await readSealedPersonVmHostConfiguration(verified!)).toBeNull();
+  } finally {
+    process.argv = argv;
+  }
 });
 it('refuses a directory tree at the fixed private Host configuration path', async () => {
   const f = await fixture(),

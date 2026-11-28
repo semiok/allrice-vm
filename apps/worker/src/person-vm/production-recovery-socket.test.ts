@@ -1,6 +1,7 @@
 import { stat } from 'node:fs/promises';
 import { request } from 'node:http';
 import { dirname } from 'node:path';
+import { PersonVmError } from '@allrice/person-vm';
 import { expect, it, vi } from 'vitest';
 import {
   deferred,
@@ -187,6 +188,145 @@ it('joins authentication for a disconnected client before releasing the maintena
     release.resolve();
     await closing;
     expect(recover).not.toHaveBeenCalled();
+  } finally {
+    client.destroy();
+    release.resolve();
+    await socket.close();
+  }
+});
+
+it('only drains through the private socket for the authenticated and exact Worker boot', async () => {
+  const context = modelBinding().context;
+  const expiresAt = '2099-01-01T00:00:00.000Z';
+  const drain = vi.fn(async () => ({ stopped: 2, expiresAt }));
+  const afterClaim = deferred();
+  let drained = false;
+  drain.mockImplementation(async () => {
+    drained = true;
+    return { stopped: 2, expiresAt };
+  });
+  const claimShutdown = vi.fn(async (_context, expected: string) => {
+    if (!drained || expected !== expiresAt)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    return afterClaim.resolve;
+  });
+  const socket = await openProductionRecoverySocket({
+    authenticate: async () => null,
+    recover: async () => 0,
+    pending: () => true,
+    upgrade: {
+      bootId: 'worker-upgrade-boot',
+      authenticate: async (token) =>
+        token === 'operator-session' ? context : null,
+      drain,
+      claimShutdown,
+    },
+  });
+  function post(token: string, boot: string, claim?: string) {
+    return new Promise<{ status?: number; body: string }>((resolve, reject) => {
+      const req = request(
+        {
+          socketPath: socket.path,
+          path: claim ? '/shutdown-after-drain' : '/drain-for-upgrade',
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer ' + token,
+            'x-allrice-worker-boot': boot,
+            ...(claim && { 'x-allrice-drain-expires': claim }),
+          },
+        },
+        (res) => {
+          res.setEncoding('utf8');
+          let body = '';
+          res.on('data', (chunk: string) => (body += chunk));
+          res.on('end', () => resolve({ status: res.statusCode, body }));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+  }
+  try {
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', expiresAt)).status,
+    ).toBe(409);
+    expect(
+      (await post('operator-session', 'wrong-boot', expiresAt)).status,
+    ).toBe(409);
+
+    expect((await post('employee-session', 'worker-upgrade-boot')).status).toBe(
+      401,
+    );
+    expect((await post('operator-session', 'previous-boot')).status).toBe(409);
+    expect(drain).not.toHaveBeenCalled();
+    expect(await post('operator-session', 'worker-upgrade-boot')).toEqual({
+      status: 200,
+      body: JSON.stringify({
+        stopped: 2,
+        expiresAt,
+        bootId: 'worker-upgrade-boot',
+      }),
+    });
+    expect(drain).toHaveBeenCalledExactlyOnceWith(
+      context,
+      expect.any(AbortSignal),
+    );
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', 'invalid')).status,
+    ).toBe(409);
+    expect(
+      (await post('operator-session', 'worker-upgrade-boot', expiresAt)).status,
+    ).toBe(202);
+    await afterClaim.promise;
+  } finally {
+    await socket.close();
+  }
+});
+
+it('keeps the consumed release handoff when the private client disconnects', async () => {
+  const context = modelBinding().context;
+  const entered = deferred<AbortSignal>();
+  const release = deferred();
+  const completed = deferred();
+  const retire = vi.fn(completed.resolve);
+  const socket = await openProductionRecoverySocket({
+    authenticate: async () => null,
+    recover: async () => 0,
+    pending: () => true,
+    upgrade: {
+      bootId: 'worker-boot',
+      authenticate: async () => context,
+      drain: async () => ({ stopped: 0, expiresAt: 'same-receipt' }),
+      async claimShutdown(_context, _expiresAt, active) {
+        entered.resolve(active);
+        await release.promise;
+        return retire;
+      },
+    },
+  });
+  const client = request({
+    socketPath: socket.path,
+    method: 'POST',
+    path: '/shutdown-after-drain',
+    headers: {
+      authorization: 'Bearer synthetic',
+      'x-allrice-worker-boot': 'worker-boot',
+      'x-allrice-drain-expires': 'same-receipt',
+    },
+  });
+  client.on('error', () => {});
+  client.end();
+  try {
+    const active = await entered.promise;
+    const disconnected = deferred();
+    active.addEventListener('abort', () => disconnected.resolve(), {
+      once: true,
+    });
+    client.destroy();
+    await disconnected.promise;
+    release.resolve();
+    await completed.promise;
+    expect(retire).toHaveBeenCalledTimes(1);
   } finally {
     client.destroy();
     release.resolve();

@@ -40,11 +40,10 @@
           - id: !!js process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol'
             # The pinned pi-ai catalog predates GPT-6. Declare these current
             # models through DSH's native configuration extension; otherwise
-            # an unknown ID defaults to reasoning=false. Model metadata checked
-            # against the official Codex catalog on 2026-09-30.
-            contextWindow: !!js "['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? 272000 : undefined"
-            input: !!js "['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? ['text', 'image'] : undefined"
-            reasoningEfforts: !!js "['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' } : undefined"
+            # an unknown ID defaults to reasoning=false.
+            contextWindow: !!js "['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? 272000 : undefined"
+            input: !!js "['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? ['text', 'image'] : undefined"
+            reasoningEfforts: !!js "['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(process.env.DSH_CODEX_MODEL ?? 'gpt-6.1-sol') ? { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' } : undefined"
       openai-compatible:
         apiKeyEnv: OPENAI_COMPATIBLE_API_KEY
         api: openai-completions

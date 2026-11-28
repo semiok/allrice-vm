@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { decodeDEntryRegisteredThread } from '@allrice/contracts';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -213,6 +214,289 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   closePage(next.peer);
   await next.receive();
   await next.receive();
+});
+
+it('replaces the bound root on the same page socket and only the target watch remains live', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  const revoked = f.registerThread(target);
+  const { peer, scopeId, receive } = await open(f);
+  const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: {
+      type: 'switch',
+      requestId,
+      threadId: target,
+    },
+  });
+  const switched = await receive('life');
+  expect(switched).toMatchObject({
+    type: 'item',
+    value: {
+      type: 'switched',
+      requestId,
+      threadId: target,
+      nativeSessionId: 'root-' + target,
+    },
+  });
+  const nextScope = switched.value.scopeId as string;
+  expect(nextScope).not.toBe(scopeId);
+  expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+    404,
+  );
+  expect((await f.invokeThread(nextScope, target)).status).toBe(200);
+  expect((await f.invokeThread(nextScope, f.selection.threadId)).status).toBe(
+    404,
+  );
+  const targetClosed = once(peer, 'close');
+  revoked.abort();
+  expect(await receive('life')).toMatchObject({ type: 'error' });
+  await targetClosed;
+  expect((await f.invokeThread(nextScope, target)).status).toBe(404);
+});
+
+it('requires proof from the current browser login even while the original login remains active', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive } = await open(f);
+  const requestId = randomUUID();
+  expect(
+    (await f.proveSwitch(scopeId, target, requestId, otherToken)).status,
+  ).toBe(404);
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId, threadId: target },
+  });
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'switch-unavailable', requestId },
+  });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledOnce();
+  expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+    200,
+  );
+  closePage(peer);
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+});
+
+it('drains an already dispatched native create through registration and response before rotating', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const registering = deferred();
+  const release = deferred();
+  const register = f.registerRoot.getMockImplementation()!;
+  f.registerRoot.mockImplementation(
+    async (context, identity, receipt, active) => {
+      registering.resolve();
+      await release.promise;
+      active.throwIfAborted();
+      return register(context, identity, receipt, active);
+    },
+  );
+  const write = f.invoke(scopeId, sessionToken, {
+    endpoint: 'session/create',
+    payload: { args: { request: {} } },
+  });
+  await registering.promise;
+  const requestId = randomUUID();
+  try {
+    expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+    send(peer, {
+      type: 'item',
+      streamId: 'life',
+      value: { type: 'switch', requestId, threadId: target },
+    });
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(2));
+    expect(revoked.aborted).toBe(false);
+  } finally {
+    release.resolve();
+  }
+  const response = await write;
+  expect(response.status).toBe(200);
+  expect(
+    decodeDEntryRegisteredThread(
+      response.headers.get('x-allrice-d-entry-thread'),
+    )?.id,
+  ).toBeDefined();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'switched', requestId },
+  });
+  expect(revoked.aborted).toBe(true);
+  closePage(peer);
+  expect(await receive('life')).toMatchObject({ value: { type: 'closed' } });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+});
+
+it('joins a cancelled target lookup and the old page on close during a handoff', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+  const entered = deferred();
+  const allow = deferred();
+  f.authenticate.mockImplementationOnce(async () => {
+    entered.resolve();
+    await allow.promise;
+    return f.context;
+  });
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId, threadId: target },
+  });
+  await entered.promise;
+  const fenced = once(revoked, 'abort');
+  closePage(peer);
+  await fenced;
+  allow.resolve();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+});
+
+it('joins a staged native scope and acknowledges the old page on close before publication', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+  const entered = deferred();
+  const allow = deferred();
+  f.authenticate.mockImplementation(async () => {
+    if (f.pageSignals.size === 2) {
+      entered.resolve();
+      await allow.promise;
+    }
+    return f.context;
+  });
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId, threadId: target },
+  });
+  await entered.promise;
+  const fenced = once(revoked, 'abort');
+  closePage(peer);
+  await fenced;
+  allow.resolve();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(2);
+  expect([...f.pageSignals.values()].every((signal) => signal.aborted)).toBe(
+    true,
+  );
+});
+
+it.each(['employee', 'login', 'tenant', 'epoch'] as const)(
+  'refuses native reuse when the %s changes and leaves the exact old scope joinable',
+  async (change) => {
+    const f = await fixture();
+    const target = randomUUID();
+    f.registerThread(target);
+    const { peer, scopeId, receive } = await open(f);
+    const requestId = randomUUID();
+    expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+    if (change === 'employee')
+      f.historyIdentity.mockResolvedValueOnce({
+        ...f.identity,
+        threadId: target,
+        employeeInstanceId: randomUUID(),
+      });
+    if (change === 'login')
+      f.authenticate.mockResolvedValueOnce({
+        ...f.context,
+        sessionId: randomUUID(),
+      });
+    if (change === 'tenant')
+      f.historyIdentity.mockResolvedValueOnce({
+        ...f.identity,
+        threadId: target,
+        organizationId: randomUUID(),
+      });
+    if (change === 'epoch')
+      f.deps.owners.resolve.mockResolvedValueOnce({
+        ...f.owner,
+        receipt: {
+          ...f.owner.receipt,
+          binding: { ...f.binding, leaseEpoch: 2 },
+        },
+      });
+    send(peer, {
+      type: 'item',
+      streamId: 'life',
+      value: {
+        type: 'switch',
+        requestId,
+        threadId: target,
+      },
+    });
+    expect(await receive('life')).toMatchObject({
+      type: 'item',
+      value: {
+        type: 'switch-unavailable',
+        requestId,
+      },
+    });
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+      200,
+    );
+    closePage(peer);
+    expect(await receive('life')).toMatchObject({
+      value: { type: 'closed', scopeId },
+    });
+    expect(await receive('life')).toMatchObject({ type: 'end' });
+  },
+);
+
+it('joins shared resource guards before releasing the page admission', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const entered = deferred();
+  const release = deferred();
+  f.authenticate.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return f.context;
+  });
+  send(life.peer, {
+    type: 'open',
+    streamId: 'resource',
+    endpoint: '$events',
+    payload: { args: {} },
+  });
+  try {
+    await entered.promise;
+    closePage(life.peer);
+    await expect
+      .poll(() => f.pageSignals.get(life.scopeId)?.aborted)
+      .toBe(true);
+    expect(f.data.admission.boundary.finish).not.toHaveBeenCalled();
+  } finally {
+    release.resolve();
+  }
+  expect(await life.receive('life')).toMatchObject({
+    type: 'item',
+    value: { type: 'closed' },
+  });
+  expect(await life.receive('life')).toMatchObject({ type: 'end' });
+  expect(f.data.admission.boundary.finish).toHaveBeenCalledOnce();
 });
 
 function observeProfileRequest(
@@ -1301,6 +1585,10 @@ it('uses actual DSH replies for create and fork registration on a page without a
   expect(await create.json()).toMatchObject({
     result: { ok: true, value: { sessionId: 'native-created' } },
   });
+  expect(
+    decodeDEntryRegisteredThread(create.headers.get('x-allrice-d-entry-thread'))
+      ?.id,
+  ).toBe((await f.registerRoot.mock.results[0]?.value)?.identity.threadId);
   expect(f.host.catalog.creationRequests).toEqual([{}]);
   expect(f.prepareEditorRoot).not.toHaveBeenCalled();
   expect(f.registerRoot).toHaveBeenNthCalledWith(

@@ -211,6 +211,8 @@ export * from './platform-repository-merges.ts';
 export { repositoryMergeRequestGate } from './platform-repository-merge-authority.ts';
 export {
   readServiceBuildIdentity,
+  readSealedPersonVmHostConfiguration,
+  readServicePersonVmEmployeePortSlots,
   verifyServiceBuildIdentity,
   ServiceBuildManifestSchema,
   type ServiceBuildIdentity,
@@ -450,6 +452,12 @@ export {
 
 export * from './employee-memory-port.ts';
 export * from './capabilities/native-schedule-observation-ledger.ts';
+export {
+  createPostgresPersonVmScheduledWakeStore,
+  readPersonVmWakeRoster,
+  withOwnedPersonVmAuthorityTransaction,
+  type ScheduledWakeClaim,
+} from './capabilities/person-vm-scheduled-wake.ts';
 export {
   createPostgresPersonalSkillPackageSource,
   type PersonalSkillPackageRead,

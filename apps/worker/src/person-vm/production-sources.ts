@@ -17,7 +17,14 @@ import {
   createProductionModelRouting,
   type ProductionModelRouting,
 } from './production-model-routing.js';
+import { createHostSearchProvider } from './production-web-search.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
+import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  createProductionNativeActivity,
+  getIdleScheduleGuardMs,
+} from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
 type ModelRuntime = ProductionModelRouting['fallback'];
@@ -44,7 +51,7 @@ export interface ProductionNativeModelExecution {
     input: {
       route: ModelRuntime['route'];
       routeRevoked: AbortSignal;
-      readModelInfo: ModelRuntime['readModelInfo'];
+      readModelMetadata: ModelRuntime['readModelMetadata'];
       assertRouteCurrent: ModelRuntime['assertCurrent'];
       confirmTransportStopped: ModelRuntime['confirmTransportStopped'];
       scoped?: Pick<
@@ -53,6 +60,12 @@ export interface ProductionNativeModelExecution {
       >;
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
+      webSearch?: {
+        provider: NonNullable<ReturnType<typeof createHostSearchProvider>>;
+        bind: ReturnType<
+          typeof createProductionEgressAuthority
+        >['bindWebSearch'];
+      };
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
@@ -98,26 +111,36 @@ export function createProductionPersonVmSources(
             : modelRuntime.route,
           lifetime,
         });
+        const provider = createHostSearchProvider(process.env.DEEPSEEK_API_KEY);
         native = await execution.attach(host, {
           route: modelRuntime.route,
           routeRevoked: modelLifetime,
-          readModelInfo: modelRuntime.readModelInfo,
+          readModelMetadata: modelRuntime.readModelMetadata,
           assertRouteCurrent: modelRuntime.assertCurrent,
           confirmTransportStopped: routing.confirmTransportStopped,
           scoped: routing.scoped ? routing : undefined,
           bindReference: (call, signal) =>
             egress.bindModelCall(call, signal, 'model-reference'),
           issueCall: calls.issue,
+          ...(provider
+            ? { webSearch: { provider, bind: egress.bindWebSearch } }
+            : {}),
         });
         const owned = native;
         lifetime.throwIfAborted();
         entry = installProductionDEntrySource({
           startup,
+          vm: host.vm,
           admission,
           lifetime,
           confirmPhysical: (context, identity, binding, active) =>
             host.current.withCurrentSelection(context, identity, active, () =>
-              host.vm.assertRunningReadiness(context, binding, active),
+              host.vm.assertRunningReadiness(
+                context,
+                binding,
+                active,
+                startup.slottedEntryReceipt(binding, identity, active),
+              ),
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, modelLifetime, signal]);
@@ -145,6 +168,15 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
+          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            sampleIntervalMs:
+              host.providers.configuration.lifecycle.idleSampleIntervalMs ??
+              DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+            scheduleGuardMs: getIdleScheduleGuardMs(
+              host.providers.configuration.lifecycle,
+            ),
+          }),
           runtime: {
             async readiness(binding, signal) {
               if (!routing.applies(binding))

@@ -1,3 +1,8 @@
+import {
+  captureNativeWebRosterChange,
+  isNativeWebRosterAdmissionError,
+} from './employees/native-web-capacity.ts';
+import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { notifyNativeRosterInserts } from './employees/native-roster-notification.ts';
 import {
   employeePublicationPolicy,
@@ -13,10 +18,44 @@ import { getDatabase } from './core/client.ts';
 type Scope = { organizationId: string; workspaceId: string };
 type Tx = postgres.TransactionSql;
 
+type SyncSelection = {
+  personIds?: readonly string[];
+  employeeId?: string;
+  // Full reconciliation leaves this unset. A foreground write may refresh an
+  // existing active assignment but only create or restore for these recipients.
+  newAssignmentPeople?: readonly string[];
+  refreshTargets?: boolean;
+};
+
+function selectedAssignments(tx: Tx, selection: SyncSelection) {
+  return tx`
+    ${selection.personIds ? tx`and a.user_id=any(${tx.array([...selection.personIds])}::uuid[])` : tx``}
+    ${selection.employeeId ? tx`and a.employee_id=${selection.employeeId}` : tx``}`;
+}
+
+async function keepAssignmentDefault(
+  tx: Tx,
+  scope: Scope,
+  employeeId: string,
+  personIds?: readonly string[],
+) {
+  const { organizationId, workspaceId } = scope;
+  await tx`update allrice_employee_assignments a set is_default=true,updated_at=clock_timestamp()
+    where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and a.employee_id=${employeeId}
+      ${selectedAssignments(tx, { personIds })}
+      and a.active and not a.is_default and not exists(select 1 from allrice_employee_assignments other
+        where other.organization_id=a.organization_id and other.workspace_id=a.workspace_id and other.user_id=a.user_id and other.active and other.is_default)`;
+}
+
 /** Materialize the existing workspace deployment + current membership relation.
  * Called by membership/publication writes, never by a readiness GET. Assignment
  * IDs remain stable so withdrawal does not delete or rebind historical chats. */
-export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
+export async function synchronizeTenantEmployeeAccess(
+  tx: Tx,
+  scope: Scope,
+  selection: SyncSelection = {},
+) {
+  if (selection.personIds?.length === 0) return;
   const { organizationId, workspaceId } = scope;
   await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${organizationId}:${workspaceId}`},0))`;
   const deployments = await tx`
@@ -24,30 +63,82 @@ export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
     join allrice_employees e on e.id=d.tenant_employee_id
     where d.organization_id=${organizationId} and d.workspace_id=${workspaceId}
     order by d.is_default desc,d.assigned_at,d.id`;
-  if (!deployments.length) return;
-  await prepareManagedCloudTargets(tx, scope);
+  const selected = deployments.filter(
+    (d) =>
+      !selection.employeeId || d.tenant_employee_id === selection.employeeId,
+  );
+  if (!selected.length) return;
+  const checkRoster = await captureNativeWebRosterChange(tx, {
+    ...scope,
+    personIds: selection.personIds,
+  });
+  if (selection.refreshTargets !== false)
+    await prepareManagedCloudTargets(tx, scope);
+  // A selected employee may lose the previous default. Only those recipients
+  // can need an existing alternate assignment promoted to default.
+  const priorDefaults = selection.employeeId
+    ? await tx<
+        { user_id: string }[]
+      >`select a.user_id from allrice_employee_assignments a
+      where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and a.active and a.is_default
+        ${selectedAssignments(tx, selection)}`
+    : [];
+  const releasedPeople = (await readDEntryReleasePolicy(tx, true)).selections
+    .filter(
+      (selection) => selection.organizationId === organizationId.toLowerCase(),
+    )
+    .map(({ personId }) => personId);
+  // An account pause closes the actual identity, but keeps an already-granted
+  // 4.0 assignment as history. Real membership/choice/employee withdrawals
+  // below still revoke it; an inactive intent is never promoted this way.
   await tx`update allrice_employee_assignments a set active=false,is_default=false,updated_at=clock_timestamp()
     where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and (a.active or a.is_default)
+      ${selectedAssignments(tx, selection)}
       and exists(select 1 from allrice_platform_employee_tenant_assignments d
         join allrice_employees e on e.id=d.tenant_employee_id
         where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id and d.tenant_employee_id=a.employee_id
           and (not d.active or e.status<>'active' or a.selection_mode='exclude'
             or (a.selection_mode='inherit' and not d.inherit_by_default) or not exists(
-            select 1 from allrice_memberships m join allrice_users u on u.id=m.user_id and u.status='active'
+            select 1 from allrice_memberships m join allrice_users u on u.id=m.user_id
+              and (u.status='active' or (u.status='disabled' and u.id=any(${tx.array(releasedPeople)}::uuid[])))
             where m.organization_id=a.organization_id and m.user_id=a.user_id and m.active and m.role in ('admin','member')
               and (m.workspace_id is null or m.workspace_id=a.workspace_id))))`;
   const affectedPeople = new Set<string>();
-  for (const d of deployments.filter(
+  const assignments = new Set<string>();
+  const grantedPeople = new Set<string>();
+  const previousDefaultPeople = priorDefaults.map(({ user_id }) => user_id);
+  const activeDeployments = deployments.filter(
     (d) => d.active && d.employee_status === 'active',
-  )) {
+  );
+  for (const d of activeDeployments) {
+    const people =
+      !selection.employeeId || d.tenant_employee_id === selection.employeeId
+        ? selection.personIds
+        : previousDefaultPeople;
+    if (people?.length === 0) continue;
+    if (selection.employeeId && d.tenant_employee_id !== selection.employeeId) {
+      await keepAssignmentDefault(tx, scope, d.tenant_employee_id, people);
+      continue;
+    }
     const changed = await tx<
-      { user_id: string }[]
-    >`insert into allrice_employee_assignments
+      { id: string; user_id: string; granted: boolean }[]
+    >`with changed as (insert into allrice_employee_assignments
       (organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
       select ${organizationId},${workspaceId},${d.tenant_employee_id},${d.tenant_employee_version_id},m.user_id,false,true,null
       from allrice_memberships m join allrice_users u on u.id=m.user_id and u.status='active'
       where m.organization_id=${organizationId} and (m.workspace_id is null or m.workspace_id=${workspaceId})
         and m.active and m.role in ('admin','member')
+        ${people ? tx`and m.user_id=any(${tx.array([...people])}::uuid[])` : tx``}
+        ${
+          selection.newAssignmentPeople
+            ? tx`
+          and (m.user_id=any(${tx.array([...selection.newAssignmentPeople])}::uuid[])
+            or exists(select 1 from allrice_employee_assignments current
+              where current.organization_id=${organizationId} and current.workspace_id=${workspaceId}
+                and current.user_id=m.user_id and current.employee_id=${d.tenant_employee_id} and current.active))
+        `
+            : tx``
+        }
         and (${d.inherit_by_default}=true or exists(select 1 from allrice_employee_assignments chosen
           where chosen.organization_id=${organizationId} and chosen.workspace_id=${workspaceId}
             and chosen.employee_id=${d.tenant_employee_id} and chosen.user_id=m.user_id and chosen.selection_mode='include'))
@@ -59,14 +150,21 @@ export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
         set employee_version_id=excluded.employee_version_id,is_default=allrice_employee_assignments.active and allrice_employee_assignments.is_default,active=true,updated_at=clock_timestamp()
         where allrice_employee_assignments.selection_mode<>'exclude' and (not allrice_employee_assignments.active
           or allrice_employee_assignments.employee_version_id<>excluded.employee_version_id)
-      returning user_id`;
-    for (const { user_id } of changed) affectedPeople.add(user_id);
-    // Preserve an existing personal default; new members inherit the workspace default.
-    await tx`update allrice_employee_assignments a set is_default=true,updated_at=clock_timestamp()
-      where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and a.employee_id=${d.tenant_employee_id}
-        and a.active and not a.is_default and not exists(select 1 from allrice_employee_assignments other
-          where other.organization_id=a.organization_id and other.workspace_id=a.workspace_id and other.user_id=a.user_id and other.active and other.is_default)`;
+      returning id,user_id)
+      select changed.id,changed.user_id,not coalesce(prior.active,false) granted
+      from changed left join allrice_employee_assignments prior on prior.id=changed.id`;
+    for (const { id, user_id, granted } of changed) {
+      assignments.add(id);
+      affectedPeople.add(user_id);
+      if (granted) grantedPeople.add(user_id);
+    }
+    await keepAssignmentDefault(tx, scope, d.tenant_employee_id, people);
   }
+  await checkRoster({
+    assignmentIds: assignments,
+    employeeId: selection.employeeId,
+    grantedPeople,
+  });
   await notifyNativeRosterInserts(tx, 'allrice_employee_assignments', scope, [
     ...affectedPeople,
   ]);
@@ -77,11 +175,16 @@ export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
       and v.employee_id=a.employee_id and v.organization_id=a.organization_id and v.workspace_id=a.workspace_id
     where s.employee_assignment_id=a.id
       and s.organization_id=${organizationId} and s.workspace_id=${workspaceId} and a.active
+      ${selectedAssignments(tx, selection)}
       and s.employee_version_id<>a.employee_version_id
       and allrice_native_session_version_compatible(s.native_root_origin,v.manifest)
       and exists(select 1 from allrice_platform_employee_tenant_assignments d where d.tenant_employee_id=a.employee_id
         and d.organization_id=a.organization_id and d.workspace_id=a.workspace_id and d.active)`;
-  await prepareTenantCloudGrants(tx, scope);
+  await prepareTenantCloudGrants(tx, {
+    ...scope,
+    employeeId: selection.employeeId,
+    personIds: selection.personIds,
+  });
 }
 
 export type ManagedCloudEnvironmentReport = {
@@ -109,16 +212,60 @@ export async function recordManagedCloudEnvironment(
     join allrice_workspaces w on w.id=d.workspace_id and w.archived_at is null
     join allrice_organizations o on o.id=d.organization_id and o.archived_at is null
     order by d.organization_id,d.workspace_id`;
-  for (const workspace of workspaces)
-    await db.begin(async (tx) => {
-      const scope = {
-        organizationId: workspace.organization_id,
-        workspaceId: workspace.workspace_id,
-      };
+  for (const workspace of workspaces) {
+    const scope = {
+      organizationId: workspace.organization_id,
+      workspaceId: workspace.workspace_id,
+    };
+    const refused = await db.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${scope.organizationId}:${scope.workspaceId}`},0))`;
       await prepareTenantExecutionDefaults(tx, scope);
-      await synchronizeTenantEmployeeAccess(tx, scope);
+      await prepareManagedCloudTargets(tx, scope);
+      try {
+        await tx.savepoint((savepoint) =>
+          synchronizeTenantEmployeeAccess(savepoint, scope, {
+            refreshTargets: false,
+          }),
+        );
+        return [];
+      } catch (error) {
+        if (!isNativeWebRosterAdmissionError(error)) throw error;
+      }
+      // The failed batch rolled back. Reconcile each current member or
+      // existing recipient separately so one refusal cannot strand others.
+      const people = await tx<{ user_id: string }[]>`
+        select m.user_id from allrice_memberships m
+        join allrice_users u on u.id=m.user_id and u.status='active'
+        where m.organization_id=${scope.organizationId} and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=${scope.workspaceId})
+        union
+        select a.user_id from allrice_employee_assignments a
+        join allrice_platform_employee_tenant_assignments d on d.organization_id=a.organization_id
+          and d.workspace_id=a.workspace_id and d.tenant_employee_id=a.employee_id
+        where a.organization_id=${scope.organizationId} and a.workspace_id=${scope.workspaceId}
+        order by user_id`;
+      const deferred: Error[] = [];
+      for (const { user_id } of people) {
+        try {
+          await tx.savepoint((savepoint) =>
+            synchronizeTenantEmployeeAccess(savepoint, scope, {
+              personIds: [user_id],
+              refreshTargets: false,
+            }),
+          );
+        } catch (error) {
+          if (!isNativeWebRosterAdmissionError(error)) throw error;
+          deferred.push(error);
+        }
+      }
+      return deferred;
     });
+    for (const error of refused)
+      console.warn('[MET-159] managed cloud roster sync deferred', {
+        ...scope,
+        error,
+      });
+  }
 }
 
 async function prepareManagedCloudTargets(tx: Tx, scope: Scope) {
@@ -187,14 +334,24 @@ export async function synchronizeTenantMembershipAccess(
   input: {
     organizationId: string;
     workspaceId: string | null;
+    personIds: readonly string[];
+    allowNewAssignments?: boolean;
   },
 ) {
   const workspaces = await lockTenantEmployeeWorkspaces(tx, input);
   for (const workspace of workspaces)
-    await synchronizeTenantEmployeeAccess(tx, {
-      organizationId: input.organizationId,
-      workspaceId: workspace.id,
-    });
+    await synchronizeTenantEmployeeAccess(
+      tx,
+      {
+        organizationId: input.organizationId,
+        workspaceId: workspace.id,
+      },
+      {
+        personIds: input.personIds,
+        newAssignmentPeople:
+          input.allowNewAssignments === false ? [] : undefined,
+      },
+    );
 }
 
 /** Membership writers take these locks before changing membership rows. This

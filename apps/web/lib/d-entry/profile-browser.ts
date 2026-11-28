@@ -1,12 +1,21 @@
+import { borrowPageMux, type NativePageSocket } from './page-mux-client';
 import {
   DEntryPageBorrowSchema,
+  DEntryPageSwitchResultSchema,
   DEntryPageUnarySchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileChunkFilenameSchema,
   type DEntryProfileGraphSchema,
   UuidSchema,
+  dEntryRegisteredThreadHeader,
+  decodeDEntryRegisteredThread,
 } from '@allrice/contracts';
 import { z } from 'zod';
+import {
+  profileBundleTimeoutMs,
+  sealedProfileBundleFetch,
+  type EarlyProfileBundles,
+} from './initial-document';
 import {
   nativeMuxUrl,
   pageClosing,
@@ -14,6 +23,15 @@ import {
   pageRevoked,
   pendingPageResult,
 } from './page-carrier';
+import {
+  pageNativeThreadRegistered,
+  pageThreadScope,
+  pageThreadSwitchCancel,
+  pageThreadSwitchPrepare,
+  pageThreadSwitchPrepared,
+  type PageNativeThreadRegistration,
+  type PageThreadScope,
+} from './page-messages';
 
 const sender = z.strictObject({
   type: z.literal('client-request'),
@@ -21,6 +39,51 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+const createdSessionReply = z.object({
+  type: z.literal('server-response'),
+  rpcId: z.string(),
+  result: z.object({
+    ok: z.literal(true),
+    value: z.object({ sessionId: z.string().min(1).max(256) }),
+  }),
+});
+
+function publishNativeThread(
+  reply: Response,
+  bytes: ArrayBuffer,
+  scopeId: string,
+  resourceScopeId: string,
+  rpcId: string,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+) {
+  const thread = decodeDEntryRegisteredThread(
+    reply.headers.get(dEntryRegisteredThreadHeader),
+  );
+  if (!reply.ok || !thread) return;
+  // Never replace or reinterpret the RPC result that DSH itself consumes.
+  try {
+    const parsed = createdSessionReply.safeParse(
+      JSON.parse(new TextDecoder().decode(bytes)),
+    );
+    if (!parsed.success || parsed.data.rpcId !== rpcId) return;
+    const receipt = {
+      scopeId,
+      resourceScopeId,
+      thread,
+      nativeSessionId: parsed.data.result.value.sessionId,
+    };
+    onThreadRegistered?.(receipt);
+    document.dispatchEvent(
+      new CustomEvent<PageNativeThreadRegistration>(
+        pageNativeThreadRegistered,
+        { detail: receipt },
+      ),
+    );
+  } catch {
+    // A malformed optional sidebar receipt must not cause a native write retry.
+  }
+}
+
 const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
 const publicBundlesSchema = z.array(
   z.strictObject({
@@ -46,8 +109,6 @@ export function releasedBundleResolver(data: DOMStringMap) {
     return () => undefined;
   }
 }
-
-const profileBundleTimeoutMs = 30_000;
 
 export function profileBundleReference(
   graph: z.infer<typeof DEntryProfileGraphSchema>,
@@ -81,7 +142,7 @@ export class EmployeeProfileBundleTimeout extends Error {
 async function fetchProfileBundle(
   url: URL | string,
   parent: AbortSignal,
-  options: Pick<RequestInit, 'credentials' | 'cache'>,
+  options: Pick<RequestInit, 'credentials' | 'cache' | 'redirect'>,
 ) {
   parent.throwIfAborted();
   const timeout = new AbortController();
@@ -112,6 +173,7 @@ export async function readProfileBundle(
   target: URL,
   signal: AbortSignal,
   publicUrl?: string,
+  preloaded?: Promise<ArrayBuffer>,
 ) {
   const read = () =>
     fetchProfileBundle(target, signal, {
@@ -119,9 +181,13 @@ export async function readProfileBundle(
       cache: 'no-store',
     });
   try {
-    return await (publicUrl
-      ? fetchProfileBundle(publicUrl, signal, { credentials: 'omit' })
+    signal.throwIfAborted();
+    const bytes = await (publicUrl
+      ? (preloaded ??
+        fetchProfileBundle(publicUrl, signal, sealedProfileBundleFetch))
       : read());
+    signal.throwIfAborted();
+    return bytes;
   } catch (error) {
     signal.throwIfAborted();
     if (!publicUrl && !(error instanceof EmployeeProfileBundleTimeout))
@@ -158,6 +224,9 @@ export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
+  earlyBundles?: EarlyProfileBundles,
+  onThreadScope?: (scope: PageThreadScope) => void,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -166,8 +235,16 @@ export function nativeProfileDocument(
   const graphRev = container.dataset.graphRev!;
   const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
+  let authority = {
+    scopeId,
+    selection,
+    lifetime: new AbortController(),
+  };
   const pending = new Set<Promise<unknown>>();
-  const channels = new Map<WebSocket, Promise<void>>();
+  const threadWrites = new Set<Promise<Response>>();
+  let switching: { requestId: string; drainsComplete?: boolean } | undefined;
+  const preloaded = new Map<string, Promise<ArrayBuffer>>();
+  const channels = new Map<NativePageSocket, Promise<void>>();
   const done = pendingPageResult<void>();
   const owned = <T>(task: Promise<T>) => {
     pending.add(task);
@@ -176,6 +253,11 @@ export function nativeProfileDocument(
       () => pending.delete(task),
     );
     return task;
+  };
+  const cancel = () => {
+    lifetime.abort();
+    authority.lifetime.abort();
+    earlyBundles?.cancel();
   };
   void done.promise.catch(() => {});
   const query = new URLSearchParams({
@@ -189,7 +271,7 @@ export function nativeProfileDocument(
   let published:
     ReturnType<typeof DEntryProfileBootstrapSchema.parse> | undefined;
   let closing: Promise<void> | undefined;
-  let peer: WebSocket | undefined;
+  let peer: NativePageSocket | undefined;
   const receive = (event: MessageEvent) => {
     if (
       event.origin !== location.origin ||
@@ -205,11 +287,69 @@ export function nativeProfileDocument(
       if (event.data.state === 'closed') done.resolve();
       else done.reject(Error('Native page close is unconfirmed'));
     }
+    if (
+      event.data.type === pageThreadSwitchPrepare &&
+      !lifetime.signal.aborted &&
+      !switching &&
+      UuidSchema.safeParse(event.data.requestId).success
+    ) {
+      const { requestId } = event.data;
+      const handoff = { requestId, drainsComplete: false };
+      switching = handoff;
+      // A native write stays owned through consumption of its registration
+      // header and response body, not just until the guest first replies.
+      void Promise.allSettled(threadWrites).then(() => {
+        if (switching !== handoff || lifetime.signal.aborted) return;
+        handoff.drainsComplete = true;
+        parent.postMessage(
+          { type: pageThreadSwitchPrepared, scopeId, requestId },
+          location.origin,
+        );
+      });
+    }
+    if (
+      event.data.type === pageThreadSwitchCancel &&
+      switching?.requestId === event.data.requestId
+    )
+      switching = undefined;
+    if (
+      event.data.type === pageThreadScope &&
+      onThreadScope &&
+      !lifetime.signal.aborted &&
+      container.dataset.sharedMux === '1'
+    ) {
+      const result = DEntryPageSwitchResultSchema.safeParse(event.data.issued);
+      if (
+        !result.success ||
+        result.data.type !== 'switched' ||
+        result.data.scopeId === authority.scopeId ||
+        result.data.requestId !== switching?.requestId
+      )
+        return;
+      const next = result.data;
+      switching = undefined;
+      const old = peer;
+      peer = undefined;
+      authority.lifetime.abort();
+      authority = {
+        scopeId: next.scopeId,
+        selection: { ...selection, threadId: next.threadId },
+        lifetime: new AbortController(),
+      };
+      old?.close();
+      try {
+        onThreadScope(next);
+      } catch {
+        cancel();
+        onRevoked();
+      }
+    }
   };
   window.addEventListener('message', receive);
   function stop() {
     if (closing) return closing;
-    lifetime.abort();
+    cancel();
+    preloaded.clear();
     parent.postMessage({ type: pageClosing, scopeId }, location.origin);
     closing = (async () => {
       const [remote] = await Promise.allSettled([done.promise]);
@@ -225,16 +365,24 @@ export function nativeProfileDocument(
   return {
     signal: lifetime.signal,
     close: stop,
-    cancel: () => lifetime.abort(),
+    cancel,
     async bootstrap(signal: AbortSignal) {
       const active = AbortSignal.any([lifetime.signal, signal]);
-      const response = await fetch(profileUrl('bootstrap'), {
-        signal: active,
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!response.ok) throw Error('Employee profile unavailable');
-      const result = DEntryProfileBootstrapSchema.parse(await response.json());
+      const inline = container.ownerDocument.getElementById(
+        'allrice-employee-bootstrap',
+      );
+      async function fetchBootstrap() {
+        const response = await fetch(profileUrl('bootstrap'), {
+          signal: active,
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        if (!response.ok) throw Error('Employee profile unavailable');
+        return response.json();
+      }
+      const result = DEntryProfileBootstrapSchema.parse(
+        inline ? JSON.parse(inline.textContent ?? '') : await fetchBootstrap(),
+      );
       active.throwIfAborted();
       if (
         result.scopeReference.scopeId !== scopeId ||
@@ -243,13 +391,60 @@ export function nativeProfileDocument(
       )
         throw Error('Employee profile changed during startup');
       published = result;
+      const earlyReads = inline ? earlyBundles?.take() : undefined;
+      const readEarly = (url: string) =>
+        earlyReads?.get(url)?.catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'TimeoutError')
+            throw new EmployeeProfileBundleTimeout();
+          throw error;
+        });
+      const bootstrapBatch = result.graph.batches.find(
+        ({ phase }) => phase === 'bootstrap',
+      );
+      if (bootstrapBatch) {
+        const url = releasedBundle(bootstrapBatch);
+        const bytes = url && readEarly(url);
+        if (bytes) preloaded.set(bootstrapBatch.url, owned(bytes));
+      }
+      // The rc.2 injection interpreter leaves preload rows as hints. Fetch
+      // only the co-sealed public bytes and let the native loader execute them.
+      for (const injection of result.injections) {
+        if (injection.kind !== 'script-preload') continue;
+        const batch = result.graph.batches.find(
+          ({ phase, url }) => phase === 'application' && url === injection.src,
+        );
+        const publicUrl = batch && releasedBundle(batch);
+        if (publicUrl && !preloaded.has(injection.src))
+          preloaded.set(
+            injection.src,
+            owned(
+              readEarly(publicUrl) ??
+                fetchProfileBundle(publicUrl, active, sealedProfileBundleFetch),
+            ),
+          );
+      }
       return result.injections;
     },
     transport: {
       fetch(input: string | URL, init: RequestInit) {
-        return owned(
+        const isThreadWrite =
+          input === 'api/session/create' || input === 'api/session/fork';
+        if (isThreadWrite && switching)
+          return Promise.reject(
+            new DOMException(
+              'Native session switch in progress',
+              'InvalidStateError',
+            ),
+          );
+        const current = authority;
+        const signal = AbortSignal.any(
+          init.signal
+            ? [lifetime.signal, current.lifetime.signal, init.signal]
+            : [lifetime.signal, current.lifetime.signal],
+        );
+        const task = owned(
           Promise.resolve().then(() => {
-            lifetime.signal.throwIfAborted();
+            signal.throwIfAborted();
             const endpoint =
               typeof input === 'string' && input.startsWith('api/')
                 ? DEntryPageUnarySchema.safeParse(input.slice(4))
@@ -267,26 +462,45 @@ export function nativeProfileDocument(
               method: 'POST',
               credentials: 'same-origin',
               cache: 'no-store',
-              signal: init.signal
-                ? AbortSignal.any([lifetime.signal, init.signal])
-                : lifetime.signal,
+              signal,
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({
-                selection,
-                scopeId,
+                selection: current.selection,
+                scopeId: current.scopeId,
                 rpcId: request.rpcId,
                 endpoint: request.method,
                 payload: request.payload,
               }),
-            }).then(
-              async (reply) =>
-                new Response(await reply.arrayBuffer(), {
-                  status: reply.status,
-                  headers: reply.headers,
-                }),
-            );
+            }).then(async (reply) => {
+              const bytes = await reply.arrayBuffer();
+              signal.throwIfAborted();
+              if (
+                request.method === 'session/create' ||
+                request.method === 'session/fork'
+              )
+                publishNativeThread(
+                  reply,
+                  bytes,
+                  scopeId,
+                  current.scopeId,
+                  request.rpcId,
+                  onThreadRegistered,
+                );
+              return new Response(bytes, {
+                status: reply.status,
+                headers: reply.headers,
+              });
+            });
           }),
         );
+        if (isThreadWrite) {
+          threadWrites.add(task);
+          void task.then(
+            () => threadWrites.delete(task),
+            () => threadWrites.delete(task),
+          );
+        }
+        return task;
       },
       createWebSocket(input: string) {
         lifetime.signal.throwIfAborted();
@@ -294,9 +508,22 @@ export function nativeProfileDocument(
         expected.protocol = expected.protocol === 'https:' ? 'wss:' : 'ws:';
         if (new URL(input).href !== expected.href || peer)
           throw Error('Native connection is unavailable');
-        const socket = new WebSocket(
-          nativeMuxUrl(location.origin, organizationId, selection, scopeId),
-        );
+        const socket =
+          container.dataset.sharedMux === '1' &&
+          window.frameElement?.getAttribute('data-page-mux') === 'v1'
+            ? borrowPageMux(
+                scopeId,
+                authority.scopeId,
+                () => !switching?.drainsComplete,
+              )
+            : new WebSocket(
+                nativeMuxUrl(
+                  location.origin,
+                  organizationId,
+                  selection,
+                  scopeId,
+                ),
+              );
         peer = socket;
         channels.set(
           socket,
@@ -306,7 +533,7 @@ export function nativeProfileDocument(
               () => {
                 channels.delete(socket);
                 resolve();
-                if (!lifetime.signal.aborted) {
+                if (peer === socket && !lifetime.signal.aborted) {
                   lifetime.abort();
                   onRevoked();
                 }
@@ -320,19 +547,29 @@ export function nativeProfileDocument(
       loadBundle(reference: string) {
         return owned(
           (async () => {
-            const signal = lifetime.signal;
+            const current = authority;
+            const signal = AbortSignal.any([
+              lifetime.signal,
+              current.lifetime.signal,
+            ]);
             signal.throwIfAborted();
             const graph = published?.graph;
             const resource = graph && profileBundleReference(graph, reference);
             if (!resource) throw Error('Native bundle was not published');
             const target = profileUrl('assets');
+            target.searchParams.set('scopeId', current.scopeId);
+            if (current.selection.threadId)
+              target.searchParams.set('threadId', current.selection.threadId);
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);
+            const prefetched = preloaded.get(resource.url);
+            preloaded.delete(resource.url);
             const bytes = await readProfileBundle(
               target,
               signal,
               releasedBundle(resource),
+              prefetched,
             ).catch((error: unknown) => {
               if (
                 error instanceof EmployeeProfileBundleTimeout &&

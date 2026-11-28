@@ -3,7 +3,10 @@ import {
   createLaunchEnvironmentSnapshot,
   DSH_LAUNCH_ENVIRONMENT_KEY,
 } from '@deepseek-ai/dsh-launch-environment';
-import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
+import Llm, {
+  type LlmResolvedModelInfo,
+  type LlmRuntime,
+} from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
   classifyDeepSeek,
@@ -185,6 +188,10 @@ export async function createProductionOpenAiRuntime(
       model,
       revoked,
     );
+    const metadata = {
+      modelInfo,
+      historicalModels: [] as LlmResolvedModelInfo[],
+    };
     if (requireCredentialAtBoot) await assertCurrent();
     const llm: Pick<LlmRuntime, 'prepareCall'> = {
       async prepareCall(config, signal) {
@@ -220,13 +227,13 @@ export async function createProductionOpenAiRuntime(
       revoked,
       assertCurrent,
       close,
-      async readCatalogModelInfo(signal: AbortSignal) {
+      async readCatalogModelMetadata(signal: AbortSignal) {
         signal.throwIfAborted();
-        return modelInfo;
+        return metadata;
       },
-      async readModelInfo(signal: AbortSignal) {
+      async readModelMetadata(signal: AbortSignal) {
         await assertCurrent(signal);
-        return modelInfo;
+        return metadata;
       },
       scopeStream: images?.stream,
       transport: {

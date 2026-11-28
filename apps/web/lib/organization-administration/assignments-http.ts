@@ -3,6 +3,7 @@ import {
   IdentityError,
   TenantEmployeeError,
   EmployeeAccessBusyError,
+  EmployeeInstanceError,
   listOrganizationAiAssignments,
   changeOrganizationAiAssignments,
 } from '@allrice/database';
@@ -71,6 +72,14 @@ export async function organizationAssignmentsHttp(
     } else if (error instanceof EmployeeAccessBusyError) {
       status = 409;
       code = 'employee_access_busy';
+    } else if (
+      error instanceof EmployeeInstanceError &&
+      error.code === 'employee_port_slots_full'
+    ) {
+      return Response.json(
+        { code: error.code, message: error.message },
+        { status: 409, headers },
+      );
     } else if (error instanceof TenantEmployeeError) {
       status = 409;
       code = error.code;

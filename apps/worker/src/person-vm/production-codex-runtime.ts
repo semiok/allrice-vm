@@ -3,7 +3,11 @@ import { Context } from '@deepseek-ai/cordis';
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
-import { getDatabase } from '@allrice/database';
+import {
+  PlatformModelConfigurationSchema,
+  type PlatformModelConfiguration,
+} from '@allrice/contracts';
+import { getDatabase, readPlatformModelSettings } from '@allrice/database';
 import {
   ModelGatewayError,
   createOwnedModelTransport,
@@ -20,20 +24,32 @@ import { codexSubscriptionHome } from '../codex-subscription-home.js';
 const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
 
-async function readSelectedSubscription() {
+async function readSelectedSubscription(connectionId: string) {
   const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
     select slot, extract(epoch from updated_at)::text as revision
-    from allrice_codex_subscriptions where enabled
+    from allrice_codex_subscriptions
+    where enabled and exists (
+      select 1
+      from allrice_model_connections c
+      join allrice_model_providers p on p.id=c.provider_id
+      where c.id=${connectionId} and c.scope='platform'
+        and c.credential_reference='deployment:codex-default' and c.base_url is null
+        and c.status='ready' and p.enabled
+        and p.provider_key in ('codex','openai-codex') and p.auth_mode='chatgpt_subscription'
+    )
   `;
   if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
   return selected;
 }
 
 export function managedCodexModel(model: string) {
-  if (!['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model))
+  if (
+    !['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model)
+  )
     return { id: model };
   return {
     id: model,
+    ...(model === 'gpt-6.2-sol' ? { name: 'GPT-6.2 Sol' } : {}),
     contextWindow: 272000,
     input: ['text', 'image'] as ('text' | 'image')[],
     reasoningEfforts: {
@@ -76,12 +92,17 @@ function classify(
  * broker maintains. A change of slot never retargets this route generation. */
 async function openCodexGeneration(
   lifetime: AbortSignal,
+  connectionId: string,
   selection: Awaited<ReturnType<typeof readSelectedSubscription>>,
   model: string,
+  reasoning: PlatformModelConfiguration['reasoningEffort'],
   images: ReturnType<typeof createProductionModelImages> | undefined,
 ) {
   lifetime.throwIfAborted();
-  const modelMetadata = managedCodexModel(model);
+  const historicalIds =
+    PlatformModelConfigurationSchema.shape.workModel.options.filter(
+      (id) => id !== model,
+    );
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
@@ -108,7 +129,7 @@ async function openCodexGeneration(
     const active = AbortSignal.any([signal, revoked]);
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
-    const current = await readSelectedSubscription();
+    const current = await readSelectedSubscription(connectionId);
     active.throwIfAborted();
     if (
       !record.configured ||
@@ -129,17 +150,28 @@ async function openCodexGeneration(
     await host
       .plugin(PiAi, {
         providers: {
-          [provider]: { transport: 'sse', models: [modelMetadata] },
+          [provider]: {
+            transport: 'sse',
+            models: [model, ...historicalIds].map(managedCodexModel),
+            reasoning,
+          },
         },
       })
       .await();
     const modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
+    if (modelInfo.reasoning?.defaultEffort !== reasoning)
+      throw new ModelGatewayError('BINDING_INVALID');
+    const historicalModels = await Promise.all(
+      historicalIds.map((id) =>
+        host.llm.resolveModelInfo(provider, id, revoked),
+      ),
+    );
     await assertCurrent(revoked);
     return {
       revoked,
       retain,
       close,
-      modelInfo,
+      modelMetadata: { modelInfo, historicalModels },
       llm: host.llm,
       assertCurrent,
     };
@@ -160,13 +192,15 @@ export async function createProductionCodexRuntime(
   approvedModel?: string,
 ) {
   lifetime.throwIfAborted();
-  const model =
-    approvedModel ??
-    process.env.ALLRICE_DSH_CODEX_MODEL ??
-    process.env.ALLRICE_CODEX_MODEL ??
-    'gpt-6.1-sol';
-  if (!model || model.trim() !== model)
-    throw new ModelGatewayError('BINDING_INVALID');
+  // Keep the audited platform connection and default. A scoped Codex rule
+  // may pin a model that the same platform adapter supports.
+  const {
+    configuration: { connectionId, workModel, reasoningEffort },
+  } = await readPlatformModelSettings();
+  lifetime.throwIfAborted();
+  const model = PlatformModelConfigurationSchema.shape.workModel.parse(
+    approvedModel ?? workModel,
+  );
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const route: DshGatewayRoute = Object.freeze({
@@ -207,12 +241,14 @@ export async function createProductionCodexRuntime(
           await generation.assertCurrent(active);
           return generation;
         }
-        const selection = await readSelectedSubscription();
+        const selection = await readSelectedSubscription(connectionId);
         active.throwIfAborted();
         generation = await openCodexGeneration(
           revoked,
+          connectionId,
           selection,
           model,
+          reasoningEffort,
           images,
         );
         active.throwIfAborted();
@@ -235,8 +271,10 @@ export async function createProductionCodexRuntime(
     );
     return task;
   }
-  let catalog: ReturnType<LlmRuntime['resolveModelInfo']> | undefined;
-  function readCatalogModelInfo(signal: AbortSignal) {
+  let catalog:
+    | Promise<Awaited<ReturnType<typeof openCodexGeneration>>['modelMetadata']>
+    | undefined;
+  function readCatalogModelMetadata(signal: AbortSignal) {
     signal.throwIfAborted();
     return (catalog ??= (async () => {
       const host = new Context();
@@ -247,12 +285,23 @@ export async function createProductionCodexRuntime(
             providers: {
               [provider]: {
                 transport: 'sse',
-                models: [managedCodexModel(model)],
+                models: [
+                  ...PlatformModelConfigurationSchema.shape.workModel.options,
+                ].map(managedCodexModel),
+                reasoning: reasoningEffort,
               },
             },
           })
           .await();
-        return await host.llm.resolveModelInfo(provider, model, lifetime);
+        const all = await Promise.all(
+          PlatformModelConfigurationSchema.shape.workModel.options.map((id) =>
+            host.llm.resolveModelInfo(provider, id, lifetime),
+          ),
+        );
+        return {
+          modelInfo: all.find(({ id }) => id === model)!,
+          historicalModels: all.filter(({ id }) => id !== model),
+        };
       } finally {
         await host.fiber.dispose();
       }
@@ -296,9 +345,9 @@ export async function createProductionCodexRuntime(
   return Object.freeze({
     llm,
     route,
-    readCatalogModelInfo,
-    async readModelInfo(signal: AbortSignal) {
-      return (await current(signal)).modelInfo;
+    readCatalogModelMetadata,
+    async readModelMetadata(signal: AbortSignal) {
+      return (await current(signal)).modelMetadata;
     },
     scopeStream: images?.stream,
     revoked,

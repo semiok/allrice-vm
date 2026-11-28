@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 
 describe('actual DSH provider reasoning configuration (offline)', () => {
   it.each(
-    ['gpt-5.6-luna', 'gpt-6.1-sol'].flatMap((model) =>
+    ['gpt-5.6-luna', 'gpt-6.1-sol', 'gpt-6.2-sol'].flatMap((model) =>
       ['low', 'medium', 'high', 'xhigh'].map((effort) => ({ model, effort })),
     ),
   )(

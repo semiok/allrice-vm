@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   PersonVmError,
   PERSON_VM_COLD_MS,
@@ -8,7 +8,10 @@ import {
 import { PersonVmService } from './person-vm.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { runCommand } from './process.ts';
-import type { PersonVmBootstrapScope } from './guest-bootstrap.ts';
+import type {
+  PersonVmBootstrapScope,
+  PersonVmStartingScope,
+} from './guest-bootstrap.ts';
 import {
   context,
   harness,
@@ -19,6 +22,138 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  it.each([
+    'fresh disk and attach',
+    'previous disk',
+    'idempotent create',
+    'borrowed attachment',
+    'image changes before probe',
+    'image changes during probe',
+    'existing home',
+    'unjoined probe',
+  ] as const)(
+    'limits the first HOME receipt to an exact fresh start: %s',
+    async (state) => {
+      const h = harness();
+      const rc = context();
+      const employee = {
+        workspaceId: rc.workspaceId ?? randomUUID(),
+        employeeInstanceId: randomUUID(),
+        employeeRevision: 1,
+        employeeVersionId: randomUUID(),
+      };
+      const roster = {
+        personId: rc.actor.id,
+        organizationId: rc.organizationId,
+        entries: [employee],
+      };
+      const selectedEmployee = {
+        personId: roster.personId,
+        organizationId: roster.organizationId,
+        ...employee,
+      };
+      const port = { hostPort: 32171, guestPort: 32171 };
+      const { create, attach, inspectMount } = h.disk;
+      vi.spyOn(h.disk, 'create').mockImplementation(async (ref, scoped) => {
+        await create(ref, scoped);
+        if (state !== 'idempotent create')
+          return { device: 'synthetic', inode: ref.vmId };
+      });
+      if (state === 'borrowed attachment')
+        vi.spyOn(h.disk, 'attach').mockImplementation((disk, scoped) =>
+          attach(disk, scoped),
+        );
+      let probed = false;
+      if (
+        state === 'image changes before probe' ||
+        state === 'image changes during probe'
+      )
+        vi.spyOn(h.disk, 'inspectMount').mockImplementation(
+          (disk, active, expected) => {
+            if (state === 'image changes before probe' || probed)
+              return Promise.resolve({ state: 'unknown' });
+            return inspectMount!(disk, active, expected);
+          },
+        );
+      const observeHomes = vi.fn(
+        async (scope: PersonVmStartingScope, mount: string) => {
+          await scope.assertCurrent();
+          const during = await h.store.read(rc.actor.id);
+          expect(during?.instanceId).toBe(scope.binding.instanceId);
+          expect(during?.leaseOwner).toBeTruthy();
+          expect(during?.phase).toBe('starting');
+          expect(mount).toBe('/synthetic/' + scope.binding.vmId);
+          probed = true;
+          if (state === 'unjoined probe')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          return state !== 'existing home';
+        },
+      );
+      h.native.prepareWebEndpoints = vi.fn<
+        NonNullable<typeof h.native.prepareWebEndpoints>
+      >(async (binding, roster) => ({
+        binding,
+        rosterDigest: roster.digest,
+        slots: [port],
+        endpoints: roster.entries.map((entry) => ({ ...entry, ...port })),
+      }));
+      h.native.assertWebEndpoints = vi.fn(async () => {});
+      h.runtime.retireAfterNativeStop = vi.fn(async () => {});
+      const stage = vi.spyOn(h.runtime, 'memoryGuestPlan');
+      const service = new PersonVmService({
+        ...h.options,
+        nativeWeb: {
+          async prepare() {
+            return {
+              ...roster,
+              digest: `sha256:${createHash('sha256').update(JSON.stringify(roster)).digest('hex')}`,
+            };
+          },
+        },
+        readUnusedEmployeeHomes: observeHomes,
+      });
+      const previous =
+        state === 'previous disk' ? await service.create(rc, signal()) : null;
+      const starting = service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          selectedEmployee,
+          target: {
+            vmId: previous?.vmId ?? null,
+            instanceId: null,
+            leaseEpoch: 1,
+            assertAuthority: async () => {},
+          },
+        },
+        signal(),
+      );
+      if (state === 'unjoined probe') {
+        await expect(starting).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(observeHomes).toHaveBeenCalledOnce();
+        expect(stage).not.toHaveBeenCalled();
+        expect(h.log).toContain('native:stop');
+        return;
+      }
+      await expect(starting).resolves.toMatchObject({ ready: true });
+      const startup = stage.mock.calls[0]?.[2];
+      expect(startup?.selectedEmployee).toEqual(selectedEmployee);
+      expect(startup?.unusedEmployeeHomes).toBe(
+        state === 'fresh disk and attach' ? true : undefined,
+      );
+      expect(observeHomes).toHaveBeenCalledTimes(
+        [
+          'fresh disk and attach',
+          'existing home',
+          'image changes during probe',
+        ].includes(state)
+          ? 1
+          : 0,
+      );
+    },
+  );
   it('rejects a changed prewarm epoch under the lease before any disk or native side effect', async () => {
     const store = new MemoryStore(),
       h = harness(store),
@@ -285,6 +420,197 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       leaseOwner: null,
     });
   });
+
+  async function scheduledFixture() {
+    const store = new MemoryStore();
+    const h = harness(store);
+    const { rc, binding } = await running(h);
+    // The other module owns proof of a safe physical stop. Seed its native
+    // outcome and let the real service persist and clean up the retained VM.
+    h.states.set(binding.vmId, 'stopped');
+    await h.service.stop(rc, signal());
+    const endpoint = {
+      workspaceId: randomUUID(),
+      employeeInstanceId: randomUUID(),
+      employeeRevision: 1,
+      employeeVersionId: randomUUID(),
+    };
+    const facts = {
+      personId: binding.personId,
+      organizationId: binding.organizationId,
+      entries: [endpoint],
+    };
+    const roster = {
+      ...facts,
+      digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+    };
+    const interactiveRoster = vi.fn(async () => roster);
+    const verified = vi.fn(async () => {});
+    h.runtime.assertScheduledReady = verified;
+    h.runtime.retireAfterNativeStop = vi.fn(async () => {});
+    h.native.prepareWebEndpoints = vi.fn(async (current, expected) => ({
+      binding: current,
+      rosterDigest: expected.digest,
+      endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
+    }));
+    h.native.assertWebEndpoints = vi.fn(async () => {});
+    const idleOwner = vi.fn();
+    const service = new PersonVmService({
+      ...h.options,
+      nativeWeb: { prepare: interactiveRoster },
+      observeScheduledStart: idleOwner,
+    });
+    h.authorize(false);
+    return {
+      h,
+      store,
+      binding,
+      roster,
+      service,
+      interactiveRoster,
+      verified,
+      idleOwner,
+    };
+  }
+
+  it('resumes only the retained native VM with no user and no interactive readiness grant', async () => {
+    const f = await scheduledFixture();
+    const requestId = randomUUID();
+    const startup = vi.spyOn(f.h.runtime, 'start');
+    const browserProof = vi.spyOn(f.h.runtime, 'readiness');
+    const roster = vi.fn(async () => {
+      expect((await f.store.read(f.binding.personId))?.leaseOwner).toBeTruthy();
+      return f.roster;
+    });
+    const fenced: string[] = [];
+    const nativeStart = f.h.native.start;
+    const commitRunning = vi.fn(async () => {
+      expect(fenced).toHaveLength(2);
+      expect((await f.store.read(f.binding.personId))?.phase).toBe('starting');
+    });
+    const assertCapacityCurrent = vi.fn(async () => {});
+    f.h.native.start = async (binding, active) => {
+      expect(fenced).toHaveLength(1);
+      await nativeStart(binding, active);
+      return {
+        signal: active,
+        assertCurrent: assertCapacityCurrent,
+        commitRunning,
+      };
+    };
+    const authority: Parameters<
+      PersonVmService['startRetainedForSchedule']
+    >[2] = {
+      readRoster: roster,
+      async withCurrentAuthority(digest, active, start) {
+        fenced.push(digest);
+        expect(digest).toBe(f.roster.digest);
+        expect(
+          (await f.store.read(f.binding.personId))?.leaseOwner,
+        ).toBeTruthy();
+        return start(active);
+      },
+    };
+    const view = await f.service.startRetainedForSchedule(
+      f.binding,
+      requestId,
+      authority,
+      signal(),
+    );
+    expect(view).toMatchObject({ phase: 'running', ready: false });
+    expect(f.idleOwner).toHaveBeenCalledExactlyOnceWith(
+      {
+        ...f.binding,
+        instanceId: expect.any(String),
+        leaseEpoch: f.binding.leaseEpoch + 1,
+      },
+      f.roster,
+    );
+    expect(f.h.log.filter((item) => item === 'native:create')).toHaveLength(1);
+    expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
+    expect(startup.mock.lastCall?.[3]).toMatchObject({
+      purpose: 'scheduled-wake',
+    });
+    expect(startup.mock.lastCall?.[3]).not.toHaveProperty('context');
+    expect(f.verified).toHaveBeenCalledOnce();
+    expect(fenced).toEqual([f.roster.digest, f.roster.digest]);
+    expect(assertCapacityCurrent).toHaveBeenCalled();
+    expect(commitRunning).toHaveBeenCalledOnce();
+    expect(f.interactiveRoster).not.toHaveBeenCalled();
+    expect(browserProof).not.toHaveBeenCalled();
+    expect(
+      f.store.audits
+        .filter((audit) => audit.requestId === requestId)
+        .map(({ action, result }) => [action, result]),
+    ).toEqual([
+      ['scheduled-wake.start', 'started'],
+      ['scheduled-wake.start', 'succeeded'],
+    ]);
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        requestId,
+        authority,
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
+  });
+
+  it('does not launch or issue an unowned native stop when authority is lost before retained resume', async () => {
+    const f = await scheduledFixture();
+    const before = f.h.log.length;
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        randomUUID(),
+        {
+          readRoster: async () => f.roster,
+          withCurrentAuthority: async () => {
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(f.h.log.slice(before)).not.toContain('native:start');
+    expect(f.h.log.slice(before)).not.toContain('native:stop');
+    expect(f.verified).not.toHaveBeenCalled();
+    expect(f.idleOwner).not.toHaveBeenCalled();
+    expect(f.h.mounts.size).toBe(0);
+  });
+
+  it('retires a dispatched VM if scheduled authority is lost at running publication', async () => {
+    const f = await scheduledFixture();
+    const requestId = randomUUID();
+    const before = f.h.log.length;
+    let fenced = 0;
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        requestId,
+        {
+          readRoster: async () => f.roster,
+          async withCurrentAuthority(_digest, active, work) {
+            if (++fenced === 2) throw new PersonVmError('AUTHORIZATION_DENIED');
+            return work(active);
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(
+      f.h.log.slice(before).filter((item) => item.startsWith('native:')),
+    ).toEqual(expect.arrayContaining(['native:start', 'native:stop']));
+    expect(f.h.states.get(f.binding.vmId)).toBe('stopped');
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      f.store.audits
+        .filter((event) => event.requestId === requestId)
+        .map((event) => event.result),
+    ).toEqual(['started', 'failed']);
+  });
+
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');
@@ -326,6 +652,287 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(h.log.slice(before)).toEqual([]);
     expect((await h.service.start(rc, signal())).ready).toBe(true);
   });
+  it.each([
+    'mount conflict',
+    'pre-dispatch failure',
+    'borrowed mount',
+  ] as const)(
+    'a retained preflight does not own resources for %s',
+    async (mode) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      if (mode === 'borrowed mount')
+        await h.disk.attach({ vmId: binding.vmId, tier: 'warm' }, signal());
+      const attach = vi.spyOn(h.disk, 'attach');
+      const detach = vi.spyOn(h.disk, 'detach');
+      const proof = vi.fn(async () => {});
+      const observeOwnedMount = vi.fn();
+      if (mode === 'mount conflict')
+        vi.spyOn(h.disk, 'inspectMount').mockResolvedValue({
+          state: 'unknown',
+        });
+      if (mode === 'pre-dispatch failure')
+        attach.mockRejectedValueOnce(new PersonVmError('PROVIDER_FAILED'));
+      const vm = new PersonVmService({
+        ...h.options,
+        observeOwnedMount,
+        native: { ...h.native, assertRetainedStartup: proof },
+      });
+      const preflight = vm.reconcileStoppedEntryForPrewarm(
+        rc,
+        binding,
+        signal(),
+        true,
+      );
+      if (mode === 'borrowed mount') {
+        await expect(preflight).resolves.toBe(true);
+        expect(proof).toHaveBeenCalledOnce();
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+      } else {
+        await expect(preflight).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(proof).not.toHaveBeenCalled();
+      }
+      await vm.settleRetainedStartupMounts(signal());
+      expect(attach).toHaveBeenCalledTimes(
+        mode === 'pre-dispatch failure' ? 1 : 0,
+      );
+      expect(detach).not.toHaveBeenCalled();
+      expect(observeOwnedMount).not.toHaveBeenCalled();
+      if (mode === 'borrowed mount')
+        await h.disk.detach({ vmId: binding.vmId, tier: 'warm' }, signal());
+    },
+  );
+  it.each(['next request', 'Worker shutdown', 'attach receipt lost'] as const)(
+    'joins a dispatched retained attachment through %s without a native owner cache',
+    async (mode) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      const physicalStatus = vi.fn(async () => {
+        throw Error('native homes has not been prepared');
+      });
+      const observeOwnedMount = vi.fn();
+      const proof = vi.fn(async () => {
+        h.log.push('native:proof');
+      });
+      const detach = vi.spyOn(h.disk, 'detach');
+      const failure = new PersonVmError('PROVIDER_FAILED');
+      if (mode === 'attach receipt lost') {
+        const attach = h.disk.attach;
+        vi.spyOn(h.disk, 'attach').mockImplementationOnce(async (...args) => {
+          await attach(...args);
+          throw failure;
+        });
+      } else detach.mockRejectedValueOnce(failure);
+      const vm = new PersonVmService({
+        ...h.options,
+        observeOwnedMount,
+        native: {
+          ...h.native,
+          status: physicalStatus,
+          assertRetainedStartup: proof,
+        },
+      });
+      const preflight = () =>
+        vm.reconcileStoppedEntryForPrewarm(rc, binding, signal(), true);
+      if (mode === 'attach receipt lost') {
+        await expect(preflight()).rejects.toBe(failure);
+        await vm.settleRetainedStartupMounts(signal());
+        expect(detach).toHaveBeenCalledOnce();
+        expect(proof).not.toHaveBeenCalled();
+      } else {
+        await expect(preflight()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+        const checkpoint = h.log.length;
+        if (mode === 'next request') {
+          await expect(preflight()).resolves.toBe(true);
+          expect(h.log.slice(checkpoint)).toEqual([
+            'disk:detach',
+            'disk:attach',
+            'native:proof',
+            'disk:detach',
+          ]);
+        } else {
+          vm.fenceWorkerStartup();
+          vi.spyOn(h.disk, 'inspectMount').mockResolvedValueOnce({
+            state: 'unknown',
+          });
+          await expect(
+            vm.settleRetainedStartupMounts(signal()),
+          ).rejects.toMatchObject({
+            code: 'CLEANUP_INCOMPLETE',
+          });
+          expect(detach).toHaveBeenCalledOnce();
+          expect(h.mounts.has(binding.vmId)).toBe(true);
+          await vm.settleRetainedStartupMounts(signal());
+          expect(h.log.slice(checkpoint)).toEqual(['disk:detach']);
+        }
+      }
+      expect(h.mounts.size).toBe(0);
+      expect(physicalStatus).not.toHaveBeenCalled();
+      expect(observeOwnedMount).not.toHaveBeenCalled();
+      expect(await h.store.read(binding.personId)).toMatchObject({
+        vmId: binding.vmId,
+        instanceId: binding.instanceId,
+        leaseEpoch: binding.leaseEpoch,
+        phase: 'stopped',
+      });
+    },
+  );
+  it.each([
+    ['lifecycle reentry', 'warm', 'stopped', 'later generation'],
+    ['shutdown', 'warm', 'stopped', 'later generation'],
+    ['lifecycle reentry', 'cold', 'stopped', 'later generation'],
+    ['shutdown', 'cold', 'stopped', 'later generation'],
+    ['shutdown', 'cold', 'retained delete', 'later generation'],
+    ['shutdown', 'cold', 'erased delete', 'later generation'],
+    ['lifecycle reentry', 'cold', 'stopped', 'same generation'],
+    ['shutdown', 'cold', 'retained delete', 'same generation'],
+    ['shutdown', 'cold', 'erased delete', 'same generation'],
+  ] as const)(
+    'retires only a proved absent detach receipt on %s (%s tier, %s, %s)',
+    async (mode, tier, end, generation) => {
+      const h = harness();
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      const physicalDetach = h.disk.detach;
+      const detach = vi
+        .spyOn(h.disk, 'detach')
+        .mockImplementationOnce(async (...args) => {
+          await physicalDetach(...args);
+          throw new PersonVmError('PROVIDER_FAILED');
+        });
+      const proof = vi.fn(async () => {});
+      const first = new PersonVmService({
+        ...h.options,
+        native: { ...h.native, assertRetainedStartup: proof },
+      });
+      const second = new PersonVmService(h.options);
+      await expect(
+        first.reconcileStoppedEntryForPrewarm(rc, binding, signal(), true),
+      ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+      expect(h.mounts.size).toBe(0);
+      expect(detach).toHaveBeenCalledOnce();
+
+      const settle = () =>
+        mode === 'shutdown'
+          ? first.settleRetainedStartupMounts(signal())
+          : first.stop(rc, signal());
+      let next = binding;
+      if (generation === 'later generation') {
+        // A's missing detach receipt does not prevent another lifecycle
+        // owner obtaining its own, later exact binding.
+        await expect(second.start(rc, signal())).resolves.toMatchObject({
+          vmId: binding.vmId,
+          ready: true,
+        });
+        next = await second.resolve(rc, signal());
+        expect(next.leaseEpoch).toBe(binding.leaseEpoch + 1);
+        expect(next.instanceId).not.toBe(binding.instanceId);
+        await expect(settle()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(detach).toHaveBeenCalledOnce();
+        expect(h.mounts.has(binding.vmId)).toBe(true);
+        await expect(second.resolve(rc, signal())).resolves.toEqual(next);
+
+        h.states.set(binding.vmId, 'stopped');
+        await second.stop(rc, signal());
+        expect(detach).toHaveBeenCalledTimes(2);
+      }
+      if (tier === 'cold') {
+        h.advance(PERSON_VM_COLD_MS + 1);
+        await expect(second.reconcileIdle(rc, signal())).resolves.toMatchObject(
+          {
+            phase: 'cold',
+          },
+        );
+      }
+      if (end !== 'stopped') {
+        h.authorizeDiskDelete(true);
+        await second.delete(
+          rc,
+          { deleteDisk: end === 'erased delete' },
+          signal(),
+        );
+      }
+      const final = (await h.store.read(binding.personId))!;
+      const detached = detach.mock.calls.length;
+      const disk = { vmId: binding.vmId, tier };
+      expect(final).toMatchObject({
+        instanceId: next.instanceId,
+        leaseEpoch: next.leaseEpoch,
+      });
+      if (end === 'erased delete') {
+        expect(final).toMatchObject({ phase: 'deleted', diskRetained: false });
+        expect(h.disks.has(binding.vmId)).toBe(false);
+        const inspect = vi.spyOn(h.disk, 'inspectMount');
+        await expect(settle()).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(inspect).not.toHaveBeenCalled();
+        expect(detach).toHaveBeenCalledTimes(detached);
+        expect(await h.store.read(binding.personId)).toEqual(final);
+        return;
+      }
+      await h.disk.attach(disk, signal());
+      await expect(settle()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(h.mounts.has(binding.vmId)).toBe(true);
+      expect(detach).toHaveBeenCalledTimes(detached);
+      await physicalDetach(disk, signal());
+
+      const inspect = vi.spyOn(h.disk, 'inspectMount');
+      inspect.mockResolvedValueOnce({ state: 'unknown' });
+      if (generation === 'same generation')
+        inspect.mockResolvedValueOnce({ state: 'unknown' });
+      await expect(settle()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(detach).toHaveBeenCalledTimes(detached);
+      const beforeSettlement = h.log.length;
+      await settle();
+      expect(h.log.slice(beforeSettlement)).toEqual([]);
+      expect(inspect).toHaveBeenCalledTimes(
+        generation === 'same generation' ? 4 : 2,
+      );
+      expect(inspect).toHaveBeenLastCalledWith(
+        { vmId: binding.vmId, tier: 'warm' },
+        expect.any(AbortSignal),
+        expect.objectContaining({ acrossTier: true }),
+      );
+      expect(detach).toHaveBeenCalledTimes(detached);
+      await first.settleRetainedStartupMounts(signal());
+      expect(inspect).toHaveBeenCalledTimes(
+        generation === 'same generation' ? 4 : 2,
+      );
+      expect(proof).toHaveBeenCalledOnce();
+      expect(h.mounts.size).toBe(0);
+      expect(h.disks.has(binding.vmId)).toBe(true);
+      expect(final).toMatchObject({
+        instanceId: next.instanceId,
+        leaseEpoch: next.leaseEpoch,
+        phase:
+          end === 'retained delete'
+            ? 'deleted'
+            : tier === 'cold'
+              ? 'cold'
+              : 'stopped',
+        diskTier: tier,
+        diskRetained: true,
+      });
+      expect(await h.store.read(binding.personId)).toEqual(final);
+    },
+  );
   it.each(['stopped', 'absent', 'unknown'] as const)(
     'failure cleanup native=%s才可退役；未知不调用/不detach',
     async (state) => {
@@ -523,6 +1130,163 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(h.log).not.toContain('native:bootstrap');
     expect(h.log).not.toContain('runtime:start');
     expect(h.mounts.size).toBe(0);
+  });
+
+  it.each(['guest plan', 'readiness', 'capacity commit'] as const)(
+    'losing retained-start capacity during %s prevents activation',
+    async (stage) => {
+      const store = new MemoryStore();
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+
+      const owner = new AbortController();
+      const lost = new PersonVmError('LEASE_LOST');
+      const assertCurrent = vi.fn(async () => owner.signal.throwIfAborted());
+      const commitRunning = vi.fn(async () => {
+        if (stage === 'capacity commit') owner.abort(lost);
+        owner.signal.throwIfAborted();
+      });
+      const startNative = h.native.start;
+      h.native.start = async (...args) => {
+        await startNative(...args);
+        return { signal: owner.signal, assertCurrent, commitRunning };
+      };
+      const plan = h.runtime.memoryGuestPlan;
+      const readiness = h.runtime.readiness;
+      const cancel = (active: AbortSignal) => {
+        expect(active.aborted).toBe(false);
+        owner.abort(lost);
+        expect(active.reason).toBe(lost);
+      };
+      h.runtime.memoryGuestPlan = async (...args) => {
+        if (stage === 'guest plan') cancel(args[1]);
+        return plan(...args);
+      };
+      h.runtime.readiness = async (...args) => {
+        if (stage === 'readiness') cancel(args[1]);
+        return readiness(...args);
+      };
+      const before = h.log.length;
+      const auditStart = store.audits.length;
+      await expect(h.service.start(rc, signal())).rejects.toBe(lost);
+
+      expect(assertCurrent).toHaveBeenCalled();
+      expect(commitRunning).toHaveBeenCalledTimes(
+        stage === 'capacity commit' ? 1 : 0,
+      );
+      const effects = h.log.slice(before);
+      expect(effects).toContain('native:start');
+      if (stage === 'guest plan')
+        expect(effects).not.toContain('native:bootstrap');
+      expect(effects).toContain('native:stop');
+      expect(effects).toContain('disk:detach');
+      expect(await store.read(binding.personId)).toMatchObject({
+        phase: 'stopped',
+        diskRetained: true,
+      });
+      expect(
+        store.audits
+          .slice(auditStart)
+          .filter(({ action }) => action === 'start')
+          .map(({ result }) => result),
+      ).toEqual(['started', 'failed']);
+    },
+  );
+  it.each(['publish', 'release'] as const)(
+    'keeps the post-commit running charge when the reservation expires during %s',
+    async (stage) => {
+      const owner = new AbortController();
+      let charged = false;
+      const expire = () => {
+        expect(charged).toBe(true);
+        owner.abort(new PersonVmError('LEASE_LOST'));
+      };
+      const store = new (class extends MemoryStore {
+        override withLease<T>(...args: Parameters<MemoryStore['withLease']>) {
+          const [person, options, work] = args;
+          return super.withLease<T>(person, options, async (lease) => {
+            const result = await work({
+              ...lease,
+              save: async (row, details) => {
+                const event =
+                  details && 'audit' in details ? details.audit : undefined;
+                if (
+                  charged &&
+                  stage === 'publish' &&
+                  event?.action === 'start' &&
+                  event.result === 'succeeded'
+                )
+                  expire();
+                await lease.save(row, details);
+              },
+            });
+            if (charged && stage === 'release') expire();
+            return result;
+          });
+        }
+      })();
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+
+      const startNative = h.native.start;
+      const commitRunning = vi.fn(async () => {
+        owner.signal.throwIfAborted();
+        expect(await store.read(binding.personId)).toMatchObject({
+          phase: 'starting',
+        });
+        owner.signal.throwIfAborted();
+        charged = true;
+      });
+      h.native.start = async (...args) => {
+        await startNative(...args);
+        return {
+          signal: owner.signal,
+          assertCurrent: async () => owner.signal.throwIfAborted(),
+          commitRunning,
+        };
+      };
+      const auditStart = store.audits.length;
+      await expect(h.service.start(rc, signal())).resolves.toMatchObject({
+        phase: 'running',
+        ready: true,
+      });
+      expect(commitRunning).toHaveBeenCalledOnce();
+      expect(owner.signal.aborted).toBe(true);
+      expect(charged).toBe(true);
+      expect(await store.read(binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseOwner: null,
+      });
+      expect(
+        store.audits.slice(auditStart).map(({ result }) => result),
+      ).toEqual(['started', 'succeeded']);
+    },
+  );
+  it('retains the disk and leaves a failed binding when retained start and cleanup are unconfirmed', async () => {
+    const h = harness();
+    const { rc, binding } = await running(h);
+    h.states.set(binding.vmId, 'stopped');
+    await h.service.stop(rc, signal());
+    h.native.start = async (current) => {
+      h.states.set(current.vmId, 'unknown');
+      throw new PersonVmError('PROVIDER_FAILED');
+    };
+    h.native.stop = async () => {};
+    const before = h.log.length;
+    await expect(h.service.start(rc, signal())).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    expect(h.log.slice(before)).not.toContain('disk:detach');
+    expect(h.mounts.has(binding.vmId)).toBe(true);
+    expect(await h.store.read(binding.personId)).toMatchObject({
+      phase: 'failed',
+      diskRetained: true,
+      leaseEpoch: binding.leaseEpoch + 1,
+    });
   });
   it.each(['authority', 'egress'] as const)(
     'starting失去%s后launch零派发，callback捕获拒绝也不得ready',

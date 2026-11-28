@@ -2,7 +2,6 @@ import type { RequestContext } from '@allrice/contracts';
 import { sameDEntryIdentity } from '@allrice/contracts';
 import {
   DataAccessError,
-  readPersonNativeWebRoster,
   requireDEntryNativeIdentity,
 } from '@allrice/database';
 import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
@@ -21,18 +20,6 @@ import {
 } from '../d-entry/native-owner.js';
 
 type Endpoint = ResolvedDEntryNativeOwner['endpoint'];
-export type CurrentNativeCatalogRoster = Readonly<{
-  personId: string;
-  organizationId: string;
-  digest: string;
-  entries: readonly Pick<
-    Endpoint,
-    | 'workspaceId'
-    | 'employeeInstanceId'
-    | 'employeeRevision'
-    | 'employeeVersionId'
-  >[];
-}>;
 /** The existing startup owner publishes this exact receipt, never a guest DTO. */
 export type PublishedNativeCatalog = Readonly<{
   receipt: ResolvedDEntryNativeOwner['receipt'];
@@ -68,10 +55,6 @@ export type PublishedNativeCatalog = Readonly<{
 /** Required trusted producers. No start/prewarm, generic RPC or history port. */
 export type NativeCatalogHost = Readonly<{
   vm: Pick<PersonVmPort, 'resolve' | 'assertCurrentBinding'>;
-  readRoster(
-    context: RequestContext,
-    signal: AbortSignal,
-  ): Promise<CurrentNativeCatalogRoster>;
   catalog(
     binding: PersonVmBinding,
     employeeInstanceId: string,
@@ -130,8 +113,6 @@ export function createDEntryNativeCatalogPort(input: {
           if (!binding) binding = await input.host.vm.resolve(who, active);
           else await input.host.vm.assertCurrentBinding(who, binding, active);
           active.throwIfAborted();
-          const roster = await input.host.readRoster(who, active);
-          active.throwIfAborted();
           const found = input.host.catalog(
             binding,
             identity.employeeInstanceId,
@@ -146,18 +127,15 @@ export function createDEntryNativeCatalogPort(input: {
           const selected = view.receipt.endpoints.filter((endpoint) =>
             employeeKeys.every((key) => endpoint[key] === identity[key]),
           );
+          // The receipt pins this owner. Unrelated roster changes leave its
+          // process and receipt intact. requireDEntryNativeIdentity already
+          // rechecks this employee, its assignment and writable workspace.
           if (
-            roster.personId !== identity.personId ||
-            roster.organizationId !== identity.organizationId ||
-            roster.digest !== view.receipt.rosterDigest ||
             !sameDEntryVmBinding(binding, view.receipt.binding) ||
             binding.personId !== identity.personId ||
             binding.organizationId !== identity.organizationId ||
             selected.length !== 1 ||
             JSON.stringify(selected[0]) !== JSON.stringify(view.endpoint) ||
-            !roster.entries.some((endpoint) =>
-              employeeKeys.every((key) => endpoint[key] === identity[key]),
-            ) ||
             (published &&
               (published.receipt !== found.receipt ||
                 published.endpoint !== found.endpoint ||
@@ -309,7 +287,7 @@ export function installDEntryNativeCatalog(input: {
   return { close };
 }
 
-/** Bind the real readonly SQL producer and actual already-started native group.
+/** Bind real current identity and the actual already-started native group.
  * Production still supplies its real VM/startup owners and lifetime. */
 export function installAssignedDEntryNativeCatalog(input: {
   vm: NativeCatalogHost['vm'];
@@ -322,12 +300,6 @@ export function installAssignedDEntryNativeCatalog(input: {
       vm: input.vm,
       catalog: (binding, employeeInstanceId) =>
         input.startup.catalog(binding, employeeInstanceId),
-      async readRoster(context, signal) {
-        signal.throwIfAborted();
-        const roster = await readPersonNativeWebRoster(context);
-        signal.throwIfAborted();
-        return roster;
-      },
     },
   });
 }

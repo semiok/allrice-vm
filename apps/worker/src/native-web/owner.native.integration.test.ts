@@ -19,6 +19,7 @@ import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { z } from 'zod';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
@@ -910,11 +911,15 @@ it.skipIf(!cli)(
       origin: 'http://127.0.0.1:1',
       capability: 'a'.repeat(43),
       provider: 'openai-codex',
-      model: 'fixture-codex',
+      model: 'gpt-6.2-sol',
       modelInfo: {
         provider: 'openai-codex',
-        id: 'fixture-codex',
-        name: 'fixture-codex',
+        id: 'gpt-6.2-sol',
+        name: 'GPT-6.2 Sol',
+        reasoning: {
+          efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+          defaultEffort: ReasoningEffortId('high'),
+        },
       },
     };
     const f = await setupNativeWebFixture(
@@ -932,16 +937,199 @@ it.skipIf(!cli)(
       async (_profile, readModels, _active, installed) => {
         const catalog = await readModels();
         expect(installed).toBe(f.owner.modelAdapterId);
-        expect(catalog.value.default).toMatchObject({
+        expect(catalog.value.default).toEqual({
           provider: route.provider,
           model: route.model,
         });
+        const provider = catalog.value.groups.find(
+          ({ id }) => id === route.provider,
+        );
+        expect(provider?.models).toEqual([
+          {
+            id: route.model,
+            name: route.modelInfo.name,
+            reasoning: route.modelInfo.reasoning,
+          },
+        ]);
         expect(catalog.value.routableProviders).toContain(route.provider);
         expect(catalog.value.failures).not.toContainEqual(
           expect.objectContaining({ id: route.provider }),
         );
       },
     );
+  },
+);
+
+it.skipIf(!cli)(
+  'continues a retained native conversation using the new Host model and effort',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const capability = 'a'.repeat(43);
+    const assistantModels: string[] = [];
+    const assistantInputs: { reasoningEffort: string; messages: unknown[] }[] =
+      [];
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        expect(request.headers.authorization).toBe('Bearer ' + capability);
+        const body = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        if (request.url?.startsWith('/v1/reference')) {
+          if (request.url === '/v1/reference') assistantModels.push(body.model);
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference: 'b'.repeat(43) }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        if (body.purpose !== 'session-title') assistantInputs.push(body);
+        const text = 'Synthetic reply';
+        const events = [
+          { type: 'text-delta', index: 0, text },
+          { type: 'finish', reason: { kind: 'stop' } },
+        ];
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          events.map((event) => JSON.stringify(event) + '\n').join(''),
+        );
+      })().catch((error: unknown) => {
+        response.destroy(error as Error);
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    function route(model: string, effort: string) {
+      const level = ReasoningEffortId(effort);
+      return {
+        origin,
+        capability,
+        provider: 'openai-codex',
+        model,
+        modelInfo: {
+          provider: 'openai-codex',
+          id: model,
+          name: model,
+          inputModalities: ['text', 'image'] as const,
+          context: { contextWindow: 272000 },
+          reasoning: {
+            efforts: [
+              { id: ReasoningEffortId('low'), name: 'Low' },
+              { id: ReasoningEffortId('high'), name: 'High' },
+            ],
+            defaultEffort: level,
+          },
+        },
+      };
+    }
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        transport = create(...args);
+        return transport;
+      },
+    );
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      route('gpt-5.6-sol', 'low'),
+    );
+    const signal = AbortSignal.timeout(20_000);
+    const root = await f.owner.createRootFor(f.context, {}, signal);
+    if (!root.ok) throw Error('Native session not created');
+    const sessionId = root.value.sessionId;
+    async function rpc(method: string, args: object) {
+      if (!transport) throw Error('Native fixture transport missing');
+      const response = await transport.fetch('api/' + method, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: randomUUID(),
+          method,
+          payload: { args },
+        }),
+      });
+      return serverResponseSchema.parse(await response.json()).result;
+    }
+    async function prompt(owner: typeof f.owner, turn: number) {
+      const png =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+      expect(
+        await rpc('session/prompt', {
+          request: {
+            sessionId,
+            requestId: randomUUID(),
+            content: [
+              { type: 'text', text: 'Synthetic turn ' + turn },
+              ...(turn === 2
+                ? [{ type: 'image', mediaType: 'image/png', data: png }]
+                : []),
+            ],
+            mode: 'queue',
+          },
+        }),
+      ).toMatchObject({
+        ok: true,
+        value: { accepted: true },
+      });
+      await expect(
+        owner.waitNativeTurnEnd(
+          f.context,
+          { kind: 'session', sessionId: SessionId(sessionId) },
+          turn,
+          signal,
+        ),
+      ).resolves.toMatchObject({ reason: 'completed' });
+    }
+    await prompt(f.owner, 1);
+    await f.owner.close();
+    const next = await f.restartRetained({
+      ...route('gpt-6.2-sol', 'high'),
+      historicalModels: [route('gpt-5.6-sol', 'low').modelInfo],
+    });
+    await prompt(next.owner, 2);
+    expect(assistantInputs[1]!.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: 'user',
+          content: [{ type: 'text', text: 'Synthetic turn 1' }],
+        }),
+        expect.objectContaining({
+          role: 'user',
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'image',
+              attachment: expect.anything(),
+            }),
+          ]),
+        }),
+      ]),
+    );
+    expect(
+      await rpc('session/selectModel', {
+        request: {
+          sessionId,
+          provider: 'openai-codex',
+          model: 'gpt-6.2-sol',
+          reasoningEffort: 'low',
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: { selected: { reasoningEffort: 'low' } },
+    });
+    await prompt(next.owner, 3);
+    expect(assistantModels).toEqual([
+      'gpt-5.6-sol',
+      'gpt-6.2-sol',
+      'gpt-6.2-sol',
+    ]);
+    expect(
+      assistantInputs.map(({ reasoningEffort }) => reasoningEffort),
+    ).toEqual(['low', 'high', 'low']);
   },
 );
 
@@ -1589,19 +1777,21 @@ for (const method of [
       },
     );
 it.skipIf(!cli)(
-  '真实native control失联只撤可达资格，不重放；lifetime取消仍精确结束job并join',
+  '真实 native job 已退出时以原 wait 收口，关闭 owner 不再发 kill',
   { tags: [tag], timeout: 30000 },
   async () => {
     const f = await setup();
     const revoked = once(f.owner.revoked, 'abort');
     f.child.kill('SIGKILL');
     await revoked;
+    await f.exited;
+    await new Promise<void>((done) => setImmediate(done));
     expect(f.owner.controlReady()).toBe(false);
     await expect(
       f.owner.readSessions(new AbortController().signal),
     ).rejects.toBeDefined();
     await f.owner.close();
-    expect(f.kills()).toBe(1);
+    expect(f.kills()).toBe(0);
   },
 );
 
@@ -1776,6 +1966,9 @@ it.skipIf(!cli)(
     disconnect.forEach((close) => close());
     await revoked;
     expect(f.owner.controlReady()).toBe(false);
+    expect(f.owner.jobExited.aborted).toBe(false);
+    expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
+    expect(f.waitSignal().aborted).toBe(false);
     expect(f.child.exitCode).toBeNull();
     expect(f.kills()).toBe(0);
     await expect(
@@ -1783,6 +1976,113 @@ it.skipIf(!cli)(
     ).rejects.toBeDefined();
     await f.owner.close();
     expect(f.kills()).toBe(1);
+  },
+);
+it
+  .skipIf(!cli)
+  .each([
+    'history scope',
+    'unused terminal grant',
+    'unconfirmed owned PTY',
+  ] as const)(
+  'separates exact managed Web-job exit from remote resource closure after transport loss (%s)',
+  { tags: [tag], timeout: 30000 },
+  async (resource) => {
+    const create = NativeTransport.nativeWebTransport;
+    const disconnect: (() => void)[] = [];
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        const transport = create(...args);
+        return {
+          ...transport,
+          createWebSocket(input) {
+            const socket = transport.createWebSocket(input);
+            disconnect.push(() => socket.close());
+            return socket;
+          },
+        };
+      },
+    );
+    const f = await setup();
+    const active = new AbortController().signal;
+    const native = await f.owner.createRootFor(f.context, {}, active);
+    if (!native.ok) throw Error('The fixture root could not be created');
+    const issue = {
+      scopeId: randomUUID(),
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
+      },
+      root: {
+        nativeSessionId: native.value.sessionId,
+        rootOriginDigest: 'fixture-root-origin',
+        rootBindingRef: 'fixture-root-binding',
+      },
+    };
+    const ownsTerminal = resource === 'unconfirmed owned PTY';
+    const activity = f.owner.acquirePrincipal(
+      resource === 'history scope'
+        ? { ...issue, access: 'history' }
+        : {
+            scopeId: issue.scopeId,
+            identity: { ...issue.identity, threadId: null },
+            access: 'page',
+            terminalOwner: true,
+          },
+      active,
+      f.context,
+    );
+    const scope = await activity.run(active);
+    if (ownsTerminal) {
+      const id = randomUUID();
+      await expect(
+        scope.invokePage(
+          {
+            kind: 'page',
+            scopeId: issue.scopeId,
+            endpoint: 'terminal/create',
+            args: {
+              agentId: native.value.sessionId,
+              request: { id, cols: 80, rows: 24 },
+            },
+          },
+          active,
+        ),
+      ).resolves.toMatchObject({ value: { id, state: 'running' } });
+    }
+    const revoked = once(f.owner.revoked, 'abort');
+    disconnect.forEach((close) => close());
+    await revoked;
+    expect(f.owner.jobExited.aborted).toBe(false);
+    expect(f.owner.retireAfterJobExit(f.owner.binding)).toBeUndefined();
+    expect(f.waitSignal().aborted).toBe(false);
+    expect(() =>
+      f.owner.retireAfterJobExit({
+        ...f.owner.binding,
+        leaseEpoch: f.owner.binding.leaseEpoch + 1,
+      }),
+    ).toThrow('LEASE_LOST');
+    const exactExit = once(f.owner.jobExited, 'abort');
+    f.child.kill('SIGKILL');
+    await f.exited;
+    await exactExit;
+    await expect(f.owner.close()).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    const joined = f.owner.retireAfterJobExit(f.owner.binding);
+    if (ownsTerminal) {
+      expect(joined).toBeUndefined();
+      // The test supplies the trusted stop hook separately from the job wait.
+      await f.owner.retireAfterNativeStop(f.owner.binding, active);
+    } else {
+      expect(joined).toBeDefined();
+      await joined;
+    }
+    expect(f.kills()).toBe(0);
+    expect(f.owner.controlReady()).toBe(false);
+    expect(scope.revoked.aborted).toBe(true);
   },
 );
 it.skipIf(!cli)(
@@ -2083,6 +2383,7 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
     } else {
       f.child.kill('SIGKILL');
       await f.exited;
+      await new Promise<void>((done) => setImmediate(done));
       await expect(f.owner.close()).rejects.toMatchObject({
         code: 'CLEANUP_INCOMPLETE',
       });
@@ -2094,7 +2395,7 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
       await f.owner.close();
     }
     expect(secondScope.revoked.aborted).toBe(true);
-    expect(f.kills()).toBe(1);
+    expect(f.kills()).toBe(mode === 'normal' ? 1 : 0);
   },
 );
 

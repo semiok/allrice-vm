@@ -177,12 +177,9 @@ export async function createProductionModelRouting(
     process.env.ALLRICE_DSH_MODEL_PROVIDER ?? 'openai-codex';
   if (defaultProvider !== 'openai-codex' && defaultProvider !== 'openai')
     throw new ModelGatewayError('BINDING_INVALID');
-  const defaultModel =
-    defaultProvider === 'openai'
-      ? process.env.ALLRICE_DSH_OPENAI_MODEL
-      : (process.env.ALLRICE_DSH_CODEX_MODEL ??
-        process.env.ALLRICE_CODEX_MODEL);
-  if (defaultModel) rejectCredentialText(defaultModel);
+  const defaultModel = process.env.ALLRICE_DSH_OPENAI_MODEL;
+  if (defaultProvider === 'openai' && defaultModel)
+    rejectCredentialText(defaultModel);
   const fallback = await (defaultProvider === 'openai'
     ? createProductionOpenAiRuntime(
         lifetime,
@@ -355,21 +352,27 @@ export async function createProductionModelRouting(
         if (!rules.length) return;
         const models = await Promise.all(
           runtimes
-            .filter(({ route }) =>
-              rules.some((rule) => sameModelRoute(rule, route)),
+            .filter(
+              (runtime) =>
+                runtime !== fallback &&
+                rules.some((rule) => sameModelRoute(rule, runtime.route)),
             )
             .map(async (runtime) => ({
               provider: runtime.route.provider,
               model: runtime.route.model,
-              modelInfo: await runtime.readCatalogModelInfo(signal),
+              modelInfo: (await runtime.readCatalogModelMetadata(signal))
+                .modelInfo,
             })),
         );
         const maintenance = (attempt: 'compaction' | 'session-title') => {
           const rule = rules.find((rule) => rule.attempt === attempt);
           return rule && { provider: rule.provider, model: rule.model };
         };
+        const { modelInfo, historicalModels } =
+          await fallback.readCatalogModelMetadata(signal);
         return {
-          defaultModelInfo: await fallback.readCatalogModelInfo(signal),
+          defaultModelInfo: modelInfo,
+          historicalModels,
           rules,
           models,
           compaction: maintenance('compaction'),

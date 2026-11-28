@@ -25,6 +25,22 @@ import {
 import { createProductionModelRouting } from './production-model-routing.js';
 import { createProductionOpenAiRuntime } from './production-openai-runtime.js';
 
+vi.mock('@allrice/database', async (original) => ({
+  ...(await original<typeof import('@allrice/database')>()),
+  readPlatformModelSettings: async () => ({
+    revision: 1,
+    configuration: {
+      connectionId: '52000000-0000-4000-8000-000000000001',
+      workModel: 'gpt-6.2-sol',
+      reasoningEffort: 'high',
+      timeoutMs: 300_000,
+      imageModel: 'auto',
+      imagesEnabled: false,
+    },
+    updatedAt: '2026-11-26T00:00:00.000Z',
+  }),
+}));
+
 const deepSeekKey = 'synthetic-deepseek-api';
 const openAiKey = 'synthetic-openai-api';
 const origins = {
@@ -32,7 +48,7 @@ const origins = {
   chat: 'https://api.deepseek.com/chat/completions',
   responses: 'https://api.deepseek.com/responses',
 };
-const fallback = { provider: 'openai-codex', model: 'gpt-6.1-sol' };
+const fallback = { provider: 'openai-codex', model: 'gpt-6.2-sol' };
 const modelRoutes = {
   openai: { provider: 'openai', model: 'gpt-4.1-mini' },
   chat: { provider: 'deepseek', model: 'deepseek-flash' },
@@ -150,6 +166,18 @@ it('selects only trusted tenant/person rules in order for exact sessions, child 
     new AbortController().signal,
   );
   expect(catalog?.models).toHaveLength(3);
+  expect(catalog?.defaultModelInfo).toMatchObject({
+    ...{ provider: fallback.provider, id: fallback.model },
+    reasoning: { defaultEffort: 'high' },
+  });
+  expect(catalog?.historicalModels).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        provider: fallback.provider,
+        id: 'gpt-6-sol',
+      }),
+    ]),
+  );
   expect(catalog?.title).toEqual(modelRoutes.chat);
   expect(catalog?.compaction).toEqual(modelRoutes.responses);
   expect(JSON.stringify(catalog)).not.toContain(deepSeekKey);

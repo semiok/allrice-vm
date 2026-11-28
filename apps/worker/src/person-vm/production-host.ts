@@ -1,13 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { RequestContext } from '@allrice/contracts';
 import {
+  confirmDEntryEmployeeArchive,
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
+  createPostgresPersonVmScheduledWakeStore,
   getDatabase,
+  readContentPrincipal,
+  readPersonNativeWebRoster,
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
+  readPersonVmWakeRoster,
+  requireCurrentPlatformAdmin,
+  subscribeDEntryEmployeeArchive,
 } from '@allrice/database';
 import {
   createModelGateway,
@@ -40,9 +48,12 @@ import {
   type PersonVmNativeActivityPort,
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
+  type PersonVmScheduledIdleAuthority,
+  type PersonVmWebRoster,
   type PlatformVmDeletionRequest,
   type PlatformVmDeletionResult,
 } from '@allrice/person-vm';
+import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
   primeWorkerEmployeeWebRelease,
@@ -59,10 +70,28 @@ import {
   createProductionPersonVmAuthority,
 } from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
-import { createProductionCurrentPrewarm } from './production-prewarm.js';
+import {
+  createProductionCurrentPrewarm,
+  createProductionStoppedEntryReconciliation,
+} from './production-prewarm.js';
+import {
+  assertNoPreviousWorker,
+  withPreviousGatewayFenced,
+} from './production-upgrade-fence.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
+import {
+  createProductionScheduledWake,
+  type PersonVmWakePreparation,
+  type ProductionScheduledWakeSource,
+} from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  getIdleScheduleGuardMs,
+  IDLE_RECONCILE_TIMEOUT_MS,
+} from './production-native-activity.js';
+import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -111,6 +140,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       close(): Promise<void>;
     };
     nativeActivity?: PersonVmNativeActivityPort;
+    scheduledWake?: ProductionScheduledWakeSource;
     egress: {
       authority: EgressAuthority;
       policy: EgressPolicy;
@@ -150,13 +180,29 @@ export type ProductionPersonVmHostSources = Readonly<{
 }>;
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
+const UPGRADE_HANDOFF_MS = 30_000;
+const UPGRADE_WAIT_MS = 120_000;
+type UpgradeDrainReceipt = Readonly<{ stopped: number; expiresAt: string }>;
+
 export interface ProductionPersonVmHost {
+  recoveryState(): 'host-ready' | 'wake-ready' | 'drain-required';
+  prepareStopWithWake(
+    request: PersonVmWakePreparation,
+    signal: AbortSignal,
+  ): Promise<PrepareStopWithWakeResult>;
   deletePersonVm(
     context: RequestContext,
     request: PlatformVmDeletionRequest,
     signal: AbortSignal,
   ): Promise<PlatformVmDeletionResult>;
-  assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
+  assertWorkerShutdownSafe(
+    signal: AbortSignal,
+    drainExpiresAt?: string,
+  ): Promise<void>;
+  drainForUpgrade(
+    context: RequestContext,
+    signal: AbortSignal,
+  ): Promise<UpgradeDrainReceipt>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
   /** Trusted in-process maintenance only. The model authority verifies the
@@ -192,12 +238,25 @@ export function createProductionPersonVmHost(input: {
   const retiredReceipts = new Map<string, PersonVmEgressReceipt>();
   const ownedVms = new Map<
     string,
-    { binding: PersonVmBinding; stopNative: boolean }
+    {
+      binding: PersonVmBinding;
+      stopNative: boolean;
+      idleContext?: RequestContext;
+      scheduledIdleRoster?: PersonVmWebRoster;
+      idleAccessOrder?: number;
+    }
   >();
   let personVm: PersonVmService | undefined;
   let diskPreprovision:
     ReturnType<typeof startProductionDiskPreprovision> | undefined;
   let gracefulStop = false;
+  let pauseIdle = false;
+  const inspectingIdle = new Set<string>();
+  let upgradeDraining = false;
+  let shutdownChecking = false;
+  let upgradeDrained: UpgradeDrainReceipt | undefined;
+  let upgradeDrainRequested = false;
+  let upgradeHandoff: ReturnType<typeof setTimeout> | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
     PersonVmBinding,
@@ -215,6 +274,7 @@ export function createProductionPersonVmHost(input: {
     bound: BoundSources | undefined,
     gateway: ReturnType<typeof createEgressGateway> | undefined,
     model: ModelGatewayPort | undefined,
+    scheduledWake: ReturnType<typeof createProductionScheduledWake> | undefined,
     installed:
       ReturnType<typeof installAssignedDEntryNativeRuntime> | undefined,
     closing: Promise<void> | undefined;
@@ -264,6 +324,13 @@ export function createProductionPersonVmHost(input: {
     }
     active.throwIfAborted();
     return result.value;
+  }
+  function ownsRunningBinding(binding: PersonVmBinding) {
+    const retired = retiredReceipts.get(binding.personId);
+    return (
+      Boolean(retired && sameVmBinding(retired.binding, binding)) ||
+      [...receipts].some((receipt) => sameVmBinding(receipt.binding, binding))
+    );
   }
   function sameReceipt(
     left: PersonVmEgressReceipt,
@@ -377,21 +444,27 @@ export function createProductionPersonVmHost(input: {
     if (retired && sameVmBinding(retired.binding, binding))
       retiredReceipts.delete(binding.personId);
   }
-  function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
+  async function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
     const vm = personVm;
-    if (!vm) return Promise.resolve([]);
+    if (!vm || !providers) return [];
+    const timeout = providers.configuration.lifecycle.cleanupTimeoutMs;
+    const mountFailures = await collectFailures([
+      () => vm.settleRetainedStartupMounts(AbortSignal.timeout(timeout)),
+    ]);
     const targets = [...ownedVms.values()].filter(
       ({ binding }) =>
         !deferUnconfirmedEgress || !hasUnconfirmedPreparation(binding),
     );
-    return collectFailures(
+    const vmFailures = await collectFailures(
       targets.map(({ binding, stopNative }) => async () => {
         await vm.shutdownOwned(binding, gracefulStop ? false : stopNative);
         ownedVms.delete(binding.personId);
       }),
     );
+    return [...mountFailures, ...vmFailures];
   }
   function close(): Promise<void> {
+    clearTimeout(upgradeHandoff);
     if (recoveredClose)
       return recoveredClose.error
         ? Promise.reject(recoveredClose.error)
@@ -410,6 +483,7 @@ export function createProductionPersonVmHost(input: {
         authorityOwner = current,
         startupOwner = startup,
         sourceOwner = bound;
+      if (scheduledWake) await settle([scheduledWake.close]);
       await settle([
         ...(installation ? [() => installation.close()] : []),
         ...(preparation ? [() => preparation.close()] : []),
@@ -570,16 +644,84 @@ export function createProductionPersonVmHost(input: {
   const construction = (async () => {
     try {
       lifetime.throwIfAborted();
-      providers = await createProductionPersonVmProviders(lifetime);
+      let capacityStore: PostgresPersonVmStore | undefined;
+      providers = await createProductionPersonVmProviders(
+        lifetime,
+        async ({ binding, memoryMiB }, signal) => {
+          const store = capacityStore;
+          if (!store || providers?.platform.memoryMiB !== memoryMiB)
+            throw new PersonVmError('RUNTIME_NOT_READY');
+          const assertCurrent = async (
+            request: { binding: PersonVmBinding; memoryMiB: number },
+            active: AbortSignal,
+          ) => {
+            if (
+              request.memoryMiB !== memoryMiB ||
+              !sameVmBinding(request.binding, binding)
+            )
+              throw new PersonVmError('LEASE_LOST');
+            active.throwIfAborted();
+            const row = await store.read(binding.personId);
+            active.throwIfAborted();
+            if (
+              !row?.leaseOwner ||
+              row.phase !== 'starting' ||
+              !sameVmBinding(
+                {
+                  vmId: row.vmId,
+                  personId: row.personId,
+                  organizationId: row.organizationId,
+                  instanceId: row.instanceId!,
+                  leaseEpoch: row.leaseEpoch,
+                },
+                binding,
+              )
+            )
+              throw new PersonVmError('LEASE_LOST');
+          };
+          await assertCurrent({ binding, memoryMiB }, signal);
+          // The durable starting row is already charged. This exact guard is
+          // the transfer to running: neither AbortSignal nor TTL frees the row.
+          return {
+            signal: lifetime,
+            assertCurrent,
+            commitRunning: assertCurrent,
+          };
+        },
+      );
       await primeWorkerEmployeeWebRelease(lifetime);
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every
       // actual store/admission operation opens its own dedicated SQL client.
       const trustedDatabase = getDatabase();
+      const wakeStore =
+        createPostgresPersonVmScheduledWakeStore(trustedDatabase);
+      const assertNoCommittedWake = async (signal: AbortSignal) => {
+        const wakeAt = await (scheduledWake ?? wakeStore).nextCommittedWakeAt(
+          signal,
+        );
+        signal.throwIfAborted();
+        // Snapshot, migration and restarting a release have no hard bound.
+        // Keep the current scheduler responsible for any committed wake.
+        if (wakeAt !== null) throw new PersonVmError('ACTIVITY_UNKNOWN');
+      };
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
-      const store = new PostgresPersonVmStore(openSql);
+      const budget = providers.configuration.lifecycle.hostVmBudgetMiB;
+      if (budget !== undefined && budget * 1024 ** 2 > totalmem())
+        throw new PersonVmError('PROVIDER_FAILED');
+      // Existing VM rows do not record their launch cap. Charge the maximum
+      // supported guest size plus overhead through confirmed physical release.
+      const store =
+        budget === undefined
+          ? new PostgresPersonVmStore(openSql)
+          : new PostgresPersonVmStore(
+              openSql,
+              undefined,
+              Math.floor(budget / (4096 + 512)),
+            );
+      if (budget !== undefined) capacityStore = store;
       const diskRoot = providers.configuration.disk.root;
       const diskPool = new PersonVmDiskPool(
         diskRoot,
@@ -592,11 +734,16 @@ export function createProductionPersonVmHost(input: {
         start: (...args) => requireStartup().start(...args),
         retireAfterNativeStop: (...args) =>
           requireStartup().retireAfterNativeStop(...args),
-        readiness: (binding, signal) =>
+        assertScheduledReady: async (binding, signal) => {
+          requireStartup().assertAuthenticatedGroup(binding, signal);
+        },
+        readiness: (binding, signal, context) =>
           own(() =>
             currentWork(signal, async (active) => {
               const native = requireStartup();
               native.assertAuthenticatedGroup(binding, active);
+              if (context)
+                await native.prepareForegroundEditor(binding, context, active);
               const readiness = await requireRuntime().readiness(
                 binding,
                 active,
@@ -617,17 +764,50 @@ export function createProductionPersonVmHost(input: {
         store,
         authority: current.authority,
         native: providers.native,
+        ...(budget !== undefined && { nativeCapacityAccounting: true }),
         disk: providers.disk,
         diskPool,
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
-        observeOwnedStart(binding) {
+        observeOwnedStart(binding, context) {
           ownedVms.set(binding.personId, {
             binding: Object.freeze({ ...binding }),
             stopNative: true,
+            ...(context &&
+              providers!.configuration.lifecycle.idleStopEnabled === true && {
+                idleContext: structuredClone(context),
+              }),
           });
         },
+        ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          observeScheduledStart(
+            binding: PersonVmBinding,
+            roster: PersonVmWebRoster,
+          ) {
+            const entry = ownedVms.get(binding.personId);
+            if (entry?.stopNative && sameVmBinding(entry.binding, binding))
+              entry.scheduledIdleRoster = structuredClone(roster);
+          },
+          observeOwnedAccess(
+            binding: PersonVmBinding,
+            context: RequestContext,
+            order: number,
+          ) {
+            const entry = ownedVms.get(binding.personId);
+            if (
+              entry?.stopNative &&
+              sameVmBinding(entry.binding, binding) &&
+              order > (entry.idleAccessOrder ?? 0)
+            ) {
+              entry.idleContext = structuredClone(context);
+              entry.idleAccessOrder = order;
+              // A verified foreground access owns the current roster check.
+              // Retire the wake-time roster, including any in-flight idle check.
+              delete entry.scheduledIdleRoster;
+            }
+          },
+        }),
         observeOwnedMount(binding) {
           const existing = ownedVms.get(binding.personId);
           if (
@@ -664,12 +844,50 @@ export function createProductionPersonVmHost(input: {
           );
         },
         settleSupersededBinding,
+        upgradeActivity: {
+          observe(binding, signal, purpose) {
+            return currentWork(signal, (active) => {
+              if (!bound?.nativeActivity)
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+              return bound.nativeActivity.observe(binding, active, purpose);
+            });
+          },
+          assertSampleCurrent(binding, cursor, active) {
+            if (!bound?.nativeActivity?.assertSampleCurrent)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            bound.nativeActivity.assertSampleCurrent(binding, cursor, active);
+          },
+        },
+        async withPreviousGatewayFenced(binding, ports, signal, stop) {
+          if (
+            ownsRunningBinding(binding) ||
+            requireStartup().hasLocalOwner(binding)
+          )
+            throw new PersonVmError('LEASE_CONFLICT');
+          const address = providers!.configuration.egress?.listenAddress;
+          if (!address) throw new PersonVmError('EGRESS_UNAVAILABLE');
+          await assertNoPreviousWorker(diskRoot, signal);
+          return withPreviousGatewayFenced(address, ports, signal, async () => {
+            if (
+              ownsRunningBinding(binding) ||
+              requireStartup().hasLocalOwner(binding)
+            )
+              throw new PersonVmError('LEASE_CONFLICT');
+            await assertNoPreviousWorker(diskRoot, signal);
+            return stop();
+          });
+        },
         ...providers.configuration.lifecycle,
       });
       personVm = vm;
       const { native, web } = providers.configuration;
       startup = createAssignedNativeWebStartup({
         vm,
+        hotGuest: providers.native,
+        archive: {
+          subscribe: subscribeDEntryEmployeeArchive,
+          confirm: confirmDEntryEmployeeArchive,
+        },
         memoryGuestPlan: providers.memoryGuestPlan,
         commandMemory: {
           controls: native.readonlyCommandMemoryDirectory,
@@ -695,17 +913,97 @@ export function createProductionPersonVmHost(input: {
         lifetime,
         cleanupTimeoutMs: providers.configuration.lifecycle.cleanupTimeoutMs,
       });
+      const scheduledIdleAuthority: PersonVmScheduledIdleAuthority = {
+        assertOwned(binding, roster) {
+          const owner = ownedVms.get(binding.personId);
+          if (
+            !owner?.stopNative ||
+            !sameVmBinding(owner.binding, binding) ||
+            owner.scheduledIdleRoster !== roster
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          lifetime.throwIfAborted();
+        },
+        async assertCurrent(binding, roster, signal) {
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.assertScheduledIdleCurrent(
+            binding,
+            roster,
+            signal,
+          );
+        },
+        async dispatch(binding, roster, requestId, signal, stop) {
+          this.assertOwned(binding, roster);
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.dispatchScheduledIdleStop(
+            binding,
+            roster,
+            requestId,
+            signal,
+            (active) => {
+              this.assertOwned(binding, roster);
+              return stop(active);
+            },
+          );
+        },
+      };
       const admission = vm.createAdmissionHost({
         openSql,
         idleMs: providers.platform.idleMs,
+        ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          scheduledIdleAuthority,
+          async prepareIdleStop(request, signal) {
+            const wake = scheduledWake;
+            if (!wake) return { blocked: true };
+            if (!('context' in request))
+              return wake.prepareStopWithWake(request, signal);
+
+            const { binding, context } = request;
+            const roster = await readPersonNativeWebRoster(
+              context,
+              trustedDatabase,
+            );
+            signal.throwIfAborted();
+            const plan = await wake.prepareStopWithWake(request, signal);
+            if ('blocked' in plan) return plan;
+            return {
+              ...plan,
+              dispatch: (active, stop) =>
+                wake.dispatchScheduledIdleStop(
+                  binding,
+                  roster,
+                  context.requestId,
+                  active,
+                  stop,
+                  async (tx, checking) => {
+                    if (
+                      !context.sessionId ||
+                      !(await readContentPrincipal(context, tx, true))
+                    )
+                      throw new PersonVmError('AUTHORIZATION_DENIED');
+                    checking.throwIfAborted();
+                  },
+                ),
+            };
+          },
+        }),
         nativeActivity: {
-          observe(binding, signal) {
+          observe(binding, signal, purpose) {
             return own(() =>
               currentWork(signal, async (active) => {
                 if (!bound?.nativeActivity)
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
-                return bound.nativeActivity.observe(binding, active);
+                return bound.nativeActivity.observe(binding, active, purpose);
               }),
+            );
+          },
+          assertSampleCurrent(binding, cursor, signal) {
+            if (!bound?.nativeActivity?.assertSampleCurrent)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            bound.nativeActivity.assertSampleCurrent(
+              binding,
+              cursor,
+              AbortSignal.any([signal, lifetime]),
             );
           },
           subscribe(binding, signal) {
@@ -835,6 +1133,11 @@ export function createProductionPersonVmHost(input: {
         authority: egressSource.authority,
         policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
+        publicProxy: ['127.0.0.1', '::1'].includes(
+          providers.configuration.egress?.listenAddress ?? '',
+        )
+          ? admission.withPublicEgress.bind(admission)
+          : undefined,
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
@@ -848,9 +1151,181 @@ export function createProductionPersonVmHost(input: {
         vm,
         startup,
         lifetime,
+        isLiveSlottedBinding: startup.isLiveSlottedBinding,
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
+        ownsRunningBinding,
+        reconcileStoppedEntry: createProductionStoppedEntryReconciliation({
+          vm,
+          current,
+        }),
       });
       lifetime.throwIfAborted();
+      if (bound.scheduledWake) {
+        const wake = createProductionScheduledWake({
+          startup,
+          database: trustedDatabase,
+          source: bound.scheduledWake,
+          minimumLeadMs: getIdleScheduleGuardMs(
+            providers.configuration.lifecycle,
+          ),
+          lifetime,
+        });
+        scheduledWake = wake;
+        wake.start();
+      }
+
+      function inspectIdle(
+        binding: PersonVmBinding,
+        inspect: (signal: AbortSignal) => Promise<void>,
+      ) {
+        if (pauseIdle || inspectingIdle.has(binding.personId)) return;
+        inspectingIdle.add(binding.personId);
+        return own(async () => {
+          try {
+            if (pauseIdle || lifetime.aborted) return;
+            await inspect(
+              AbortSignal.any([
+                lifetime,
+                AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
+              ]),
+            );
+          } catch (error) {
+            if (!lifetime.aborted && !(error instanceof PersonVmError))
+              console.error('[person-vm] idle reconciliation failed');
+          } finally {
+            inspectingIdle.delete(binding.personId);
+          }
+        });
+      }
+
+      if (scheduledWake)
+        void own(async () => {
+          while (!lifetime.aborted) {
+            try {
+              if (!pauseIdle) {
+                const active = AbortSignal.any([
+                  lifetime,
+                  AbortSignal.timeout(3000),
+                ]);
+                for (const row of await store.listJoinedIdleStopCandidates(
+                  active,
+                )) {
+                  if (!row.instanceId) continue;
+                  const binding = {
+                    personId: row.personId,
+                    organizationId: row.organizationId,
+                    vmId: row.vmId,
+                    instanceId: row.instanceId,
+                    leaseEpoch: row.leaseEpoch,
+                  };
+                  // After a restart, ownedVms has no record of a stop the
+                  // previous Worker joined without publishing its receipt.
+                  await inspectIdle(binding, async (signal) => {
+                    await vm.recoverJoinedIdleStop(binding, signal);
+                  });
+                }
+              }
+            } catch {
+              if (!lifetime.aborted)
+                console.warn(
+                  '[person-vm] idle stop recovery inventory unavailable',
+                );
+            }
+            await sleep(5000, undefined, { signal: lifetime, ref: false });
+          }
+        }).catch(() => {}); // Host close aborts and joins the recovery loop.
+      if (
+        providers.configuration.lifecycle.idleStopEnabled === true &&
+        bound.nativeActivity &&
+        scheduledWake
+      ) {
+        const period =
+          providers.configuration.lifecycle.idleSampleIntervalMs ??
+          DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
+        void own(async () => {
+          let slot = Math.floor(performance.now() / period);
+          while (!lifetime.aborted) {
+            const delay = Math.max(
+              1,
+              Math.ceil((slot + 1) * period - performance.now()),
+            );
+            await sleep(delay, undefined, { signal: lifetime, ref: false });
+            const current = Math.floor(performance.now() / period);
+            if (current <= slot) continue;
+            slot = current;
+            if (pauseIdle) continue;
+            // Each VM owns its own in-flight inspection. A stalled read
+            // leaves a gap for that VM without delaying the other clocks.
+            for (const {
+              binding,
+              idleContext,
+              scheduledIdleRoster,
+            } of ownedVms.values()) {
+              void inspectIdle(binding, async (active) => {
+                if (scheduledIdleRoster)
+                  await admission.reconcileScheduledIdle(
+                    binding,
+                    scheduledIdleRoster,
+                    active,
+                  );
+                else if (idleContext)
+                  await admission.reconcileIdle(
+                    { ...idleContext, requestId: randomUUID() },
+                    binding,
+                    active,
+                  );
+              });
+            }
+          }
+        }).catch((error: unknown) => {
+          if (!lifetime.aborted)
+            console.error('[person-vm] idle owner failed', error);
+        });
+      }
+      void own(async () => {
+        const reported = new Set<string>();
+        while (!lifetime.aborted) {
+          await sleep(60_000, undefined, { signal: lifetime, ref: false });
+          try {
+            const active = AbortSignal.any([
+              lifetime,
+              AbortSignal.timeout(3000),
+            ]);
+            const running = await store.listUpgradeCandidates(active);
+            const unknown = new Set<string>();
+            for (const row of running) {
+              if (
+                row.phase !== 'running' ||
+                !row.instanceId ||
+                ownsRunningBinding({
+                  personId: row.personId,
+                  organizationId: row.organizationId,
+                  vmId: row.vmId,
+                  instanceId: row.instanceId,
+                  leaseEpoch: row.leaseEpoch,
+                })
+              )
+                continue;
+              const key = row.vmId + ':' + row.leaseEpoch;
+              unknown.add(key);
+              if (!reported.has(key))
+                console.warn(
+                  '[person-vm] previous VM activity unconfirmed; awaiting employee open',
+                  {
+                    vmId: row.vmId,
+                    leaseEpoch: row.leaseEpoch,
+                  },
+                );
+              reported.add(key);
+            }
+            for (const key of reported)
+              if (!unknown.has(key)) reported.delete(key);
+          } catch {
+            if (!lifetime.aborted)
+              console.warn('[person-vm] previous VM inventory unavailable');
+          }
+        }
+      }).catch(() => {}); // Host close aborts and joins the inventory loop.
       const { disk } = providers.configuration;
       if (disk.preprovision?.enabled) {
         const databaseUrl = process.env.DATABASE_URL;
@@ -871,6 +1346,190 @@ export function createProductionPersonVmHost(input: {
         });
       }
       return Object.freeze({
+        recoveryState: () =>
+          upgradeDrainRequested
+            ? 'drain-required'
+            : scheduledWake?.readyForRecovery()
+              ? 'wake-ready'
+              : 'host-ready',
+        async prepareStopWithWake(
+          request: PersonVmWakePreparation,
+          signal: AbortSignal,
+        ) {
+          const active = AbortSignal.any([signal, lifetime]);
+          active.throwIfAborted();
+          if (!scheduledWake)
+            return {
+              blocked: true,
+              reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+            } as const;
+          return scheduledWake.prepareStopWithWake(request, active);
+        },
+        async drainForUpgrade(context: RequestContext, signal: AbortSignal) {
+          const active = AbortSignal.any([signal, lifetime]);
+          active.throwIfAborted();
+          const authorize = async (current: AbortSignal) => {
+            current.throwIfAborted();
+            await requireCurrentPlatformAdmin(context, trustedDatabase, false);
+            current.throwIfAborted();
+          };
+          await authorize(active);
+          if (upgradeDraining || shutdownChecking || gracefulStop)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if (upgradeDrained) {
+            const receipt = upgradeDrained;
+            await assertNoCommittedWake(active);
+            if ((await store.listUpgradeCandidates(active)).length)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            if (
+              upgradeDrained !== receipt ||
+              Date.now() >= Date.parse(receipt.expiresAt)
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            return receipt;
+          }
+          upgradeDraining = true;
+          upgradeDrainRequested = true;
+          pauseIdle = true;
+          let reopen: (() => void) | undefined;
+          const resume = () => {
+            upgradeDrained = undefined;
+            pauseIdle = false;
+            reopen?.();
+            scheduledWake?.resume();
+          };
+          try {
+            // An older idle inspection can still publish its wake after
+            // dispatch. Let it finish with the scheduler running.
+            if (inspectingIdle.size)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            await assertNoCommittedWake(active);
+            await scheduledWake?.pause(active);
+            // Join an already claimed wake before fencing the next startup.
+            // The new gate must not strand a claim staged in the next epoch.
+            reopen = vm.fenceWorkerStartup();
+            await assertNoCommittedWake(active);
+            const deadline = AbortSignal.any([
+              active,
+              AbortSignal.timeout(UPGRADE_WAIT_MS),
+            ]);
+            let candidates = await store.listUpgradeCandidates(deadline);
+            while (
+              candidates.some(
+                (row) => row.phase === 'starting' || !row.instanceId,
+              )
+            ) {
+              await assertNoCommittedWake(deadline);
+              await sleep(1000, undefined, { signal: deadline, ref: false });
+              candidates = await store.listUpgradeCandidates(deadline);
+            }
+            for (const row of candidates) {
+              if (!row.instanceId) throw new PersonVmError('LEASE_LOST');
+              const binding = {
+                vmId: row.vmId,
+                personId: row.personId,
+                organizationId: row.organizationId,
+                instanceId: row.instanceId,
+                leaseEpoch: row.leaseEpoch,
+              };
+              const drain = () =>
+                vm.stopRunningForUpgrade(
+                  binding,
+                  randomUUID(),
+                  deadline,
+                  authorize,
+                  async (request, reading) => {
+                    const wake = scheduledWake;
+                    if (!wake) throw new PersonVmError('ACTIVITY_UNKNOWN');
+                    await request.assertStopCurrent(reading);
+                    const catalogs = requireStartup().activityCatalogs(
+                      request.binding,
+                      reading,
+                    );
+                    const roster = await trustedDatabase.begin(
+                      'isolation level repeatable read read only',
+                      (tx) =>
+                        readPersonVmWakeRoster(
+                          tx,
+                          request.binding,
+                          catalogs.map(({ endpoint }) => endpoint),
+                        ),
+                    );
+                    reading.throwIfAborted();
+                    if (!roster)
+                      throw new PersonVmError('AUTHORIZATION_DENIED');
+                    const plan = await wake.prepareUpgradeStop(
+                      { ...request, scheduledRoster: roster },
+                      reading,
+                    );
+                    if (!('ok' in plan))
+                      throw new PersonVmError('ACTIVITY_UNKNOWN');
+                    if (plan.nextWakeAt !== null)
+                      throw new PersonVmError('RUNTIME_NOT_READY');
+                    return {
+                      nextWakeAt: plan.nextWakeAt,
+                      scheduleFingerprints: plan.scheduleFingerprints,
+                      dispatch: (checking, stop) =>
+                        wake.dispatchUpgradeStop(
+                          request.binding,
+                          roster,
+                          request.requestId,
+                          checking,
+                          stop,
+                          async (tx, fenced) => {
+                            await requireCurrentPlatformAdmin(context, tx);
+                            fenced.throwIfAborted();
+                          },
+                        ),
+                    };
+                  },
+                );
+              for (;;) {
+                deadline.throwIfAborted();
+                await authorize(deadline);
+                await assertNoCommittedWake(deadline);
+                try {
+                  await drain();
+                  break;
+                } catch (error) {
+                  if (
+                    !(error instanceof PersonVmError) ||
+                    ![
+                      'VM_ACTIVE',
+                      'ACTIVITY_UNKNOWN',
+                      'LEASE_CONFLICT',
+                    ].includes(error.code) ||
+                    deadline.aborted
+                  )
+                    throw error;
+                  await assertNoCommittedWake(deadline);
+                  await sleep(1000, undefined, {
+                    signal: deadline,
+                    ref: false,
+                  });
+                }
+              }
+              // A joined stop can publish a wake while it is recovered.
+              await assertNoCommittedWake(deadline);
+            }
+            if ((await store.listUpgradeCandidates(active)).length)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            // Recovery of a joined stop can publish a previously invisible
+            // wake without preparing a plan during this drain attempt.
+            await assertNoCommittedWake(active);
+            const receipt = Object.freeze({
+              stopped: candidates.length,
+              expiresAt: new Date(
+                Date.now() + UPGRADE_HANDOFF_MS,
+              ).toISOString(),
+            });
+            upgradeHandoff = setTimeout(resume, UPGRADE_HANDOFF_MS).unref();
+            return (upgradeDrained = receipt);
+          } finally {
+            upgradeDraining = false;
+            if (!upgradeDrained) resume();
+          }
+        },
         deletePersonVm(
           context: RequestContext,
           request: PlatformVmDeletionRequest,
@@ -884,16 +1543,76 @@ export function createProductionPersonVmHost(input: {
             ),
           );
         },
-        async assertWorkerShutdownSafe(signal: AbortSignal) {
+        async assertWorkerShutdownSafe(
+          signal: AbortSignal,
+          drainExpiresAt?: string,
+        ) {
+          signal.throwIfAborted();
+          if (
+            drainExpiresAt !== undefined &&
+            upgradeDrained?.expiresAt !== drainExpiresAt
+          )
+            throw new PersonVmError('RUNTIME_NOT_READY');
           if (gracefulStop) return;
-          const reopen = vm.fenceWorkerStartup();
+          if (upgradeDraining || shutdownChecking)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if (upgradeDrained) {
+            // A signal may complete an already claimed shutdown. It cannot
+            // consume a release receipt before the launcher records its intent.
+            if (drainExpiresAt === undefined)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            shutdownChecking = true;
+            const receipt = upgradeDrained;
+            try {
+              if ((await store.listUpgradeCandidates(signal)).length)
+                throw new PersonVmError('CLEANUP_INCOMPLETE');
+              await assertNoCommittedWake(signal);
+              if (
+                upgradeDrained !== receipt ||
+                Date.now() >= Date.parse(receipt.expiresAt)
+              )
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              clearTimeout(upgradeHandoff);
+              gracefulStop = true;
+              return;
+            } finally {
+              shutdownChecking = false;
+            }
+          }
+          // An expired or failed release attempt cannot be treated as an
+          // ordinary process shutdown and bypass the whole-host drain.
+          if (upgradeDrainRequested)
+            throw new PersonVmError('RUNTIME_NOT_READY');
+          shutdownChecking = true;
+          pauseIdle = true;
+          let reopen: (() => void) | undefined;
           try {
-            for (const { binding } of ownedVms.values())
+            if (inspectingIdle.size)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            await assertNoCommittedWake(signal);
+            await scheduledWake?.pause(signal);
+            signal.throwIfAborted();
+            // The current wake may already own the next epoch. Let it join
+            // before closing the startup path it still needs.
+            reopen = vm.fenceWorkerStartup();
+            await vm.settleRetainedStartupMounts(signal);
+            for (const { binding } of ownedVms.values()) {
+              await admission.recoverJoinedPublicEgress(
+                binding.personId,
+                signal,
+              );
+              await vm.recoverStoppedEntryWork(binding, signal);
               await vm.assertWorkerShutdownSafe(binding, signal);
+            }
+            await assertNoCommittedWake(signal);
             gracefulStop = true;
           } catch (error) {
-            reopen();
+            pauseIdle = false;
+            reopen?.();
+            scheduledWake?.resume();
             throw error;
+          } finally {
+            shutdownChecking = false;
           }
         },
         close,

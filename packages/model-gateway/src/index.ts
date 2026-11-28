@@ -31,7 +31,10 @@ export {
 } from './dsh-provider.ts';
 export { createNativeModelCallReferences } from './native-call-reference.ts';
 export { createPostgresModelGatewayStore } from './postgres-store.ts';
-export { withGatewayAuthTransaction } from './transport.ts';
+export {
+  runWithOwnedNativeFetch,
+  withGatewayAuthTransaction,
+} from './transport.ts';
 export { createOwnedModelTransport } from './owned-transport.ts';
 export {
   classifyOpenAiResponses,

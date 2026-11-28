@@ -6,17 +6,34 @@ import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { composeEntries } from '@deepseek-ai/dsh-app-boot';
-import type {
-  PersonVmBootstrapScope,
-  PersonVmJobExit,
-  PersonVmNativeWebGuestAddress,
+import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeWebTools from '@deepseek-ai/dsh-tool-web';
+import Tools from '@deepseek-ai/dsh-tools';
+import Web from '@deepseek-ai/dsh-web';
+import {
+  NativeWebGuestLaunchUnacknowledged,
+  PersonVmError,
+  type PersonVmBootstrapScope,
+  type PersonVmJobExit,
+  type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 import { nativeScopedModelPatches } from './model-task-presets.js';
-import { nativeWebBundlePatches } from './search-tools.js';
+import {
+  nativeSearchToolPatches,
+  nativeWebBundlePatches,
+} from './search-tools.js';
 import { nativeSetupError } from './startup-diagnostic.js';
+import * as webTransport from './transport.js';
+
+vi.mock(import('./transport.js'), async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, nativeWebTransport: vi.fn(actual.nativeWebTransport) };
+});
 
 const binding = {
   vmId: randomUUID(),
@@ -256,6 +273,95 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
 
+it.each([false, true])(
+  'advertises native Search only with a host provider (%s) and still executes WebFetch',
+  async (webSearchEnabled) => {
+    const layers = nativeWebBundlePatches();
+    const patches = nativeSearchToolPatches(webSearchEnabled);
+    const before = composeEntries(layers);
+    // prepareNativeWebLaunch writes this overlay as JSON in the guest.
+    const composed = composeEntries([
+      ...layers,
+      JSON.parse(JSON.stringify(patches)),
+    ]);
+    const presetIds = ['preset-standard', 'preset-ptc', 'preset-cordis'];
+    expect(patches.map(({ id }) => id)).toEqual(
+      webSearchEnabled ? [] : presetIds,
+    );
+    expect(composed.find(({ id }) => id === 'tool-web')?.disabled).toBe(true);
+    for (const id of presetIds) {
+      const original = before.find((entry) => entry.id === id)?.config;
+      const actual = composed.find((entry) => entry.id === id)?.config;
+      expect(actual).toEqual({
+        ...original,
+        plugins: original.plugins.map(
+          (plugin: { name: string; config?: Record<string, unknown> }) =>
+            !webSearchEnabled && plugin.name === '@deepseek-ai/dsh-tool-web'
+              ? { ...plugin, config: { ...plugin.config, search: false } }
+              : plugin,
+        ),
+      });
+    }
+    const standard = composed.find(
+      ({ id }) => id === 'preset-standard',
+    )?.config;
+    const config = standard.plugins.find(
+      (plugin: { id: string }) => plugin.id === 'tool-web',
+    )?.config;
+    expect(config).toEqual({
+      fetch: true,
+      searchTimeoutMs: 60_000,
+      ...(webSearchEnabled ? {} : { search: false }),
+    });
+
+    const ctx = new Context();
+    try {
+      await ctx.plugin(SystemPrompt);
+      await ctx.plugin(Tools);
+      await ctx.plugin(Web, {
+        searchProvider: 'deepseek-official',
+        fetchProvider: 'http',
+      });
+      if (webSearchEnabled)
+        ctx.web.registerSearchProvider({
+          id: 'deepseek-official',
+          available: () => true,
+          search: async () => ({ sources: [], truncated: false }),
+        });
+      ctx.web.registerFetchProvider({
+        id: 'http',
+        available: () => true,
+        fetch: async ({ url }) => ({
+          url,
+          statusCode: 200,
+          body: { kind: 'text', content: 'fixture fetch' },
+          truncated: false,
+        }),
+      });
+      await ctx.plugin(
+        NativeWebTools,
+        config as Parameters<typeof NativeWebTools.apply>[1],
+      );
+      const assembled = await ctx.systemPrompt.assemble();
+      expect(assembled.tools.map(({ name }) => name).sort()).toEqual(
+        webSearchEnabled ? ['web_fetch', 'web_search'] : ['web_fetch'],
+      );
+      const fetch = await ctx.tools.execute({
+        callId: ToolCallId('fixture-fetch'),
+        name: 'web_fetch',
+        arguments: { url: 'https://example.test/' },
+        signal: new AbortController().signal,
+      });
+      expect(fetch).toMatchObject({
+        isError: false,
+        value: { statusCode: 200 },
+      });
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  },
+);
+
 it('真实Web启动缺有界auth capability时先拒绝，不launch或假ready', async () => {
   const launch = {
     binding,
@@ -317,19 +423,104 @@ it('启动plan绑定exact host epoch，旧plan不能在新scope dispatch', async
   expect(scope.launch).not.toHaveBeenCalled();
 });
 
+it.each([true, false])(
+  'reports the unacknowledged guest receipt as guest-only only when the Host joins (%s)',
+  async (joined) => {
+    const closeEntered = deferred<void>();
+    const finishClose = deferred<void>();
+    const lostReceipt = new PersonVmError('CLEANUP_INCOMPLETE');
+    const hostFailure = Error('Host transport close did not prove join');
+    const real = await vi.importActual<typeof webTransport>('./transport.js');
+    vi.mocked(webTransport.nativeWebTransport).mockImplementationOnce(
+      (...args) => {
+        const transport = real.nativeWebTransport(...args);
+        return {
+          ...transport,
+          async close() {
+            closeEntered.resolve(undefined);
+            await finishClose.promise;
+            await transport.close();
+            if (!joined) throw hostFailure;
+          },
+        };
+      },
+    );
+    const readNativeWebAuth = vi.fn();
+    let settled = false;
+    const outcome = openNativeWebOwner({
+      scope: {
+        binding,
+        signal: new AbortController().signal,
+        assertCurrent: async () => {},
+        launch: vi.fn().mockRejectedValue(lostReceipt),
+        readNativeWebAuth,
+      },
+      launch: {
+        binding,
+        auth: {
+          dshHome: '/work/a',
+          nonce: randomUUID(),
+          origin: 'http://127.0.0.1:32179/',
+          timeoutMs: 3000,
+        },
+        files: [],
+        command: { executable: 'node', args: [] },
+      },
+      context: {} as never,
+      vm: { assertCurrentBinding: vi.fn() },
+      lifetime: new AbortController().signal,
+      cleanupTimeoutMs: 3000,
+    }).catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    try {
+      await closeEntered.promise;
+      expect(settled).toBe(false);
+      expect(readNativeWebAuth).not.toHaveBeenCalled();
+    } finally {
+      finishClose.resolve(undefined);
+    }
+    const error = await outcome;
+    expect(error).toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+    if (joined) {
+      expect(error).toBeInstanceOf(NativeWebGuestLaunchUnacknowledged);
+      expect(error).toHaveProperty('cause', lostReceipt);
+    } else {
+      expect(error).not.toBeInstanceOf(NativeWebGuestLaunchUnacknowledged);
+      expect(error).toHaveProperty('cause.errors', [
+        expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' }),
+      ]);
+    }
+  },
+);
+
 it('CLI 启动退出会取消本次认证读取，等读取和原生关闭收尾后返回脱敏错误', async () => {
   const lifetime = new AbortController();
   const guestExited = deferred<PersonVmJobExit>();
   const readerStarted = deferred<AbortSignal | undefined>();
   const readerClosed = deferred<void>();
-  const cancelStarted = deferred<AbortSignal>();
-  const cancelClosed = deferred<void>();
+  const readerJoined = deferred<void>();
+  const transportClosing = deferred<void>();
+  const allowTransportClose = deferred<void>();
+  const transportClosed = deferred<void>();
   const exit = { exitCode: 1, timedOut: false };
-  const cancelAndWait = vi.fn(async (signal: AbortSignal) => {
-    cancelStarted.resolve(signal);
-    await cancelClosed.promise;
-    return exit;
-  });
+  const cancelAndWait = vi.fn(async () => exit);
+  const real = await vi.importActual<typeof webTransport>('./transport.js');
+  vi.mocked(webTransport.nativeWebTransport).mockImplementationOnce(
+    (...args) => {
+      const transport = real.nativeWebTransport(...args);
+      return {
+        ...transport,
+        async close() {
+          transportClosing.resolve(undefined);
+          await allowTransportClose.promise;
+          await transport.close();
+          transportClosed.resolve(undefined);
+        },
+      };
+    },
+  );
   const launch = {
     binding,
     auth: {
@@ -355,6 +546,7 @@ it('CLI 启动退出会取消本次认证读取，等读取和原生关闭收尾
       expect(request).toBe(launch.auth);
       readerStarted.resolve(signal);
       await readerClosed.promise;
+      readerJoined.resolve(undefined);
       throw Error('fixture private reader diagnostic');
     },
   };
@@ -375,24 +567,27 @@ it('CLI 启动退出会取消本次认证读取，等读取和原生关闭收尾
     const readerSignal = await readerStarted.promise;
     guestExited.resolve(exit);
     await vi.waitFor(() => expect(readerSignal?.aborted).toBe(true));
+    await transportClosing.promise;
     expect(scope.signal.aborted).toBe(false);
     expect(lifetime.signal.aborted).toBe(false);
     expect(settled).toBe(false);
     readerClosed.resolve(undefined);
-    expect((await cancelStarted.promise).aborted).toBe(false);
+    await readerJoined.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(settled).toBe(false);
-    cancelClosed.resolve(undefined);
+    allowTransportClose.resolve(undefined);
+    await transportClosed.promise;
     const failure = await outcome;
     expect(failure).toMatchObject({
       code: 'PROVIDER_FAILED',
       message: 'PROVIDER_FAILED',
     });
     expect(failure).not.toHaveProperty('cause');
-    expect(cancelAndWait).toHaveBeenCalledTimes(1);
+    expect(cancelAndWait).not.toHaveBeenCalled();
   } finally {
     guestExited.resolve(exit);
     readerClosed.resolve(undefined);
-    cancelClosed.resolve(undefined);
+    allowTransportClose.resolve(undefined);
     lifetime.abort();
     await outcome;
   }

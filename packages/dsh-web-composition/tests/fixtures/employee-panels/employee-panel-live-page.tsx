@@ -27,7 +27,11 @@ let openPanel: ((kind: 'files' | 'materials') => void) | undefined;
 // The independent BFF is exercised without starting a VM. Give the real
 // panel the same mounted-session value that its native Dock supplies.
 ctx.provide('sidebarRight', {
-  mounted: { getSnapshot: () => sessionId },
+  mounted: {
+    getSnapshot: () => sessionId,
+    // This isolated panel document retains one mounted session.
+    subscribe: () => () => {},
+  },
   isExpanded: () => true,
   openTab(id: string) {
     if (id === employeePanelKinds.files) openPanel?.('files');
