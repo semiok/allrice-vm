@@ -373,6 +373,27 @@ it('requires the issued scope in the document address and leaves the two exact n
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
   ]);
+
+  const oldSeal = '3'.repeat(64);
+  const oldRoot = '/_next/static/dsh-profile/' + oldSeal + '/';
+  releasedAssets.mockResolvedValueOnce({
+    root: oldRoot,
+    stamp: oldSeal,
+    paths: new Set(['managed/employee-web-entry.js']),
+    startup: ['managed/employee-web-entry.js'],
+    bundles: [{ reference: bundle, revision: 'r1', sha256: '2'.repeat(64) }],
+  });
+  const withoutLocalSeal = await GET(
+    request(query + '&scopeId=' + scopeId + '&threadId=' + threadId),
+  );
+  expect(withoutLocalSeal.status).toBe(200);
+  expect(withoutLocalSeal.headers.get('cache-control')).toBe(
+    'private, no-store',
+  );
+  const scopedHtml = await withoutLocalSeal.text();
+  expect(scopedHtml).not.toContain(oldRoot);
+  expect(scopedHtml).not.toContain('rel="modulepreload"');
+  expect(scopedHtml).toContain('id="allrice-employee-bootstrap"');
 });
 
 it(

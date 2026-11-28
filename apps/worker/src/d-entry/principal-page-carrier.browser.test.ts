@@ -84,13 +84,13 @@ it
     const warmRefresh = scenario === 'refresh';
     const refreshBenchmark =
       warmRefresh && process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL === '1';
-    const usePublicFiles = coldAssets || warmRefresh;
-    const realShell =
-      switching || nativeCreate || usePublicFiles || crossRetain;
+    const initialWarmIdentity = warmRefresh || crossRetain;
+    const usePublicFiles = coldAssets || initialWarmIdentity;
+    const realShell = switching || nativeCreate || usePublicFiles;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
-    const independentlyInstalled = coldAssets || scenario === 'refresh';
+    const independentlyInstalled = usePublicFiles;
     const live = independentlyInstalled ? await buildProfileFixture() : release;
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
@@ -811,14 +811,14 @@ it
               })
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
-                  (warmRefresh
+                  (initialWarmIdentity
                     ? '<script id="warm-identity" type="application/json">' +
                       JSON.stringify(f.identity) +
                       '</script>'
                     : '') +
-                  (warmRefresh || (coldAssets && bench !== 'progress')
+                  (initialWarmIdentity || (coldAssets && bench !== 'progress')
                     ? '<script id="startup-assets" type="application/json">' +
-                      JSON.stringify(warmRefresh ? startupUrls : coldPaths) +
+                      JSON.stringify(coldAssets ? coldPaths : startupUrls) +
                       '</script>'
                     : '') +
                   '<script src="/outer.js"></script>',
@@ -987,7 +987,7 @@ it
         if (usePublicFiles && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
           if (
-            warmRefresh &&
+            initialWarmIdentity &&
             startupUrls.includes(url.pathname) &&
             request.headers['sec-fetch-dest'] === 'empty'
           ) {
@@ -1152,7 +1152,7 @@ it
         const html = `<!doctype html>
           ${refreshBenchmark ? lifecycle : ''}
           ${usePublicFiles ? managedPreloads : ''}
-          ${usePublicFiles || crossRetain ? nativeStyles : ''}
+          ${usePublicFiles ? nativeStyles : ''}
           <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
           ${refreshBenchmark ? '' : lifecycle}
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
@@ -1548,6 +1548,7 @@ it
       const c = third!.identity.employeeInstanceId;
       const d = fourth!.identity.employeeInstanceId;
       const app = workbench.locator('#app');
+      expect(parentAssetWarms).toBeGreaterThan(0);
       const borrow = (
         scopeId: string,
         identity: typeof f.identity,
@@ -2840,6 +2841,47 @@ it
             await recordRefreshWaterfall(page, editor, cdp, sample, cache);
           }
         }
+      }
+      const releaseProof = deferred();
+      let checkingWarmProof = false;
+      const verifyWarmEditor = f.confirmVerifiedEditor.getMockImplementation()!;
+      f.confirmVerifiedEditor.mockImplementationOnce(async () => {
+        checkingWarmProof = true;
+        await releaseProof.promise;
+        return verifyWarmEditor();
+      });
+      await page.addInitScript((asset) => {
+        if (window !== parent) return;
+        const original = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const signal = options?.signal;
+          if (input !== asset || !signal || options?.credentials !== 'omit')
+            return original(input, options);
+          document.documentElement.dataset.warmAsset = 'pending';
+          return new Promise<Response>((_, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => {
+                document.documentElement.dataset.warmAsset = 'aborted';
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          });
+        };
+      }, applicationPath);
+      try {
+        await page.reload({ waitUntil: 'commit' });
+        await page.locator('html[data-warm-asset="pending"]').waitFor();
+        await expect.poll(() => checkingWarmProof).toBe(true);
+        await page
+          .getByRole('button', { name: '取消等待', exact: true })
+          .click();
+        await page.locator('html[data-warm-asset="aborted"]').waitFor({
+          timeout: 5_000,
+        });
+      } finally {
+        releaseProof.resolve();
       }
     }
     if (!warmRefresh)
