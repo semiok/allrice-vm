@@ -1,3 +1,4 @@
+import { referenceArchivePolicy } from '@allrice/file-archives';
 import { z } from 'zod';
 import {
   MaterialsActionCommandProjectionSchema,
@@ -278,7 +279,11 @@ export function createEmployeePanelsHandlers(
         quotableFileIds: catalog.files
           .filter((file) => {
             if (params.get('mention') === '1')
-              return isIndexableReferenceSource(file);
+              return (
+                isIndexableReferenceSource(file) ||
+                (file.mediaType === 'application/zip' &&
+                  file.sizeBytes <= referenceArchivePolicy.maximumBytes)
+              );
             if (file.reference?.companyTemplate) return true;
             const current =
               file.reference?.checksum === file.checksum

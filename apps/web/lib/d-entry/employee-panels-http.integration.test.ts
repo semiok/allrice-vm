@@ -1,3 +1,4 @@
+import { createFileArchive } from '@allrice/file-archives';
 import type {
   ModelCallBinding,
   GatewayModelInput,
@@ -27,6 +28,7 @@ import {
   DataAccessError,
   addEmployeeInstanceModule,
   createChatSession,
+  createEmployeeInstance,
   ensureDEntryNativeRoot,
   readDEntryEmployeeDirectory,
   requireDEntryNativeIdentity,
@@ -1891,9 +1893,10 @@ suite(
       } as ModelCallBinding;
     }
     function referenceMessage(threadId: string, pin: EmployeeFileMentionPin) {
+      const id = randomUUID() as GatewayModelInput['messages'][number]['id'];
       return [
         {
-          id: randomUUID(),
+          id,
           role: 'user',
           source: { kind: 'user' },
           content: [
@@ -1909,11 +1912,17 @@ suite(
             },
           ],
         },
-      ] as GatewayModelInput['messages'];
+      ] satisfies GatewayModelInput['messages'];
     }
     it('rechecks a sealed file quote after queued publication withdrawal and denies other employees and organizations before reading bytes', async () => {
       const p = await person();
       const other = await person();
+      const peer = await createEmployeeInstance(p.context, {
+        workspaceId: p.selection.workspaceId,
+        assignmentId: p.selection.employeeInstanceId,
+        requestId: randomUUID(),
+        profile: { name: 'Another employee under the same person' },
+      });
       await release(p, other);
       const thread = await createChatSession(p.context, p.selection, {
         executionGeneration: '4.0',
@@ -1924,11 +1933,17 @@ suite(
         { executionGeneration: '4.0' },
       );
       const text = 'original-model-excerpt-' + randomUUID();
-      const published = await p.client.publishUpload(
+      const source = await p.client.uploadDeliverable(
+        uploadInput(p, 'record.txt', text),
+        signal(),
+      );
+      const published = await p.client.publishFile(
         {
-          ...uploadInput(p, 'record.txt', text),
-          origin: 'upload',
-          purpose: '',
+          workspaceId: p.selection.workspaceId,
+          origin: 'file',
+          objectId: source.objectId,
+          requestId: randomUUID(),
+          purpose: 'Fixed private document',
           audience: { scope: 'personal', departmentIds: [] },
         },
         signal(),
@@ -1949,19 +1964,13 @@ suite(
         digest: selection.digest,
         checksum: selection.checksum,
       };
-      const get = vi.fn(runtimeFixtureStorage(f.db).get);
-      const read = createProductionFileMentionContext({
-        ...runtimeFixtureStorage(f.db),
-        get,
-      });
+      const storage = runtimeFixtureStorage(f.db);
+      const get = vi.fn(storage.get.bind(storage));
+      const read = createProductionFileMentionContext({ get });
       const call = modelCall(p, thread.id);
       const messages = referenceMessage(thread.id, pin);
       await expect(
-        read(
-          { ...call, employeeInstanceId: other.selection.employeeInstanceId },
-          messages,
-          signal(),
-        ),
+        read({ ...call, employeeInstanceId: peer.id }, messages, signal()),
       ).rejects.toThrow();
       await expect(
         read(
@@ -2014,10 +2023,12 @@ suite(
       const stream = 'BT /F1 12 Tf 40 100 Td (' + marker + ') Tj ET';
       const objects = [
         '<< /Type /Catalog /Pages 2 0 R >>',
-        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>',
         '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
         '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
         `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>',
+        `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream.replace('FIRST', 'LATER')}\nendstream`,
       ];
       let pdf = '%PDF-1.4\n';
       const offsets = objects.map((object, i) => {
@@ -2027,11 +2038,11 @@ suite(
       });
       const xref = Buffer.byteLength(pdf);
       pdf +=
-        'xref\n0 6\n0000000000 65535 f \n' +
+        'xref\n0 8\n0000000000 65535 f \n' +
         offsets
           .map((offset) => String(offset).padStart(10, '0') + ' 00000 n \n')
           .join('') +
-        `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+        `trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
       const bytes = Buffer.from(pdf);
       const { objectId } = await p.client.uploadDeliverable(
         {
@@ -2059,12 +2070,86 @@ suite(
         signal(),
       );
       expect(JSON.stringify(prepared?.messages)).toContain(marker);
+      expect(JSON.stringify(prepared?.messages)).not.toContain(
+        'LATER_NATIVE_PDF',
+      );
+      const added = prepared!.messages[0]!.content.at(-1);
+      if (added?.type !== 'text') throw Error('Missing file reference content');
+      const next = JSON.parse(added.text.slice(added.text.indexOf('{'))).next;
+      expect(typeof next).toBe('string');
+      const nextPage = await read(
+        modelCall(p, thread.id),
+        [
+          {
+            ...prepared!.messages[0]!,
+            content: [{ type: 'text', text: next }],
+          },
+        ],
+        signal(),
+      );
+      expect(JSON.stringify(nextPage?.messages)).toContain('LATER_NATIVE_PDF');
+      expect(JSON.stringify(nextPage?.messages)).not.toContain(marker);
+
       const dispatch = vi.fn(async () => {});
       await prepared!.withCurrent(signal(), undefined, dispatch);
       expect(dispatch).toHaveBeenCalledTimes(1);
       const [copies] =
         await f.db`select count(*)::int as count from allrice_knowledge_revisions where organization_id=${p.context.organizationId}`;
       expect(copies?.count).toBe(0);
+    });
+    it('lists the validated directory of an owned ZIP delivery without exposing member text', async () => {
+      const p = await person();
+      await release(p);
+      const thread = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const bytes = await createFileArchive([
+        {
+          path: 'quarter/notes.txt',
+          bytes: Buffer.from('unexpanded member body'),
+        },
+      ]);
+      const { objectId } = await p.client.uploadDeliverable(
+        {
+          ...uploadInput(p, 'evidence.zip'),
+          mediaType: 'application/zip',
+          contentBase64: Buffer.from(bytes).toString('base64'),
+        },
+        signal(),
+      );
+      await f.db`insert into allrice_deliverable_versions
+        (id,organization_id,workspace_id,owner_id,object_id,series_id,version,session_id,file_name,format)
+        values (${randomUUID()},${p.context.organizationId},${p.selection.workspaceId},${p.context.actor.id},
+        ${objectId},${randomUUID()},1,${thread.id},'evidence.zip','zip')`;
+      const catalog = await p.client.listDeliverables(
+        {
+          workspaceId: p.selection.workspaceId,
+          category: 'artifact',
+          mention: true,
+        },
+        signal(),
+      );
+      expect(catalog.quotableFileIds).toContain(objectId);
+      const read = createProductionFileMentionContext(
+        runtimeFixtureStorage(f.db),
+      );
+      const pin = {
+        kind: 'deliverable' as const,
+        objectId,
+        checksum: 'sha256:' + createHash('sha256').update(bytes).digest('hex'),
+      };
+      const prepared = await read(
+        modelCall(p, thread.id),
+        referenceMessage(thread.id, pin),
+        signal(),
+      );
+      expect(JSON.stringify(prepared?.messages)).toContain('quarter/notes.txt');
+      expect(JSON.stringify(prepared?.messages)).not.toContain(
+        'unexpanded member body',
+      );
+      const dispatch = vi.fn(async () => {});
+      await prepared!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(1);
     });
     it('uploads independent same-name files, favorites all employees, publishes a fixed copy and rejects its exact selection after revoke without B/MCP/VM', async () => {
       const p = await person();

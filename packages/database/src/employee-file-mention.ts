@@ -69,11 +69,11 @@ async function requireOriginal(
       and dv.workspace_id=${context.workspaceId!} and dv.owner_id=${context.actor.id}
     order by dv.id for share of dv,s`;
   await tx`
-    select a.id from allrice_workbench_artifacts a
+    select a.version_id from allrice_workbench_artifacts a
     join allrice_deliverable_versions dv on dv.id=a.version_id
     where dv.object_id=${pin.objectId} and a.organization_id=${context.organizationId}
       and a.workspace_id=${context.workspaceId!} and a.owner_id=${context.actor.id}
-    order by a.id for share of a`;
+    order by a.version_id for share of a`;
   const [eligible] = await tx`with ${personalWorkbenchOrigins(tx, {
     organizationId: context.organizationId,
     workspaceId: context.workspaceId!,
@@ -83,7 +83,11 @@ async function requireOriginal(
   const file = await readWorkbenchFile(context, pin.objectId, tx);
   if (file.object.checksum !== pin.checksum)
     throw new DataAccessError('not_found');
-  return { object: file.object, fileName: file.row.file_name, archive: false };
+  return {
+    object: file.object,
+    fileName: file.row.file_name,
+    archive: file.object.mediaType === 'application/zip',
+  };
 }
 
 /** Model Host only. Dispatch joins the memory transaction if present. The

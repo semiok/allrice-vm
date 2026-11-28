@@ -60,7 +60,7 @@ function position(text: string, index: number) {
 }
 
 export function createProductionFileMentionContext(
-  storage: StoragePort = new LocalStorageAdapter(
+  storage: Pick<StoragePort, 'get'> = new LocalStorageAdapter(
     process.env.ALLRICE_STORAGE_ROOT ?? '.local/storage',
   ),
   builtin = createApplicationBuiltinModuleAuthority('worker'),
@@ -124,7 +124,9 @@ export function createProductionFileMentionContext(
       );
       let text: string;
       let parserLimit = false;
+      let nextPage: number | undefined;
       if (file.archive) {
+        if (mention.pdfPage !== undefined) throw deny();
         const zip = await openReferenceArchive(bytes, { signal });
         try {
           text = JSON.stringify(
@@ -138,19 +140,48 @@ export function createProductionFileMentionContext(
           zip.close();
         }
       } else {
+        const pdf =
+          file.object.mediaType === 'application/pdf' ||
+          file.fileName.toLowerCase().endsWith('.pdf');
+        if (!pdf && mention.pdfPage !== undefined) throw deny();
+        const page = mention.pdfPage ?? 1;
         const parsed = await parseDocument({
           bytes,
           fileName: file.fileName,
           mediaType: file.object.mediaType,
           maximumCharacters,
+          ...(pdf && { pages: [page] }),
         });
-        text = parsed.text;
-        parserLimit = parsed.truncated;
+        if (pdf) {
+          text = parsed.text;
+          parserLimit =
+            parsed.warningCodes?.includes('PDF_CONTENT_TRUNCATED') ?? false;
+          if (parsed.totalPages && page < parsed.totalPages)
+            nextPage = page + 1;
+        } else {
+          // The Office reader exposes normalized units independently of its
+          // first-page render limit. Page those exact units on the next quote.
+          text = parsed.truncated
+            ? parsed.units
+                .map(({ label, text }) => '## ' + label + '\n\n' + text)
+                .join('\n\n')
+            : parsed.text;
+        }
       }
       signal.throwIfAborted();
       const start = position(text, mention.offset ?? 0);
-      if (start >= text.length || !text.trim()) throw deny();
+      if (start > text.length || (!nextPage && !text.trim())) throw deny();
       const end = position(text, Math.min(text.length, start + pageCharacters));
+      const next =
+        end < text.length
+          ? encodeEmployeeFileMention({ ...mention, offset: end })
+          : nextPage === undefined
+            ? undefined
+            : encodeEmployeeFileMention({
+                ...mention,
+                pdfPage: nextPage,
+                offset: 0,
+              });
       content.push({
         type: 'text',
         text:
@@ -160,10 +191,7 @@ export function createProductionFileMentionContext(
             pin: mention.pin,
             content: text.slice(start, end),
             offset: start,
-            next:
-              end < text.length
-                ? encodeEmployeeFileMention({ ...mention, offset: end })
-                : undefined,
+            next,
             parserLimit,
             kind: file.archive ? 'archive-directory' : 'document-text',
           }),

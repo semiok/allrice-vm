@@ -32,7 +32,13 @@ export const EmployeeFileMentionSchema = z
     threadId: UuidSchema,
     label: z.string().min(1).max(160),
     pin: EmployeeFileMentionPinSchema,
-    offset: z.number().int().nonnegative().max(300_000).optional(),
+    pdfPage: z.number().int().positive().max(10_000).optional(),
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(20 * 1024 * 1024)
+      .optional(),
   })
   .strict();
 export type EmployeeFileMention = z.infer<typeof EmployeeFileMentionSchema>;

@@ -409,7 +409,9 @@ it.skipIf(
         const send = () =>
           host.dispatchRoot(context, restore, signal, route, dispatch);
         await send();
-        expect(dispatch).toHaveBeenCalledExactlyOnceWith(issued);
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch.mock.calls[0]?.[0]).toEqual(issued);
+        expect(typeof dispatch.mock.calls[0]?.[1]).toBe('function');
         dispatch.mockClear();
         const held = deferredPromptFact<number>();
         const release = deferredPromptFact<void>();
@@ -449,7 +451,9 @@ it.skipIf(
           await db`update allrice_model_connections set status='ready' where id=${route.connectionId}`;
         }
         await send();
-        expect(dispatch).toHaveBeenCalledExactlyOnceWith(issued);
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch.mock.calls[0]?.[0]).toEqual(issued);
+        expect(typeof dispatch.mock.calls[0]?.[1]).toBe('function');
       }
 
       async function commitWithoutDelivery(ref: string, input: unknown) {
