@@ -110,6 +110,7 @@ files:
     - apps/worker/src/native-schedule-once.test.ts
   db:
     - apps/worker/src/person-vm/scheduled-wake.integration.test.ts
+    - apps/worker/src/person-vm/production-disk-preprovision.integration.test.ts
     - apps/web/lib/d-entry/history-authority.integration.test.ts
     - apps/worker/src/person-vm/production-delete.integration.test.ts
     - packages/egress-gateway/src/admission.integration.test.ts
