@@ -24,6 +24,10 @@ const application = 'plugins/' + '2'.repeat(64) + '.js';
 const artifact = 'apps/worker/dist/d-entry-web';
 const next = 'apps/web/.next';
 const reference = 'plugins/??application/client.js&rev=build';
+const singleReference = 'plugins/??application/client.js&rev=single';
+const single = 'plugins/' + '3'.repeat(64) + '.js';
+const script = (body, rev) =>
+  body + `\n//# sourceMappingURL=??application/client.js.map&rev=${rev}\n`;
 const paths = {
   'managed/employee-web-entry.js': 'export const runtime = 1;',
   'managed/employee-web-entry.css': '.entry {color: black}',
@@ -45,11 +49,12 @@ async function fixture(op) {
   try {
     await mkdir(join(root, next, 'static'), { recursive: true });
     await mkdir(join(root, next, 'server'), { recursive: true });
-    const build = async (body) => {
+    const build = async (body, singleton = body) => {
       const files = [];
       for (const [path, contents] of Object.entries({
         ...paths,
-        [application]: body,
+        [application]: script(body, 'build'),
+        [single]: script(singleton, 'single'),
       })) {
         const filename = join(root, artifact, path);
         await mkdir(dirname(filename), { recursive: true });
@@ -67,10 +72,22 @@ async function fixture(op) {
         files,
         profile: {
           graph: {
-            batches: [{ url: reference, rev: 'build', phase: 'application' }],
+            entries: [{ id: 'application', url: singleReference }],
+            batches: [
+              {
+                url: reference,
+                rev: 'build',
+                phase: 'application',
+                entries: ['application'],
+              },
+            ],
           },
           files: [
             { ...files.find((item) => item.path === application), reference },
+            {
+              ...files.find((item) => item.path === single),
+              reference: singleReference,
+            },
           ],
         },
       });
@@ -128,8 +145,9 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
       'employee-web-entry.js',
       'lazy-language.js',
     ]);
-    const bundle = 'bundles/' + digest(body) + '.js';
-    expect(await readFile(join(directory, bundle), 'utf8')).toBe(body);
+    const bytes = script(body, 'build');
+    const bundle = 'bundles/' + digest(bytes) + '.js';
+    expect(await readFile(join(directory, bundle), 'utf8')).toBe(bytes);
     expect(
       JSON.parse(
         await readFile(join(root, next, 'server/dsh-profile.json'), 'utf8'),
@@ -137,7 +155,24 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
     ).toMatchObject({
       stamp: first,
       paths: expect.arrayContaining([bundle]),
-      bundles: [{ reference, revision: 'build', sha256: digest(body) }],
+      bundles: [
+        {
+          reference,
+          revision: 'build',
+          sha256: digest(bytes),
+          layout: {
+            phase: 'application',
+            byteLength: Buffer.byteLength(bytes),
+            entries: [
+              {
+                id: 'application',
+                offset: 0,
+                length: Buffer.byteLength(body + '\n'),
+              },
+            ],
+          },
+        },
+      ],
     });
     const entrypoint = join(root, 'apps/web/server.mjs');
     const released = await readReleasedProfileAssets(first, entrypoint);
@@ -163,7 +198,7 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
       );
       expect(upgraded.root).not.toBe(released.root);
     });
-    expect(await readFile(join(directory, bundle), 'utf8')).toBe(body);
+    expect(await readFile(join(directory, bundle), 'utf8')).toBe(bytes);
   });
 });
 
@@ -197,6 +232,17 @@ test('refuses symlinks and mismatched bytes before publishing', async () => {
     await expect(stageDshProfileAssets(root, head)).rejects.toThrow(
       /Untrusted/,
     );
+    expect(await readdir(join(root, next, 'server'))).toEqual([]);
+  });
+});
+
+test('refuses an aggregate that does not match the individually sealed registration', async () => {
+  await fixture(async (root, build) => {
+    await build('first factory', 'other factory');
+    await expect(stageDshProfileAssets(root, head)).rejects.toThrow(
+      /batch differs from sealed module registrations/,
+    );
+    expect(await readdir(join(root, next, 'static/dsh-profile'))).toEqual([]);
     expect(await readdir(join(root, next, 'server'))).toEqual([]);
   });
 });

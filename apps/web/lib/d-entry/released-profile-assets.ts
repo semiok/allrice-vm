@@ -2,19 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { publicProfileStartupPath } from './public-profile-warmup';
+import { publicProfileBundles } from './public-profile-bundles';
 
 const sha = z.string().regex(/^[a-f0-9]{64}$/);
 const index = z.strictObject({
   stamp: sha,
   paths: z.array(z.string()),
   startup: z.array(z.string()),
-  bundles: z.array(
-    z.strictObject({
-      reference: z.string(),
-      revision: z.string(),
-      sha256: sha,
-    }),
-  ),
+  bundles: publicProfileBundles,
 });
 
 async function readLocalProfileAssets(entrypoint = process.argv[1]) {

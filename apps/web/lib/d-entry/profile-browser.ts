@@ -13,6 +13,10 @@ import {
 import { z } from 'zod';
 import type { EarlyProfileBundles } from './initial-document';
 import {
+  findPublicProfileBundle,
+  publicProfileBundles,
+} from './public-profile-bundles';
+import {
   downloadProfileResource,
   profileDownloadLimits,
   sealedProfileBundleFetch,
@@ -85,27 +89,15 @@ function publishNativeThread(
   }
 }
 
-const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
-const publicBundlesSchema = z.array(
-  z.strictObject({
-    reference: z.string(),
-    revision: z.string(),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  }),
-);
 export function releasedBundleResolver(data: DOMStringMap) {
   const root = data.publicAssetRoot;
-  if (!root || !publicRoot.test(root)) return () => undefined;
+  if (!root) return () => undefined;
   try {
-    const bundles = publicBundlesSchema.parse(
+    const bundles = publicProfileBundles.parse(
       JSON.parse(data.publicBundles ?? '[]'),
     );
-    return ({ url, rev }: { url: string; rev: string }) => {
-      const entry = bundles.find(
-        ({ reference, revision }) => url === reference && rev === revision,
-      );
-      return entry ? root + 'bundles/' + entry.sha256 + '.js' : undefined;
-    };
+    return (resource: Parameters<typeof findPublicProfileBundle>[1]) =>
+      findPublicProfileBundle({ root, bundles }, resource);
   } catch {
     return () => undefined;
   }
@@ -160,6 +152,7 @@ export async function readProfileBundle(
   signal: AbortSignal,
   publicUrl?: string,
   preloaded?: Promise<ArrayBuffer>,
+  assemble?: (bytes: ArrayBuffer) => Promise<ArrayBuffer>,
 ) {
   const read = () =>
     fetchProfileBundle(target, signal, {
@@ -168,10 +161,14 @@ export async function readProfileBundle(
     });
   try {
     signal.throwIfAborted();
-    const bytes = await (publicUrl
+    let bytes = await (publicUrl
       ? (preloaded ??
         fetchProfileBundle(publicUrl, signal, sealedProfileBundleFetch))
       : read());
+    if (publicUrl && assemble) {
+      signal.throwIfAborted();
+      bytes = await assemble(bytes);
+    }
     signal.throwIfAborted();
     return bytes;
   } catch (error) {
@@ -388,7 +385,7 @@ export function nativeProfileDocument(
         ({ phase }) => phase === 'bootstrap',
       );
       if (bootstrapBatch) {
-        const url = releasedBundle(bootstrapBatch);
+        const url = releasedBundle(bootstrapBatch)?.url;
         const bytes = url && readEarly(url);
         if (bytes) preloaded.set(bootstrapBatch.url, owned(bytes));
       }
@@ -399,7 +396,7 @@ export function nativeProfileDocument(
         const batch = result.graph.batches.find(
           ({ phase, url }) => phase === 'application' && url === injection.src,
         );
-        const publicUrl = batch && releasedBundle(batch);
+        const publicUrl = batch && releasedBundle(batch)?.url;
         if (publicUrl && !preloaded.has(injection.src))
           preloaded.set(
             injection.src,
@@ -551,11 +548,13 @@ export function nativeProfileDocument(
             target.searchParams.set('revision', resource.rev);
             const prefetched = preloaded.get(resource.url);
             preloaded.delete(resource.url);
+            const packet = releasedBundle(resource);
             const bytes = await readProfileBundle(
               target,
               signal,
-              releasedBundle(resource),
+              packet?.url,
               prefetched,
+              packet?.assemble,
             ).catch((error: unknown) => {
               if (
                 error instanceof EmployeeProfileBundleTimeout &&

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   EmployeeProfileBundleTimeout,
@@ -21,9 +22,9 @@ it('uses a public digest only for the exact graph resource and revision', () => 
   };
   const data = { publicAssetRoot: root, publicBundles: JSON.stringify([row]) };
   const resolve = releasedBundleResolver(data);
-  expect(resolve({ url: row.reference, rev: row.revision })).toBe(
-    root + 'bundles/' + sha256 + '.js',
-  );
+  expect(resolve({ url: row.reference, rev: row.revision })).toEqual({
+    url: root + 'bundles/' + sha256 + '.js',
+  });
   expect(resolve({ url: row.reference, rev: 'r2' })).toBeUndefined();
   expect(
     resolve({ url: 'plugins/??other/client.js&rev=r1', rev: 'r1' }),
@@ -33,6 +34,74 @@ it('uses a public digest only for the exact graph resource and revision', () => 
       ...data,
       publicAssetRoot: 'https://other.example/',
     })({ url: row.reference, rev: 'r1' }),
+  ).toBeUndefined();
+});
+
+it('uses the same verified public packet after relocation and reconstructs the admitted native order', async () => {
+  const root = '/_next/static/dsh-profile/' + 'a'.repeat(64) + '/';
+  const rev = '1'.repeat(12);
+  const url = `plugins/??@dsh/second/client.js,@dsh/first/client.js&rev=${rev}`;
+  const first = 'first("中");\n';
+  const second = 'second();\n';
+  const bytes = new TextEncoder().encode(first + second + 'sealed trailer');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const data = {
+    publicAssetRoot: root,
+    publicBundles: JSON.stringify([
+      {
+        reference: 'sealed',
+        revision: 'build',
+        sha256,
+        layout: {
+          phase: 'application',
+          byteLength: bytes.length,
+          entries: [
+            { id: '@dsh/first', offset: 0, length: Buffer.byteLength(first) },
+            {
+              id: '@dsh/second',
+              offset: Buffer.byteLength(first),
+              length: Buffer.byteLength(second),
+            },
+          ],
+        },
+      },
+    ]),
+  };
+  const resolve = releasedBundleResolver(data);
+  const batch = {
+    url,
+    rev,
+    phase: 'application',
+    entries: ['@dsh/second', '@dsh/first'],
+  };
+  const packet = resolve(batch)!;
+  expect(packet.url).toBe(root + 'bundles/' + sha256 + '.js');
+  const received = await packet.assemble!(bytes.buffer);
+  expect(new TextDecoder().decode(received)).toBe(
+    second +
+      first +
+      '//# sourceMappingURL=' +
+      url.slice('plugins/'.length).replaceAll('/client.js', '/client.js.map') +
+      '\n',
+  );
+  const changed = bytes.slice();
+  changed[0] = 0;
+  await expect(packet.assemble!(changed.buffer)).rejects.toThrow(
+    'Invalid public profile packet digest',
+  );
+  await expect(packet.assemble!(bytes.slice(0, -1).buffer)).rejects.toThrow(
+    'Invalid public profile packet length',
+  );
+  expect(resolve({ ...batch, phase: 'bootstrap' })).toBeUndefined();
+  expect(
+    resolve({ ...batch, entries: ['@dsh/first', '@dsh/second'] }),
+  ).toBeUndefined();
+  expect(
+    resolve({
+      ...batch,
+      entries: ['@dsh/third'],
+      url: `plugins/??@dsh/third/client.js&rev=${rev}`,
+    }),
   ).toBeUndefined();
 });
 

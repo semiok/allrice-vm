@@ -22,6 +22,7 @@ import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
+import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
 import {
   fixture,
   buildProfileFixture,
@@ -62,6 +63,10 @@ it
       (nativeCreate && process.platform !== 'darwin');
     const realShell = switching || nativeCreate || coldAssets;
     const release = await buildProfileFixture();
+    // The production pack and guest materialize the same code separately.
+    // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
+    const independentlyInstalled = coldAssets || scenario === 'refresh';
+    const live = independentlyInstalled ? await buildProfileFixture() : release;
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
       source: { head: string };
@@ -74,7 +79,7 @@ it
       '.css': 'text/css',
       '.wasm': 'application/wasm',
     };
-    const f = await fixture(release);
+    const f = await fixture({ ...live, directory: release.directory });
     const otherThread = randomUUID();
     const revokeOther =
       switching || createAfterSwitch
@@ -262,9 +267,14 @@ it
       'dynamicCordisRunner/syncInspectManifest',
     ]);
     const graph = DEntryProfileGraphSchema.parse(release.graph);
-    const application = graph.batches.find(
+    const liveGraph = DEntryProfileGraphSchema.parse(live.graph);
+    const application = liveGraph.batches.find(
       ({ phase }) => phase === 'application',
     )!;
+    if (independentlyInstalled)
+      expect(application.rev).not.toBe(
+        graph.batches.find(({ phase }) => phase === 'application')?.rev,
+      );
     const publicRoot =
       '/_next/static/dsh-profile/' +
       createHash('sha256').update(sealed).digest('hex') +
@@ -283,6 +293,16 @@ it
         bundle,
       ]),
     );
+    const applicationPath = [...publicBundles].find(
+      ([, bundle]) => bundle.phase === 'application',
+    )![0];
+    let publicIndex = publicProfileBundles.parse(
+      bundles.map(({ reference, revision, sha256 }) => ({
+        reference,
+        revision,
+        sha256,
+      })),
+    );
     const publicEntry = publicRoot + 'managed/employee-web-entry.js';
     const publicStyle = publicRoot + 'managed/employee-web-entry.css';
     const nativeStyles = manifest.files
@@ -296,7 +316,7 @@ it
       .join('');
     let coldPaths: string[] = [];
     let stagedPaths: Set<string> | undefined;
-    if (coldAssets && bench !== 'baseline') {
+    if (independentlyInstalled) {
       const root = await realpath(
         await mkdtemp(join(tmpdir(), 'd-entry-warm-')),
       );
@@ -317,13 +337,16 @@ it
         stageDshProfileAssets(root: string, sourceSha: string): Promise<void>;
       } = await import(stageModule.href);
       await stageDshProfileAssets(root, manifest.source.head);
-      const index: { paths: string[]; startup: string[] } = JSON.parse(
-        await readFile(
-          join(root, 'apps/web/.next/server/dsh-profile.json'),
-          'utf8',
-        ),
-      );
-      coldPaths = index.startup.map((path) => publicRoot + path);
+      const index: { paths: string[]; startup: string[]; bundles: unknown } =
+        JSON.parse(
+          await readFile(
+            join(root, 'apps/web/.next/server/dsh-profile.json'),
+            'utf8',
+          ),
+        );
+      publicIndex = publicProfileBundles.parse(index.bundles);
+      if (coldAssets && bench !== 'baseline')
+        coldPaths = index.startup.map((path) => publicRoot + path);
       stagedPaths = new Set(index.paths);
     }
     const coldRequests = new Map<string, number>();
@@ -731,7 +754,7 @@ it
           ? []
           : publicStartupBundleUrls(published, {
               root: publicRoot,
-              bundles,
+              bundles: publicIndex,
             });
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
@@ -742,8 +765,8 @@ it
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
-            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${graph.rev}"
-            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
+            data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${published.graph.rev}"
+            ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
           <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
@@ -761,12 +784,7 @@ it
     ]);
     const page = await context.newPage();
     if (bench === 'overlap') {
-      const href =
-        f.origin +
-        publicRoot +
-        'bundles/' +
-        bundles.find((bundle) => bundle.phase === 'application')!.sha256 +
-        '.js';
+      const href = f.origin + applicationPath;
       page.on('request', (request) => {
         if (request.url() === href && request.frame() !== page.mainFrame())
           frameApplicationAt ??= performance.now();
@@ -1486,6 +1504,24 @@ it
     const refreshedAt = performance.now();
     await page.reload();
     await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
+    const cached = await workbench.locator('#app').evaluate(
+      (_, url) =>
+        performance
+          .getEntriesByName(url)
+          .filter(
+            (entry): entry is PerformanceResourceTiming =>
+              entry instanceof PerformanceResourceTiming,
+          )
+          .map(({ transferSize, decodedBodySize }) => ({
+            transferSize,
+            decodedBodySize,
+          })),
+      f.origin + applicationPath,
+    );
+    expect(cached).toEqual([
+      { transferSize: 0, decodedBodySize: expect.any(Number) },
+    ]);
+    expect(cached[0]!.decodedBodySize).toBeGreaterThan(1_000_000);
     expect(
       downloaded()
         .map(({ kind }) => kind)
@@ -1500,6 +1536,11 @@ it
           browser: browser.version(),
           sealedBundleRequests: downloaded().length - 2,
           scopedBundleRequests: scopedBundleReads,
+          applicationTransferBytes: cached[0]!.transferSize,
+          sealedApplicationRevision: graph.batches.find(
+            ({ phase }) => phase === 'application',
+          )!.rev,
+          liveApplicationRevision: application.rev,
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
     );

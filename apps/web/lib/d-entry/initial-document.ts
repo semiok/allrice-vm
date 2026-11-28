@@ -11,6 +11,7 @@ import {
   profileDownloadLimits,
   sealedProfileBundleFetch,
 } from './profile-download.ts';
+import { findPublicProfileBundle } from './public-profile-bundles.ts';
 
 const publicBundlePath =
   /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/bundles\/[a-f0-9]{64}\.js$/;
@@ -20,13 +21,17 @@ export function publicStartupBundleUrls(
     graph,
     injections,
   }: {
-    graph: { batches: readonly { phase: string; url: string; rev: string }[] };
+    graph: {
+      batches: readonly {
+        phase: string;
+        url: string;
+        rev: string;
+        entries?: readonly string[];
+      }[];
+    };
     injections: readonly { kind: string; src?: string }[];
   },
-  release: {
-    root: string;
-    bundles: readonly { reference: string; revision: string; sha256: string }[];
-  },
+  release: Parameters<typeof findPublicProfileBundle>[0],
 ) {
   const batches = [
     graph.batches.find(({ phase }) => phase === 'bootstrap'),
@@ -41,15 +46,8 @@ export function publicStartupBundleUrls(
   return [
     ...new Set(
       batches.flatMap((batch) => {
-        const sealed =
-          batch &&
-          release.bundles.find(
-            ({ reference, revision }) =>
-              reference === batch.url && revision === batch.rev,
-          );
-        if (!sealed) return [];
-        const url = release.root + 'bundles/' + sealed.sha256 + '.js';
-        return publicBundlePath.test(url) ? [url] : [];
+        const packet = batch && findPublicProfileBundle(release, batch);
+        return packet ? [packet.url] : [];
       }),
     ),
   ];

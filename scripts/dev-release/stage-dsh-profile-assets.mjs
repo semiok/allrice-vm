@@ -95,16 +95,64 @@ export async function stageDshProfileAssets(root, sourceSha) {
   const target = join(publicRoot, stamp);
   const staging = await mkdtemp(join(next, '.dsh-profile-'));
 
-  async function copy(path, output) {
+  async function readAsset(path) {
     const proof = proofs.get(path);
     if (!proof || !file.test(path) || !sha.test(proof.sha256))
       throw new Error('Missing Employee Web public asset proof');
     const bytes = await readRegular(join(source, path));
     if (bytes.length !== proof.bytes || digest(bytes) !== proof.sha256)
       throw new Error('Employee Web public asset differs from the seal');
+    return bytes;
+  }
+
+  async function writeAsset(output, bytes) {
     const destination = join(staging, output);
     await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, bytes, { flag: 'wx' });
+  }
+
+  function batchTrailer(reference) {
+    return Buffer.from(
+      '//# sourceMappingURL=' +
+        reference
+          .slice('plugins/'.length)
+          .replaceAll('/client.js', '/client.js.map') +
+        '\n',
+    );
+  }
+
+  const graph = manifest.profile.graph;
+  const resources = new Map(
+    manifest.profile.files.map((row) => [row.reference, row]),
+  );
+
+  // rc.2 emits each module's registration bytes followed by the batch's
+  // revision-specific source-map comment. Prove the ranges against both the
+  // sealed separate responses and the sealed aggregate before advertising them.
+  async function bundleLayout(batch, bytes) {
+    const entries = [];
+    let offset = 0;
+    for (const id of batch.entries) {
+      const entry = graph.entries.find((item) => item.id === id);
+      const single = await readAsset(resources.get(entry?.url)?.path);
+      const trailer = batchTrailer(entry.url);
+      const length = single.length - trailer.length;
+      if (
+        length <= 0 ||
+        !single.subarray(length).equals(trailer) ||
+        !bytes
+          .subarray(offset, offset + length)
+          .equals(single.subarray(0, length))
+      )
+        throw new Error(
+          'Employee Web batch differs from sealed module registrations',
+        );
+      entries.push({ id, offset, length });
+      offset += length;
+    }
+    if (!bytes.subarray(offset).equals(batchTrailer(batch.url)))
+      throw new Error('Invalid Employee Web public bundle trailer');
+    return { phase: batch.phase, byteLength: bytes.length, entries };
   }
 
   try {
@@ -114,10 +162,10 @@ export async function stageDshProfileAssets(root, sourceSha) {
     const required = [managedEntry, 'managed/employee-web-entry.css'];
     if (required.some((path) => !paths.includes(path)))
       throw new Error('Employee Web public entry is missing');
-    for (const path of paths) await copy(path, path);
+    for (const path of paths) await writeAsset(path, await readAsset(path));
 
     const bundles = [];
-    for (const batch of manifest.profile.graph.batches) {
+    for (const batch of graph.batches) {
       if (!['bootstrap', 'application'].includes(batch.phase)) continue;
       const rows = manifest.profile.files.filter(
         (row) => row.reference === batch.url,
@@ -134,15 +182,17 @@ export async function stageDshProfileAssets(root, sourceSha) {
         typeof batch.rev !== 'string'
       )
         throw new Error('Invalid Employee Web public bundle proof');
+      const bytes = await readAsset(row.path);
       const path = 'bundles/' + row.sha256 + '.js';
       if (!bundles.some((entry) => entry.sha256 === row.sha256)) {
-        await copy(row.path, path);
+        await writeAsset(path, bytes);
         paths.push(path);
       }
       bundles.push({
         reference: batch.url,
         revision: batch.rev,
         sha256: row.sha256,
+        layout: await bundleLayout(batch, bytes),
       });
     }
     const kernel = JSON.parse(
