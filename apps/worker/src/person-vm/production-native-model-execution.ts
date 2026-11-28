@@ -1,4 +1,3 @@
-import type { getDatabase } from '@allrice/database';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
