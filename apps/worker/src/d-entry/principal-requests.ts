@@ -100,7 +100,7 @@ export type DEntryPageHandle = Readonly<{
   authorizeFollow(
     nativeSessionId: string,
     signal: AbortSignal,
-  ): Promise<boolean>;
+  ): Promise<(() => Promise<void>) | undefined>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -677,28 +677,41 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     active.throwIfAborted();
                   },
                   async authorizeFollow(nativeSessionId, active) {
-                    await assertCurrent(active);
-                    if (nativeSessionId === pin?.rootNativeSessionId)
-                      return false;
                     // Create/fork can start following its new native root before
                     // the browser installs the new page. Only its actual durable
                     // registration can bridge that opening.
                     const registered = registeredRoots.get(nativeSessionId);
-                    if (registered?.identity.threadId) {
-                      const next = await deps.root(auth.context, {
-                        ...input.selection,
-                        threadId: registered.identity.threadId,
-                      });
-                      if (!sameRoot(next, registered)) throw denied();
-                      active.throwIfAborted();
-                      return true;
+                    const threadId = registered?.identity.threadId;
+                    if (registered && threadId) {
+                      const registeredPin = async () => {
+                        await assertCurrent(active);
+                        const next = await deps.root(auth.context, {
+                          ...input.selection,
+                          threadId,
+                        });
+                        if (!sameRoot(next, registered)) throw denied();
+                        active.throwIfAborted();
+                        return next;
+                      };
+                      await ownThreadWork(() =>
+                        resolveDEntryNativeResource({
+                          ...auth,
+                          identity: registered.identity,
+                          nativeSessionId,
+                          owner: catalog.owner,
+                          signal: active,
+                          root: registeredPin,
+                        }),
+                      );
+                      return async () => {
+                        await registeredPin();
+                      };
                     }
-                    // Any descendant read that was already dispatched must
+                    // Any native read already dispatched for opening must
                     // settle before a normal switch retires the old catalog.
                     await ownThreadWork(() =>
                       authorize(nativeSessionId, 'read', active),
                     );
-                    return false;
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
                     await assertCurrent(active);

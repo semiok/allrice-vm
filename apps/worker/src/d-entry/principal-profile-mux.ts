@@ -537,7 +537,7 @@ function pageStreams(
     const id = frame.streamId;
     let settled = false;
     let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
-    let newRoot: string | undefined;
+    let verifyRegistration: (() => Promise<void>) | undefined;
     let followedId: string | undefined;
     let openingSent = false;
     let buffered = 0;
@@ -574,7 +574,7 @@ function pageStreams(
               ? address.sessionId
               : address.childSessionId;
           followedId = id;
-          if (await page.authorizeFollow(id, child)) newRoot = id;
+          verifyRegistration = await page.authorizeFollow(id, child);
         }
         follow = await page.watchFollow(child);
       }
@@ -624,7 +624,7 @@ function pageStreams(
             while ((pending = follow.pending())) await pending;
             follow.signal.throwIfAborted();
           } else await page.assertCurrent(child);
-          if (newRoot) await page.authorizeFollow(newRoot, child);
+          if (verifyRegistration) await verifyRegistration();
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           openingSent = true;
