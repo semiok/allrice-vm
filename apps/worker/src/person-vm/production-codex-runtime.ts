@@ -329,7 +329,9 @@ export async function createProductionCodexRuntime(
   let catalog:
     | Promise<Awaited<ReturnType<typeof openCodexGeneration>>['modelMetadata']>
     | undefined;
+  let catalogDisposal: Promise<unknown> | undefined;
   function readCatalogModelMetadata(signal: AbortSignal) {
+    revoked.throwIfAborted();
     signal.throwIfAborted();
     return (catalog ??= (async () => {
       const host = new Context();
@@ -348,17 +350,22 @@ export async function createProductionCodexRuntime(
             },
           })
           .await();
-        const all = await Promise.all(
+        const results = await Promise.allSettled(
           PlatformModelConfigurationSchema.shape.workModel.options.map((id) =>
-            host.llm.resolveModelInfo(provider, id, lifetime),
+            host.llm.resolveModelInfo(provider, id, revoked),
           ),
         );
+        const all = results.map((result) => {
+          if (result.status === 'rejected') throw result.reason;
+          return result.value;
+        });
         return {
           modelInfo: all.find(({ id }) => id === model)!,
           historicalModels: all.filter(({ id }) => id !== model),
         };
       } finally {
-        await host.fiber.dispose();
+        catalogDisposal = Promise.resolve().then(() => host.fiber.dispose());
+        await catalogDisposal;
       }
     })()).then((info) => {
       signal.throwIfAborted();
@@ -420,7 +427,9 @@ export async function createProductionCodexRuntime(
     return (closing = Promise.allSettled([
       transport.close(),
       oauthStopped,
-      catalog,
+      // The lookup may have failed while its Context joined successfully.
+      // Wait for every lookup, then check the actual disposal result.
+      Promise.allSettled([catalog]).then(() => catalogDisposal),
       operations.then(async () => {
         if (generation) retire(generation);
         await Promise.allSettled([...retiring]);

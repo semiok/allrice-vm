@@ -188,18 +188,23 @@ suite(
           expect(notify).toHaveBeenCalledWith(device, 'work'),
         );
         await admin`select pg_terminate_backend(${first!.pid})`;
-        await vi.waitFor(
+        const replacementPid = await vi.waitFor(
           async () => {
             const [replacement] = await subscriptionPids();
             expect(replacement?.pid).toBeDefined();
             expect(replacement?.pid).not.toBe(first!.pid);
+            return replacement!.pid;
           },
           { timeout: 5000 },
         );
         await close();
-        await vi.waitFor(async () =>
-          expect(await subscriptionPids()).toEqual([]),
-        );
+        await vi.waitFor(async () => {
+          expect(
+            await admin`
+            select pid from pg_stat_activity where pid = ${replacementPid}
+          `,
+          ).toEqual([]);
+        });
         await expect(web`select 1 as healthy`).resolves.toMatchObject([
           { healthy: 1 },
         ]);

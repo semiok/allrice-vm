@@ -478,8 +478,11 @@ export function createProductionPersonVmHost(input: {
       // Construction may be held in real I/O. Join it before taking the owner
       // snapshot; a late returned source must never escape rollback.
       await prepared;
-      async function settle(tasks: (() => Promise<unknown>)[]) {
-        independentCloseFailures.push(...(await collectFailures(tasks)));
+      const failedStages: string[] = [];
+      async function settle(stage: string, tasks: (() => Promise<unknown>)[]) {
+        const failures = await collectFailures(tasks);
+        if (failures.length) failedStages.push(stage);
+        independentCloseFailures.push(...failures);
       }
       // Each close fences its own ingress synchronously and joins owned work.
       const installation = installed,
@@ -487,8 +490,8 @@ export function createProductionPersonVmHost(input: {
         authorityOwner = current,
         startupOwner = startup,
         sourceOwner = bound;
-      if (scheduledWake) await settle([scheduledWake.close]);
-      await settle([
+      if (scheduledWake) await settle('scheduled_wake', [scheduledWake.close]);
+      await settle('host_sources', [
         ...(installation ? [() => installation.close()] : []),
         ...(preparation ? [() => preparation.close()] : []),
         ...(authorityOwner ? [() => authorityOwner.close()] : []),
@@ -499,6 +502,7 @@ export function createProductionPersonVmHost(input: {
       ]);
       while (pending.size) await Promise.allSettled([...pending]);
       await settle(
+        'native_subscriptions',
         [...nativeSubscriptions].map(
           (subscription) => () => subscription.close(),
         ),
@@ -513,11 +517,13 @@ export function createProductionPersonVmHost(input: {
         : [];
       const capacityDatabase = modelCapacityDatabase;
       if (capacityDatabase)
-        await settle([() => capacityDatabase.end({ timeout: 5 })]);
+        await settle('model_capacity_listener', [
+          () => capacityDatabase.end({ timeout: 5 }),
+        ]);
       const closeTransport =
         sourceOwner?.model.closeTransport ??
         sourceOwner?.model.transport?.close;
-      if (closeTransport) await settle([closeTransport]);
+      if (closeTransport) await settle('model_transport', [closeTransport]);
       if (closeTransport && modelOwner?.reconcileClosedOwner && providers) {
         const cleanup = AbortSignal.timeout(
           providers.configuration.lifecycle.cleanupTimeoutMs,
@@ -538,7 +544,8 @@ export function createProductionPersonVmHost(input: {
       }
       // The lifetime drain may have started before an exact stop. Verify the
       // remaining owners after every stop/receipt retry has joined.
-      if (startupOwner) await settle([() => startupOwner.close()]);
+      if (startupOwner)
+        await settle('native_startup', [() => startupOwner.close()]);
       const providerOwner = providers;
       const installationFailures = providerOwner
         ? await collectFailures([
@@ -556,7 +563,7 @@ export function createProductionPersonVmHost(input: {
       )
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       if (sourceOwner && !modelRecovery)
-        await settle([() => sourceOwner.egress.close()]);
+        await settle('source_egress', [() => sourceOwner.egress.close()]);
       input.lifetime.removeEventListener('abort', aborted);
       const errors = [
         ...independentCloseFailures,
@@ -566,8 +573,21 @@ export function createProductionPersonVmHost(input: {
         ...installationFailures,
         ...modelFailures,
       ];
-      if (errors.length)
+      if (errors.length) {
+        // Report only internal stage names. Provider errors can contain
+        // connection details and belong to the local recovery owner.
+        console.error('[person-vm] Host close unconfirmed', {
+          failedStages: [
+            ...failedStages,
+            ...(uncertainPreparation.size ? ['egress_preparation'] : []),
+            ...(vmFailures.length ? ['vm_readback'] : []),
+            ...(receiptFailures.length ? ['egress_receipts'] : []),
+            ...(installationFailures.length ? ['egress_installation'] : []),
+            ...(modelFailures.length ? ['model_gateway'] : []),
+          ],
+        });
         throw new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE');
+      }
     });
     stopped.abort(new ProductionPersonVmHostUnavailable('HOST_CLOSED'));
     return closing;
