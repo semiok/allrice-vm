@@ -4,6 +4,11 @@ import { PHASE_PRODUCTION_BUILD } from 'next/constants.js';
 const nextConfig: NextConfig = {
   poweredByHeader: false,
   compress: true,
+  experimental: {
+    // A 50 MiB materials upload takes 69,905,068 bytes in Base64. Allow
+    // the JSON envelope too; the publication handler enforces the file cap.
+    proxyClientMaxBodySize: 70_100_000,
+  },
   serverExternalPackages: [
     '@deepseek-ai/dsh-office-to-pdf',
     '@deepseek-ai/libreoffice-kit',
