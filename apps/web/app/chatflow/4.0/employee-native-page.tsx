@@ -28,6 +28,7 @@ import {
   pageNativeThreadSelected,
   pageRevoked,
   pageStartupFailed,
+  readPageMessage,
 } from '../../../lib/d-entry/page-messages';
 import {
   cancelEmployeeCapacityWait,
@@ -614,23 +615,24 @@ export function EmployeeNativePage({
         });
     }
     const receive = (event: MessageEvent) => {
+      const data = readPageMessage(
+        event,
+        frame.current?.contentWindow,
+        scopeId,
+      );
+      if (!data) return;
       if (
-        event.origin !== location.origin ||
-        event.source !== frame.current?.contentWindow ||
-        !scopeId ||
-        event.data?.scopeId !== scopeId
+        data.type === pageMuxAttach &&
+        event.ports.length === 1 &&
+        (data.resourceScopeId === undefined ||
+          typeof data.resourceScopeId === 'string')
       )
-        return;
-      if (event.data.type === pageMuxAttach && event.ports.length === 1)
-        carrier?.attachMux(
-          event.ports[0]!,
-          event.data.resourceScopeId ?? scopeId,
-        );
-      if (event.data.type === pageSwitchReady) switchReady = true;
+        carrier?.attachMux(event.ports[0]!, data.resourceScopeId ?? scopeId);
+      if (data.type === pageSwitchReady) switchReady = true;
       if (
-        event.data.type === pageThreadSwitchPrepared &&
+        data.type === pageThreadSwitchPrepared &&
         switching &&
-        switching.requestId === event.data.requestId &&
+        switching.requestId === data.requestId &&
         !switching.submitted &&
         !navigating &&
         !detached &&
@@ -638,9 +640,9 @@ export function EmployeeNativePage({
       )
         submitSwitch(switching);
       if (
-        event.data.type === pageThreadSelected &&
+        data.type === pageThreadSelected &&
         switching?.scopeId &&
-        event.data.resourceScopeId === switching.scopeId &&
+        data.resourceScopeId === switching.scopeId &&
         !navigating &&
         !detached &&
         !remoteRevoked
@@ -661,27 +663,25 @@ export function EmployeeNativePage({
         nextQuery.current = displayedQuery.current = query;
         history.pushState(history.state, '', '/chatflow/4.0?' + query);
       }
-      if (event.data.type === pageClosing) {
+      if (data.type === pageClosing) {
         navigationClosed = true;
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
-      if (event.data.type === pageStartupFailed) {
+      if (data.type === pageStartupFailed) {
         if (prepare)
-          finish(
-            event.data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed',
-          );
+          finish(data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed');
         else {
           setFailed(true);
           void close();
         }
       }
-      if (event.data.type === pageDocumentReady) {
+      if (data.type === pageDocumentReady) {
         documentStarted = true;
         if (replacing || remoteRevoked) send(pageRevoked);
       }
       if (
-        event.data.type === pageEditorMounted &&
+        data.type === pageEditorMounted &&
         prepare &&
         !navigating &&
         !remoteRevoked
@@ -702,19 +702,19 @@ export function EmployeeNativePage({
         }
       }
       if (
-        event.data.type === pageCompletion &&
-        ['closed', 'unknown'].includes(event.data.state)
+        data.type === pageCompletion &&
+        (data.state === 'closed' || data.state === 'unknown')
       ) {
         navigationClosed = true;
-        local.resolve(event.data.state);
+        local.resolve(data.state);
       }
-      if (event.data.type === pageNativeThreadSelected) {
-        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+      if (data.type === pageNativeThreadSelected) {
+        const next = DEntrySelectionInputSchema.safeParse(data.selection);
         if (
           !prepare ||
           !carrier ||
           switching?.submitted ||
-          event.data.resourceScopeId !== resourceScopeId ||
+          data.resourceScopeId !== resourceScopeId ||
           !next.success ||
           !next.data.threadId ||
           next.data.workspaceId !== selectedEmployee?.workspaceId ||
@@ -742,7 +742,7 @@ export function EmployeeNativePage({
         history.replaceState(history.state, '', '/chatflow/4.0?' + query);
       }
       if (
-        event.data.type === pageEmployeeArchived &&
+        data.type === pageEmployeeArchived &&
         prepare &&
         !navigating &&
         !detached &&
@@ -761,8 +761,8 @@ export function EmployeeNativePage({
         });
         return;
       }
-      if (event.data.type === pageNavigate) {
-        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+      if (data.type === pageNavigate) {
+        const next = DEntrySelectionInputSchema.safeParse(data.selection);
         if (
           !next.success ||
           !carrier ||
@@ -813,7 +813,7 @@ export function EmployeeNativePage({
             },
             location.origin,
           );
-        } else navigate(selection, event.data.reopen === true);
+        } else navigate(selection, data.reopen === true);
       }
     };
     window.addEventListener('message', receive);
@@ -1034,7 +1034,10 @@ export function EmployeeNativePage({
           title="员工工作区"
           data-page-mux="v1"
           src={source}
-          onLoad={(event) => loaded.current?.(event.currentTarget)}
+          onLoad={(event) => {
+            if (event.nativeEvent.isTrusted)
+              loaded.current?.(event.currentTarget);
+          }}
           referrerPolicy="no-referrer"
           className={
             prepare && status !== 'ready' ? styles.startingFrame : undefined

@@ -43,6 +43,112 @@ import {
   otherToken,
 } from './principal-page-carrier.fixture.js';
 
+// Install the child fixture in the actual document response. A Playwright
+// init script may first run in the iframe's initial about:blank document.
+function walletInterference(
+  child: boolean,
+  denied: boolean,
+  ownedError: boolean,
+  writeDenied = false,
+) {
+  return String.raw`(() => {
+    if ((window !== parent) !== ${child}) return;
+    if (${denied}) {
+      const blocked = () => {
+        throw new DOMException('Access to storage is not allowed from this context', 'SecurityError');
+      };
+      for (const name of ['localStorage', 'caches', 'indexedDB'])
+        Object.defineProperty(window, name, { get: blocked });
+      Object.defineProperty(Storage.prototype, 'getItem', { value: blocked });
+    }
+    if (${writeDenied}) {
+      const write = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (key, value) {
+        if (this === localStorage && key.includes('/dsh.conversation.'))
+          throw new DOMException('Synthetic draft quota', 'QuotaExceededError');
+        return write.call(this, key, value);
+      };
+    }
+    const noise = { target: 'metamask-inpage', data: { name: 'ObjectMultiplex' } };
+    let bursts = 0;
+    const timer = setInterval(() => {
+      const peer = ${child} ? parent : document.querySelector('iframe')?.contentWindow;
+      if (!peer) return;
+      const scopeId = document.getElementById('app')?.dataset.scopeId;
+      for (let i = 0; i < 24; i++)
+        peer.postMessage({ ...noise, scopeId }, location.origin);
+      document.documentElement.dataset.walletBursts = String(++bursts);
+      if (bursts === 40) clearInterval(timer);
+    }, 10);
+    if (!${child}) return;
+    const errorListeners = new Set();
+    const add = window.addEventListener;
+    const remove = window.removeEventListener;
+    window.addEventListener = function (type, listener, options) {
+      if (type === 'error' && options === undefined) errorListeners.add(listener);
+      return add.call(this, type, listener, options);
+    };
+    window.removeEventListener = function (type, listener, options) {
+      if (type === 'error' && options === undefined) errorListeners.delete(listener);
+      return remove.call(this, type, listener, options);
+    };
+    const append = Element.prototype.append;
+    Element.prototype.append = function (...nodes) {
+      const registration = nodes.find(node => node instanceof HTMLScriptElement && node.textContent);
+      if (this !== document.head || !registration || errorListeners.size === 0 ||
+          document.documentElement.hasAttribute('data-wallet-registration-noise'))
+        return append.apply(this, nodes);
+      document.documentElement.dataset.walletRegistrationNoise = '1';
+      const recordOwnedScript = (event) => {
+        if (event.message?.includes('Owned bundle registration failed'))
+          parent.document.documentElement.dataset.walletErrorOwner =
+            document.currentScript === registration ? 'bundle' : 'unknown';
+      };
+      if (${ownedError}) {
+        registration.textContent += "\n;throw Error('Owned bundle registration failed');";
+        add.call(window, 'error', recordOwnedScript);
+        try {
+          return append.apply(this, nodes);
+        } finally {
+          remove.call(window, 'error', recordOwnedScript);
+        }
+      }
+      if (${denied}) {
+        const scopeId = document.getElementById('app').dataset.scopeId;
+        parent.dispatchEvent(new MessageEvent('message', {
+          origin: location.origin, source: window,
+          data: { type: 'allrice:d-entry:startup-failed', scopeId },
+        }));
+        window.dispatchEvent(new MessageEvent('message', {
+          origin: location.origin, source: parent,
+          data: { type: 'allrice:d-entry:revoked', scopeId },
+        }));
+      }
+      const scopeId = document.getElementById('app').dataset.scopeId;
+      window.postMessage({ type: 'allrice:d-entry:revoked', scopeId }, location.origin);
+      parent.postMessage({ type: 'allrice:d-entry:startup-failed', scopeId: 'stale' }, location.origin);
+      const injected = document.createElement('script');
+      injected.textContent = "throw Error('Wallet content script noise');";
+      const recordInjectedScript = (event) => {
+        if (event.message?.includes('Wallet content script noise'))
+          parent.document.documentElement.dataset.walletErrorOwner =
+            document.currentScript === injected ? 'extension' : 'unknown';
+      };
+      add.call(window, 'error', recordInjectedScript);
+      try {
+        append.call(this, injected);
+      } finally {
+        remove.call(window, 'error', recordInjectedScript);
+        injected.remove();
+      }
+      const extra = document.createElement('script');
+      extra.src = '/wallet-extension-chunk.js';
+      append.call(this, extra);
+      append.apply(this, nodes);
+    };
+  })();`;
+}
+
 const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
@@ -62,6 +168,10 @@ it
     'sidebar-create-after-switch',
     'native-title',
     'native-title-reopen',
+    'wallet-storage',
+    'wallet-write',
+    'wallet-messages',
+    'wallet-owned-error',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -81,7 +191,8 @@ it
       sidebarCreate ||
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const wallet = scenario.startsWith('wallet-');
+    const realShell = switching || nativeCreate || coldAssets || wallet;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -1103,8 +1214,9 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
+          ${wallet ? '<script>' + walletInterference(true, scenario === 'wallet-storage', scenario === 'wallet-owned-error', scenario === 'wallet-write') + '</script>' : ''}
           ${coldAssets ? nativeStyles : ''}
-          <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
+          <link rel="stylesheet" data-allrice-document-asset="style" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
@@ -1114,7 +1226,7 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
+          <script type="module" data-allrice-document-asset="entry" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
       } catch {
         response.writeHead(500).end();
       }
@@ -1151,6 +1263,10 @@ it
         );
       });
     }
+    if (wallet)
+      await page.addInitScript({
+        content: walletInterference(false, false, false),
+      });
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
       page.on('request', (request) => {
@@ -1316,6 +1432,28 @@ it
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
+    if (scenario === 'wallet-owned-error') {
+      try {
+        await page.getByRole('alert').waitFor({ timeout: 12_000 });
+        expect(errors).toContain('Owned bundle registration failed');
+        expect(
+          await page.locator('html').getAttribute('data-wallet-error-owner'),
+        ).toBe('bundle');
+        expect(workspaceBaselines).toHaveLength(0);
+      } catch (cause) {
+        throw Error(
+          JSON.stringify({
+            errors,
+            heading: await page.getByRole('heading').allInnerTexts(),
+            scopedBundleReads,
+            workspaces: workspaceBaselines.length,
+          }),
+          { cause },
+        );
+      }
+      await context.close();
+      return;
+    }
     if (coldAssets) {
       const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
       await expect
@@ -1565,6 +1703,93 @@ it
         observedTitle,
         currentTitle,
       ]);
+      await context.close();
+      return;
+    }
+    if (wallet) {
+      expect(await editor.innerText()).toContain('未发送的原生草稿');
+      await expect.poll(() => page.locator('iframe').isVisible()).toBe(true);
+      expect(
+        await page.getByRole('heading', { name: '工作台已就绪' }).count(),
+      ).toBe(0);
+      await page
+        .locator('html[data-wallet-bursts]')
+        .waitFor({ state: 'attached' });
+      const childRoot = workbench.locator('html');
+      expect(await childRoot.getAttribute('data-wallet-bursts')).toBeTruthy();
+      expect(
+        await childRoot.getAttribute('data-wallet-registration-noise'),
+        JSON.stringify({ errors, scopedBundleReads, earlyUrls }),
+      ).toBe('1');
+      expect(errors).toContain('Wallet content script noise');
+      expect(
+        await page.locator('html').getAttribute('data-wallet-error-owner'),
+      ).toBe('extension');
+      expect(errors).not.toContain(
+        'Access to storage is not allowed from this context',
+      );
+      await expect
+        .poll(() => errors.includes('404 /wallet-extension-chunk.js'))
+        .toBe(true);
+      if (scenario === 'wallet-write') {
+        const persisted = await workbench
+          .locator('#app')
+          .evaluate((node: HTMLElement) => {
+            const {
+              organizationId,
+              viewerId,
+              workspaceId,
+              employeeInstanceId,
+              threadId,
+            } = node.dataset;
+            const employeeNamespace =
+              'allrice:d-entry:conversation:v1:' +
+              [organizationId, viewerId, workspaceId, employeeInstanceId].join(
+                '/',
+              ) +
+              '/';
+            const namespace = employeeNamespace + threadId + '/';
+            const otherDraft = namespace + 'dsh.conversation.old';
+            parent.localStorage.setItem(otherDraft, 'kept draft');
+            const next = 'dsh.conversation.root';
+            localStorage.setItem(next, 'volatile draft');
+            const seen: string[] = [];
+            window.addEventListener('storage', (event) => {
+              if (
+                event.key?.endsWith('/other/dsh.conversation.other') ||
+                event.key === 'wallet-visible-preference'
+              ) {
+                seen.push(event.key);
+                node.dataset.walletStorageEvents = JSON.stringify(seen);
+              }
+            });
+            parent.localStorage.setItem(
+              employeeNamespace + 'other/dsh.conversation.other',
+              'other employee draft',
+            );
+            parent.localStorage.setItem(
+              'wallet-visible-preference',
+              'visible preference',
+            );
+            return {
+              old: localStorage.getItem('dsh.conversation.old'),
+              draft: localStorage.getItem(next),
+              persisted: parent.localStorage.getItem(namespace + next),
+            };
+          });
+        expect(persisted).toEqual({
+          old: 'kept draft',
+          draft: 'volatile draft',
+          persisted: null,
+        });
+        await expect
+          .poll(() =>
+            workbench
+              .locator('#app')
+              .getAttribute('data-wallet-storage-events'),
+          )
+          .toBe(JSON.stringify(['wallet-visible-preference']));
+      }
       await context.close();
       return;
     }
@@ -2809,7 +3034,7 @@ it.skipIf(!browserExecutable)(
     for (const scenario of [
       'navigate',
       'unknown',
-      'child-hides',
+      'synthetic-child-hide',
       'query',
       'query-unknown',
       'query-roundtrip',
@@ -2832,23 +3057,30 @@ it.skipIf(!browserExecutable)(
         f.registerThread(next.threadId);
         if (scenario.startsWith('query')) {
           await select(page, next);
-        } else
-          await frame.evaluate(
-            ({ scenario, scopeId, next }) => {
-              if (scenario === 'child-hides')
-                window.dispatchEvent(new Event('pagehide'));
-              else
-                parent.postMessage(
-                  {
-                    type: 'allrice:d-entry:navigate',
-                    scopeId,
-                    selection: next,
-                  },
-                  location.origin,
-                );
-            },
-            { scenario, scopeId, next },
+        } else if (scenario === 'synthetic-child-hide') {
+          await frame.evaluate(() =>
+            window.dispatchEvent(new Event('pagehide')),
           );
+          expect((await f.invoke(scopeId)).status).toBe(200);
+          expect(blocked.destroyed).toBe(false);
+          await page
+            .locator('iframe')
+            .evaluate((node: HTMLIFrameElement, scopeId) => {
+              node.contentWindow!.postMessage(
+                { type: 'allrice:d-entry:revoked', scopeId },
+                location.origin,
+              );
+            }, scopeId);
+        } else {
+          await frame.evaluate(
+            ({ scopeId, next }) =>
+              parent.postMessage(
+                { type: 'allrice:d-entry:navigate', scopeId, selection: next },
+                location.origin,
+              ),
+            { scopeId, next },
+          );
+        }
         await cancelled.promise;
         expect(blocked.destroyed).toBe(true);
         expect(blocked.writableFinished).toBe(false);
@@ -2930,6 +3162,12 @@ it.skipIf(!browserExecutable)(
           if (phase === 'style') style.writeHead(503).end();
           else {
             const early = await earlyTransfer.promise;
+            const child = page
+              .frames()
+              .find((frame) => frame.url().includes(scopeId));
+            await child!.evaluate(() =>
+              window.dispatchEvent(new Event('load')),
+            );
             await select(page, next);
             await earlyClose.promise;
             expect(early.writableFinished).toBe(false);

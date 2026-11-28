@@ -66,7 +66,6 @@ function boot(
           return { state: 'closed' };
         });
     const finish = (state: EmployeeWebEntryClose['state']) => {
-      window.removeEventListener('pagehide', close);
       documentOwner.signal.removeEventListener('abort', close);
       if (scope.__DSH_TRANSPORT__ === profile?.transport)
         delete scope.__DSH_TRANSPORT__;
@@ -112,7 +111,6 @@ function boot(
       cancel: document.cancel,
       cleanup: document.close,
     });
-    window.addEventListener('pagehide', close, { once: true });
     documentOwner.signal.addEventListener('abort', close, { once: true });
     void entry.started.then((result) => {
       if (result.state === 'ready' && !document.signal.aborted && !closing)

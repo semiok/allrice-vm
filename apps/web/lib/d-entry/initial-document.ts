@@ -4,6 +4,7 @@ import {
   pageDocumentReady,
   pageRevoked,
   pageStartupFailed,
+  readPageMessage,
 } from './page-messages.ts';
 
 import {
@@ -116,17 +117,25 @@ export const initialDocumentLifecycle = `(() => {
       if (document.readyState === 'complete') finish('closed');
     }
   };
+  const readMessage = (${readPageMessage.toString()});
   const received = (event) => {
-    if (event.source === parent && event.origin === location.origin &&
-        event.data?.scopeId === scopeId && event.data.type === protocol.revoke) stop();
+    if (readMessage(event, parent, scopeId)?.type === protocol.revoke) stop();
   };
   const error = (event) => {
-    const asset = event.target?.dataset?.allriceDocumentAsset;
-    if (!asset) return;
+    const asset = event.target;
+    if (!event.isTrusted || !(
+      (asset instanceof HTMLScriptElement && asset.type === 'module' &&
+        asset.dataset.allriceDocumentAsset === 'entry') ||
+      (asset instanceof HTMLLinkElement && asset.rel === 'stylesheet' &&
+        asset.dataset.allriceDocumentAsset === 'style')
+    )) return;
     send(protocol.fail);
     stop();
   };
-  const loaded = () => {
+  const leaving = (event) => { if (event.isTrusted) stop(); };
+  const loaded = (event) => {
+    if (!event.isTrusted) return;
+    window.removeEventListener('load', loaded);
     if (controller.signal.aborted && !claimed) finish('closed');
   };
   const finish = (state) => {
@@ -134,7 +143,7 @@ export const initialDocumentLifecycle = `(() => {
     complete = true;
     window.removeEventListener('message', received);
     window.removeEventListener('error', error, true);
-    window.removeEventListener('pagehide', stop);
+    window.removeEventListener('pagehide', leaving);
     window.removeEventListener('load', loaded);
     if (earlyBundles) {
       earlyBundles.cancel();
@@ -143,8 +152,8 @@ export const initialDocumentLifecycle = `(() => {
   };
   window.addEventListener('error', error, true);
   window.addEventListener('message', received);
-  window.addEventListener('pagehide', stop, { once: true });
-  window.addEventListener('load', loaded, { once: true });
+  window.addEventListener('pagehide', leaving);
+  window.addEventListener('load', loaded);
   globalThis.__ALLRICE_EMPLOYEE_DOCUMENT__ = Object.freeze({
     scopeId,
     signal: controller.signal,
