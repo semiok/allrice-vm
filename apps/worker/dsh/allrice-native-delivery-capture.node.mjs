@@ -217,10 +217,11 @@ test('keeps native success behind the exact archive acknowledgement', async (t) 
     result,
     async () => ({ kind: 'accept' }),
   );
-  assert.equal(
-    (await receive({ action: 'delivery-pending' }).json()).length,
-    1,
-  );
+  await nextTick();
+  const [second] = await receive({ action: 'delivery-pending' }).json();
+  assert.equal(second.callId, offer.callId);
+  assert.notEqual(second.callSequence, offer.callSequence);
+  assert.notEqual(second.attemptId, offer.attemptId);
   lifetime.abort();
   assert.equal((await interrupted).kind, 'block');
   assert.deepEqual(await receive({ action: 'delivery-pending' }).json(), []);

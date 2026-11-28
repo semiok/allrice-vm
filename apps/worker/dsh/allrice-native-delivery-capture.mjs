@@ -262,6 +262,8 @@ export function observeNativeDeliveries(
       return next();
     attempt.calls.delete(exec.callId);
     executing.set(exec.token, null);
+    const forget = () => executing.delete(exec.token);
+    signal.addEventListener('abort', forget, { once: true });
     try {
       const cwd = await scope.workingDirectory.ensure(exec.agent, signal);
       const finish = await captureNativeDelivery(
@@ -273,6 +275,7 @@ export function observeNativeDeliveries(
       );
       const result = await next();
       if (
+        !signal.aborted &&
         !result.isError &&
         result.value?.turn === attempt.turn &&
         attempts.get(session) === attempt &&
@@ -288,6 +291,7 @@ export function observeNativeDeliveries(
           cursor: attempt.cursor,
           callId: exec.callId,
           callSequence,
+          forget,
         });
       } else {
         executing.delete(exec.token);
@@ -307,6 +311,7 @@ export function observeNativeDeliveries(
     if (exec.name !== 'present' || !exec.agent) return next();
     const found = executing.get(exec.token);
     executing.delete(exec.token);
+    found?.signal.removeEventListener('abort', found.forget);
     if (result.isError) return next();
     if (!found || !isLive(found.session)) return unavailable();
     const selected = await next();
@@ -337,7 +342,10 @@ export function observeNativeDeliveries(
   return function delivery(value) {
     const headers = { 'cache-control': 'no-store' };
     const live = (entry) =>
-      entry && !entry.signal.aborted && isLive(entry.session);
+      entry &&
+      !entry.signal.aborted &&
+      isLive(entry.session) &&
+      attempts.get(entry.session)?.attemptId === entry.attemptId;
     const proof = (
       ticket,
       { session, turn, callId, callSequence, attemptId, cursor },

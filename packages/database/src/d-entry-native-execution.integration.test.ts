@@ -21,7 +21,11 @@ import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
 import { authenticateSession, createSession } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import { createRunAuthorityFixture } from './run-authority.fixture.ts';
-import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
+import {
+  createRuntimeFixtureDatabase,
+  runtimeFixtureStorage,
+} from './runtime.fixture.ts';
+import { LocalStorageAdapter } from '../../storage/src/local.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1' ? describe : describe.skip;
@@ -230,20 +234,19 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       cursor: attempt.cursor,
       files: [{ path: file, base64: Buffer.from(bytes).toString('base64') }],
     });
-    const stored = new Map<string, string>();
+    const stored = new Map<string, Parameters<StoragePort['put']>[0]>();
+    const disk = runtimeFixtureStorage(db);
     const storage: StoragePort = {
       async put(object, content) {
-        stored.set(object.id, await new Response(content).text());
+        await disk.put(object, content);
+        stored.set(object.id, object);
       },
-      async get(object) {
-        return new Blob([stored.get(object.id)!]).stream();
-      },
+      get: (object) => disk.get(object),
       async delete(object) {
+        await disk.delete(object);
         stored.delete(object.id);
       },
-      async exists(object) {
-        return stored.has(object.id);
-      },
+      exists: (object) => disk.exists(object),
     };
     let boundaries = 0;
     const first = capture('first-present', 'exact first bytes');
@@ -281,18 +284,34 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     const assertCurrent = (
       tx: Parameters<typeof assertDEntryNativeDeliveryRun>[0],
     ) => assertDEntryNativeDeliveryRun(tx, candidate, owner, signal);
+    const begin = db.begin.bind(db);
+    let replies = 0;
+    const lostCommitReply = vi.spyOn(db, 'begin').mockImplementation(((
+      operation: Parameters<typeof db.begin>[0],
+    ) =>
+      begin(operation).then((committed) => {
+        if (++replies === 2) throw Error('fixture disconnected after COMMIT');
+        return committed;
+      })) as typeof db.begin);
+    try {
+      await expect(
+        publishCapturedDEntryDelivery(
+          candidate,
+          first,
+          storage,
+          assertCurrent,
+          signal,
+        ),
+      ).rejects.toThrow('fixture disconnected after COMMIT');
+    } finally {
+      lostCommitReply.mockRestore();
+    }
+    expect(await disk.exists(stored.get(pendingObject!.id)!)).toBe(true);
+    // A replacement reader recovers the committed receipt from the same disk.
     await publishCapturedDEntryDelivery(
       candidate,
       first,
-      storage,
-      assertCurrent,
-      signal,
-    );
-    // The same successful receipt can be requested after an ACK is lost.
-    await publishCapturedDEntryDelivery(
-      candidate,
-      first,
-      storage,
+      new LocalStorageAdapter(fixture.storageRoot),
       assertCurrent,
       signal,
     );
@@ -314,7 +333,9 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       pathDigest,
     );
     expect(latest).not.toBe(pendingObject?.id);
-    expect(stored.get(latest)).toBe('new immutable bytes');
+    expect(await new Response(await disk.get(stored.get(latest)!)).text()).toBe(
+      'new immutable bytes',
+    );
     expect(
       await findDEntryNativeDelivery(
         context,
