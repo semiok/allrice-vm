@@ -86,7 +86,14 @@ export function EmployeeFirstStart({
             scopeId: viewerId,
             headers,
             onEmployeeChanged: (instance) => {
-              if (!instance.archivedAt) window.location.assign('/chatflow/4.0');
+              if (!instance.archivedAt)
+                window.location.assign(
+                  '/chatflow/4.0?' +
+                    new URLSearchParams({
+                      workspaceId: instance.workspaceId,
+                      employeeInstanceId: instance.id,
+                    }),
+                );
             },
             onSessionChanged: () => {},
           }}

@@ -336,6 +336,36 @@ it('drains an already dispatched native create through registration and response
   expect(await receive('life')).toMatchObject({ type: 'end' });
 });
 
+it('fences a revoked page and sends closed only after the owned authority has joined', async () => {
+  const f = await fixture();
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const closing = deferred();
+  const release = deferred();
+  f.authorityClose.mockImplementationOnce(async () => {
+    closing.resolve();
+    await release.promise;
+  });
+  const fenced = once(revoked, 'abort');
+  const socketClosed = once(peer, 'close');
+  f.identityRevoked.abort(new DataAccessError('authorization_denied'));
+  try {
+    await fenced;
+    expect(await receive('life')).toMatchObject({
+      value: { type: 'revoked', scopeId },
+    });
+    await closing.promise;
+    expect((await f.invoke(scopeId)).status).toBe(404);
+    expect(peer.readyState).toBe(peer.OPEN);
+  } finally {
+    release.resolve();
+  }
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toEqual({ type: 'end', streamId: 'life' });
+  await socketClosed;
+});
+
 it('joins a cancelled target lookup and the old page on close during a handoff', async () => {
   const f = await fixture();
   const target = randomUUID();

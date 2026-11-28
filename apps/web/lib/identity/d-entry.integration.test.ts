@@ -643,17 +643,20 @@ suite(
           };
         },
       );
-      function temporary() {
+      function temporary(
+        _context: Parameters<typeof native.owner.acquirePrincipal>[0],
+        input: Parameters<typeof native.owner.acquirePrincipal>[1],
+      ) {
         return {
           close,
           run: async (): Promise<DEntryPrincipalControlScope> => ({
             opened: {
               type: 'opened',
-              scopeId: randomUUID(),
+              scopeId: input.scopeId,
               principal: {
                 kind: 'allrice-d-entry',
-                scopeId: randomUUID(),
-                identity: f.identity,
+                scopeId: input.scopeId,
+                identity: input.identity,
               },
               baseline: { type: 'baseline', owner: false, grants: [] },
             },
@@ -688,9 +691,21 @@ suite(
         };
       }
       vi.mocked(native.owner.acquirePrincipal).mockImplementation(temporary);
+      const prepare = vi.fn(async () => ({
+        key: 'verified-retained-root',
+        target: {
+          vmId: binding.vmId,
+          instanceId: null,
+          leaseEpoch: binding.leaseEpoch,
+        },
+      }));
+      const warm = vi.fn(async () => {
+        await fixture.db`update person_virtual_machines set phase='running' where vm_id=${binding.vmId}`;
+      });
       const server = await nativeEntryServer(native, {
         ...dEntryHttpDefaults,
         owners: native.deps.owners,
+        prewarm: { prepare, isCurrent: async () => true, prewarm: warm },
         data: native.deps.data,
         watch: (context, selection, identity, signal) =>
           watchDEntryNativeAuthority(
@@ -708,12 +723,14 @@ suite(
         change: unknown,
         employee = f.assignment,
         origin = 'https://allrice.test',
+        requestSignal?: AbortSignal,
       ) =>
         PATCH(
           new Request(
             `https://allrice.test/api/v1/sessions/${f.thread.id}?entry=4.0&workspaceId=${f.workspace}&employeeInstanceId=${employee}`,
             {
               method: 'PATCH',
+              signal: requestSignal,
               headers: {
                 origin,
                 host: 'allrice.test',
@@ -769,7 +786,22 @@ suite(
         await expect(
           requireDEntryNativeIdentity(f.context, f.selection),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await fixture.db`update person_virtual_machines set phase='stopped' where vm_id=${binding.vmId}`;
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
+        prepare.mockResolvedValueOnce({
+          key: 'wrong-disk',
+          target: { vmId: randomUUID(), instanceId: null, leaseEpoch: 1 },
+        });
+        expect((await patch({ archived: false })).status).toBe(503);
+        expect(warm).not.toHaveBeenCalled();
+        expect((await stored()).archived_at).toBeInstanceOf(Date);
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
         const restored = await patch({ archived: false });
+        expect(warm).toHaveBeenCalledOnce();
         expect(restored.status, await restored.clone().text()).toBe(200);
         expect(await stored()).toMatchObject({
           title: '发票核对',
@@ -778,6 +810,40 @@ suite(
         });
         expect(followed).toHaveBeenCalledTimes(2);
         expect(close).toHaveBeenCalledTimes(4);
+
+        // An idempotent native unarchive ACK alone cannot prove a vanished root.
+        const invocations = invokePage.mock.calls.length;
+        native.owner.readSessions.mockResolvedValueOnce({
+          ok: true,
+          value: { items: [] },
+        });
+        expect((await patch({ archived: false })).status).toBe(404);
+        expect(invokePage).toHaveBeenCalledTimes(invocations);
+
+        const baselineRead = Promise.withResolvers<void>();
+        const releaseProjection = Promise.withResolvers<void>();
+        followed.mockImplementationOnce(async () => {
+          baselineRead.resolve();
+          await releaseProjection.promise;
+        });
+        const disconnect = new AbortController();
+        const attempted = patch(
+          { archived: true },
+          f.assignment,
+          'https://allrice.test',
+          disconnect.signal,
+        );
+        try {
+          await baselineRead.promise;
+          disconnect.abort();
+          expect((await stored()).archived_at).toBeNull();
+        } finally {
+          releaseProjection.resolve();
+          await attempted;
+        }
+        await vi.waitFor(async () =>
+          expect((await stored()).archived_at).toBeInstanceOf(Date),
+        );
       } finally {
         await server.close();
         await feed.close();

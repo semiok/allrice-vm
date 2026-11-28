@@ -88,7 +88,9 @@ export function useSessionArchive({
   const [request, setRequest] = useState<SessionArchiveConfirmRequest | null>(
     null,
   );
-  const [toast, setToast] = useState<RowToastState | null>(null);
+  const [toast, setToast] = useState<
+    (RowToastState & { employeeId?: string }) | null
+  >(null);
   const generation = useRef(0);
   const employeeRequests = useRef(new Map<string, symbol>());
   const pending = useRef(new Map<string, symbol>());
@@ -412,27 +414,29 @@ export function useSessionArchive({
       if (current()) employeeRequests.current.delete(employeeId);
     }
   }
-  function updateUrl(id: string) {
+  function updateUrl(id: string, employeeId?: string) {
     const row = sessions.find((item) => item.id === id);
+    const target = employeeId ?? (row ? sessionEmployeeKey(row) : undefined);
     const query = new URLSearchParams({ workspaceId: workspaceId ?? '' });
-    if (entry && row) {
+    if (entry && target) {
       query.set('entry', entry);
-      query.set('employeeInstanceId', sessionEmployeeKey(row));
+      query.set('employeeInstanceId', target);
     }
-    if (entry && !row) throw Error('无法读取对话，请刷新后重试。');
+    if (entry && !target) throw Error('无法读取对话，请刷新后重试。');
     return `/api/v1/sessions/${encodeURIComponent(id)}?${query}`;
   }
   async function mutate(
     sessionId: string,
     archived: boolean,
     stopActivity = false,
+    employeeId?: string,
   ) {
     if (!workspaceId || pending.current.has(sessionId)) return;
     const operation = Symbol();
     pending.current.set(sessionId, operation);
     setError('');
     try {
-      const response = await fetch(updateUrl(sessionId), {
+      const response = await fetch(updateUrl(sessionId, employeeId), {
         method: 'PATCH',
         headers: { ...headers, 'content-type': 'application/json' },
         signal: lifetime,
@@ -482,6 +486,7 @@ export function useSessionArchive({
         setToast({
           kind: stopActivity ? 'stoppedAndArchived' : 'archived',
           sessionId,
+          ...(entry && { employeeId: sessionEmployeeKey(result.session) }),
           seq: ++toastSeq.current,
         });
       await load();
@@ -493,8 +498,8 @@ export function useSessionArchive({
         pending.current.delete(sessionId);
     }
   }
-  const act = (id: string, archived: boolean) => {
-    void mutate(id, archived).catch((cause) => {
+  const act = (id: string, archived: boolean, employeeId?: string) => {
+    void mutate(id, archived, false, employeeId).catch((cause) => {
       if (currentScope.current === scope)
         setError(cause instanceof Error ? cause.message : '归档操作失败');
     });
@@ -567,7 +572,10 @@ export function useSessionArchive({
     | 'sidebar.workspaces.session.row.action'
   >['renderSlot'] = (name, props, context) => {
     const session = sessions.find((s) => s.id === props.sessionId);
-    if ((entry || session?.ownerId) && session?.ownerId !== workspace?.viewerId)
+    if (
+      (entry && session?.visibility !== 'private') ||
+      ((entry || session?.ownerId) && session?.ownerId !== workspace?.viewerId)
+    )
       return null;
     const injected = {
       sessionId: props.sessionId,
@@ -735,7 +743,7 @@ export function useSessionArchive({
         <RowActionToast
           useToast={(select) => select(toast)}
           dismissToast={() => setToast(null)}
-          undoArchive={(id) => act(id, false)}
+          undoArchive={(id) => act(id, false, toast?.employeeId)}
           showArchived={onShowArchived ?? (() => setFilter('only'))}
           t={employeeTranslate}
         />

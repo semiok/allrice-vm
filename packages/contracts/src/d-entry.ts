@@ -145,6 +145,10 @@ export const DEntryPageOpenedSchema = z
     bindingRef: z.string().min(1),
   })
   .strict();
+export const DEntryPageRevokedSchema = z.strictObject({
+  type: z.literal('revoked'),
+  scopeId: UuidSchema,
+});
 export const DEntryPageClosedSchema = z
   .object({ type: z.literal('closed'), scopeId: UuidSchema })
   .strict();

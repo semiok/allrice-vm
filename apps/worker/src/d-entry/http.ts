@@ -317,11 +317,15 @@ export function createDEntryHttpHandler(
       if (path === '/internal/d-entry/session-change') {
         const input = DEntrySessionChangeRequestSchema.parse(decoded);
         parsedInput = true;
+        signal.throwIfAborted();
         const result = await changeDEntrySession(
           deps,
           token,
           input,
-          signal,
+          // Once the full mutation has been accepted, the Worker owns its
+          // checked native write and PostgreSQL projection even if the tab exits.
+          // Exact authorization and Worker shutdown can still cancel it.
+          AbortSignal.any([workerLifetime, AbortSignal.timeout(60_000)]),
           (error) => cleanupErrors.push(error),
         );
         signal.throwIfAborted();

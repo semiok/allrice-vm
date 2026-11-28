@@ -225,12 +225,14 @@ export function syncDEntryNativeRootTitle(
   binding: MetadataBinding,
   readTitle: (signal: AbortSignal) => Promise<string | undefined>,
   signal: AbortSignal,
+  includeArchived = false,
 ) {
   return syncDEntryNativeRootMetadata(
     context,
     root,
     binding,
     'title',
+    includeArchived,
     async (active) => {
       const title = ChatSessionSchema.shape.title
         .optional()
@@ -253,6 +255,7 @@ export function syncDEntryNativeRootArchive(
     root,
     binding,
     'archive',
+    true,
     async (active) => ({
       archived: await readArchived(active),
     }),
@@ -265,6 +268,7 @@ async function syncDEntryNativeRootMetadata(
   root: DEntryHistoryRootPin,
   binding: MetadataBinding,
   field: 'title' | 'archive',
+  includeArchived: boolean,
   readMetadata: (
     signal: AbortSignal,
   ) => Promise<{ title: string } | { archived: boolean } | undefined>,
@@ -294,7 +298,7 @@ async function syncDEntryNativeRootMetadata(
       and owner_id=${identity.personId}
       and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
       and execution_generation='4.0' and visibility='private'
-      and (${field === 'archive'} or archived_at is null)
+      and (${includeArchived} or archived_at is null)
     ${lock ? db`for no key update` : db``}`;
   const ensureRoot = (value: unknown) => {
     const pin = projectPin(value, identity);

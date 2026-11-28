@@ -3,13 +3,15 @@ import { z } from 'zod';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import {
   DEntrySessionActivitySchema,
-  type DEntrySessionChangeRequestSchema,
+  DEntrySessionChangeRequestSchema,
   type DEntrySessionChangeResultSchema,
+  sameDEntryIdentity,
 } from '@allrice/contracts';
 import {
   authorizeSessionHistoryOwner,
   DataAccessError,
   EmployeeInstanceError,
+  getDEntryHistoryRootPin,
   requireDEntrySessionChangeRoot,
   runDEntryAdmittedActivity,
   syncDEntryNativeRootArchive,
@@ -21,6 +23,7 @@ import {
   DEntryNativeUnavailable,
   currentDEntryNativeOwner,
   sameDEntryVmBinding,
+  resolveDEntryNativeResource,
 } from './native-owner.js';
 import { observeDEntryFinish, ownDEntryCatalog } from './native-data.js';
 
@@ -62,8 +65,12 @@ export async function changeDEntrySession(
       error instanceof EmployeeInstanceError &&
       error.code === 'instance_archived'
     ) {
+      if ('title' in change) throw denied();
       const target = await session();
-      if (target.employeeInstanceId !== selection.employeeInstanceId)
+      if (
+        target.visibility !== 'private' ||
+        !(await getDEntryHistoryRootPin(scope, input.selection))
+      )
         throw denied();
       return { state: 'employee_archived' };
     }
@@ -86,8 +93,7 @@ export async function changeDEntrySession(
       if (
         fresh.rootOriginDigest !== expected.rootOriginDigest ||
         fresh.identity.employeeRevision !== identity.employeeRevision ||
-        fresh.identity.employeeVersionId !== identity.employeeVersionId ||
-        ('title' in change && (await session()).archivedAt)
+        fresh.identity.employeeVersionId !== identity.employeeVersionId
       )
         throw denied();
       active.throwIfAborted();
@@ -100,13 +106,33 @@ export async function changeDEntrySession(
         !(error instanceof DEntryNativeUnavailable) &&
         !(
           error instanceof PersonVmError &&
-          ['NOT_FOUND', 'RUNTIME_NOT_READY'].includes(error.code)
+          ['LEASE_CONFLICT', 'NOT_FOUND', 'RUNTIME_NOT_READY'].includes(
+            error.code,
+          )
         )
       )
         throw error;
-      // The same production prewarm owner can activate an existing employee
-      // without minting a thread or approving an upgrade stop.
-      await deps.prewarm.prewarm(scope, identity, 'page', signal, signal);
+      const plan = await deps.prewarm.prepare?.(scope, identity, signal);
+      // A stopped/retained disk keeps the same persistent VM namespace.
+      // A lease-conflict alone is never proof that the VM can be started.
+      if (
+        !plan ||
+        plan.target.vmId !== expected.vmId ||
+        plan.upgradeRestart ||
+        plan.reuse ||
+        plan.orphanedInstanceId ||
+        (!plan.running && plan.target.instanceId !== null) ||
+        !(await deps.prewarm.isCurrent?.(
+          scope,
+          identity,
+          plan,
+          signal,
+          'issue',
+        ))
+      )
+        throw error;
+      await assertRoot(signal);
+      await deps.prewarm.prewarm(scope, identity, 'page', signal, signal, plan);
       return resolve();
     });
     const binding = current.view.receipt.binding;
@@ -154,6 +180,13 @@ export async function changeDEntrySession(
             active,
           ): Promise<z.infer<typeof DEntrySessionChangeResultSchema>> {
             const native = await activity.run(active);
+            if (
+              native.opened.scopeId !== scopeId ||
+              native.opened.principal.scopeId !== scopeId ||
+              native.opened.baseline.owner !== false ||
+              !sameDEntryIdentity(native.opened.principal.identity, identity)
+            )
+              throw denied();
             const sessionId = expected.rootNativeSessionId;
             const call = async (
               endpoint: string,
@@ -162,6 +195,9 @@ export async function changeDEntrySession(
             ) => {
               await assertRoot(signal);
               await owner.assertCurrent(signal);
+              if (endpoint === 'session/rename' && (await session()).archivedAt)
+                throw denied();
+              signal.throwIfAborted();
               const result = await native.invokePage(
                 { kind: 'page', scopeId, endpoint, args: { request } },
                 signal,
@@ -199,8 +235,31 @@ export async function changeDEntrySession(
                   return title;
                 },
                 active,
+                // A concurrent archive can commit after the native rename.
+                // Its title projection still belongs to the exact history row.
+                true,
               );
             } else {
+              const assertNativeRoot = (signal: AbortSignal) =>
+                resolveDEntryNativeResource({
+                  context: scope,
+                  identity: expected.identity,
+                  owner: catalog.owner,
+                  nativeSessionId: sessionId,
+                  signal,
+                  root: async (context, selection) => {
+                    const root = await requireDEntrySessionChangeRoot(
+                      context,
+                      DEntrySessionChangeRequestSchema.shape.selection.parse(
+                        selection,
+                      ),
+                    );
+                    if (root.rootOriginDigest !== expected.rootOriginDigest)
+                      throw denied();
+                    return root;
+                  },
+                });
+              await assertNativeRoot(active);
               try {
                 const answer = archiveValue.parse(
                   await call(
@@ -234,7 +293,7 @@ export async function changeDEntrySession(
                 expected,
                 binding,
                 async (signal) => {
-                  await assertRoot(signal);
+                  await assertNativeRoot(signal);
                   await owner.assertCurrent(signal);
                   // Read the current native archive state for each PG CAS attempt.
                   // An earlier RPC receipt alone can predate a concurrent reversal.

@@ -610,7 +610,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             if (session.archivedAt && session.id === activeThreadId)
               navigate(selection.employeeInstanceId, undefined, true);
           },
-          onEmployeeChanged(instance) {
+          async onEmployeeChanged(instance) {
             const current = sidebar.getSnapshot();
             if (
               !current ||
@@ -625,7 +625,68 @@ export function installEmployeeProductOwner(ctx: Context) {
               !instance.archivedAt &&
               !employeeChoice(workspace, instance.id)
             ) {
-              navigate(instance.id, undefined, true);
+              try {
+                const query = new URLSearchParams({
+                  ...selection,
+                  threadId: activeThreadId,
+                  entry: '4.0',
+                });
+                const response = await fetch('/api/v1/workspace?' + query, {
+                  headers: requestHeaders,
+                  signal,
+                  cache: 'no-store',
+                });
+                if (!response.ok) throw Error('Employee catalog unavailable');
+                const directory = (await response.json()) as Pick<
+                  Workspace,
+                  | 'viewerId'
+                  | 'workspaceId'
+                  | 'organizationId'
+                  | 'employees'
+                  | 'sessions'
+                >;
+                const latest = sidebar.getSnapshot();
+                if (signal.aborted || !latest) return;
+                if (
+                  directory.viewerId !== viewerId ||
+                  directory.organizationId !== organizationId ||
+                  directory.workspaceId !== selection.workspaceId
+                )
+                  throw Error('Employee catalog changed');
+                const choice = employeeChoice(
+                  {
+                    ...latest.tree.workspace,
+                    employees: directory.employees,
+                  },
+                  instance.id,
+                );
+                if (!choice) throw Error('Employee unavailable');
+                if (employeeChoice(latest.tree.workspace, instance.id)) return;
+                const employees = [...latest.tree.workspace.employees, choice];
+                const sessions = [
+                  ...latest.tree.sessions,
+                  ...directory.sessions.filter(
+                    (row) =>
+                      row.ownerId === viewerId &&
+                      !row.archivedAt &&
+                      sessionEmployeeKey(row) === instance.id,
+                  ),
+                ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+                sidebar.update({
+                  ...latest,
+                  tree: {
+                    ...latest.tree,
+                    sessions,
+                    workspace: {
+                      ...latest.tree.workspace,
+                      employees,
+                      sessions,
+                    },
+                  },
+                });
+              } catch {
+                notice('员工已恢复，暂时无法刷新员工列表。');
+              }
               return;
             }
             if (

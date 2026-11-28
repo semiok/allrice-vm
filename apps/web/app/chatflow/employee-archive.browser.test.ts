@@ -828,6 +828,12 @@ suite('U1 employee archive lifecycle', () => {
         await menu();
         await page.getByText('归档会话', { exact: true }).click();
         await row.waitFor({ state: 'detached' });
+        await page.getByRole('button', { name: '撤销', exact: true }).click();
+        await row.waitFor();
+        await row.hover();
+        await menu();
+        await page.getByText('归档会话', { exact: true }).click();
+        await row.waitFor({ state: 'detached' });
         await sidebar.getByRole('button', { name: '查看归档' }).click();
         await page.getByRole('tab', { name: '对话', exact: true }).click();
         const archivedRow = page
@@ -883,6 +889,8 @@ suite('U1 employee archive lifecycle', () => {
           { title: '核对完成' },
           { archived: true },
           { archived: false },
+          { archived: true },
+          { archived: false },
         ]);
         expect(state.errors).toEqual([]);
       } finally {
@@ -897,7 +905,7 @@ suite('U1 employee archive lifecycle', () => {
       archived: true,
     });
     try {
-      await page.route('**/chatflow/4.0', (route) =>
+      await page.route('**/chatflow/4.0?**', (route) =>
         route.fulfill({ body: 'Entry rechecked' }),
       );
       await page.getByRole('button', { name: '查看归档' }).click();
@@ -905,7 +913,11 @@ suite('U1 employee archive lifecycle', () => {
         .getByRole('heading', { name: '流程哥', exact: true })
         .waitFor();
       await page.getByRole('button', { name: '恢复员工' }).click();
-      await page.waitForURL('**/chatflow/4.0');
+      await page.waitForURL(
+        (url) =>
+          url.pathname === '/chatflow/4.0' &&
+          url.searchParams.get('employeeInstanceId') === state.instances[1]?.id,
+      );
       expect(state.instances[1]).toMatchObject({
         archivedAt: null,
         revision: 3,

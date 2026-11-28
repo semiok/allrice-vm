@@ -2,6 +2,7 @@ import {
   DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
 } from '@allrice/contracts';
+import { requireDEntryNativeIdentity } from '@allrice/database';
 import { requireRequestContext } from '../../../../../lib/identity/session';
 import { resolveDEntryIdentity } from '../../../../../lib/d-entry/identity';
 import { dEntryErrorResponse } from '../../../../../lib/d-entry/responses';
@@ -20,10 +21,17 @@ export async function GET(request: Request) {
         code: 'VALIDATION_FAILED',
         message: 'Entry selectors must be unique',
       });
+    const access = query.get('access');
+    if (access !== null && access !== 'execute')
+      throw new SyntaxError('Invalid access');
+    query.delete('access');
     const selection = DEntrySelectionInputSchema.parse(
       Object.fromEntries(query),
     );
-    const identity = await resolveDEntryIdentity(context, selection, 'history');
+    const identity =
+      access === 'execute'
+        ? await requireDEntryNativeIdentity(context, selection)
+        : await resolveDEntryIdentity(context, selection, 'history');
     return Response.json(DEntryIdentityResultSchema.parse({ identity }), {
       headers: { 'cache-control': 'private, no-store' },
     });

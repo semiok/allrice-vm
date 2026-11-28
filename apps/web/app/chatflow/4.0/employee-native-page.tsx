@@ -752,7 +752,12 @@ export function EmployeeNativePage({
         void retire().then((closed) => {
           if (!closed) setStatus('unknown');
           else if (!detached && replace.current === applyQuery)
-            location.replace('/chatflow/4.0');
+            location.replace(
+              '/chatflow/4.0?' +
+                new URLSearchParams({
+                  workspaceId: selectedEmployee!.workspaceId,
+                }),
+            );
         });
         return;
       }
@@ -888,6 +893,8 @@ export function EmployeeNativePage({
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
       carrier = openNativePageCarrier(identity, selection, () => {
+        const mayReopenSelection = !navigating && !superseded;
+        const target = selectedEmployee;
         remoteRevoked = true;
         unbindMemoryWrites?.();
         send(pageRevoked);
@@ -909,41 +916,59 @@ export function EmployeeNativePage({
               // The unqualified entry checks the cookie again on navigation.
               const stillCurrent = () =>
                 !detached &&
-                !navigating &&
                 !superseded &&
+                nextQuery.current === displayedQuery.current &&
                 replace.current === applyQuery;
               if (!stillCurrent()) return;
               if (response.status === 401) {
                 location.replace('/chatflow/4.0');
                 return;
               }
-              if (!prepare || !response.ok || !mounted || !selectedEmployee)
+              if (!mayReopenSelection || !prepare || !response.ok || !target)
                 return;
               // Committed metadata can revoke the old document before the
               // initiating dialog receives its HTTP reply.
-              const target = selectedEmployee;
-              const next = await readEmployeeEntryIdentity(
-                target,
-                lifetime.signal,
-              ).catch((error: unknown) => {
-                if (
-                  error instanceof EmployeeEntryError &&
-                  [403, 404, 409].includes(error.status) &&
-                  !error.reason
-                )
-                  return null;
-                throw error;
-              });
+              const { threadId, ...employee } = target;
+              const readCurrent = (selection: typeof target) =>
+                readEmployeeEntryIdentity(
+                  selection,
+                  lifetime.signal,
+                  'execute',
+                ).catch((error: unknown) => {
+                  if (
+                    error instanceof EmployeeEntryError &&
+                    [403, 404, 409].includes(error.status) &&
+                    !error.reason
+                  )
+                    return null;
+                  throw error;
+                });
+              const next = await readCurrent(employee);
               if (!stillCurrent() || target !== selectedEmployee) return;
-              if (!next) location.replace('/chatflow/4.0');
-              else if (
-                next.organizationId === identity.organizationId &&
-                next.personId === identity.personId &&
-                (next.employeeRevision !== identity.employeeRevision ||
-                  next.employeeVersionId !== identity.employeeVersionId)
+              if (!next) {
+                location.replace(
+                  '/chatflow/4.0?' +
+                    new URLSearchParams({
+                      workspaceId: employee.workspaceId,
+                    }),
+                );
+                return;
+              }
+              if (
+                next.organizationId !== identity.organizationId ||
+                next.personId !== identity.personId
+              )
+                return;
+              const thread = threadId ? await readCurrent(target) : next;
+              if (!stillCurrent() || target !== selectedEmployee) return;
+              if (
+                !thread ||
+                next.employeeRevision !== identity.employeeRevision ||
+                next.employeeVersionId !== identity.employeeVersionId
               )
                 location.replace(
-                  '/chatflow/4.0?' + new URLSearchParams(target),
+                  '/chatflow/4.0?' +
+                    new URLSearchParams(thread ? target : employee),
                 );
             })
             .catch(() => {});

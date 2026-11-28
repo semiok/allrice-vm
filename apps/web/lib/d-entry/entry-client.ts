@@ -40,10 +40,15 @@ export function employeeEntryQuery(query: string, prepare: boolean) {
 export async function readEmployeeEntryIdentity(
   selection: DEntrySelectionInput,
   signal: AbortSignal,
+  access?: 'execute',
 ) {
   signal.throwIfAborted();
   const response = await fetch(
-    '/api/v1/d-entry/identity?' + new URLSearchParams(selection),
+    '/api/v1/d-entry/identity?' +
+      new URLSearchParams({
+        ...selection,
+        ...(access && { access }),
+      }),
     { signal, cache: 'no-store', credentials: 'same-origin' },
   );
   if (!response.ok) throw new EmployeeEntryError(response.status);
