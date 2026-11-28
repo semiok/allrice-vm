@@ -311,9 +311,10 @@ suite('R3 preintegration through the installed workbench', () => {
         await page.keyboard.press('Enter');
         await editor.getByText(material.fileName, { exact: true }).waitFor();
         await page.keyboard.press('End');
-        await page.keyboard.insertText(' @');
+        await page.keyboard.insertText(' @"');
         await folder.click();
         await reference.waitFor();
+        expect(await editor.innerText()).toContain('@"企业资料/');
         await menu
           .getByRole('button', { name: '文件与文件夹', exact: true })
           .click();

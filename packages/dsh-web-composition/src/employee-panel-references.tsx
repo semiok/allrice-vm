@@ -232,6 +232,7 @@ export function apply(ctx: Context) {
       };
       const rootCrumb = 'root';
       const folderCrumb = 'materials';
+      const quotedFolderCrumb = 'materials-quoted';
       native.effect(() =>
         native.inputTriggers.registerSource({
           trigger: '@',
@@ -322,7 +323,7 @@ export function apply(ctx: Context) {
                   icon: 'folder',
                   section: filesSection,
                   drill: true,
-                  value: folderCrumb,
+                  value: quoted ? quotedFolderCrumb : folderCrumb,
                 });
               if (
                 files.status === 'fulfilled' &&
@@ -365,9 +366,17 @@ export function apply(ctx: Context) {
             if (!current(session.sessionId) || !candidate.value) return;
             if (candidate.value === rootCrumb)
               return { text: '@', continue: true };
-            if (candidate.value === folderCrumb) {
+            if (
+              candidate.value === folderCrumb ||
+              candidate.value === quotedFolderCrumb
+            ) {
               if (currentPanelOwner(session.sessionId))
-                return { text: '@' + materialPath, continue: true };
+                return {
+                  text:
+                    (candidate.value === quotedFolderCrumb ? '@"' : '@') +
+                    materialPath,
+                  continue: true,
+                };
               return;
             }
             const value: unknown = JSON.parse(candidate.value);
