@@ -1136,6 +1136,8 @@ it
     }
     const streams = new Map<string, string>();
     let socketCount = 0;
+    const joinedScopes = new Set<string>();
+    const closedSockets = new Set<string>();
     let lastScopeId: string | undefined;
     const firstItems: string[] = [];
     const workspaceBaselines: unknown[] = [];
@@ -1151,6 +1153,14 @@ it
     });
     page.on('websocket', (socket) => {
       socketCount++;
+      let attachedScope: string | undefined;
+      let acknowledged = false;
+      let joined = false;
+      socket.on('close', () => {
+        if (!attachedScope) return;
+        closedSockets.add(attachedScope);
+        if (joined) joinedScopes.add(attachedScope);
+      });
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
@@ -1158,7 +1168,12 @@ it
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'item' && frame.value.type === 'opened')
-          lastScopeId = frame.value.scopeReference.scopeId;
+          lastScopeId = attachedScope = frame.value.scopeReference.scopeId;
+        if (streams.get(frame.streamId) === '$d-entry/page') {
+          if (frame.type === 'item' && frame.value.type === 'closed')
+            acknowledged = frame.value.scopeId === attachedScope;
+          if (frame.type === 'end' && acknowledged) joined = true;
+        }
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
@@ -1514,6 +1529,8 @@ it
       }
       expect(await pending.count()).toBe(0);
       expect({ documentLoads, socketCount }).toEqual(network);
+      expect(closedSockets.has(firstScope)).toBe(false);
+      expect(closedSockets.has(secondScope)).toBe(false);
       console.info(
         'CROSS_EMPLOYEE_NATIVE_RETURN ' +
           JSON.stringify({
@@ -1534,6 +1551,7 @@ it
       ).toBe(false);
       expect((await f.invoke(secondScope)).status).toBe(404);
       expect(f.pageSignals.get(secondScope)?.aborted).toBe(true);
+      await expect.poll(() => joinedScopes.has(secondScope)).toBe(true);
       expect(
         await page.locator('html').getAttribute('data-test-peak-frames'),
       ).toBe('3');
@@ -1558,6 +1576,11 @@ it
       await expect.poll(() => page.locator('iframe').count()).toBe(0);
       expect(f.pageSignals.get(firstScope)?.aborted).toBe(true);
       expect(f.pageSignals.get(fourthScope)?.aborted).toBe(true);
+      await expect
+        .poll(
+          () => closedSockets.has(firstScope) && closedSockets.has(fourthScope),
+        )
+        .toBe(true);
       expect((await f.invoke(firstScope)).status).toBe(404);
       expect((await f.invoke(fourthScope)).status).toBe(404);
       await context.close();

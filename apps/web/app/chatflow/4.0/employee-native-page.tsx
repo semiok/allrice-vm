@@ -710,12 +710,12 @@ function EmployeeNativePane({
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
-        if (owner?.ready() && !navigating) owner.revoked();
+        if (owner?.ready() && !owner.visible() && !navigating) owner.revoked();
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
       if (event.data.type === pageStartupFailed) {
-        if (owner?.ready() && !navigating) owner.revoked();
+        if (owner?.ready() && !owner.visible() && !navigating) owner.revoked();
         if (prepare)
           finish(
             event.data.reason === 'asset-timeout' ? 'asset-timeout' : 'failed',
