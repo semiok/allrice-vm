@@ -110,6 +110,10 @@ export async function withEmployeeFileMentions<T>(
 ) {
   async function run(tx: Sql) {
     signal.throwIfAborted();
+    if (!dispatch?.transaction) {
+      await tx`set local lock_timeout = '2000ms'`;
+      await tx`set local statement_timeout = '3000ms'`;
+    }
     if (!(await readContentPrincipal(context, tx, true)))
       throw new DataAccessError('authorization_denied');
     const { employeeVersionId, ...selection } = owner;

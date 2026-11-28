@@ -82,6 +82,9 @@ export interface ProductionNativeModelExecution {
         ReturnType<ProductionPersonVmHostSources['bind']>
       >['model']['withMemoryIndex']
     >;
+    prepareReferences?: Awaited<
+      ReturnType<ProductionPersonVmHostSources['bind']>
+    >['model']['prepareReferences'];
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
@@ -277,6 +280,7 @@ export function createProductionPersonVmSources(
               : {}),
             readMemoryIndex: owned.readMemoryIndex,
             withMemoryIndex: owned.withMemoryIndex,
+            prepareReferences: owned.prepareReferences,
             async resolveCall(headers, binding, signal) {
               const call = await calls.resolveCall(headers, binding, signal);
               await routing.assertCurrent(call, signal);

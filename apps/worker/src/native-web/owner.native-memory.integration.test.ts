@@ -1,3 +1,4 @@
+import { encodeEmployeeFileMention } from '@allrice/contracts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -499,6 +500,15 @@ it.skipIf(
         });
       }
 
+      const fileMarker = encodeEmployeeFileMention({
+        threadId: primary.id,
+        label: 'Native transport fixture',
+        pin: {
+          kind: 'deliverable',
+          objectId: randomUUID(),
+          checksum: 'sha256:' + 'f'.repeat(64),
+        },
+      });
       const server = createServer((request, response) => {
         void (async () => {
           if (request.headers.authorization !== 'Bearer ' + capability)
@@ -532,6 +542,28 @@ it.skipIf(
           if (request.url !== '/v1/stream' || title === undefined)
             throw Error('Unknown test model request');
           if (!title) assistantCalls++;
+          if (!title && assistantCalls === 1) {
+            const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            const message = input.messages.find(
+              (value: {
+                role: string;
+                source?: { kind: string };
+                content: { text?: string }[];
+              }) =>
+                value.role === 'user' &&
+                value.source?.kind === 'user' &&
+                value.content.some((block) => block.text?.includes(fileMarker)),
+            );
+            const attempt = await owner.readNativeAttemptFor(
+              context,
+              { kind: 'session', sessionId: nativeSessionId },
+              signal,
+            );
+            expect(
+              attempt?.prompts.map(({ messageId }) => messageId),
+            ).toContain(message?.id);
+          }
+
           if (!title && assistantCalls === 3) {
             const modelInput = Buffer.concat(chunks).toString('utf8');
             expect(modelInput).toContain(confirmed.details);
@@ -787,7 +819,10 @@ it.skipIf(
                   sessionId: nativeSessionId,
                   requestId: nativePromptId,
                   content: [
-                    { type: 'text', text: 'Run the isolated memory check.' },
+                    {
+                      type: 'text',
+                      text: 'Run the isolated memory check.\n' + fileMarker,
+                    },
                   ],
                   mode: 'queue',
                 },

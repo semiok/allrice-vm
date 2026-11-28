@@ -29,29 +29,37 @@ const maximumCharacters = 300_000;
 const pageCharacters = 120_000;
 const deny = () => new ModelGatewayError('AUTHORIZATION_DENIED');
 
-function collectMentions(messages: Messages) {
-  // History and injected session snapshots retain only opaque pins. Only the
-  // last actual user message requests expansion for the current model call.
-  const index = messages.findLastIndex(
-    (message) => message.role === 'user' && message.source?.kind === 'user',
-  );
-  if (index === -1) return;
-  const original = messages[index]!;
-  const unique = new Map<string, EmployeeFileMention>();
+function collectMentions(messages: Messages, adopted: ReadonlySet<string>) {
+  // A native turn can adopt several queued or steered messages. Only the
+  // already-proven occurrences may trigger sourcing, not retained history.
+  const mentions: { index: number; mention: EmployeeFileMention }[] = [];
+  const unique = new Set<string>();
   try {
-    for (const block of original.content) {
-      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
-      for (const line of block.text.split('\n')) {
-        const mention = decodeEmployeeFileMention(line.trim());
-        if (!mention) continue;
-        unique.set(encodeEmployeeFileMention(mention), mention);
-        if (unique.size > maximumMentions) throw deny();
+    for (const [index, message] of messages.entries()) {
+      if (
+        message.role !== 'user' ||
+        message.source?.kind !== 'user' ||
+        !message.id ||
+        !adopted.has(message.id)
+      )
+        continue;
+      for (const block of message.content) {
+        if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+        for (const line of block.text.split('\n')) {
+          const mention = decodeEmployeeFileMention(line.trim());
+          if (!mention) continue;
+          const key = index + ':' + encodeEmployeeFileMention(mention);
+          if (unique.has(key)) continue;
+          unique.add(key);
+          mentions.push({ index, mention });
+          if (mentions.length > maximumMentions) throw deny();
+        }
       }
     }
   } catch {
     throw deny();
   }
-  if (unique.size) return { index, original, mentions: [...unique.values()] };
+  return mentions;
 }
 
 function position(text: string, index: number) {
@@ -68,18 +76,17 @@ export function createProductionFileMentionContext(
   return async (
     call: ModelCallBinding,
     messages: Messages,
+    adopted: ReadonlySet<string>,
     signal: AbortSignal,
   ): Promise<PreparedModelReferences | undefined> => {
-    const request = collectMentions(messages);
-    if (!request) return;
+    const mentions = collectMentions(messages, adopted);
+    if (!mentions.length) return;
     const { context } = call;
     const { workspaceId } = context;
     if (
       !workspaceId ||
       context.actor.type !== 'user' ||
-      request.mentions.some(
-        (mention) => mention.threadId !== call.allriceThreadRef,
-      )
+      mentions.some(({ mention }) => mention.threadId !== call.allriceThreadRef)
     )
       throw deny();
     const owner = {
@@ -88,7 +95,7 @@ export function createProductionFileMentionContext(
       threadId: call.allriceThreadRef,
       employeeVersionId: call.employeeRelease,
     };
-    const pins = request.mentions.map(({ pin }) => pin);
+    const pins = mentions.map(({ mention }) => mention.pin);
     const modules = new Set(
       pins.map((pin) =>
         pin.kind === 'material' ? 'enterprise-materials' : 'deliverables',
@@ -109,9 +116,9 @@ export function createProductionFileMentionContext(
       (identity) => requireModules(identity, signal),
       async (current) => current,
     );
-    const content = [...request.original.content];
-    for (const [index, file] of files.entries()) {
-      const mention = request.mentions[index]!;
+    const additions = new Map<number, { type: 'text'; text: string }[]>();
+    for (const [fileIndex, file] of files.entries()) {
+      const { index, mention } = mentions[fileIndex]!;
       signal.throwIfAborted();
       const bytes = await readReferenceBytes(
         storage,
@@ -182,6 +189,7 @@ export function createProductionFileMentionContext(
                 pdfPage: nextPage,
                 offset: 0,
               });
+      const content = additions.get(index) ?? [];
       content.push({
         type: 'text',
         text:
@@ -196,11 +204,15 @@ export function createProductionFileMentionContext(
             kind: file.archive ? 'archive-directory' : 'document-text',
           }),
       });
+      additions.set(index, content);
     }
     return {
-      messages: messages.map((message, index) =>
-        index === request.index ? { ...message, content } : message,
-      ),
+      messages: messages.map((message, index) => {
+        const extra = additions.get(index);
+        return extra
+          ? { ...message, content: [...message.content, ...extra] }
+          : message;
+      }),
       async withCurrent(active, authority, dispatch, transaction) {
         const codex = authority?.codex;
         if ((call.provider === 'openai-codex') !== !!codex) throw deny();

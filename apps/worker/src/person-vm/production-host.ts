@@ -1,4 +1,3 @@
-import { createProductionFileMentionContext } from './production-file-mentions.js';
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -184,6 +183,9 @@ export type ProductionPersonVmHostSources = Readonly<{
       withMemoryIndex?: Parameters<
         typeof createModelGateway
       >[0]['withTrustedContext'];
+      prepareReferences?: Parameters<
+        typeof createModelGateway
+      >[0]['prepareReferences'];
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
@@ -1163,7 +1165,7 @@ export function createProductionPersonVmHost(input: {
           ),
         readTrustedContext: memory && modelSource.readMemoryIndex,
         withTrustedContext: memory && modelSource.withMemoryIndex,
-        prepareReferences: createProductionFileMentionContext(),
+        prepareReferences: modelSource.prepareReferences,
         store: storeModel,
         confirmTransportStopped:
           modelSource.confirmTransportStopped ??

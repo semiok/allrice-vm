@@ -1916,6 +1916,17 @@ suite(
         },
       ] satisfies GatewayModelInput['messages'];
     }
+    function fileMentions(
+      storage: Parameters<typeof createProductionFileMentionContext>[0],
+    ) {
+      const read = createProductionFileMentionContext(storage);
+      return (
+        call: ModelCallBinding,
+        messages: GatewayModelInput['messages'],
+        active: AbortSignal,
+        adopted = new Set(messages.flatMap(({ id }) => (id ? [id] : []))),
+      ) => read(call, messages, adopted, active);
+    }
     it('rechecks a sealed file quote after queued publication withdrawal and denies other employees and organizations before reading bytes', async () => {
       const p = await person();
       const other = await person();
@@ -1968,7 +1979,7 @@ suite(
       };
       const storage = runtimeFixtureStorage(f.db);
       const get = vi.fn(storage.get.bind(storage));
-      const read = createProductionFileMentionContext({ get });
+      const read = fileMentions({ get });
       const call = modelCall(p, thread.id);
       const messages = referenceMessage(thread.id, pin);
       await expect(
@@ -1982,7 +1993,26 @@ suite(
         ),
       ).rejects.toThrow();
       expect(get).not.toHaveBeenCalled();
-      const prepared = await read(call, messages, signal());
+      const [quoted] = messages;
+      const later = {
+        ...quoted!,
+        id: randomUUID() as NonNullable<
+          GatewayModelInput['messages'][number]['id']
+        >,
+        content: [
+          {
+            type: 'text' as const,
+            text: 'A later input in the same native turn.',
+          },
+        ],
+      };
+      const coalesced = [quoted!, later];
+      const prepared = await read(call, coalesced, signal());
+      expect(prepared?.messages[1]).toEqual(later);
+      expect(
+        await read(call, coalesced, signal(), new Set([later.id])),
+      ).toBeUndefined();
+
       expect(JSON.stringify(messages)).not.toContain(text);
       expect(JSON.stringify(prepared?.messages)).toContain(text);
       const dispatch = vi.fn(async () => {});
@@ -2058,9 +2088,7 @@ suite(
         (id,organization_id,workspace_id,owner_id,object_id,series_id,version,session_id,file_name,format)
         values (${randomUUID()},${p.context.organizationId},${p.selection.workspaceId},${p.context.actor.id},
         ${objectId},${randomUUID()},1,${thread.id},'first.pdf','pdf')`;
-      const read = createProductionFileMentionContext(
-        runtimeFixtureStorage(f.db),
-      );
+      const read = fileMentions(runtimeFixtureStorage(f.db));
       const pin = {
         kind: 'deliverable' as const,
         objectId,
@@ -2167,9 +2195,7 @@ suite(
         signal(),
       );
       expect(catalog.quotableFileIds).toContain(objectId);
-      const read = createProductionFileMentionContext(
-        runtimeFixtureStorage(f.db),
-      );
+      const read = fileMentions(runtimeFixtureStorage(f.db));
       const pin = {
         kind: 'deliverable' as const,
         objectId,

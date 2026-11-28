@@ -1,3 +1,4 @@
+import { createProductionFileMentionContext } from './production-file-mentions.js';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
@@ -465,6 +466,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         }
       >();
       const operations = new Set<Promise<unknown>>();
+      const prepareFileMentions = createProductionFileMentionContext();
       type EvidenceReceipt = NonNullable<
         Awaited<ReturnType<typeof persistExecution>>
       >;
@@ -2068,6 +2070,18 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         },
         references: [...references, ...searchService()],
         readMemoryIndex,
+        async prepareReferences(call, messages, signal) {
+          const entry = calls.get(call.native.callId);
+          if (!entry?.delivery) return undefined;
+          const active = AbortSignal.any([signal, entry.delivery, entry.route]);
+          active.throwIfAborted();
+          return prepareFileMentions(
+            call,
+            messages,
+            new Set(entry.prompts.map(({ messageId }) => messageId)),
+            active,
+          );
+        },
         async withMemoryIndex(call, signal, authority, start) {
           if (!authority) return reject();
           await readMemoryIndex(call, signal, 'dispatch', { authority, start });
