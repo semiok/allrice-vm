@@ -222,10 +222,11 @@ it('requires the issued scope in the document address and leaves the two exact n
     graphRev: 'verified-graph',
     manifestSha256: '1'.repeat(64),
   };
+  const documentAddress = { ...claims, nativeSessionId: 'real-native-root' };
   const bundle = 'plugins/??fixture/client.js&rev=r1';
   profileRequest.mockImplementation(async (_input, _type, _selectors, mode) =>
     mode === 'document'
-      ? Response.json({ ...claims, nativeSessionId: 'real-native-root' })
+      ? Response.json(documentAddress)
       : Response.json({
           version: 1,
           scopeReference: { scopeId },
@@ -375,7 +376,7 @@ it('requires the issued scope in the document address and leaves the two exact n
     ['bootstrap', { scopeId }, 'document'],
   ]);
   profileRequest.mockResolvedValueOnce(
-    Response.json({ ...claims, bindingRef: 'stale-profile' }),
+    Response.json({ ...documentAddress, bindingRef: 'stale-profile' }),
   );
   expect((await call('api/present.host')).status).toBe(404);
   expect((await call('api/present.open', 'POST')).status).toBe(404);
