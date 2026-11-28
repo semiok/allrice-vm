@@ -5,7 +5,6 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type * as Database from '@allrice/database';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
-import type * as Database from '@allrice/database';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deferredPromptFact,
