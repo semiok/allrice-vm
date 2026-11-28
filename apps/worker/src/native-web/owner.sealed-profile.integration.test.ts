@@ -359,6 +359,7 @@ it(
       },
     );
     const root = f.launch.command.workdir;
+    if (!root) throw Error('Missing isolated native workspace');
     const read = (path: string) => readFile(join(root, path), 'utf8');
     const receipt = await vi.waitFor(
       async () => JSON.parse(await read('permissions.json')),
