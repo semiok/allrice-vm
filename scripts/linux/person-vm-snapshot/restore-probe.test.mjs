@@ -9,6 +9,11 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import {
+  binding as diskBinding,
+  createLinuxLuks2Fixture,
+  disk as personDisk,
+} from '../../../packages/person-vm/test/linux-luks2-person-vm-disk.fixture.ts';
 import { sealTemplate } from './build.mjs';
 import { createCaptureFixture } from './capture.fixture.mjs';
 import { withGuestFreshnessHelper } from './guest-freshness.fixture.mjs';
@@ -221,16 +226,17 @@ function setup(options = {}) {
       options.qualify ??
       (async (seal) => ({ seal, manifest: options.manifest ?? manifest })),
     gateTimeoutMs: options.gateTimeoutMs,
-    reserve: async () => ({
-      ...lease,
-      binding: (lease.binding = {
+    reserve: async () => {
+      attempt++;
+      lease.binding = options.binding ?? {
         organizationId: 'org',
-        personId: 'person-' + ++attempt,
+        personId: 'person-' + attempt,
         vmId: 'vm-' + attempt,
         instanceId: 'instance-' + attempt,
         leaseEpoch: attempt,
-      }),
-    }),
+      };
+      return { ...lease, binding: lease.binding };
+    },
     openScope: (binding) =>
       Object.assign(scope, {
         disk: {
@@ -286,25 +292,88 @@ describe('offline signed archive to restore probe', () => {
     };
   }
 
-  it('uses the sealed archive and joins the real C gate before committing seven synthetic spans', async ({
+  it('restores the sealed archive with a LUKS2 work receipt and joins the C gate in seven synthetic spans', async ({
     onTestFinished,
   }) => {
     const { seal, manifest, qualification } = await publish(onTestFinished);
     const qualify = vi.fn((seal, signal) =>
       verifyTemplate({ ...qualification, seal, signal }),
     );
+    const { adapter } = await createLinuxLuks2Fixture();
     const random = vi.fn((size) => Buffer.alloc(size, 17));
     random.mockImplementationOnce((size) => Buffer.alloc(size, 23));
     const fixture = setup({
       qualify,
       random,
+      binding: diskBinding,
     });
-    // Only the private-stream gate is real here. Kernel ioctls and the VM
-    // restore/CoW path belong to the independent Linux ARM64/KVM run.
+
+    const { scope } = fixture;
+    let issued;
+    const prepare = scope.prepare.getMockImplementation();
+    scope.prepare.mockImplementation(async (template, signal) => {
+      await prepare(template, signal);
+      await adapter.create(personDisk, signal);
+      await adapter.attach(personDisk, signal);
+      issued = await adapter.issueOwnedWorkDisk(
+        personDisk,
+        diskBinding,
+        signal,
+      );
+      scope.disk = issued;
+    });
+    const read = scope.readOwnedReceipts.getMockImplementation();
+    scope.readOwnedReceipts.mockImplementation(async (signal) => {
+      await adapter.verifyOwnedWorkDisk(
+        issued,
+        personDisk,
+        diskBinding,
+        signal,
+      );
+      return read(signal);
+    });
+    const withCurrent = scope.withCurrentAuthority.getMockImplementation();
+    scope.withCurrentAuthority.mockImplementation(
+      async (expected, signal, start) => {
+        // Preserve the issued object in the scope. The probe's frozen snapshot
+        // carries the same fields but is not the adapter's authority token.
+        expect(expected.disk).toEqual(issued);
+        await adapter.verifyOwnedWorkDisk(
+          issued,
+          personDisk,
+          expected.binding,
+          signal,
+        );
+        return withCurrent(expected, signal, start);
+      },
+    );
+    const release = scope.release.getMockImplementation();
+    scope.release.mockImplementation(async (signal) => {
+      await adapter.detach(personDisk, signal);
+      expect(
+        await adapter.inspectMount(personDisk, signal, { image: issued.image }),
+      ).toEqual({
+        state: 'absent',
+        image: issued.image,
+      });
+      return release(signal);
+    });
+
+    // The private stream runs the C gate. Device observations, kernel ioctls
+    // and VM restore/CoW are still synthetic in this test.
     await withGuestFreshnessHelper(async (binary) => {
       let child;
       let closed;
       let transportFailure;
+      async function joinGate() {
+        if (child && child.exitCode === null) child.kill();
+        await closed;
+      }
+      const fence = scope.fenceAndJoin.getMockImplementation();
+      scope.fenceAndJoin.mockImplementation(async (signal) => {
+        await joinGate();
+        return fence(signal);
+      });
       const connect = fixture.scope.connectGate.getMockImplementation();
       fixture.scope.connectGate.mockImplementation(async (compute, signal) => {
         const peer = await connect(compute, signal);
@@ -369,8 +438,7 @@ describe('offline signed archive to restore probe', () => {
           },
         });
       } finally {
-        if (child && child.exitCode === null) child.kill();
-        await closed;
+        await joinGate();
       }
     });
 
@@ -378,6 +446,10 @@ describe('offline signed archive to restore probe', () => {
     expect(qualified).toEqual({ seal, manifest });
     const [dispatch] = fixture.native.restoreStrict.mock.calls[0];
     expect(dispatch.template).toEqual(qualified);
+    expect(dispatch.disk).toEqual(issued);
+    expect(dispatch.disk).not.toBe(issued);
+    const volume = dispatch.argv.indexOf('--volume');
+    expect(dispatch.argv[volume + 1]).toBe(issued.workDirectory + ':/work');
     expect(dispatch.argv.slice(0, 3)).toEqual([
       'snap',
       'restore',
@@ -385,6 +457,7 @@ describe('offline signed archive to restore probe', () => {
     ]);
     expect(fixture.scope.probeSyntheticEditor.mock.calls[0][0]).toMatchObject({
       templateDigest: seal.manifestSha256,
+      guestWorkMount: { sourceMountId: issued.mountId },
       freshness: { controlChallengeConsumed: true },
     });
     expect(fixture.calls).toEqual([
