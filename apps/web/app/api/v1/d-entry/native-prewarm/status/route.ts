@@ -4,7 +4,10 @@ import {
 } from '@allrice/contracts';
 import { requireRequestContext } from '../../../../../../lib/identity/session';
 import { apiProblem } from '../../../../../../lib/api-error-response';
-import { currentNativeRequest } from '../../../../../../lib/d-entry/native-request';
+import {
+  authenticateNativeRequest,
+  currentNativeRequest,
+} from '../../../../../../lib/d-entry/native-request';
 import {
   readDEntryWorkerJson,
   requestDEntryPrewarmStatus,
@@ -15,9 +18,11 @@ import { dEntryErrorResponse } from '../../../../../../lib/d-entry/responses';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET(request: Request) {
+async function prewarmStatus(request: Request, method: 'GET' | 'DELETE') {
   try {
-    const context = await requireRequestContext(request);
+    const context = await (method === 'DELETE'
+      ? authenticateNativeRequest(request)
+      : requireRequestContext(request));
     const query = new URL(request.url).searchParams;
     if ([...query.keys()].some((key) => query.getAll(key).length !== 1))
       return apiProblem({
@@ -28,7 +33,11 @@ export async function GET(request: Request) {
     const { operationId, ...selection } =
       DEntryNativePrewarmStatusQuerySchema.parse(Object.fromEntries(query));
     const input = await currentNativeRequest(request, selection, context);
-    const response = await requestDEntryPrewarmStatus(input, operationId);
+    const response = await requestDEntryPrewarmStatus(
+      input,
+      operationId,
+      method,
+    );
     const result = await readDEntryWorkerJson(
       response,
       DEntryNativePrewarmStatusSchema.parse,
@@ -42,4 +51,12 @@ export async function GET(request: Request) {
   } catch (error) {
     return dEntryErrorResponse(error);
   }
+}
+
+export function GET(request: Request) {
+  return prewarmStatus(request, 'GET');
+}
+
+export function DELETE(request: Request) {
+  return prewarmStatus(request, 'DELETE');
 }

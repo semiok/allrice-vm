@@ -1,10 +1,6 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import {
-  IdentityError,
-  hasExistingDEntryEmployeeOrVm,
-  preparePersonNativeWebRoster,
-} from '@allrice/database';
+import { IdentityError, preparePersonNativeWebRoster } from '@allrice/database';
 import {
   findDEntryCreationWorkspace,
   findDEntryEmployee,
@@ -77,10 +73,6 @@ export default async function EmployeeNativeEntryPage({
                 organizationId={context.organizationId}
                 workspaceId={workspaceId}
                 viewerId={context.actor.id}
-                creationBlocked={await hasExistingDEntryEmployeeOrVm({
-                  ...context,
-                  workspaceId,
-                })}
               />
             );
           selection = await findDEntryEmployee(context);

@@ -92,6 +92,7 @@ import {
   IDLE_RECONCILE_TIMEOUT_MS,
 } from './production-native-activity.js';
 import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -714,6 +715,10 @@ export function createProductionPersonVmHost(input: {
               Math.floor(budget / (4096 + 512)),
             );
       if (budget !== undefined) capacityStore = store;
+      const employeeRuntime = createProductionEmployeeRuntime(
+        providers.employeeRuntimeSettings,
+        providers.platform.employeePortSlots,
+      );
       const diskRoot = providers.configuration.disk.root;
       const diskPool = new PersonVmDiskPool(
         diskRoot,
@@ -876,6 +881,7 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
+        employeeRuntime,
         archive: {
           subscribe: subscribeDEntryEmployeeArchive,
           confirm: confirmDEntryEmployeeArchive,

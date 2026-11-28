@@ -252,18 +252,15 @@ describe('private production Host configuration', () => {
       const loaded = await readProductionHostConfiguration(signal());
       expect(loaded.employeeRuntimeSettings).toEqual(settings);
       expect(Object.isFrozen(loaded.employeeRuntimeSettings)).toBe(true);
-      const native = { readAttachedProbe: vi.fn() };
       expect(
         createProductionEmployeeRuntime(
           loaded.employeeRuntimeSettings,
-          native,
           loaded.platform.employeePortSlots,
         ),
       ).toMatchObject({
         maxRunning: settings.employeeMaxRunning,
         employeeIdleMs: settings.employeeIdleMs,
       });
-      expect(native.readAttachedProbe).not.toHaveBeenCalled();
     },
   );
 

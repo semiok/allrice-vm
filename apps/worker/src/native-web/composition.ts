@@ -41,10 +41,7 @@ import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
 type EmployeeProfile = Omit<DEntryIdentity, 'threadId'>;
-type ColdEmployeeSelection = Readonly<{
-  selected: EmployeeProfile;
-  neverStarted: readonly EmployeeProfile[];
-}>;
+type ReportCapacity = (limit: number | undefined) => void;
 function sameEmployee(
   a: Pick<
     Endpoint,
@@ -113,12 +110,11 @@ export function createAssignedNativeWebStartup(input: {
   };
   employeeRuntime?: Readonly<{
     maxRunning?: number;
-    /** Host proof for this startup and exact employee profiles. Absence keeps
-     * the existing eager plan. A roster row alone cannot prove never started. */
+    /** Exact current selection for this startup lease. */
     readColdSelection?(
       startup: PersonVmWebStartup,
       signal: AbortSignal,
-    ): Promise<ColdEmployeeSelection | null>;
+    ): EmployeeProfile | null;
   }>;
   commandMemory?: Readonly<{
     controls: ReadonlyCommandMemoryDirectory;
@@ -216,33 +212,48 @@ export function createAssignedNativeWebStartup(input: {
     void operation.then(settle, settle);
     return operation;
   }
-  function employeeCapacityFull(group: RunningGroup) {
-    return (
-      group.runtimeLimit !== undefined &&
-      new Set([
-        ...group.owners.keys(),
-        ...group.startingEmployees,
-        ...group.blockedEmployees.keys(),
-      ]).size >= group.runtimeLimit
-    );
+  function fullEmployeeCapacity(group: RunningGroup) {
+    const limit = group.runtimeLimit;
+    if (limit === undefined) return;
+    const occupied = new Set([
+      ...group.owners.keys(),
+      ...group.startingEmployees,
+      ...group.blockedEmployees.keys(),
+    ]);
+    return occupied.size >= limit ? limit : undefined;
   }
   function withEmployeeCapacity(
     group: RunningGroup,
     signal: AbortSignal,
-    work: () => Promise<void | 'wait-for-capacity'>,
+    reportCapacity: ReportCapacity | undefined,
+    work: (setWaiting: ReportCapacity) => Promise<void | 'wait-for-capacity'>,
   ) {
     return track(async () => {
-      for (;;) {
-        signal.throwIfAborted();
-        // Capture before the attempt so a joined owner cannot release capacity
-        // between the attempt completing and the waiter attaching.
-        const changed = group.capacityChanged.signal;
-        if ((await update(group, work)) !== 'wait-for-capacity') return;
-        const exits = [...group.owners].flatMap(([id, owner]) =>
-          group.blockedEmployees.has(id) ? [] : [owner.jobExited],
-        );
-        const wake = AbortSignal.any([signal, changed, ...exits]);
-        if (!wake.aborted) await once(wake, 'abort');
+      let reported: number | undefined;
+      const setWaiting = (limit: number | undefined) => {
+        if (reported === limit) return;
+        reported = limit;
+        reportCapacity?.(limit);
+      };
+      try {
+        for (;;) {
+          signal.throwIfAborted();
+          // Capture before the attempt so a joined owner cannot release capacity
+          // between the attempt completing and the waiter attaching.
+          const changed = group.capacityChanged.signal;
+          if (
+            (await update(group, () => work(setWaiting))) !==
+            'wait-for-capacity'
+          )
+            return;
+          const exits = [...group.owners].flatMap(([id, owner]) =>
+            group.blockedEmployees.has(id) ? [] : [owner.jobExited],
+          );
+          const wake = AbortSignal.any([signal, changed, ...exits]);
+          if (!wake.aborted) await once(wake, 'abort');
+        }
+      } finally {
+        setWaiting(undefined);
       }
     });
   }
@@ -432,41 +443,40 @@ export function createAssignedNativeWebStartup(input: {
       throw new PersonVmError('LEASE_LOST');
     return web;
   }
-  async function coldEmployees(web: PersonVmWebStartup, signal: AbortSignal) {
+  function coldEmployees(
+    web: PersonVmWebStartup,
+    signal: AbortSignal,
+  ): {
+    endpoints: PersonVmWebEndpointReceipt['endpoints'];
+    selectedId?: string;
+    runtimeLimit?: number;
+  } {
     const { binding, endpoints, slots } = web.receipt;
-    if (!slots || !input.employeeRuntime) return { endpoints };
-    const selection = await input.employeeRuntime.readColdSelection?.(
-      web,
-      signal,
-    );
-    signal.throwIfAborted();
-    const selectedId = selection?.selected.employeeInstanceId;
-    const deferred = new Set<string>();
-    if (selection) {
-      const requireExactProfile = (profile: EmployeeProfile) => {
-        if (
-          profile.personId !== binding.personId ||
-          profile.organizationId !== binding.organizationId ||
-          !endpoints.some((employee) => sameEmployee(employee, profile))
-        )
-          throw new PersonVmError('AUTHORIZATION_DENIED');
-      };
-      requireExactProfile(selection.selected);
-      for (const profile of selection.neverStarted) {
-        requireExactProfile(profile);
-        deferred.add(profile.employeeInstanceId);
-      }
+    if (!input.employeeRuntime) return { endpoints };
+    if (!slots?.length) throw new PersonVmError('RUNTIME_NOT_READY');
+    const maxRunning = Math.min(runtimeLimit, slots.length);
+    const select = input.employeeRuntime.readColdSelection;
+    if (!select) {
+      if (endpoints.length > maxRunning)
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      return { endpoints, runtimeLimit: maxRunning };
     }
-    const launches = endpoints.filter(
-      ({ employeeInstanceId }) =>
-        employeeInstanceId === selectedId || !deferred.has(employeeInstanceId),
+    const employee = select(web, signal);
+    if (!employee) throw new PersonVmError('RUNTIME_NOT_READY');
+    const selected = endpoints.find((endpoint) =>
+      sameEmployee(endpoint, employee),
     );
-    // A retained roster can have more mandatory profiles than the new limit.
-    // Keep this generation on the established eager path until its owners can
-    // be safely deferred. Only a plan that fits may enable the running limit.
-    return launches.length > runtimeLimit
-      ? { endpoints, selectedId }
-      : { endpoints: launches, selectedId, runtimeLimit };
+    if (
+      !selected ||
+      employee.personId !== binding.personId ||
+      employee.organizationId !== binding.organizationId
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    return {
+      endpoints: [selected],
+      selectedId: selected.employeeInstanceId,
+      runtimeLimit: maxRunning,
+    };
   }
   async function close() {
     if (closing) return closing;
@@ -533,7 +543,7 @@ export function createAssignedNativeWebStartup(input: {
         const web = current(binding, startup);
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
-        const cold = await coldEmployees(web, signal);
+        const cold = coldEmployees(web, signal);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
         const profile = await input.readEmployeeProfile(signal);
@@ -932,6 +942,7 @@ export function createAssignedNativeWebStartup(input: {
       identity: DEntryIdentity,
       check: (signal: AbortSignal) => Promise<void>,
       caller: AbortSignal,
+      reportCapacity?: ReportCapacity,
     ) {
       const group = running.get(binding.vmId);
       const slots = group?.slots;
@@ -944,7 +955,9 @@ export function createAssignedNativeWebStartup(input: {
       )
         return Promise.resolve();
       const signal = AbortSignal.any([caller, lifetime, group.revoked.signal]);
-      return withEmployeeCapacity(group, signal, async () => {
+      const startSelectedEmployee = async (
+        setWaiting: ReportCapacity,
+      ): Promise<void | 'wait-for-capacity'> => {
         const rosterFor = input.readRoster ?? readPersonNativeWebRoster;
         const scope = {
           binding,
@@ -1004,7 +1017,7 @@ export function createAssignedNativeWebStartup(input: {
           await scope.assertCurrent();
         }
         if (
-          employeeCapacityFull(group) &&
+          fullEmployeeCapacity(group) !== undefined &&
           (await retireOneExitedEmployee(group))
         )
           await scope.assertCurrent();
@@ -1039,9 +1052,16 @@ export function createAssignedNativeWebStartup(input: {
             break;
           }
         }
-        // Preserve exact archived physical-slot reclaim before a capacity
-        // wait. Capacity alone grants no right to close another live owner.
-        if (employeeCapacityFull(group)) return 'wait-for-capacity';
+        // The sealed employee idle timer stays disabled. Demand starts are
+        // capped, only exact exit or archive releases a running slot, and
+        // physical idle stop remains a separate conservative VM operation (#59).
+        const limit = fullEmployeeCapacity(group);
+        if (limit !== undefined) {
+          setWaiting(limit);
+          return 'wait-for-capacity';
+        }
+        setWaiting(undefined);
+        signal.throwIfAborted();
         if (!slot) throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
         const endpoint = Object.freeze({ ...selected, ...slot });
         const profile = await input.readEmployeeProfile(signal);
@@ -1121,7 +1141,13 @@ export function createAssignedNativeWebStartup(input: {
         } finally {
           group.startingEmployees.delete(employeeId);
         }
-      });
+      };
+      return withEmployeeCapacity(
+        group,
+        signal,
+        reportCapacity,
+        startSelectedEmployee,
+      );
     },
     ensureVerifiedEditor(
       context: RequestContext,

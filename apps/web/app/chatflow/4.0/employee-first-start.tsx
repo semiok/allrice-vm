@@ -1,7 +1,6 @@
 'use client';
 
 import { useState } from 'react';
-import { dEntryFirstEmployeeLimitMessage } from '../../../lib/d-entry/employee-creation';
 import { EmployeeCreateDialog } from '../employee-create-dialog';
 import styles from './employee-native-page.module.css';
 
@@ -9,23 +8,12 @@ export function EmployeeFirstStart({
   organizationId,
   workspaceId,
   viewerId,
-  creationBlocked,
 }: {
   organizationId: string;
   workspaceId: string;
   viewerId: string;
-  creationBlocked?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-
-  if (creationBlocked)
-    return (
-      <main className={styles.status}>
-        <section>
-          <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
-        </section>
-      </main>
-    );
 
   return (
     <main className={styles.status}>
