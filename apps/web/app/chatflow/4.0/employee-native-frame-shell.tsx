@@ -259,7 +259,11 @@ export function EmployeeNativeFrameShell({
         reopen: boolean,
         resumeEmployee: boolean,
       ) {
-        const params = new URLSearchParams(selection);
+        const params = new URLSearchParams({
+          workspaceId: selection.workspaceId,
+          employeeInstanceId: selection.employeeInstanceId,
+        });
+        if (selection.threadId) params.set('threadId', selection.threadId);
         if (!selection.threadId && !reopen)
           params.set('new', crypto.randomUUID());
         request({

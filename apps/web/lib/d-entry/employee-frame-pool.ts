@@ -63,7 +63,9 @@ function advance(pool: EmployeeFramePool): EmployeeFramePool {
     };
 
   const frames = pool.frames.map((frame) =>
-    frame.phase === 'opening' && !sameEmployee(frame, wanted)
+    frame.phase === 'opening' &&
+    (!sameEmployee(frame, wanted) ||
+      frame.selection.threadId !== wanted.selection.threadId)
       ? closeFrame(frame)
       : frame,
   );

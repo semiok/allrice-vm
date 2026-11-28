@@ -6,12 +6,16 @@ import {
 
 function journey() {
   let pool = emptyEmployeeFramePool();
-  function select(employeeInstanceId: string, workspaceId = 'workspace') {
+  function select(
+    employeeInstanceId: string,
+    workspaceId = 'workspace',
+    threadId?: string,
+  ) {
     pool = updateEmployeeFramePool(pool, {
       type: 'select',
       request: {
         query: employeeInstanceId,
-        selection: { workspaceId, employeeInstanceId },
+        selection: { workspaceId, employeeInstanceId, threadId },
       },
     });
     return pool.frames.find(
@@ -68,6 +72,26 @@ describe('employee workbench frame pool', () => {
     expect(state.pool.frames.find(({ id }) => id === b)?.phase).toBe('closing');
     state.apply({ type: 'ready', id: c });
     expect(state.pool.visible).toBe(c);
+  });
+
+  it('joins a superseded pending thread before opening the latest selection for the employee', () => {
+    const state = journey();
+    const a = state.open('a');
+    const b = state.select('b', 'workspace', 'old-thread')!.id;
+    state.select('b', 'workspace', 'new-thread');
+    expect(state.pool.frames.find((frame) => frame.id === b)?.phase).toBe(
+      'closing',
+    );
+    state.apply({ type: 'ready', id: b });
+    expect(state.pool.visible).toBe(a);
+    state.apply({ type: 'joined', id: b, confirmed: true });
+    const latest = state.pool.frames.find(
+      (frame) => frame.phase === 'opening',
+    )!;
+    expect(latest.selection.threadId).toBe('new-thread');
+    state.apply({ type: 'ready', id: latest.id });
+    expect(state.pool.visible).toBe(latest.id);
+    expect(state.pool.wanted).toBeUndefined();
   });
 
   it('immediately fences revoked and old-workspace frames and awaits joined proof', () => {
