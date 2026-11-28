@@ -1,15 +1,22 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type { StoragePort } from '@allrice/contracts';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as database from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import { createDEntryAuthorityFeed } from './d-entry-authority.ts';
 import * as rootPin from './d-entry-native-root.ts';
 import {
+  assertDEntryNativeDeliveryRun,
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
   nextRetainedDEntryNativeRunJournalOwner,
   publishDEntryNativeRunTerminal,
 } from './d-entry-native-execution.ts';
+import {
+  findDEntryNativeDelivery,
+  publishCapturedDEntryDelivery,
+  sweepDEntryNativeDeliveryReservations,
+} from './d-entry-native-delivery.ts';
 import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
 import { authenticateSession, createSession } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
@@ -210,6 +217,172 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     expect(
       await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
     ).toBe(true);
+    const coordinate = (parts: (string | number)[]) =>
+      createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+    const file = '/work/report.md';
+    const capture = (callId: string, bytes: string) => ({
+      ticket: randomUUID(),
+      sessionId: rootSessionId,
+      turn: 1,
+      callId,
+      files: [{ path: file, base64: Buffer.from(bytes).toString('base64') }],
+    });
+    const stored = new Map<string, string>();
+    const storage: StoragePort = {
+      async put(object, content) {
+        stored.set(object.id, await new Response(content).text());
+      },
+      async get(object) {
+        return new Blob([stored.get(object.id)!]).stream();
+      },
+      async delete(object) {
+        stored.delete(object.id);
+      },
+      async exists(object) {
+        return stored.has(object.id);
+      },
+    };
+    let boundaries = 0;
+    const first = capture('first-present', 'exact first bytes');
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        first,
+        storage,
+        async (tx) => {
+          await assertDEntryNativeDeliveryRun(tx, candidate, owner, signal);
+          if (++boundaries === 2) {
+            const [connection] = await tx<
+              { pid: number }[]
+            >`select pg_backend_pid() as pid`;
+            await db`select pg_terminate_backend(${connection!.pid})`;
+          }
+        },
+        signal,
+      ),
+    ).rejects.toThrow();
+    expect(boundaries).toBe(2);
+    expect(stored.size).toBe(1);
+    const [pendingObject] =
+      await db`select id,state from allrice_storage_objects where id=${[...stored.keys()][0]!}`;
+    expect(pendingObject?.state).toBe('pending');
+    const selection = {
+      workspaceId,
+      threadId: f.session,
+      employeeInstanceId: f.assignment,
+    };
+    const pathDigest = coordinate([rootSessionId, file]);
+    await expect(
+      findDEntryNativeDelivery(context, selection, pathDigest),
+    ).rejects.toThrow();
+    const assertCurrent = (
+      tx: Parameters<typeof assertDEntryNativeDeliveryRun>[0],
+    ) => assertDEntryNativeDeliveryRun(tx, candidate, owner, signal);
+    await publishCapturedDEntryDelivery(
+      candidate,
+      first,
+      storage,
+      assertCurrent,
+      signal,
+    );
+    // The same successful receipt can be requested after an ACK is lost.
+    await publishCapturedDEntryDelivery(
+      candidate,
+      first,
+      storage,
+      assertCurrent,
+      signal,
+    );
+    expect(stored.size).toBe(1);
+    expect(await findDEntryNativeDelivery(context, selection, pathDigest)).toBe(
+      pendingObject?.id,
+    );
+    const second = capture('second-present', 'new immutable bytes');
+    await publishCapturedDEntryDelivery(
+      candidate,
+      second,
+      storage,
+      assertCurrent,
+      signal,
+    );
+    const latest = await findDEntryNativeDelivery(
+      context,
+      selection,
+      pathDigest,
+    );
+    expect(latest).not.toBe(pendingObject?.id);
+    expect(stored.get(latest)).toBe('new immutable bytes');
+    expect(
+      await findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 'first-present', 0]),
+      ),
+    ).toBe(pendingObject?.id);
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 'first-present', 1]),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      findDEntryNativeDelivery(
+        { ...context, actor: { type: 'user', id: randomUUID() } },
+        selection,
+        pathDigest,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        { ...selection, employeeInstanceId: randomUUID() },
+        pathDigest,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        capture('first-present', 'replacement'),
+        storage,
+        assertCurrent,
+        signal,
+      ),
+    ).rejects.toThrow();
+    const rows = await db`select v.version, o.visibility, o.state
+      from allrice_deliverable_versions v join allrice_storage_objects o on o.id=v.object_id
+      where v.session_id=${f.session} order by v.version`;
+    expect(rows).toEqual([
+      { version: 1, visibility: 'private', state: 'ready' },
+      { version: 2, visibility: 'private', state: 'ready' },
+    ]);
+
+    const abandoned = capture('unacknowledged', 'abandoned bytes');
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        abandoned,
+        {
+          ...storage,
+          async put(object, content) {
+            await storage.put(object, content);
+            throw Error('storage lost reply');
+          },
+        },
+        assertCurrent,
+        signal,
+      ),
+    ).rejects.toThrow('storage lost reply');
+    const [expired] =
+      await db`update allrice_storage_objects set updated_at=clock_timestamp()-interval '2 hours'
+      where workspace_id=${workspaceId} and state='pending' returning id`;
+    await sweepDEntryNativeDeliveryReservations(storage, signal);
+    await db`update allrice_storage_objects set deleted_at=clock_timestamp()-interval '6 minutes' where id=${expired!.id}`;
+    await sweepDEntryNativeDeliveryReservations(storage, signal);
+    expect(stored.has(expired!.id)).toBe(false);
+    expect(stored.size).toBe(2);
     await db.unsafe(`
       create function refuse_native_terminal_fixture() returns trigger
       language plpgsql as $$
@@ -251,6 +424,17 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     expect(
       await isDEntryNativeRunJournalCurrent(candidate, restarted, signal),
     ).toBe(true);
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        capture('stale-epoch', 'stale'),
+        storage,
+        (tx) => assertDEntryNativeDeliveryRun(tx, candidate, restarted, signal),
+        signal,
+      ),
+    ).rejects.toThrow();
+    expect(stored.size).toBe(2);
+
     expect(
       await isDEntryNativeRunJournalCurrent(
         {

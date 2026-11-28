@@ -613,10 +613,11 @@ it('registers a callable contribution in real Cordis/slot lifetimes and releases
       true,
     ),
   );
-  expect(registered).toEqual(
-    referenceKinds.map((kind) => 'allrice-employee-panels.' + kind),
-  );
-  expect(ctx.slots.entries('sidebar.right.pane.tab')).toHaveLength(4);
+  expect(registered).toEqual([
+    'allrice-native-delivery',
+    ...referenceKinds.map((kind) => 'allrice-employee-panels.' + kind),
+  ]);
+  expect(ctx.slots.entries('sidebar.right.pane.tab')).toHaveLength(5);
   const ref = window.__allricePanelsReference!;
   ref.open(['files']);
   expect(ref.evidence().activeKind).toBe('allrice-employee-panels.files');

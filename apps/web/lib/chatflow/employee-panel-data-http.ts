@@ -339,6 +339,21 @@ export function createEmployeePanelsHttpClient(
         }),
       );
     },
+    async resolveNativeDelivery(
+      input: { workspaceId: string; coordinate: string; occurrence?: string },
+      signal: AbortSignal,
+    ) {
+      return DeliverableUploadResultProjectionSchema.parse(
+        await call('/deliverables/native', signal, input, {
+          query: {
+            coordinate: z.hash('sha256').parse(input.coordinate),
+            ...(input.occurrence === undefined
+              ? {}
+              : { occurrence: z.hash('sha256').parse(input.occurrence) }),
+          },
+        }),
+      );
+    },
     async listDeliverables(
       input: z.input<typeof WorkbenchDeliverablesFilterSchema>,
       signal: AbortSignal,

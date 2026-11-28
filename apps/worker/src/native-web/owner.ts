@@ -28,6 +28,7 @@ import type {
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import {
   DEntryNativeTurnEndSchema,
+  type DEntryNativeDeliveryClaim,
   getDEntryPageNativeRoot,
 } from '@allrice/database';
 import type {
@@ -1529,6 +1530,32 @@ export async function openNativeWebOwner(input: {
               follow.dispose();
               await frames.return?.();
             }
+          },
+        );
+      },
+      exchangeNativeDeliveryFor(
+        request:
+          | { action: 'delivery-pending' }
+          | (DEntryNativeDeliveryClaim & {
+              action: 'delivery-read' | 'delivery-ack';
+            }),
+        caller: AbortSignal,
+      ) {
+        const active = AbortSignal.any([caller, AbortSignal.timeout(5_000)]);
+        return readCurrent(
+          active,
+          async () => {},
+          async (signal) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const wire = await transport.readManagedModelProof(
+              JSON.stringify({ ...request, adapterId: installedModelAdapter }),
+              signal,
+              false,
+              undefined,
+              request.action === 'delivery-read' ? 22_000_000 : undefined,
+            );
+            return wire ? (JSON.parse(wire) as unknown) : null;
           },
         );
       },

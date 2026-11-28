@@ -5,6 +5,7 @@ import {
   memoryIndexPolicy,
   type DEntryIdentity,
   type RequestContext,
+  type StoragePort,
 } from '@allrice/contracts';
 import {
   DataAccessError,
@@ -383,7 +384,9 @@ const reject = (): never => {
   throw new ModelGatewayError('AUTHORIZATION_DENIED');
 };
 
-export function createProductionNativeModelExecution(): ProductionNativeModelExecution {
+export function createProductionNativeModelExecution(
+  deliveryStorage?: StoragePort,
+): ProductionNativeModelExecution {
   let installed: Installed | undefined;
 
   return {
@@ -2032,7 +2035,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       };
       installed = owner;
       void run(live, (active) =>
-        reconcileNativeRunTerminals(host.startup, active),
+        reconcileNativeRunTerminals(host.startup, active, deliveryStorage),
       ).catch(() => {});
       return owner;
     },

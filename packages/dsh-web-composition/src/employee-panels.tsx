@@ -14,6 +14,10 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
+import type {} from '@deepseek-ai/dsh-client-ui-deliverables/client';
+import type {} from '@deepseek-ai/dsh-api-remotes/client';
+import type {} from '@deepseek-ai/dsh-api-session-controller/client';
+import { parseFileAddress } from '@deepseek-ai/dsh-util-workspace-path';
 import { EnterpriseMaterialsPanel } from '../../../apps/web/app/chatflow/enterprise-materials-panel';
 import { WorkbenchFilesPanel } from '../../../apps/web/app/chatflow/workbench-files-panel';
 import { EmployeeMemorySidebar } from '../../../apps/web/app/chatflow/employee-memory-sidebar';
@@ -494,12 +498,312 @@ export function EmployeePanelsGuide({
   );
 }
 
+const nativeDeliveryTab = 'allrice-native-delivery';
+const exactDeliveryResource = 'dsh-resource://allrice-delivery-version/';
+
+function presentedCoordinates(actionUrl: string, sessionId: string) {
+  const url = new URL(actionUrl, 'https://allrice.invalid/');
+  const fields = url.searchParams;
+  const sequence = Number(fields.get('seq'));
+  const index = Number(fields.get('index'));
+  if (
+    url.origin !== 'https://allrice.invalid' ||
+    url.pathname !== '/api/present.open' ||
+    fields.get('sessionId') !== sessionId ||
+    !fields.has('seq') ||
+    !fields.has('index') ||
+    !Number.isSafeInteger(sequence) ||
+    sequence < 1 ||
+    !Number.isSafeInteger(index) ||
+    index < 0 ||
+    index >= 8
+  )
+    return;
+  return { sequence, index };
+}
+
+function exactDeliveryAddress(address: string) {
+  if (!address.startsWith(exactDeliveryResource)) return;
+  const [session, sequence, index, extra] = address
+    .slice(exactDeliveryResource.length)
+    .split('/');
+  if (!session || extra !== undefined) return;
+  try {
+    const sessionId = decodeURIComponent(session);
+    const query = new URLSearchParams({
+      sessionId,
+      seq: sequence ?? '',
+      index: index ?? '',
+    });
+    const coords = presentedCoordinates('api/present.open?' + query, sessionId);
+    return coords && { sessionId, ...coords };
+  } catch {
+    return;
+  }
+}
+
+function NativeDeliveryVersionAction({
+  owner,
+  sessionId,
+  ctx,
+  binding,
+}: PropsRuntime<'deliverables.file.actions'> & {
+  ctx: Context;
+  binding: EmployeePanelsBinding;
+}) {
+  const snapshot = useOwner(binding, sessionId);
+  const coords = presentedCoordinates(owner.actionUrl, sessionId);
+  if (!coords || !snapshot?.files.dataClient) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        assertEmployeePanelSession(ctx, sessionId);
+        assertEmployeePanelsCurrent(
+          binding,
+          sessionId,
+          { scopeKey: snapshot.scopeKey },
+          binding.signal,
+        );
+        ctx.sidebarRight.openResource(
+          exactDeliveryResource +
+            [encodeURIComponent(sessionId), coords.sequence, coords.index].join(
+              '/',
+            ),
+        );
+      }}
+    >
+      查看此版本详情
+    </button>
+  );
+}
+
+function nativeDeliveryAddress(address: string) {
+  const file = parseFileAddress(address);
+  if (
+    file?.scope !== 'session' ||
+    (file.path.startsWith('/') && !file.path.startsWith('/work/'))
+  )
+    return;
+  // The journal stores the canonical path. Keep the wire lookup free of file
+  // names and raw filesystem paths.
+  const parts = file.path
+    .replace(/^\/work\//u, '')
+    .split('/')
+    .filter((part) => part && part !== '.');
+  if (
+    !parts.length ||
+    parts.some((part) => part.startsWith('.')) ||
+    Array.from(file.path).some(
+      (part) => part < ' ' || part === '\u007f' || part === '\\',
+    )
+  )
+    return;
+  return {
+    sessionId: file.sessionId,
+    path: '/work/' + parts.join('/'),
+    name: parts.at(-1)!,
+  };
+}
+
+async function deliveryDigest(value: readonly (string | number)[]) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join(
+    '',
+  );
+}
+
+function EmployeeNativeDelivery({
+  ctx,
+  binding,
+  sessionId,
+  useTabInfo,
+}: PropsRuntime<'sidebar.right.pane.tab'> & {
+  ctx: Context;
+  binding: EmployeePanelsBinding;
+}) {
+  const snapshot = useOwner(binding, sessionId);
+  const { tab } = useTabInfo();
+  const lifetime = useMemo(
+    () => new AbortController(),
+    [sessionId, tab.signal, tab.contentId, tab.visible, snapshot?.scopeKey],
+  );
+  useEffect(() => () => lifetime.abort(), [lifetime]);
+  const signal = useMemo(
+    () => AbortSignal.any([binding.signal, tab.signal, lifetime.signal]),
+    [binding.signal, tab.signal, lifetime.signal],
+  );
+  const data = snapshot?.files.dataClient;
+  const workspaceId = snapshot?.files.workspaceId;
+  const scopeKey = snapshot?.scopeKey;
+  const [resolution, setResolution] = useState<{
+    signal: AbortSignal;
+    objectId: string | null;
+  }>();
+  useEffect(() => {
+    const address = nativeDeliveryAddress(tab.contentId);
+    const exact = exactDeliveryAddress(tab.contentId);
+    if (
+      !tab.visible ||
+      (!address && !exact) ||
+      !data ||
+      !workspaceId ||
+      !scopeKey ||
+      signal.aborted
+    )
+      return;
+    const pending = new AbortController();
+    const active = AbortSignal.any([signal, pending.signal]);
+    const assertCurrent = () => {
+      assertEmployeePanelSession(ctx, sessionId);
+      assertEmployeePanelsCurrent(binding, sessionId, { scopeKey }, active);
+    };
+    const load = async () => {
+      assertCurrent();
+      let path = address?.path;
+      let occurrence: string | undefined;
+      if (exact) {
+        if (exact.sessionId !== sessionId)
+          throw Error('DELIVERY_VERSION_UNAVAILABLE');
+        // The native history endpoint is already admitted for this exact Session.
+        // Its event is only a selector; it cannot create or replace stored bytes.
+        const page = await ctx.remote.session.page(
+          {
+            address: { kind: 'session', sessionId },
+            throughSeq: exact.sequence,
+            maxMessages: 1,
+          },
+          active,
+        );
+        const event =
+          page.ok &&
+          page.value.records.find(
+            ({ event }) =>
+              event.seq === exact.sequence &&
+              event.type === 'deliverables/presented',
+          )?.event;
+        const value =
+          event &&
+          (event.data as {
+            turn?: number;
+            callId?: string;
+            files?: { path?: string }[];
+          });
+        if (
+          !value ||
+          !Number.isSafeInteger(value.turn) ||
+          typeof value.callId !== 'string'
+        )
+          throw Error('DELIVERY_VERSION_UNAVAILABLE');
+        path = value.files?.[exact.index]?.path;
+        occurrence = await deliveryDigest([
+          value.turn!,
+          value.callId,
+          exact.index,
+        ]);
+      }
+      if (!path?.startsWith('/work/'))
+        throw Error('DELIVERY_VERSION_UNAVAILABLE');
+      const coordinate = await deliveryDigest([
+        (address ?? exact)!.sessionId,
+        path,
+      ]);
+      assertCurrent();
+      const { objectId } = await data.resolveNativeDelivery(
+        { workspaceId, coordinate, occurrence },
+        active,
+      );
+      active.throwIfAborted();
+      setResolution({ signal, objectId });
+    };
+    void load().catch(() => {
+      if (!active.aborted) setResolution({ signal, objectId: null });
+    });
+    return () => pending.abort();
+  }, [
+    ctx,
+    binding,
+    data,
+    workspaceId,
+    scopeKey,
+    sessionId,
+    signal,
+    tab.contentId,
+    tab.visible,
+  ]);
+  if (!snapshot || !tab.visible || signal.aborted) return null;
+  const current = resolution?.signal === signal ? resolution : undefined;
+  return (
+    <div className={`${css.surface} ${css.body}`}>
+      {current?.objectId ? (
+        <EmployeePanelContent
+          ctx={ctx}
+          binding={binding}
+          sessionId={sessionId}
+          signal={signal}
+          kind="files"
+          snapshot={{
+            ...snapshot,
+            filePreview: {
+              objectId: current.objectId,
+              close: tab.actions.close,
+            },
+          }}
+        />
+      ) : (
+        <p role="status">
+          {current ? '文件尚未归档到交付成果。' : '正在读取交付成果…'}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Only public registries; no default owner, private component or Dock store. */
 export function apply(ctx: Context) {
   ctx.inject(
     ['allriceEmployeePanels', 'sidebarRightTabs', 'sidebarRight', 'layout'],
     (scope) => {
       const binding = scope.allriceEmployeePanels;
+      scope.effect(() =>
+        scope.sidebarRightTabs.register({
+          id: nativeDeliveryTab,
+          kind: nativeDeliveryTab,
+          patterns: [
+            'dsh-resource://file/session/[\\s\\S]+',
+            exactDeliveryResource + '[\\s\\S]+',
+          ],
+          priority: 'extension',
+          canOpen: (address) =>
+            !!(nativeDeliveryAddress(address) ?? exactDeliveryAddress(address)),
+          title: (address) =>
+            nativeDeliveryAddress(address)?.name ?? '交付成果',
+        }),
+      );
+      scope.slots.inject('sidebar.right.pane.tab', () =>
+        scope.slots.register(
+          { name: 'sidebar.right.pane.tab', key: nativeDeliveryTab },
+          (props: PropsRuntime<'sidebar.right.pane.tab'>) => (
+            <EmployeeNativeDelivery {...props} ctx={scope} binding={binding} />
+          ),
+        ),
+      );
+      scope.slots.inject('deliverables.file.actions', () =>
+        scope.slots.register(
+          {
+            name: 'deliverables.file.actions',
+            id: 'allrice-native-delivery-version',
+          },
+          (props: PropsRuntime<'deliverables.file.actions'>) => (
+            <NativeDeliveryVersionAction
+              {...props}
+              ctx={scope}
+              binding={binding}
+            />
+          ),
+        ),
+      );
       for (const kind of Object.keys(
         employeePanelKinds,
       ) as EmployeePanelKind[]) {
