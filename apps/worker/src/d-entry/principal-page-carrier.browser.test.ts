@@ -110,7 +110,10 @@ it
     const titleChanges = new EventEmitter();
     let projectionSeq = 0;
     let nativeTitle: string | undefined;
+    let forkTitle: string | undefined;
+    let failNextTitle = false;
     const projectedTitles: string[] = [];
+    const projectedThreads: (string | null)[] = [];
     const titleRead = deferred();
     const allowTitleWrite = deferred();
     const reopening = scenario === 'native-title-reopen';
@@ -119,8 +122,8 @@ it
         nativeTitle = '上次关闭前的原生标题';
         projectionSeq = 1;
         f.host.catalog.onRename = ({ sessionId, title }) => {
-          expect(sessionId).toBe('root');
-          nativeTitle = title;
+          if (sessionId === 'native-forked') forkTitle = title;
+          else nativeTitle = title;
           return { title, seq: ++projectionSeq };
         };
         f.host.catalog.snapshotRecords = (sessionId) =>
@@ -142,14 +145,16 @@ it
               ]
             : [];
       }
-      f.host.catalog.readProjections = (sessionId) =>
-        sessionId === 'root' && nativeTitle
+      f.host.catalog.readProjections = (sessionId) => {
+        const title = sessionId === 'root' ? nativeTitle : forkTitle;
+        return title
           ? {
               kind: 'sequenced',
               asOfSeq: projectionSeq,
-              values: { title: nativeTitle },
+              values: { title },
             }
           : null;
+      };
       f.host.catalog.controlFrames = async function* (signal) {
         try {
           for await (const [frame] of on(titleChanges, 'projection', {
@@ -164,15 +169,26 @@ it
         .spyOn(database, 'syncDEntryNativeRootTitle')
         .mockImplementation(async (context, pin, binding, read, signal) => {
           expect(context.actor.id).toBe(f.identity.personId);
-          expect(pin.identity).toEqual(f.identity);
-          expect(pin.rootNativeSessionId).toBe('root');
+          expect(pin.identity).toEqual({
+            ...f.identity,
+            threadId: pin.identity.threadId,
+          });
           expect(binding).toMatchObject(f.binding);
           const title = await read(signal);
           if (!reopening && !projectedTitles.length) {
             titleRead.resolve();
             await allowTitleWrite.promise;
           }
-          if (title) projectedTitles.push(title);
+          if (failNextTitle) {
+            failNextTitle = false;
+            throw Object.assign(Error('fixture title statement timeout'), {
+              code: '57014',
+            });
+          }
+          if (title) {
+            projectedTitles.push(title);
+            projectedThreads.push(pin.identity.threadId);
+          }
         });
       closes.push(async () => {
         sync.mockRestore();
@@ -1407,22 +1423,49 @@ it
         await vi.waitFor(() => expect(projectedTitles).toEqual([nativeTitle]));
         if (!lastScopeId) throw Error('Missing fixture page carrier');
         const title = '新的原生手动标题';
-        const renameResponse = await page.request.post(
-          `${f.origin}/api/v1/d-entry/native-rpc`,
-          {
+        const nativeRpc = (endpoint: string, request: object) =>
+          page.request.post(`${f.origin}/api/v1/d-entry/native-rpc`, {
             data: {
               selection: f.selection,
               scopeId: lastScopeId,
               rpcId: randomUUID(),
-              endpoint: 'session/rename',
-              payload: { args: { request: { sessionId: 'root', title } } },
+              endpoint,
+              payload: { args: { request } },
             },
-          },
-        );
+          });
+        const renameResponse = await nativeRpc('session/rename', {
+          sessionId: 'root',
+          title,
+        });
         expect(await renameResponse.json()).toMatchObject({
           result: { ok: true, value: { title } },
         });
         expect(projectedTitles.at(-1)).toBe(title);
+
+        f.findRoot.mockResolvedValue(await f.root());
+        const forkResponse = await nativeRpc('session/fork', {
+          sessionId: 'root',
+        });
+        expect(await forkResponse.json()).toMatchObject({
+          result: { ok: true, value: { sessionId: 'native-forked' } },
+        });
+        const registered = await f.registerRoot.mock.results[0]!.value;
+        f.findRoot.mockImplementation(async (_context, _identity, _vm, id) =>
+          id === 'native-forked' ? registered : undefined,
+        );
+        const renamedFork = await nativeRpc('session/rename', {
+          sessionId: 'native-forked',
+          title: '另一个已登记的原生根',
+        });
+        expect(await renamedFork.json()).toMatchObject({
+          result: { ok: true },
+        });
+        expect(projectedTitles.at(-1)).toBe('另一个已登记的原生根');
+        expect(projectedThreads).toEqual([
+          f.selection.threadId,
+          f.selection.threadId,
+          registered.thread.id,
+        ]);
         await context.close();
         return;
       }
@@ -1457,6 +1500,23 @@ it
         allowTitleWrite.resolve();
       }
       await vi.waitFor(() => expect(projectedTitles).toEqual(titles));
+      expect(projectedThreads).toEqual([
+        f.selection.threadId,
+        f.selection.threadId,
+      ]);
+      failNextTitle = true;
+      nativeTitle = '一次写入超时后重读的标题';
+      titleChanges.emit('projection', {
+        type: 'projection',
+        sessionId: 'root',
+        key: 'title',
+        value: nativeTitle,
+        seq: ++projectionSeq,
+      });
+      await row.getByText(nativeTitle, { exact: true }).waitFor();
+      await vi.waitFor(() =>
+        expect(projectedTitles).toEqual([...titles, nativeTitle]),
+      );
       await context.close();
       return;
     }

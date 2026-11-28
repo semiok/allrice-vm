@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import {
   sameDEntryIdentity,
@@ -11,6 +12,7 @@ import {
   DataAccessError,
   getDEntryHistoryRootPin,
   getDEntryPageNativeRoot,
+  isDEntryNativeTitleRetryable,
   registerDEntryPageNativeRoot,
   syncDEntryNativeRootTitle,
   resolveDEntryIdentity,
@@ -91,7 +93,8 @@ export type DEntryPageHandle = Readonly<{
   ): { drained: Promise<unknown>; release(): void } | undefined;
   runThreadWrite<T>(invoke: () => Promise<T>): Promise<T>;
   assertCurrent(signal: AbortSignal): Promise<void>;
-  syncNativeTitle(signal: AbortSignal): Promise<void>;
+  requestNativeTitle(nativeSessionId: string): void;
+  syncNativeTitle(nativeSessionId: string, signal: AbortSignal): Promise<void>;
   watchFollow(
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
@@ -589,6 +592,8 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   assertCurrent(runningSignal),
                 );
                 runningSignal.throwIfAborted();
+                const titleRequests = new Map<string, boolean>();
+                let titleJob: Promise<void> | undefined;
                 const page: DEntryPageHandle = {
                   scope,
                   bindingRef: current.view.bindingRef,
@@ -654,11 +659,62 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     }
                     active.throwIfAborted();
                   },
-                  async syncNativeTitle(active) {
+                  requestNativeTitle(nativeSessionId) {
+                    if (lifetime.aborted || !pin) return;
+                    titleRequests.set(nativeSessionId, true);
+                    // A single page-owned writer keeps directory I/O off the
+                    // native stream. Each hint may retry a transient failure.
+                    titleJob ??= page.use(lifetime, async (signal) => {
+                      for (const [id, retry] of titleRequests) {
+                        if (signal.aborted) break;
+                        titleRequests.delete(id);
+                        try {
+                          await page.syncNativeTitle(id, signal);
+                        } catch (error) {
+                          if (signal.aborted) break;
+                          if (retry && isDEntryNativeTitleRetryable(error)) {
+                            await delay(250, undefined, { signal }).catch(
+                              () => {},
+                            );
+                            if (!titleRequests.has(id))
+                              titleRequests.set(id, false);
+                          } else
+                            console.error(
+                              '[d-entry] native session title projection failed',
+                            );
+                        }
+                      }
+                      titleRequests.clear();
+                      titleJob = undefined;
+                    });
+                  },
+                  async syncNativeTitle(nativeSessionId, active) {
                     if (!pin) return;
+                    await page.assertCurrent(active);
+                    const root =
+                      nativeSessionId === pin.rootNativeSessionId
+                        ? pin
+                        : await (deps.findRoot ?? pageRootStore.findRoot)(
+                            auth.context,
+                            auth.identity,
+                            page.vmBinding.vmId,
+                            nativeSessionId,
+                          );
+                    // Registered create/fork may select a sibling in the same
+                    // carrier. Native subagents and other employees have no such row.
+                    if (
+                      !root ||
+                      root.vmId !== page.vmBinding.vmId ||
+                      root.rootNativeSessionId !== nativeSessionId ||
+                      !sameDEntryIdentity(root.identity, {
+                        ...auth.identity,
+                        threadId: root.identity.threadId,
+                      })
+                    )
+                      return;
                     await syncDEntryNativeRootTitle(
                       auth.context,
-                      pin,
+                      root,
                       page.vmBinding,
                       async (signal) => {
                         await page.assertCurrent(signal);
@@ -668,7 +724,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                             scopeId,
                             endpoint: 'session/projections',
                             args: {
-                              request: { sessionId: pin.rootNativeSessionId },
+                              request: { sessionId: root.rootNativeSessionId },
                             },
                           },
                           signal,

@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
-import { hasRootTitle, hasRootTitleSnapshot } from './native-title.js';
+import { controlTitleTargets, snapshotTitleTarget } from './native-title.js';
 
-it('only reconciles the current native root on its title baseline or projection', () => {
+it('extracts target IDs only from native title baselines and updates', () => {
   const title = {
     type: 'projection',
     sessionId: 'native-root',
@@ -18,32 +18,29 @@ it('only reconciles the current native root on its title baseline or projection'
     },
   });
   for (const frame of [title, baseline('native-root')])
-    expect(hasRootTitle(frame, 'native-root')).toBe(true);
+    expect(controlTitleTargets(frame)).toEqual(['native-root']);
+  expect(controlTitleTargets({ ...title, sessionId: 'another-root' })).toEqual([
+    'another-root',
+  ]);
   for (const frame of [
-    { ...title, sessionId: 'child' },
     { ...title, key: 'model' },
     { ...title, value: { title: 'invalid' } },
-    baseline('another-root'),
     {
       type: 'baseline',
       value: { projections: { 'native-root': { values: {} } } },
     },
   ])
-    expect(hasRootTitle(frame, 'native-root')).toBe(false);
+    expect(controlTitleTargets(frame)).toEqual([]);
 });
 
-it('recognizes a historical title in the opening snapshot only for the pinned root', () => {
+it('extracts the historical title target from a native opening snapshot', () => {
   const snapshot = {
     type: 'snapshot',
     header: { id: 'native-root' },
     projections: { asOfSeq: 8, values: { title: '已有标题' } },
   };
-  expect(hasRootTitleSnapshot(snapshot, 'native-root')).toBe(true);
-  expect(hasRootTitleSnapshot(snapshot, 'child')).toBe(false);
+  expect(snapshotTitleTarget(snapshot)).toBe('native-root');
   expect(
-    hasRootTitleSnapshot(
-      { ...snapshot, projections: { values: {} } },
-      'native-root',
-    ),
-  ).toBe(false);
+    snapshotTitleTarget({ ...snapshot, projections: { values: {} } }),
+  ).toBeUndefined();
 });

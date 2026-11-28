@@ -18,15 +18,18 @@ const titleControlFrame = z.union([
   }),
 ]);
 
-/** Only a hint to re-read the exact pinned native root. Never a write payload. */
-export function hasRootTitle(frame: unknown, root: string) {
+/** Only hints to resolve registered native roots. Never write payloads. */
+export function controlTitleTargets(frame: unknown): string[] {
   const parsed = titleControlFrame.safeParse(frame);
-  if (!parsed.success) return false;
+  if (!parsed.success) return [];
   const value = parsed.data;
   return value.type === 'projection'
-    ? value.sessionId === root
-    : Object.hasOwn(value.value.projections, root) &&
-        typeof value.value.projections[root]?.values.title === 'string';
+    ? [value.sessionId]
+    : Object.entries(value.value.projections).flatMap(([id, projection]) =>
+        typeof projection.values.title === 'string' && projection.values.title
+          ? [id]
+          : [],
+      );
 }
 
 const rootSnapshot = z.object({
@@ -36,7 +39,7 @@ const rootSnapshot = z.object({
 });
 
 /** An existing title can arrive when follow loads a previously cold session. */
-export function hasRootTitleSnapshot(frame: unknown, root: string) {
+export function snapshotTitleTarget(frame: unknown) {
   const parsed = rootSnapshot.safeParse(frame);
-  return parsed.success && parsed.data.header.id === root;
+  return parsed.success ? parsed.data.header.id : undefined;
 }

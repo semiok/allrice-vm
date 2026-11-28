@@ -23,7 +23,10 @@ import {
   resolveEmployeeSessionInstance,
 } from './employees/employee-instances.ts';
 import { readContentPrincipal } from './content-maintenance.ts';
-import { employeeAccessTransaction } from './employees/employee-access-cancellation.ts';
+import {
+  EmployeeAccessBusyError,
+  employeeAccessTransaction,
+} from './employees/employee-access-cancellation.ts';
 import { createAssignedChatSession } from './workspace/service.ts';
 
 const hostSchema = z
@@ -174,6 +177,17 @@ async function lockRunningVm(
       and vm_id=${binding.vmId} and instance_id=${binding.instanceId}
       and lease_epoch=${binding.leaseEpoch} and phase='running' for share`;
   if (!vm) return deny();
+}
+
+export function isDEntryNativeTitleRetryable(error: unknown) {
+  return (
+    error instanceof EmployeeAccessBusyError ||
+    (error instanceof Error &&
+      'code' in error &&
+      (error.code === '57014' ||
+        error.code === '40P01' ||
+        error.code === 'CONNECTION_CLOSED'))
+  );
 }
 
 /** Copy the current native projection into the registered business thread.

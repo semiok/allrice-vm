@@ -216,21 +216,32 @@ export function installEmployeeProductOwner(ctx: Context) {
     native.effect(() => {
       const list = native.sessions.list;
       const reflect = () => {
-        if (!activeNativeSession || !panelSelection(activeNativeSession))
-          return;
+        if (signal.aborted || switchingScope) return;
         const current = sidebar.getSnapshot();
         if (!current?.tree) return;
         const catalog = list.getSnapshot();
-        const nativeId = catalog.ids.find((id) => id === activeNativeSession);
-        const title = nativeId && catalog.byId[nativeId]?.title;
-        if (!title) return;
-        const row = current.tree.sessions.find(
-          (session) => session.id === activeThreadId,
-        );
-        if (!row || row.title === title) return;
-        const sessions = current.tree.sessions.map((session) =>
-          session === row ? { ...session, title } : session,
-        );
+        const titles = new Map<string, string>();
+        for (const nativeId of catalog.ids) {
+          const root = registered.get(nativeId);
+          const title = catalog.byId[nativeId]?.title;
+          if (root?.scopeId === resourceScopeId && title)
+            titles.set(root.threadId, title);
+        }
+        if (!titles.size) return;
+        let changed = false;
+        const sessions = current.tree.sessions.map((session) => {
+          const title = titles.get(session.id);
+          if (
+            !title ||
+            title === session.title ||
+            sessionEmployeeKey(session) !== selection.employeeInstanceId ||
+            session.ownerId !== viewerId
+          )
+            return session;
+          changed = true;
+          return { ...session, title };
+        });
+        if (!changed) return;
         sidebar.update({
           ...current,
           tree: {
@@ -476,6 +487,7 @@ export function installEmployeeProductOwner(ctx: Context) {
           },
         });
         followSelection();
+        reflectNativeTitle?.();
       })
       .catch(() => {});
   }

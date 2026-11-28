@@ -27,7 +27,7 @@ import {
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
-import { hasRootTitle, hasRootTitleSnapshot } from './native-title.js';
+import { controlTitleTargets, snapshotTitleTarget } from './native-title.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -393,27 +393,6 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
   const active = AbortSignal.any([signal, stop.signal]);
-  let titleRequested = false;
-  let titleJob: Promise<void> | undefined;
-
-  function requestTitleSync() {
-    if (active.aborted) return;
-    titleRequested = true;
-    // Title writes belong to the page, and cannot hold up the native stream.
-    titleJob ??= page.use(active, async (signal) => {
-      while (titleRequested && !signal.aborted) {
-        titleRequested = false;
-        try {
-          await page.syncNativeTitle(signal);
-        } catch {
-          if (!signal.aborted)
-            console.error('[d-entry] native session title projection failed');
-        }
-      }
-      titleJob = undefined;
-    });
-  }
-
   function open(frame: Extract<Frame, { type: 'open' }>) {
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
@@ -490,15 +469,13 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
-          const root = page.root?.rootNativeSessionId;
-          if (
-            root &&
-            ((frame.endpoint === 'session/control' &&
-              hasRootTitle(item.value, root)) ||
-              (frame.endpoint === 'session/follow' &&
-                hasRootTitleSnapshot(item.value, root)))
-          )
-            requestTitleSync();
+          if (frame.endpoint === 'session/control') {
+            for (const nativeId of controlTitleTargets(item.value))
+              page.requestNativeTitle(nativeId);
+          } else if (frame.endpoint === 'session/follow') {
+            const nativeId = snapshotTitleTarget(item.value);
+            if (nativeId) page.requestNativeTitle(nativeId);
+          }
         }
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
@@ -594,10 +571,7 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     },
     async close() {
       stop.abort();
-      await Promise.allSettled([
-        titleJob,
-        ...[...streams.values()].map(({ work }) => work),
-      ]);
+      await Promise.allSettled([...streams.values()].map(({ work }) => work));
     },
   };
 }
