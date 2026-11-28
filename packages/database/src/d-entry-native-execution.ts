@@ -4,13 +4,16 @@ import type { DEntryNativeDeliveryClaim } from './d-entry-native-delivery.ts';
 import {
   RunStatusSchema,
   UuidSchema,
+  hasDEntryPersonRelease,
   type RequestContext,
 } from '@allrice/contracts';
+import { readContentPrincipal } from './content-maintenance.ts';
 import { getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import { EmployeeInstanceError } from './employees/employee-instances.ts';
 import { IdentityError } from './identity.ts';
 import { getDEntryNativeRootPin } from './d-entry-native-root.ts';
+import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { mapEvent, type EventRow, type RunRow } from './queue/row-mappers.ts';
 
 const ids = z.object({ runId: UuidSchema, executionId: UuidSchema }).strict();
@@ -542,8 +545,9 @@ export function isDEntryNativeRunJournalCurrent(
   );
 }
 
-/** Live publication must never borrow the retained-disk exception for a
- * previous epoch. This is checked in both reservation and finalization. */
+/** Live present reads and publishes under the original login, current release
+ * policy and exact running VM. The retained-disk ledger may account a terminal
+ * event after that login expires. */
 export async function assertDEntryNativeDeliveryRun(
   tx: TransactionSql,
   candidate: DEntryNativeRunCandidate,
@@ -563,7 +567,27 @@ export async function assertDEntryNativeDeliveryRun(
     attempt.kind !== 'assistant' ||
     attempt.leaseEpoch !== owner.leaseEpoch ||
     attempt.vmInstanceId !== owner.vmInstanceId ||
-    !matchesRunScope(prompt, attempt) ||
+    !matchesRunScope(prompt, attempt)
+  )
+    throw new DataAccessError('not_found');
+
+  signal.throwIfAborted();
+  const principal = await readContentPrincipal(
+    {
+      actor: { type: 'user', id: ownerId },
+      organizationId,
+      workspaceId,
+      sessionId: prompt.loginSessionId,
+    },
+    tx,
+    true,
+  );
+  if (
+    !principal?.writable ||
+    !hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
+      organizationId,
+      personId: ownerId,
+    }) ||
     !(await checkCurrentRunJournal(
       tx,
       candidate,

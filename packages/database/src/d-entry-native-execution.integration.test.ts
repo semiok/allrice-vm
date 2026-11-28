@@ -6,6 +6,7 @@ import { lockWorkspaceStorageQuota } from './core/storage-quota.ts';
 import { DataAccessError } from './data.ts';
 import { createDEntryAuthorityFeed } from './d-entry-authority.ts';
 import * as rootPin from './d-entry-native-root.ts';
+import { dEntryReleasePolicyKey } from './d-entry-release-policy.ts';
 import {
   assertDEntryNativeDeliveryRun,
   isDEntryNativeRunJournalCurrent,
@@ -19,7 +20,11 @@ import {
   sweepDEntryNativeDeliveryReservations,
 } from './d-entry-native-delivery.ts';
 import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
-import { authenticateSession, createSession } from './identity.ts';
+import {
+  authenticateSession,
+  createSession,
+  revokeSession,
+} from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import { createRunAuthorityFixture } from './run-authority.fixture.ts';
 import {
@@ -106,6 +111,15 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       organizationId,
       workspaceId,
     }))!;
+    const publishRollout = (enabled: boolean) =>
+      db`insert into allrice_settings(scope_type,key,value)
+        values ('system',${dEntryReleasePolicyKey},${db.json({
+          revision: randomUUID(),
+          defaultGeneration: '3.x',
+          selections: enabled ? [{ organizationId, personId }] : [],
+        })})
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    await publishRollout(true);
     const rootSessionId = 'session-' + randomUUID();
     const runId = randomUUID();
     const executionId = randomUUID();
@@ -467,10 +481,56 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         signal,
       ),
     ).rejects.toThrow('storage lost reply');
+    for (const boundary of ['original login', '4.0 rollout'] as const) {
+      const revoked = capture(boundary, 'private bytes pending', 32);
+      const newerLogin = await createSession(personId);
+      const put = vi.fn(async (...args: Parameters<StoragePort['put']>) => {
+        await storage.put(...args);
+        if (boundary === 'original login') await revokeSession(login.token);
+        else await publishRollout(false);
+      });
+      try {
+        await expect(
+          publishCapturedDEntryDelivery(
+            candidate,
+            revoked,
+            { ...storage, put },
+            assertCurrent,
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'not_found' });
+        expect(put).toHaveBeenCalledOnce();
+        const newer = await authenticateSession(newerLogin.token, {
+          organizationId,
+          workspaceId,
+        });
+        expect(newer?.sessionId).toBeDefined();
+        expect(newer?.sessionId).not.toBe(prompt.loginSessionId);
+        const [object] = put.mock.calls[0]!;
+        expect(
+          await db`select state from allrice_storage_objects where id=${object.id}`,
+        ).toEqual([{ state: 'pending' }]);
+        expect(
+          await db`select id from allrice_deliverable_versions where object_id=${object.id}`,
+        ).toEqual([]);
+        await expect(db.begin(assertCurrent)).rejects.toMatchObject({
+          code: 'not_found',
+        });
+        expect(
+          await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
+        ).toBe(true);
+      } finally {
+        if (boundary === 'original login')
+          await db`update allrice_sessions set revoked_at=null where id=${prompt.loginSessionId}`;
+        else await publishRollout(true);
+        await revokeSession(newerLogin.token);
+      }
+    }
+
     const expired =
       await db`update allrice_storage_objects set updated_at=clock_timestamp()-interval '2 hours'
       where workspace_id=${workspaceId} and state='pending' returning id`;
-    expect(expired).toHaveLength(2);
+    expect(expired).toHaveLength(4);
     await sweepDEntryNativeDeliveryReservations(storage, signal);
     await db`update allrice_storage_objects set deleted_at=clock_timestamp()-interval '6 minutes'
       where workspace_id=${workspaceId} and state='deleted'`;

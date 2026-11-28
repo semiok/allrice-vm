@@ -79,12 +79,15 @@ async function reconcileDeliveries(
             attempt.vmInstanceId === scope.vmInstanceId,
         );
       if (!candidate) continue;
-      const capture = DEntryNativeDeliveryCaptureSchema.parse(
-        await owner.exchangeNativeDeliveryFor(
+      const capture = await sql.begin(async (tx) => {
+        await assertDEntryNativeDeliveryRun(tx, candidate, scope, active);
+        const result = await owner.exchangeNativeDeliveryFor(
           { ...offer, action: 'delivery-read' },
           active,
-        ),
-      );
+        );
+        active.throwIfAborted();
+        return DEntryNativeDeliveryCaptureSchema.parse(result);
+      });
       if (
         capture.ticket !== offer.ticket ||
         capture.sessionId !== offer.sessionId ||
