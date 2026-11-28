@@ -61,8 +61,6 @@ function publishNativeThread(
   resourceScopeId: string,
   rpcId: string,
   onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
-  onSkillsRefreshed?: () => void,
-  onSkillsRefreshed?: () => void,
 ) {
   const thread = decodeDEntryRegisteredThread(
     reply.headers.get(dEntryRegisteredThreadHeader),
@@ -213,6 +211,7 @@ export function nativeProfileDocument(
   earlyBundles?: EarlyProfileBundles,
   onThreadScope?: (scope: PageThreadScope) => void,
   onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+  onSkillsRefreshed?: () => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,

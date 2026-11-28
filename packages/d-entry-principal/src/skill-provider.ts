@@ -182,34 +182,44 @@ export function installPrincipalSkillProvider(
         };
       }),
     );
-    target.on('agent/pre-step', ({ agent, messages, turn, signal }, next) => {
-      if (turns.get(agent)?.turn !== turn) turns.delete(agent);
-      if (messages.length) {
-        const inputs = messages.filter(({ source }) => source.kind === 'user');
-        const id = inputs[0] && sourceScope(inputs[0]);
-        const scope =
-          id && inputs.every((message) => sourceScope(message) === id)
-            ? bound(scopes.get(id))
-            : undefined;
-        if (scope) turns.set(agent, { scope, turn });
-        else if (inputs.length) turns.delete(agent);
-      }
-      const claimed = turns.get(agent);
-      return run(
-        claimed?.turn === turn ? claimed.scope : undefined,
-        signal,
-        next,
-      );
-    });
-    target.on('tools/execute', (exec, next) => {
-      if (exec.name !== 'skill') return next();
-      const agent = exec.agent;
-      return run(
-        agent ? turns.get(agent)?.scope : undefined,
-        exec.signal,
-        next,
-      );
-    });
+    target.on(
+      'agent/pre-step',
+      ({ agent, messages, turn, signal }, next) => {
+        if (turns.get(agent)?.turn !== turn) turns.delete(agent);
+        if (messages.length) {
+          const inputs = messages.filter(
+            ({ source }) => source.kind === 'user',
+          );
+          const id = inputs[0] && sourceScope(inputs[0]);
+          const scope =
+            id && inputs.every((message) => sourceScope(message) === id)
+              ? bound(scopes.get(id))
+              : undefined;
+          if (scope) turns.set(agent, { scope, turn });
+          else if (inputs.length) turns.delete(agent);
+        }
+        const claimed = turns.get(agent);
+        return run(
+          claimed?.turn === turn ? claimed.scope : undefined,
+          signal,
+          next,
+        );
+      },
+      { prepend: true },
+    );
+    target.on(
+      'tools/execute',
+      (exec, next) => {
+        if (exec.name !== 'skill') return next();
+        const agent = exec.agent;
+        return run(
+          agent ? turns.get(agent)?.scope : undefined,
+          exec.signal,
+          next,
+        );
+      },
+      { prepend: true },
+    );
   });
   return { invalidate, run };
 }
