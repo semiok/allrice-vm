@@ -11,7 +11,6 @@ import {
   findDEntryEmployee,
 } from '../../../lib/d-entry/entry-threads';
 import { readStartupProfileAssetUrls } from '../../../lib/d-entry/released-profile-assets';
-import { publicProfileModules } from '../../../lib/d-entry/public-profile-warmup';
 import { getRequestContext } from '../../../lib/identity/session';
 import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
@@ -149,23 +148,12 @@ export default async function EmployeeNativeEntryPage({
     readStartupProfileAssetUrls(),
     readWarmEntry(query),
   ]);
-  const page = (
+  return (
     <EmployeeNativePage
       query={query.toString()}
       startupAssetUrls={startupAssetUrls}
       warmIdentity={warmIdentity}
       prepare
     />
-  );
-  const modules = warmIdentity ? publicProfileModules(startupAssetUrls) : [];
-  return modules.length ? (
-    <>
-      {modules.map((url) => (
-        <link key={url} rel="modulepreload" href={url} />
-      ))}
-      {page}
-    </>
-  ) : (
-    page
   );
 }

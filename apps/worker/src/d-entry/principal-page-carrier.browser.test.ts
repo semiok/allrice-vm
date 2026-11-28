@@ -421,7 +421,9 @@ it
       )
       .join('');
     let coldPaths: string[] = [];
+    let startupUrls: string[] = [];
     let managedPreloads = '';
+    let parentAssetWarms = 0;
     let stagedPaths: Set<string> | undefined;
     if (independentlyInstalled) {
       const root = await realpath(
@@ -452,11 +454,10 @@ it
           ),
         );
       publicIndex = publicProfileBundles.parse(index.bundles);
-      managedPreloads = publicProfileModules(
-        index.startup
-          .filter((path) => index.paths.includes(path))
-          .map((path) => publicRoot + path),
-      )
+      startupUrls = index.startup
+        .filter((path) => index.paths.includes(path))
+        .map((path) => publicRoot + path);
+      managedPreloads = publicProfileModules(startupUrls)
         .map((url) => `<link rel="modulepreload" href="${url}">`)
         .join('');
       if (coldAssets && bench !== 'baseline')
@@ -728,18 +729,20 @@ it
           }
           if (url.pathname === '/chatflow/4.0') {
             return response
-              .writeHead(200, { 'content-type': 'text/html' })
+              .writeHead(200, {
+                'content-type': 'text/html',
+                'cache-control': 'private, no-store',
+              })
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
                   (warmRefresh
-                    ? managedPreloads +
-                      '<script id="warm-identity" type="application/json">' +
+                    ? '<script id="warm-identity" type="application/json">' +
                       JSON.stringify(f.identity) +
                       '</script>'
                     : '') +
-                  (coldAssets && bench !== 'progress'
+                  (warmRefresh || (coldAssets && bench !== 'progress')
                     ? '<script id="startup-assets" type="application/json">' +
-                      JSON.stringify(coldPaths) +
+                      JSON.stringify(warmRefresh ? startupUrls : coldPaths) +
                       '</script>'
                     : '') +
                   '<script src="/outer.js"></script>',
@@ -880,6 +883,7 @@ it
           };
           traffic.push(timing);
           expect(request.headers.cookie).toBeUndefined();
+          if (warmRefresh) expect(request.headers.referer).toBeUndefined();
           if (coldAssets && readyAt === undefined)
             expect(request.headers.referer).toBeUndefined();
           const bytes = await release.read(
@@ -906,6 +910,15 @@ it
         }
         if (usePublicFiles && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
+          if (
+            warmRefresh &&
+            startupUrls.includes(url.pathname) &&
+            request.headers['sec-fetch-dest'] === 'empty'
+          ) {
+            expect(request.headers.cookie).toBeUndefined();
+            expect(request.headers.referer).toBeUndefined();
+            parentAssetWarms++;
+          }
           if (
             !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
           )
@@ -1078,6 +1091,7 @@ it
           .writeHead(200, {
             'content-type': 'text/html',
             'cache-control': 'private, no-store',
+            'referrer-policy': 'no-referrer',
             ...(encoded && {
               'content-encoding': 'gzip',
               'content-length': encoded.byteLength,
@@ -2356,6 +2370,7 @@ it
         }),
     );
     if (warmRefresh) {
+      expect(parentAssetWarms).toBeGreaterThan(0);
       expect(
         (await page.evaluate(timings)).reads.map(([path]) => path),
       ).not.toContain('/api/v1/d-entry/native-prewarm');
