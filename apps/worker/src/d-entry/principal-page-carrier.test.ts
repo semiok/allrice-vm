@@ -17,6 +17,7 @@ import {
 } from 'node:net';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -47,6 +48,75 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+it.each(['close', 'error', 'shutdown'] as const)(
+  'keeps an idle page on the WebSocket and clears its unrefed timer on %s',
+  async (reason) => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const cleared = vi.spyOn(globalThis, 'clearInterval');
+    const ping = vi.spyOn(WebSocket.prototype, 'ping');
+    try {
+      const f = await fixture();
+      const { peer, receive, scopeId } = await open(f);
+      const messages = vi.fn();
+      peer.on('message', messages);
+      const keepAlive = intervals.mock.calls.findIndex(
+        ([, milliseconds]) => milliseconds === 25_000,
+      );
+      expect(keepAlive).toBeGreaterThanOrEqual(0);
+      const timer = intervals.mock.results[keepAlive]!.value;
+      expect(timer.hasRef()).toBe(false);
+
+      const control = once(peer, 'ping');
+      vi.advanceTimersByTime(24_999);
+      expect(ping).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(ping).toHaveBeenCalledTimes(1);
+      const serverPeer = ping.mock.contexts[0] as WebSocket;
+      const pong = once(serverPeer, 'pong');
+      expect(await control).toEqual([Buffer.alloc(0)]);
+      expect(await pong).toEqual([Buffer.alloc(0)]);
+      // Advance past the reported idle period with no application traffic.
+      for (let tick = 0; tick < 4; tick++) {
+        const nextPing = once(peer, 'ping');
+        const nextPong = once(serverPeer, 'pong');
+        vi.advanceTimersByTime(25_000);
+        expect(await nextPing).toEqual([Buffer.alloc(0)]);
+        expect(await nextPong).toEqual([Buffer.alloc(0)]);
+      }
+      expect(ping).toHaveBeenCalledTimes(5);
+      expect(messages).not.toHaveBeenCalled();
+
+      const closed = once(peer, 'close');
+      if (reason === 'close') {
+        closePage(peer);
+        expect(await receive()).toMatchObject({
+          type: 'item',
+          value: { type: 'closed', scopeId },
+        });
+        expect(await receive()).toMatchObject({ type: 'end' });
+        expect((await closed)[0]).toBe(1000);
+      } else if (reason === 'error') {
+        serverPeer.emit('error', Error('fixture socket error'));
+        expect(cleared).toHaveBeenCalledWith(timer);
+      } else {
+        const shuttingDown = f.closeWebGateway();
+        expect(cleared).toHaveBeenCalledWith(timer);
+        await shuttingDown;
+      }
+      await closed;
+      expect(cleared).toHaveBeenCalledWith(timer);
+      vi.advanceTimersByTime(50_000);
+      expect(ping).toHaveBeenCalledTimes(5);
+    } finally {
+      ping.mockRestore();
+      intervals.mockRestore();
+      cleared.mockRestore();
+      vi.useRealTimers();
+    }
+  },
+);
 
 it('reads the sealed language default and persists a native language preference without opening platform settings', async () => {
   const f = await fixture();

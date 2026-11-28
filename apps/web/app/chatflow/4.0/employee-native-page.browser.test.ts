@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Duplex } from 'node:stream';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
 import { describe, expect, it } from 'vitest';
 import {
@@ -1055,6 +1056,62 @@ suite('4.0 browser cold entry', () => {
           .toBe(true);
       } finally {
         await stalledClose.close();
+      }
+
+      const disconnected = await context.newPage();
+      const pageSocket = deferred<Duplex>();
+      const capture = (_request: IncomingMessage, socket: Duplex) =>
+        pageSocket.resolve(socket);
+      f.web.once('upgrade', capture);
+      try {
+        await disconnected.route('**/api/v1/d-entry/native-prewarm', (route) =>
+          route.fulfill({ status: 204 }),
+        );
+        const url =
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection);
+        const markReady = () =>
+          disconnected
+            .frameLocator('iframe')
+            .locator('body[data-mount-ready=yes]')
+            .evaluate(() => {
+              Reflect.get(window, 'publishMount')();
+              return Reflect.get(window, '__ALLRICE_EMPLOYEE_DOCUMENT__')
+                .scopeId as string;
+            });
+        await disconnected.goto(url);
+        const socket = await pageSocket.promise;
+        const oldScope = await markReady();
+        await disconnected.locator('iframe').waitFor({ state: 'visible' });
+        const before = documents.length;
+        await disconnected.evaluate(() => {
+          document.documentElement.dataset.oldDocument = 'yes';
+        });
+
+        // Drop the real browser-to-Web socket before a closed/end exchange.
+        socket.destroy();
+        await disconnected
+          .getByRole('alert')
+          .getByText('无法确认旧连接已关闭。', { exact: true })
+          .waitFor();
+        expect(
+          await disconnected.getByRole('button', { name: '重试' }).count(),
+        ).toBe(0);
+        expect(documents).toHaveLength(before);
+
+        const reload = disconnected.getByRole('button', {
+          name: '刷新页面',
+          exact: true,
+        });
+        expect(await reload.count()).toBe(1);
+        await reload.click();
+        await disconnected.waitForSelector('html:not([data-old-document])');
+        expect(disconnected.url()).toBe(url);
+        expect(await markReady()).not.toBe(oldScope);
+        await disconnected.locator('iframe').waitFor({ state: 'visible' });
+        expect(documents).toHaveLength(before + 1);
+      } finally {
+        f.web.off('upgrade', capture);
+        await disconnected.close();
       }
 
       const firstStart = await context.newPage();

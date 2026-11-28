@@ -622,6 +622,7 @@ export async function fixture(
     historyIdentity,
     pageSignals,
     profileCompletion,
+    closeWebGateway: gateway.close,
     closeProfile: profile.close,
     closeControl: control.close,
     async checkUnknownControlClose() {
