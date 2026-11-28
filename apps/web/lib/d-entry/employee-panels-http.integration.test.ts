@@ -1066,8 +1066,7 @@ suite(
           await assertQuiet(publishedId, withdrawnId, pendingId);
           await page
             .getByRole('button', { name: '‹ 企业资料', exact: true })
-            .waitFor();
-          await materials();
+            .click();
           await openUpload();
           await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
           await page.route(
@@ -1099,6 +1098,49 @@ suite(
             .waitFor();
           expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
           await assertQuiet(unknownId);
+          // Two independent background reads straddle a real release change.
+          // The earlier authorised reply cannot tell the UI what happened to
+          // the other request, whose read is denied under the current policy.
+          const lateRecorded = holdReceipt(withdrawnId, 'beforeReply');
+          let allowUnknown!: () => void;
+          const unknownHeld = new Promise<void>((resolve) => {
+            allowUnknown = resolve;
+          });
+          await page.route(
+            '**' + receiptPath(unknownId) + '?*',
+            async (route) => {
+              await unknownHeld;
+              await route.continue();
+            },
+            { times: 1 },
+          );
+          try {
+            const lateResponse = page.waitForResponse(
+              receiptResponse(withdrawnId),
+            );
+            const deniedResponse = page.waitForResponse(
+              receiptResponse(unknownId),
+            );
+            const replies = Promise.all([lateResponse, deniedResponse]);
+            void replies.catch(() => {});
+            await closeUpload();
+            await lateRecorded.arrived();
+            await policy('fixture-late-recorded-withdrawal', false);
+            allowUnknown();
+            expect((await deniedResponse).status()).toBe(403);
+            lateRecorded.release();
+            const [late] = await replies;
+            await lateRecorded.assertFinished(late);
+            expect(await late.json()).toMatchObject({
+              requestId: withdrawnId,
+              status: 'recorded',
+            });
+            await assertQuiet(withdrawnId, unknownId);
+            expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
+          } finally {
+            allowUnknown();
+            lateRecorded.close();
+          }
           expect(referenceWrites).toBe(0);
           await page.unrouteAll({ behavior: 'wait' });
           await context.close();
