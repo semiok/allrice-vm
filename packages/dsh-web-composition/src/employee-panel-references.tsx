@@ -12,6 +12,7 @@ import {
   type ReferencePublicationQuerySchema,
   decodeEmployeeFileMention,
   employeeFileMentionPrefix,
+  supportsEmployeeFileMentionText,
   encodeEmployeeFileMention,
   ReferenceSelectionSchema,
 } from '@allrice/contracts';
@@ -346,10 +347,9 @@ export function apply(ctx: Context) {
                     .filter(
                       (row) =>
                         row.status === 'active' &&
-                        row.canReference === true &&
-                        (row.fullTextReady ||
-                          row.readCapabilities?.text ||
-                          row.readCapabilities?.archive),
+                        row.processing !== 'uploading' &&
+                        (row.readCapabilities?.archive ||
+                          supportsEmployeeFileMentionText(row)),
                     )
                     .map((row) => ({
                       name: row.fileName,

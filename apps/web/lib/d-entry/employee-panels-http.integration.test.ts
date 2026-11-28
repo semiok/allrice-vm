@@ -2098,6 +2098,41 @@ suite(
       const [copies] =
         await f.db`select count(*)::int as count from allrice_knowledge_revisions where organization_id=${p.context.organizationId}`;
       expect(copies?.count).toBe(0);
+      const published = await p.client.publishUpload(
+        {
+          ...uploadInput(p, 'unprocessed-material.pdf'),
+          mediaType: 'application/pdf',
+          contentBase64: bytes.toString('base64'),
+          origin: 'upload',
+          purpose: '',
+          audience: { scope: 'personal', departmentIds: [] },
+        },
+        signal(),
+      );
+      const materials = await p.client.queryMaterials(
+        { workspaceId: p.selection.workspaceId, query: {} },
+        signal(),
+      );
+      const fixed = materials.references.find(
+        (row) => row.revisionId === published.revisionId,
+      )!;
+      expect(fixed.processing).toBe('saved');
+      expect(fixed.fullTextReady).toBe(false);
+      const quotedMaterial = await read(
+        modelCall(p, thread.id),
+        referenceMessage(thread.id, {
+          kind: 'material',
+          sourceId: fixed.sourceId,
+          revisionId: fixed.revisionId,
+          revision: fixed.revision,
+          digest: fixed.manifestDigest,
+          checksum: fixed.checksum,
+        }),
+        signal(),
+      );
+      expect(JSON.stringify(quotedMaterial?.messages)).toContain(marker);
+      await quotedMaterial!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(2);
     });
     it('lists the validated directory of an owned ZIP delivery without exposing member text', async () => {
       const p = await person();

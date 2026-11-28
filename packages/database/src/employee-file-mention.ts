@@ -1,8 +1,9 @@
 import type { Sql } from 'postgres';
-import type {
-  DEntryIdentity,
-  EmployeeFileMentionPin,
-  RequestContext,
+import {
+  supportsEmployeeFileMentionText,
+  type DEntryIdentity,
+  type EmployeeFileMentionPin,
+  type RequestContext,
 } from '@allrice/contracts';
 import { withDedicatedCallerTransaction } from './business-runtime/caller-transaction.ts';
 import { getDatabase } from './core/client.ts';
@@ -32,11 +33,14 @@ async function requireOriginal(
       pin.revisionId,
       tx,
       true,
+      undefined,
+      'quote-original',
     );
     const exact = current.selection;
     if (
       !current.publication ||
-      (!current.readCapabilities.text && !current.readCapabilities.archive) ||
+      (!supportsEmployeeFileMentionText(current.object) &&
+        !current.readCapabilities.archive) ||
       exact.sourceId !== pin.sourceId ||
       exact.revision !== pin.revision ||
       exact.checksum !== pin.checksum ||

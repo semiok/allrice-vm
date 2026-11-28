@@ -7,6 +7,7 @@ import {
   ReferencePublicationQuerySchema,
   ReferencePublishInputSchema,
   UuidSchema,
+  supportsEmployeeFileMentionText,
   WorkbenchDeliverablesFilterSchema,
   WorkbenchFileFavoriteSchema,
   WorkbenchFileUploadSchema,
@@ -14,7 +15,6 @@ import {
 import {
   DataAccessError,
   isIndexableKnowledgeTextSource,
-  isIndexableReferenceSource,
 } from '@allrice/database';
 import { workbenchFileError, workbenchFileHeaders } from '../workbench-files';
 import { readStaticArtifactPreview } from '../runtime/static-artifact-preview';
@@ -280,7 +280,7 @@ export function createEmployeePanelsHandlers(
           .filter((file) => {
             if (params.get('mention') === '1')
               return (
-                isIndexableReferenceSource(file) ||
+                supportsEmployeeFileMentionText(file) ||
                 (file.mediaType === 'application/zip' &&
                   file.sizeBytes <= referenceArchivePolicy.maximumBytes)
               );

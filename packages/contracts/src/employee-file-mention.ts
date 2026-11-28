@@ -61,3 +61,23 @@ export function decodeEmployeeFileMention(line: string) {
     ),
   );
 }
+
+/** Supported originals, independently of whether reference indexing has run.
+ * The Worker still checks actual bytes and applies the native document limits. */
+export function supportsEmployeeFileMentionText(file: {
+  mediaType: string;
+  sizeBytes: number;
+}) {
+  return (
+    file.sizeBytes >= 0 &&
+    file.sizeBytes <= 20 * 1024 * 1024 &&
+    (file.mediaType.startsWith('text/') ||
+      [
+        'application/json',
+        'application/pdf',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      ].includes(file.mediaType))
+  );
+}
