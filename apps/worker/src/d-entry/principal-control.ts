@@ -4,15 +4,17 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Subagents } from '@deepseek-ai/dsh-subagent/remote';
-import type {
-  RemoteStreamHandle,
-  TypertSchema,
+import {
+  RemoteError,
+  type RemoteStreamHandle,
+  type TypertSchema,
 } from '@deepseek-ai/dsh-typert-protocol';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   DEntryScopeIssueSchema,
   type DEntryPageInput,
   type DEntryPageNativeCall,
+  type DEntryPageNativeEnd,
   type DEntryPageNativeError,
   type DEntryPageNativeItem,
   type DEntryPrincipalActivity,
@@ -26,7 +28,10 @@ import {
 } from '@allrice/d-entry-principal/types';
 
 type StreamFrame =
-  DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError;
+  | DEntryScopedStreamFrame
+  | DEntryPageNativeItem
+  | DEntryPageNativeError
+  | DEntryPageNativeEnd;
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: unknown) => void;
@@ -168,6 +173,9 @@ class Relay<T extends ScopeFrame | StreamFrame> {
     })();
     void this.done.catch(() => {});
   }
+  get acknowledgedClose() {
+    return this.closed;
+  }
   async next(): Promise<IteratorResult<T>> {
     while (true) {
       if (this.item) {
@@ -271,6 +279,7 @@ export function createDEntryPrincipalControl(
     DEntryPrincipalActivity & {
       local(): Promise<void>;
       fence(reason?: unknown): void;
+      hasUnconfirmedTerminalExit(): boolean;
     }
   >();
   const shutdown = new AbortController();
@@ -296,10 +305,15 @@ export function createDEntryPrincipalControl(
         joined: Promise<void> | undefined;
       const children = new Set<Relay<StreamFrame>>();
       const operations = new Set<Promise<unknown>>();
+      const follows = new Map<string, AbortController>();
       let detachRun = () => {};
       let published = false;
+      let terminalDispatched = false;
       const opened = deferred<Extract<ScopeFrame, { type: 'opened' }>>();
       const activity = {
+        hasUnconfirmedTerminalExit() {
+          return terminalDispatched && !relay?.acknowledgedClose;
+        },
         fence(reason?: unknown) {
           revoked.abort(reason);
         },
@@ -329,6 +343,19 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'follow-revoked' && published) {
+                  follows.get(frame.followId)?.abort(
+                    new RemoteError(
+                      'remote-access/denied',
+                      'Native session follow unavailable',
+                      {
+                        action: 'session/follow',
+                        reason: 'session-changed',
+                      },
+                    ),
+                  );
+                  return false;
+                }
                 if (frame.type === 'revoked' && published) {
                   revoked.abort(Error('PRINCIPAL_SCOPE_REVOKED'));
                   return false;
@@ -397,6 +424,14 @@ export function createDEntryPrincipalControl(
                 }
                 let known = false;
                 try {
+                  // A lost create reply can still leave a native PTY. The
+                  // owning scope's closed frame means the Guest joined it.
+                  if (
+                    issue.access === 'page' &&
+                    issue.terminalOwner &&
+                    call.endpoint === 'terminal/create'
+                  )
+                    terminalDispatched = true;
                   const result = await TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].invoke(
@@ -556,17 +591,36 @@ export function createDEntryPrincipalControl(
                 };
               },
               streamPage(call, active) {
-                const child = stream(call, active);
+                const followId = call.followId;
+                const follow = followId ? new AbortController() : undefined;
+                const child = stream(
+                  call,
+                  follow ? AbortSignal.any([active, follow.signal]) : active,
+                );
+                if (followId && follow) follows.set(followId, follow);
                 return {
+                  revoked: follow?.signal,
                   send: child.send,
                   async *[Symbol.asyncIterator]() {
-                    let failure: DEntryPageNativeError['error'] | undefined;
-                    for await (const frame of child) {
-                      if (failure || frame.type === 'item') throw unknown();
-                      if (frame.type === 'page-error') failure = frame.error;
-                      else yield frame;
+                    try {
+                      let failure: DEntryPageNativeError['error'] | undefined;
+                      for await (const frame of child) {
+                        if (failure || frame.type === 'item') throw unknown();
+                        if (frame.type === 'page-end') {
+                          if (!follow) throw unknown();
+                          break;
+                        }
+                        if (frame.type === 'page-error') {
+                          // Iterator close still joins the real child. Keep the
+                          // native failure primary if that join also fails.
+                          if (follow) throw frame.error;
+                          failure = frame.error;
+                        } else yield frame;
+                      }
+                      if (failure) throw failure;
+                    } finally {
+                      if (followId) follows.delete(followId);
                     }
-                    if (failure) throw failure;
                   },
                 };
               },
@@ -657,6 +711,16 @@ export function createDEntryPrincipalControl(
       );
       if (results.some((result) => result.status === 'rejected'))
         throw unknown();
+    },
+    hasUnconfirmedTerminalExit() {
+      return [...activities].some((activity) =>
+        activity.hasUnconfirmedTerminalExit(),
+      );
+    },
+    async retireAfterJobExit() {
+      await control.drainLocal();
+      if (control.hasUnconfirmedTerminalExit()) throw unknown();
+      activities.clear();
     },
     async retireAfterNativeStop() {
       await control.drainLocal();

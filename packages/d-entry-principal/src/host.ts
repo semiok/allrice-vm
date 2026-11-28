@@ -20,6 +20,7 @@ import type {} from '@deepseek-ai/dsh-api-gateway';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { API_REMOTE_FORWARDED_EVENTS } from '@deepseek-ai/dsh-api-remotes';
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import { TYPERT_REMOTE as Access } from '@deepseek-ai/dsh-api-remote-access/remote';
 import {
@@ -46,6 +47,7 @@ import type {
   DEntryPrincipal,
   DEntryScopeIssue,
   DEntryPageNativeCall,
+  DEntryPageNativeEnd,
   DEntryPageNativeError,
   DEntryPageNativeItem,
   DEntryPageNativeResult,
@@ -204,6 +206,31 @@ function assertContribution(
   )
     throw Error('PRINCIPAL_METADATA_INVALID');
 }
+const followCatalogIntervalMs = 5000;
+
+function followAddress(args: unknown) {
+  try {
+    return Native.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(args).request.address;
+  } catch {
+    // The native Gateway owns malformed-input errors.
+    return;
+  }
+}
+
+function sameFollowSession(
+  current: SessionSummary | undefined,
+  original: SessionSummary,
+) {
+  return (
+    current !== undefined &&
+    current.origin === original.origin &&
+    current.parentSessionId === original.parentSessionId
+  );
+}
+
 class Scope implements Projection {
   active = false;
   bindings: Projection['bindings'] = [];
@@ -222,6 +249,16 @@ class Scope implements Projection {
   private catalogReading?: Promise<void>;
   private refreshQueue = Promise.resolve();
   private refreshGeneration = 0;
+  private sessions = new Map<SessionId, SessionSummary>();
+  private readonly follows = new Set<{
+    chain: ReadonlyMap<SessionId, SessionSummary>;
+    followId?: string;
+    stop: AbortController;
+  }>();
+  private followTimer?: ReturnType<typeof setTimeout>;
+  private followRead?: Promise<void>;
+  private readonly followWithdrawals = new Set<string>();
+  private wakeFollowWithdrawal?: () => void;
   constructor(
     readonly host: PrincipalService,
     private readonly ctx: Context,
@@ -245,10 +282,14 @@ class Scope implements Projection {
       if (this.eventBindings.length) this.rememberPageEvents([sessionId]);
       void this.refresh().catch(lost);
     };
-    const added = parent.ctx.on('api-session/added', ({ sessionId }) =>
-      hint(sessionId),
-    );
-    const removed = parent.ctx.on('api-session/removed', hint);
+    const added = parent.ctx.on('api-session/added', (session) => {
+      this.fenceFollowSession(session.sessionId, session);
+      hint(session.sessionId);
+    });
+    const removed = parent.ctx.on('api-session/removed', (id) => {
+      this.fenceFollowSession(id);
+      hint(id);
+    });
     this.detach = () => {
       parent.signal.removeEventListener('abort', lost);
       added();
@@ -341,10 +382,15 @@ class Scope implements Projection {
         // this generation. A cancelled follower owns only its catalog read.
         if (generation === this.refreshGeneration) {
           this.refreshQueue = task;
-          if (this.issue.access === 'page')
+          if (this.issue.access === 'page') {
+            this.sessions = new Map(
+              catalog.items.map((item) => [item.sessionId, item]),
+            );
+            this.verifyFollows(this.sessions);
             this.rememberPageEvents(
               catalog.items.map(({ sessionId }) => sessionId),
             );
+          }
           this.publish(
             bindings,
             this.issue.access === 'page' || bindings.length > 0,
@@ -354,6 +400,8 @@ class Scope implements Projection {
         if (!signal.aborted && generation === this.refreshGeneration) {
           this.refreshQueue = task;
           this.eventBindings = [];
+          this.sessions.clear();
+          this.verifyFollows(this.sessions);
           this.publish([]);
         }
         throw error;
@@ -361,6 +409,123 @@ class Scope implements Projection {
     });
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
+  }
+  withdrawFollow(stop: AbortController, followId?: string) {
+    if (stop.signal.aborted) return;
+    stop.abort(
+      new RemoteError(
+        'remote-access/denied',
+        'Native session follow unavailable',
+        {
+          action: 'session/follow',
+          reason: 'session-changed',
+        },
+      ),
+    );
+    if (followId && !this.abort.signal.aborted) {
+      this.followWithdrawals.add(followId);
+      this.wakeFollowWithdrawal?.();
+    }
+  }
+  async nextFollowWithdrawal(signal: AbortSignal) {
+    while (true) {
+      signal.throwIfAborted();
+      const id = this.followWithdrawals.values().next().value;
+      if (id !== undefined) {
+        this.followWithdrawals.delete(id);
+        return id;
+      }
+      try {
+        await waitForRead(
+          new Promise((resolve) => {
+            this.wakeFollowWithdrawal = resolve;
+          }),
+          signal,
+        );
+      } finally {
+        this.wakeFollowWithdrawal = undefined;
+      }
+    }
+  }
+  private fenceFollowSession(id: SessionId, current?: SessionSummary) {
+    for (const { chain, stop, followId } of this.follows) {
+      const original = chain.get(id);
+      if (original && !sameFollowSession(current, original))
+        this.withdrawFollow(stop, followId);
+    }
+  }
+  private verifyFollows(sessions: ReadonlyMap<SessionId, SessionSummary>) {
+    for (const { chain, stop, followId } of this.follows) {
+      for (const [id, original] of chain) {
+        if (sameFollowSession(sessions.get(id), original)) continue;
+        this.withdrawFollow(stop, followId);
+        break;
+      }
+    }
+  }
+  private scheduleFollowRead() {
+    if (
+      this.followTimer ||
+      this.followRead ||
+      !this.follows.size ||
+      this.abort.signal.aborted
+    )
+      return;
+    this.followTimer = setTimeout(() => {
+      this.followTimer = undefined;
+      const signal = this.abort.signal;
+      this.followRead = this.track(
+        this.readInOrder(signal, async () => {
+          const { items } = await this.ctx.sessionController.list({}, signal);
+          signal.throwIfAborted();
+          this.verifyFollows(new Map(items.map((row) => [row.sessionId, row])));
+        })
+          .catch(() => this.verifyFollows(new Map()))
+          .finally(() => {
+            this.followRead = undefined;
+            this.scheduleFollowRead();
+          }),
+      );
+    }, followCatalogIntervalMs);
+    this.followTimer.unref();
+  }
+  pendingFollowRead() {
+    return this.followRead;
+  }
+  watchFollow(args: unknown, stop: AbortController, followId?: string) {
+    const address = followAddress(args);
+    if (!address) return;
+    const chain = new Map<SessionId, SessionSummary>();
+    let item = this.sessions.get(
+      address.kind === 'session' ? address.sessionId : address.childSessionId,
+    );
+    // Let the native Gateway surface its exact validation error for an
+    // unbound address. Forwarding still requires positive ancestry proof.
+    if (
+      !item ||
+      (address.kind === 'subagent' &&
+        (item.origin !== 'subagent' ||
+          item.parentSessionId !== address.parentSessionId))
+    )
+      return;
+    while (item && !chain.has(item.sessionId)) {
+      chain.set(item.sessionId, { ...item });
+      if (item.origin !== 'subagent') {
+        const follow = { chain, stop, followId };
+        this.follows.add(follow);
+        this.scheduleFollowRead();
+        return () => {
+          this.follows.delete(follow);
+          if (!this.follows.size && this.followTimer) {
+            clearTimeout(this.followTimer);
+            this.followTimer = undefined;
+          }
+        };
+      }
+      item = item.parentSessionId
+        ? this.sessions.get(item.parentSessionId)
+        : undefined;
+    }
   }
   private rememberPageEvents(ids: readonly SessionId[]) {
     const count = this.eventSessions.size;
@@ -435,11 +600,15 @@ class Scope implements Projection {
     this.bindings = [];
     this.eventBindings = [];
     this.eventSessions.clear();
+    this.followWithdrawals.clear();
+    if (this.followTimer) clearTimeout(this.followTimer);
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
     return attempt;
   }
 }
+
+type DefaultWorkspace = { path: string; ensure(): Promise<string> };
 
 /** Actual guest service; only the trusted Node API Peer can issue a scope.
  * The public Host face is the Cordis plugin, not a constructor for consumers. */
@@ -459,6 +628,7 @@ class PrincipalService extends TypertRemoteService {
   private graphObserver?: {
     ready: boolean;
     current(): boolean;
+    defaultWorkspace(): DefaultWorkspace | undefined;
     close(): Promise<void>;
   };
   private graphRetirement = Promise.resolve();
@@ -570,6 +740,7 @@ class PrincipalService extends TypertRemoteService {
     },
     owner?: {
       current(): boolean;
+      defaultWorkspace?(): DefaultWorkspace | undefined;
       publish(): Promise<void>;
       retire(): Promise<void>;
     },
@@ -580,6 +751,7 @@ class PrincipalService extends TypertRemoteService {
     const observer = {
       ready: false,
       current: () => owner?.current() ?? true,
+      defaultWorkspace: () => owner?.defaultWorkspace?.(),
       close: () => {
         if (retiring) return retiring;
         observer.ready = false;
@@ -780,9 +952,20 @@ class PrincipalService extends TypertRemoteService {
           scopeId: issue.scopeId,
           principal: peer.principal,
           baseline,
+          ...(issue.access === 'page' && { followWithdrawals: true }),
         };
       }
-      await gate.done;
+      while (!gate.abort.signal.aborted) {
+        let followId: string;
+        try {
+          followId = await scope.nextFollowWithdrawal(gate.abort.signal);
+        } catch (error) {
+          if (!gate.abort.signal.aborted) throw error;
+          break;
+        }
+        if (!gate.abort.signal.aborted)
+          yield { type: 'follow-revoked', scopeId: issue.scopeId, followId };
+      }
       if (opened && withdrawn && !signal.aborted)
         yield { type: 'revoked', scopeId: issue.scopeId };
       await join();
@@ -1019,6 +1202,24 @@ class PrincipalService extends TypertRemoteService {
           raw,
           'unary',
         );
+        let nativeArgs = args;
+        const workspace = this.graphObserver?.defaultWorkspace();
+        if (endpoint === 'session/create' && workspace) {
+          const { request } = Native.methods[endpoint]
+            .input({ strict: true })
+            .create()
+            .parse(args);
+          if (
+            request.workspaceId === undefined &&
+            (request.cwd === undefined || request.cwd === workspace.path)
+          ) {
+            const workspaceId = await workspace.ensure();
+            active.throwIfAborted();
+            const create = { ...request, workspaceId };
+            delete create.cwd;
+            nativeArgs = { request: create };
+          }
+        }
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
         const modelInput =
           endpoint === 'session/prompt' ||
@@ -1055,13 +1256,18 @@ class PrincipalService extends TypertRemoteService {
         }
         let value: unknown;
         try {
-          value = await this.ctx.typertGateway.invoke({
-            namespace: descriptor.namespace,
-            method: descriptor.method,
-            args,
-            peer: modelInput ? scope.currentPeer() : scope.parent,
-            signal: active,
-          });
+          const dispatch = () =>
+            this.ctx.typertGateway.invoke({
+              namespace: descriptor.namespace,
+              method: descriptor.method,
+              args: nativeArgs,
+              peer: modelInput ? scope.currentPeer() : scope.parent,
+              signal: active,
+            });
+          // The registry call above can overlap a catalog refresh.
+          value = await (nativeArgs === args
+            ? dispatch()
+            : scope.current(dispatch, active));
           if (terminal) terminal.possiblyAllocated = true;
         } catch (error) {
           // These rc.2 failures occur before any allocation. A success or
@@ -1100,7 +1306,10 @@ class PrincipalService extends TypertRemoteService {
     call: DEntryScopedStreamCall | DEntryPageNativeCall,
     signal: AbortSignal,
   ): RemoteStream<
-    DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError,
+    | DEntryScopedStreamFrame
+    | DEntryPageNativeItem
+    | DEntryPageNativeError
+    | DEntryPageNativeEnd,
     CloseCommand | DEntryPageInput
   > {
     const { args, invocation } = this.raw('allricePrincipal/streamScoped');
@@ -1119,7 +1328,22 @@ class PrincipalService extends TypertRemoteService {
     const inbox = endpoint === undefined ? undefined : pageUplink(endpoint);
     let pageMethod: ReturnType<PrincipalService['pageMethod']> | undefined;
     let inputFailure: unknown;
-    const pump = pumpPageInput(input, (command) => {
+    const follow = new AbortController();
+    let unwatchFollow: (() => void) | undefined;
+    let followDeliveryId: string | undefined;
+    const delivery =
+      endpoint === 'session/follow'
+        ? signalGate(scope.abort.signal)
+        : undefined;
+    const fenceUnconfirmedFollow = () => {
+      if (followDeliveryId && delivery && !delivery.abort.signal.aborted) {
+        // A broken uplink cannot prove consumption. Fence this follow through
+        // its independent control stream before releasing its watch.
+        scope.withdrawFollow(follow, followDeliveryId);
+        delivery.stop();
+      }
+    };
+    const receiveInput = (command: DEntryPageInput) => {
       if (
         !inbox ||
         (command.type === 'input' &&
@@ -1132,12 +1356,32 @@ class PrincipalService extends TypertRemoteService {
           { endpoint: endpoint ?? '' },
         );
       inbox.add(command);
+    };
+    const pump = pumpPageInput(input, (command) => {
+      if (inputFailure !== undefined) return;
+      try {
+        receiveInput(command);
+      } catch (error) {
+        if (!followDeliveryId) throw error;
+        // Abort native input, but keep reading for the consumer's close.
+        inputFailure = error;
+        gate.stop();
+      }
     })
+      .then((confirmed) => {
+        if (confirmed) delivery?.stop();
+        else fenceUnconfirmedFollow();
+      })
       .catch((error: unknown) => {
         inputFailure = error;
+        fenceUnconfirmedFollow();
       })
       .finally(gate.stop);
-    const active = AbortSignal.any([scope.abort.signal, gate.abort.signal]);
+    const active = AbortSignal.any([
+      scope.abort.signal,
+      gate.abort.signal,
+      follow.signal,
+    ]);
     if (inbox) {
       if (active.aborted) inbox.close();
       else active.addEventListener('abort', inbox.close, { once: true });
@@ -1145,6 +1389,7 @@ class PrincipalService extends TypertRemoteService {
     const setup = scope.own(async () => {
       active.throwIfAborted();
       if (page) {
+        if (raw.endpoint === 'session/follow') await scope.refresh(active);
         iterator = await scope.current(async () => {
           pageMethod = this.pageMethod(scope, raw, 'stream');
           const { endpoint, args, descriptor } = pageMethod;
@@ -1154,6 +1399,11 @@ class PrincipalService extends TypertRemoteService {
               'Native stream does not accept input',
               { endpoint },
             );
+          if (endpoint === 'session/follow') {
+            const followId = UuidSchema.optional().parse(raw.followId);
+            unwatchFollow = scope.watchFollow(args, follow, followId);
+            if (unwatchFollow) followDeliveryId = followId;
+          }
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
@@ -1286,9 +1536,28 @@ class PrincipalService extends TypertRemoteService {
             break;
           throw error;
         }
-        if (next.done) break;
-        if (gate.abort.signal.aborted || scope.abort.signal.aborted) break;
+        if (next.done && !followDeliveryId) break;
+        if (unwatchFollow) {
+          let checking;
+          while (!active.aborted && (checking = scope.pendingFollowRead())) {
+            try {
+              await waitForRead(checking, active);
+            } catch (error) {
+              if (!active.aborted) throw error;
+            }
+          }
+        }
+        if (active.aborted || next.done) break;
         if (pageMethod) {
+          if (pageMethod.endpoint === 'session/follow' && !unwatchFollow)
+            throw new RemoteError(
+              'remote-access/denied',
+              'Native session follow unavailable',
+              {
+                action: 'session/follow',
+                reason: 'session-changed',
+              },
+            );
           const { value, attachments } = encodePageNativeResult(
             pageMethod.descriptor,
             next.value,
@@ -1344,6 +1613,13 @@ class PrincipalService extends TypertRemoteService {
         yield { type: 'item', scopeId: scope.issue.scopeId, value };
       }
       if (inputFailure !== undefined) throw inputFailure;
+      follow.signal.throwIfAborted();
+      if (followDeliveryId && !active.aborted) {
+        // The Worker acknowledges once its last buffered item is delivered
+        // or discarded. Keep the independent withdrawal path alive until then.
+        yield { type: 'page-end', scopeId: scope.issue.scopeId };
+        await delivery!.done;
+      }
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
@@ -1351,10 +1627,12 @@ class PrincipalService extends TypertRemoteService {
         page &&
         !scope.abort.signal.aborted &&
         !signal.aborted &&
-        (!active.aborted || error === inputFailure)
+        (!active.aborted || error === inputFailure || follow.signal.aborted)
       ) {
-        await child.close();
-        const failure = this.ctx.typertGateway.wireStream.failure(error);
+        if (!followDeliveryId) await child.close();
+        const failure = this.ctx.typertGateway.wireStream.failure(
+          follow.signal.aborted ? follow.signal.reason : error,
+        );
         yield {
           type: 'page-error',
           scopeId: scope.issue.scopeId,
@@ -1365,6 +1643,10 @@ class PrincipalService extends TypertRemoteService {
               : {},
           },
         };
+        if (followDeliveryId) {
+          await delivery!.done;
+          await child.close();
+        }
         yield { type: 'closed', scopeId: scope.issue.scopeId };
         return;
       }
@@ -1374,6 +1656,8 @@ class PrincipalService extends TypertRemoteService {
       try {
         await (failed ? child.close().catch(() => {}) : child.close());
       } finally {
+        unwatchFollow?.();
+        delivery?.detach();
         gate.detach();
       }
     }

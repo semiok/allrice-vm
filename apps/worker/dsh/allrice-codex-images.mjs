@@ -3,6 +3,7 @@ import { Buffer } from 'node:buffer';
 
 const endpoint = 'https://chatgpt.com/backend-api/codex/responses';
 const workModels = new Set([
+  'gpt-6.2-sol',
   'gpt-6.1-sol',
   'gpt-6-sol',
   'gpt-6-luna',

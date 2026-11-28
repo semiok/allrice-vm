@@ -22,6 +22,8 @@ export const inject = [
   'loader',
   'clientModules',
   'allricePrincipal',
+  'workspaceRegistry',
+  'sessionPersistence',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
@@ -515,7 +517,7 @@ export function observeNativePrompts(scope, lifetime) {
     },
     { global: true },
   );
-  return (value, request) => {
+  function observe(value, request) {
     const notFound = () => new globalThis.Response(null, { status: 404 });
     if (
       typeof value?.id !== 'string' ||
@@ -593,11 +595,19 @@ export function observeNativePrompts(scope, lifetime) {
       },
     });
     return new globalThis.Response(body, { headers });
+  }
+  observe.claimed = (session, message, turn) => {
+    const agent = scope.agents.get(session.id);
+    if (!agent || original(agent.session) !== original(session)) return false;
+    for (const entry of matches(agent, message))
+      if (entry.itemId === message.id && entry.turn === turn) return true;
+    return false;
   };
+  return observe;
 }
 
 // Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
-export function observeDelegatedInputs(scope) {
+export function observeDelegatedInputs(scope, observedClaim = () => false) {
   const turns = new WeakMap();
   const inboxes = new WeakMap();
   const activations = new Map();
@@ -632,11 +642,19 @@ export function observeDelegatedInputs(scope) {
     const owner = root(session);
     if (!owner || !inputs?.length) return null;
     const prompts = new Map();
+    const claims = new Map();
+    let searchProven = true;
     for (const input of inputs) {
       if (input?.root !== owner) return null;
       for (const prompt of input.prompts) collectPrompt(prompts, prompt);
+      if (!input.claims) searchProven = false;
+      else for (const claim of input.claims) collectPrompt(claims, claim);
     }
-    return { root: owner, prompts: [...prompts.values()] };
+    return {
+      root: owner,
+      prompts: [...prompts.values()],
+      claims: searchProven ? [...claims.values()] : null,
+    };
   }
 
   function currentOrigin(session) {
@@ -697,6 +715,7 @@ export function observeDelegatedInputs(scope) {
       const agent = original(subject);
       const activation = activations.get(agent.id);
       if (activation?.child === agent) activation.disposed = true;
+      turns.get(original(agent.session))?.stop.abort();
     },
     global,
   );
@@ -705,7 +724,8 @@ export function observeDelegatedInputs(scope) {
     ({ id, runId, local }) => {
       const activation = activations.get(id);
       if (!local || activation?.runId !== runId) return;
-      const { notice, parent } = activation;
+      const { notice, parent, child } = activation;
+      turns.get(original(child.session))?.stop.abort();
       if (notice && liveAgent(parent.id) === parent)
         notice.origin = collect(parent.session, activation.inputs);
       activations.delete(id);
@@ -795,8 +815,10 @@ export function observeDelegatedInputs(scope) {
       const agent = liveAgent(session.id);
       if (original(agent?.session) !== session) return;
       if (event.type === 'turn/start') {
+        turns.get(session)?.stop.abort();
         turns.set(session, {
           turn: event.data.turn,
+          stop: new globalThis.AbortController(),
           claimed: new Map(),
           inputs: [],
           directClaims: new Map(),
@@ -806,7 +828,10 @@ export function observeDelegatedInputs(scope) {
       const state = turns.get(session);
       if (!state) return;
       if (event.type === 'turn/end') {
-        if (event.data.turn === state.turn) turns.delete(session);
+        if (event.data.turn === state.turn) {
+          state.stop.abort();
+          turns.delete(session);
+        }
         return;
       }
       if (event.type === 'subagent/catalog') {
@@ -834,7 +859,15 @@ export function observeDelegatedInputs(scope) {
         return;
       const direct = nativePromptOccurrence(session, event.data, state.turn);
       const origin = direct
-        ? { root: root(session), prompts: [direct] }
+        ? {
+            root: root(session),
+            prompts: [direct],
+            claims:
+              isNativeOrdinaryRoot(session.header) &&
+              observedClaim(session, event.data, state.turn)
+                ? [direct]
+                : null,
+          }
         : claimed(session, event.data, state.turn);
       state.inputs.push(origin);
       const activation = activations.get(agent.id);
@@ -842,7 +875,25 @@ export function observeDelegatedInputs(scope) {
     },
     global,
   );
-  return { root, claimed, rootWake };
+  function searchOrigin(sessionId) {
+    const agent = liveAgent(sessionId);
+    if (!agent || agent.status !== 'running') return null;
+    const session = original(agent.session);
+    const state = turns.get(session);
+    const origin = currentOrigin(session);
+    if (!state || !origin?.claims?.length || origin.claims.length > 64)
+      return null;
+    return {
+      signal: state.stop.signal,
+      proof: {
+        rootSessionId: origin.root.id,
+        claims: origin.claims,
+        turn: state.turn,
+      },
+    };
+  }
+
+  return { root, claimed, rootWake, searchOrigin };
 }
 
 export function apply(ctx, config) {
@@ -853,9 +904,16 @@ export function applyNativeWebOwner(
   ctx,
   config,
   registerManagedGatewayAdapter,
+  managedSearch,
 ) {
-  const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
-    config;
+  const {
+    artifactPath,
+    nonce,
+    baseUrl,
+    workdir,
+    commandMemoryPlugin,
+    modelAdapter,
+  } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -869,6 +927,7 @@ export function applyNativeWebOwner(
   let publicationFailure;
   let stagingCleanupFailure;
   let commandMemory;
+  let workspace;
   let registeredModel;
   let modelFiber;
   let published = false;
@@ -883,6 +942,7 @@ export function applyNativeWebOwner(
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
     value?.baseUrl === baseUrl &&
+    value?.workdir === workdir &&
     value?.commandMemoryPlugin === commandMemoryPlugin &&
     JSON.stringify(value?.modelAdapter) === JSON.stringify(modelAdapter);
   const entry = fiber.entry;
@@ -900,6 +960,13 @@ export function applyNativeWebOwner(
     });
   const observed = ctx.allricePrincipal.observeProfileGraph(ctx.clientModules, {
     current,
+    defaultWorkspace: () =>
+      workspace && {
+        path: workspace.path,
+        async ensure() {
+          return (await ctx.workspaceRegistry.create(workdir)).id;
+        },
+      },
     publish() {
       return (publishing = publish().catch((error) => {
         if (error === canceled) return;
@@ -1022,8 +1089,15 @@ export function applyNativeWebOwner(
       if (typeof registerManagedGatewayAdapter !== 'function')
         throw Error('Native managed model module is unavailable');
       if (!current()) return;
-      const { id, origin, capability, provider, model, modelInfo } =
-        modelAdapter;
+      const {
+        id,
+        origin,
+        capability,
+        provider,
+        model,
+        modelInfo,
+        historicalModels,
+      } = modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       modelFiber = ctx.inject(
@@ -1035,12 +1109,36 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
+          ...(modelAdapter.webSearchEnabled ? ['tools', 'web'] : []),
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
-          const delegations = observeDelegatedInputs(scope);
           const promptFacts = observeNativePrompts(scope, signal);
+          const delegations = observeDelegatedInputs(
+            scope,
+            modelAdapter.webSearchEnabled ? promptFacts.claimed : undefined,
+          );
+          let openSearch;
+          if (modelAdapter.webSearchEnabled) {
+            const disposeSearch = await managedSearch.applyManagedSearch(
+              scope,
+              {
+                cliPath: modelAdapter.cliPath,
+                origin,
+                capability,
+                adapterId: id,
+                enabled: true,
+              },
+            );
+            scope.on('dispose', disposeSearch);
+            openSearch = managedSearch.observeManagedSearchCalls(
+              scope,
+              id,
+              signal,
+              delegations.searchOrigin,
+            );
+          }
           const terminalAttestations = createNativeRunTerminalAttestations();
           const currentSession = (sessionId) =>
             original(scope.sessions.get(sessionId));
@@ -1090,6 +1188,12 @@ export function applyNativeWebOwner(
                   delegations.rootWake(value.sessionId),
                   { headers: { 'cache-control': 'no-store' } },
                 );
+              if (
+                value?.adapterId === id &&
+                value.action === 'observe-search-call' &&
+                openSearch
+              )
+                return openSearch(value, request);
               if (
                 value?.adapterId === id &&
                 (value.action === 'observe-prompt' ||
@@ -1185,6 +1289,7 @@ export function applyNativeWebOwner(
               provider,
               model,
               modelInfo,
+              historicalModels,
               lifetime: signal,
               async resolveCallReference(selection, active, purpose) {
                 const key = JSON.stringify([
@@ -1244,7 +1349,52 @@ export function applyNativeWebOwner(
               },
             },
           });
-          registeredModel = { dispose, llm: original(scope.llm), id };
+          const listeners = [];
+          if (modelInfo.reasoning?.defaultEffort !== undefined) {
+            // A retained session can propose its previous route. Use the
+            // current Host route for new requests, preserving explicit effort
+            // choices on that route and leaving the journal intact.
+            const outer = { global: true, prepend: true };
+            listeners.push(
+              scope.on(
+                'system-prompt/assemble',
+                async (_assembly, _context, next) => {
+                  const prompt = await next();
+                  signal.throwIfAborted();
+                  return {
+                    ...prompt,
+                    variables: { ...prompt.variables, provider, model },
+                  };
+                },
+                outer,
+              ),
+              scope.on(
+                'agent/request',
+                async (request, next) => {
+                  const config = await next();
+                  request.signal.throwIfAborted();
+                  signal.throwIfAborted();
+                  if (config.provider === provider && config.model === model)
+                    return config;
+                  return {
+                    ...config,
+                    provider,
+                    model,
+                    reasoningEffort: undefined,
+                  };
+                },
+                outer,
+              ),
+            );
+          }
+          registeredModel = {
+            dispose() {
+              for (const off of listeners) off();
+              dispose();
+            },
+            llm: original(scope.llm),
+            id,
+          };
           const models = await scope.llm.listModels(provider);
           if (models.length !== 1 || models[0].id !== model)
             throw Error('Native managed model was not registered');
@@ -1258,6 +1408,20 @@ export function applyNativeWebOwner(
         return;
       if (!registeredModel)
         throw Error('Native managed model was not installed');
+    }
+    if (!current()) return;
+    publicationStage = 'workspace';
+    workspace = await ctx.workspaceRegistry.create(workdir);
+    // The native registry's first-run import predates sessions created by the
+    // old Worker. Repair membership using this employee Host's own headers.
+    const accounted = new Set(workspace.sessionIds);
+    for (const { header } of await ctx.sessionPersistence.list({ signal })) {
+      if (!current()) return;
+      if (
+        (header.cwd === workdir || header.cwd === workspace.path) &&
+        !accounted.has(header.id)
+      )
+        await workspace.attachSession(header.id);
     }
     if (!current()) return;
     publicationStage = 'mux';

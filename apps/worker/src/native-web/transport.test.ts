@@ -114,6 +114,51 @@ it('keeps the native index exchange private and separate from API and resource r
   ]);
 });
 
+it('leaves room for retained session previews while keeping bounded native reads', async () => {
+  const body = JSON.stringify({ preview: 'x'.repeat(nativeIndexByteLimit) });
+  let tooLarge = false;
+  const server = createServer((request, response) => {
+    if (request.url?.startsWith('/connect?')) {
+      response
+        .writeHead(302, {
+          location: './api/remote.mux',
+          'set-cookie': 'fixture-api=owner; HttpOnly',
+        })
+        .end();
+      return;
+    }
+    response.setHeader('content-type', 'application/json');
+    response.setHeader(
+      'content-length',
+      tooLarge ? 8 * nativeIndexByteLimit + 1 : Buffer.byteLength(body),
+    );
+    response.end(body);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const signal = new AbortController().signal;
+  const transport = nativeWebTransport(origin, signal, () => {});
+  cleanup.push(async () => {
+    await transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  });
+  await transport.authenticate(origin + '/?token=fixture-only');
+  for (const method of ['session/list', 'session/projections'] as const) {
+    expect((await transport.readUnaryReply(method, '{}', signal)).length).toBe(
+      body.length,
+    );
+  }
+  await expect(
+    transport.readUnaryReply('schedule/catalog', '{}', signal),
+  ).rejects.toThrow('PROVIDER_FAILED');
+  tooLarge = true;
+  await expect(
+    transport.readUnaryReply('session/projections', '{}', signal),
+  ).rejects.toThrow('PROVIDER_FAILED');
+});
+
 it.each([
   'status',
   'media',

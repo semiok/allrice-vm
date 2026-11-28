@@ -18,6 +18,7 @@ export function employeeReasoningSettings(provider: string, model: string) {
     // Current Codex IDs plus historical employee model policies.
     if (
       [
+        'gpt-6.2-sol',
         'gpt-6.1-sol',
         'gpt-6-sol',
         'gpt-6-luna',

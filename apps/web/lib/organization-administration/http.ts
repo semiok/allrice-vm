@@ -1,6 +1,8 @@
 import {
   DataAccessError,
   IdentityError,
+  EmployeeAccessBusyError,
+  EmployeeInstanceError,
   OrganizationAdministrationError,
   OrganizationDepartmentError,
   listOrganizationDepartments,
@@ -120,6 +122,17 @@ export async function organizationAdministrationHttp(
     } else if (error instanceof IdentityError) {
       status = 403;
       code = 'AUTHORIZATION_DENIED';
+    } else if (error instanceof EmployeeAccessBusyError) {
+      status = 409;
+      code = 'employee_access_busy';
+    } else if (
+      error instanceof EmployeeInstanceError &&
+      error.code === 'employee_port_slots_full'
+    ) {
+      return Response.json(
+        { code: error.code, message: error.message },
+        { status: 409, headers },
+      );
     } else if (
       error instanceof OrganizationAdministrationError ||
       error instanceof OrganizationDepartmentError

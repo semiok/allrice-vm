@@ -1,5 +1,6 @@
 import {
   DEntryPageBorrowSchema,
+  DEntryPageSwitchProofSchema,
   DEntryProfileAddressSchema,
   DEntryProfileAssetSchema,
   DEntryProfileBindingSchema,
@@ -9,7 +10,10 @@ import type { DEntrySelectionInput } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
 import { z } from 'zod';
 import { requireRequestContext } from '../identity/session';
-import { currentNativeRequest } from './native-request';
+import {
+  authenticateNativeRequest,
+  currentNativeRequest,
+} from './native-request';
 import { requestDEntryProfile, readDEntryWorkerJson } from './native-worker';
 import { dEntryErrorResponse } from './responses';
 
@@ -149,4 +153,27 @@ export async function profileStaticFile(
       'static',
     ),
   );
+}
+
+export async function profileSwitch(request: Request) {
+  try {
+    const context = await authenticateNativeRequest(request);
+    const { scopeId, requestId, targetThreadId, ...selection } =
+      DEntryPageSwitchProofSchema.parse(exactProfileQuery(request.url));
+    const input = await currentNativeRequest(
+      request,
+      selection,
+      context,
+      'history',
+    );
+    return trustedResponse(
+      await requestDEntryProfile(input, 'switch', {
+        scopeId,
+        requestId,
+        targetThreadId,
+      }),
+    );
+  } catch (error) {
+    return dEntryErrorResponse(error);
+  }
 }

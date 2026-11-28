@@ -55,8 +55,14 @@ docker compose --project-name "${compose_project}" build worker
 ALLRICE_DSH_NATIVE_ARTIFACT_ID="$(
   docker compose --project-name "${compose_project}" run --no-deps --rm \
     --entrypoint node worker --input-type=module -e '
+      import assert from "node:assert/strict";
       import {readFile} from "node:fs/promises";
       import {verifyDshNativeArtifact} from "./apps/worker/dist/harness/dsh-native-artifact.js";
+      import {nativeSearchToolPatches} from "./apps/worker/dist/native-web/search-tools.js";
+      const patches=nativeSearchToolPatches(false);
+      assert.ok(patches.some(({id,config})=>id==="preset-standard" && config.plugins.some(
+        ({id,config})=>id==="tool-web" && config.search===false && config.fetch===true
+      )));
       const manifest=JSON.parse(await readFile(".local/dsh-native-artifact.json","utf8"));
       const verified=await verifyDshNativeArtifact({root:process.cwd(),expectedId:manifest.artifactId});
       process.stdout.write(verified.artifactId);

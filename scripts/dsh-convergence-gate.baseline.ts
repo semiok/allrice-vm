@@ -46,6 +46,15 @@ export const baseline: readonly BaselineEntry[] = [
   },
   {
     kind: 'table',
+    id: 'person_vm_scheduled_wakes',
+    category: '租约',
+    basis:
+      'MET-289 / 0258：DSH Schedule 保存规则、计算下次触发并投递任务。宿主表把原生观察和已提交的物理停机绑定为可撤销启动计划，记录定时开机认领、重试和审计。只有宿主能恢复本人保留的 VM。',
+    approvedBy:
+      '2026-11-26 用户授权宿主 PG 定时唤醒账本及同租约现权复核，明确系统仅恢复开机，由 DSH 自行投递。',
+  },
+  {
+    kind: 'table',
     id: 'allrice_model_gateway_calls',
     category: '账本',
     basis:
@@ -70,6 +79,15 @@ export const baseline: readonly BaselineEntry[] = [
       'MET-268：用户每人8个活跃上游模型流，跨gateway/企业按全局personId原子领取；实际transport收敛及receipt提交才释放，无TTL或Agent生命周期。',
     approvedBy:
       '2026-11-21 MET-268用户开工授权；主会话审PLAN.md四类核定通过，slots限每人准入租约。',
+  },
+  {
+    kind: 'patch',
+    id: 'allrice-managed-web-search-v1',
+    category: '门卫',
+    basis:
+      '在公开 DSH Web provider 与原生会话接缝上复用现有 Search 工具和 DeepSeek backend。宿主校验用户、VM、epoch 及当前授权，限额并随撤销停止。凭据留宿主，无新工具、会话状态机或 PG 表。',
+    approvedBy:
+      '2026-11-27 规划线转达用户授权，由宿主代理 Search，密钥留宿主。',
   },
   {
     kind: 'patch',

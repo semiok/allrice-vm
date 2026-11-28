@@ -29,6 +29,7 @@
     "@deepseek-ai/dsh-attachment": "0.2.1-rc.2",
     "@deepseek-ai/dsh-attachment-local": "0.2.1-rc.2",
     "@deepseek-ai/dsh-authorization": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-base": "0.2.1-rc.2",
     "@deepseek-ai/dsh-compaction-basic": "0.2.1-rc.2",
     "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.2.1-rc.2",
     "@deepseek-ai/dsh-credentials": "0.2.1-rc.2",
@@ -104,6 +105,7 @@
     "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
     "@deepseek-ai/dsh-anonymous-user-id": "0.2.1-rc.2",
     "@deepseek-ai/dsh-api-gateway": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-job-controller": "0.2.1-rc.2",
     "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2",
     "@deepseek-ai/dsh-atomic-write": "0.2.1-rc.2",
     "@deepseek-ai/dsh-brand": "0.2.1-rc.2",
@@ -115,6 +117,7 @@
     "@deepseek-ai/dsh-deepseek-llm-api-extensions": "0.2.1-rc.2",
     "@deepseek-ai/dsh-file-reference": "0.2.1-rc.2",
     "@deepseek-ai/dsh-fs": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-goal": "0.2.1-rc.2",
     "@deepseek-ai/dsh-home-paths": "0.2.1-rc.2",
     "@deepseek-ai/dsh-http-proxy": "0.2.1-rc.2",
     "@deepseek-ai/dsh-launch-environment": "0.2.1-rc.2",
@@ -142,6 +145,8 @@
     "@allrice/skill-import": "workspace:*",
     "@deepseek-ai/dsh-tool-web": "0.2.1-rc.2",
     "@deepseek-ai/dsh-web": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-web-app": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-web-search-deepseek": "0.2.1-rc.2",
     "@allrice/dsh-native-history-source": "workspace:*"
   },
   "devDependencies": {

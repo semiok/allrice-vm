@@ -12,6 +12,8 @@ DSH 不拥有 SaaS 当前本人/企业、受管VM instance/epoch、员工release
 
 升级须核公开消息/stream/replay词汇、pi-ai HTTP transport及fetch接缝、原生私有consumer close语义、wire终止/usage字段和缓存子集口径。上游若能直接提供host可信身份/逐HTTP attempt/全局person准入合同，可替换相应薄适配；租户授权和实际费用审计不能随替换删除。当前fixture证明loopback HTTP文本/工具往返、失败/取消/重连/8路隔离；数据库、多进程恢复及真实VM/模型验收另列，不把fixture当上线通过。完整owner合同见[model-gateway.md](model-gateway.md)。MET-225待主会话登记同名行。
 
+**个人 VM 的联网搜索。** `allrice-managed-web-search-v1` 复用 rc.2 公开 `ctx.web.registerSearchProvider`、`deepseek-official` 和宿主的原生 DeepSeek provider。原有工具、输出与界面沿用 DSH。宿主通过现有 VM 网关、原生会话和准入接口校验当前人、组织和 VM 代次，随授权撤销终止请求。宿主使用 `DEEPSEEK_API_KEY`，VM 只获现有网关 capability。配额当前为单宿主进程每人每分钟 10 次，进程重启重置。这段接入只提供 Search，个人 VM 的出站规则沿用原配置。
+
 ## MET-221：只用一代 DSH
 
 2026-10-25 起，AllRice 任何时候只依赖一代 DSH（当前 `0.2.1-rc.2` / `687f282`）。升级时 Worker、Web、Bridge、Office 与维护工具一次性换到新一代，不保留旧包、旧补丁或独立的旧版服务。
@@ -926,6 +928,8 @@ instance/profile、线程配置和导出时机须由MET-273/原生route owner绑
 `allrice-native-web-local-auth-v1` 复用 rc.2 的公开 `connection.authenticatedUrl`、`/connect`、Node Connection/Gateway/SessionController 和 Cordis Fiber lifecycle。Host 插件只原子投送0600、宿主 nonce 指定的 native local auth；Microsandbox 固定有界 reader 私下读取。Worker 固定已声明 endpoint 和 VM binding/epoch，独立长期 lifetime，关闭 join 自有 HTTP/WS/iterator 与 exact Job；无私有DSH接口、stdio桥、Agent状态或PG权威。该门卫/租约片不启用4.0流量，不代表 editor-ready、发送许可、完整idle或Linux工件已交付；新增员工端口的三方冻结安全重启另片实现。
 
 rc.2 的 Web runtime config 整块替换，须同时保留 `openBrowser:false`、可信 `publicUrl`、`surfaceContext:true` 和 `printUrl:false`。v0.7.16 exec 使用整秒参数并保留独立 host 毫秒预算；CLI close 不替代 guest stop/status。Node owner 通过公开 Agent/finishRequest 跟踪 WS 握手的真实 request/socket close，完整读操作含前后现权均纳入关闭 join。
+
+R1 的员工 Host 在发布 local auth 前，用公开 `workspaceRegistry.create` 登记现有工作目录。已存会话按该 Host 的持久化 header 补原生成员关系。外层新建和无位置的原生新建现场解析当前的原生工作区，交给 `session/create({workspaceId})`，fork 由 rc.2 按源会话的原生工作区继承。原生 `workspace/follow` 可以直接消费同一关系。AllRice 保留现有员工身份、会话归属和 VM 隔离。
 
 4.0 Run 补账沿用此 authenticated owner。Guest 接收当前进程的原生 `session/event`，将实际终态与公开 `SessionPersistence.open(id, 'read')` 读到的同一物理条目比对。Host 按原 Run 和执行记录核同一原生所有者，在终态事务复核线程、员工和 VM scope，再写入现有 Run 及事件。缺少已认证的本地 owner 时，Host 的独占只读取证仅能从仍运行且已挂载的原盘读到 journal 内容。现有工作区写权限覆盖旧 journal，读口结果不能独立证明 DSH 事件，因此未装入自动结算。缺少真实终态证明的 Run 保留原状态。
 

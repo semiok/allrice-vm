@@ -9,8 +9,8 @@ import { resolveDEntryIdentity } from '../../../../lib/d-entry/identity';
 import {
   exactProfileQuery,
   profileAddress,
-  profileDirectory,
 } from '../../../../lib/d-entry/profile';
+import { renderEmployeeDocument } from '../../../../lib/d-entry/employee-document';
 import { dEntryErrorResponse } from '../../../../lib/d-entry/responses';
 
 export const runtime = 'nodejs';
@@ -36,13 +36,8 @@ export async function GET(request: Request) {
       context,
       'history',
     );
-    const location = await profileAddress(input, scopeId);
-    response = new Response(null, {
-      status: 307,
-      headers: {
-        location: profileDirectory('document', location) + '/native/index.html',
-      },
-    });
+    const address = await profileAddress(input, scopeId);
+    response = await renderEmployeeDocument(request, input, address, true);
   } catch (error) {
     response = dEntryErrorResponse(error);
   }
@@ -50,4 +45,13 @@ export async function GET(request: Request) {
   response.headers.set('Referrer-Policy', 'no-referrer');
   response.headers.set('X-Content-Type-Options', 'nosniff');
   return response;
+}
+
+// Next otherwise falls back to GET for HEAD, which would consume the
+// page scope's one-shot bootstrap without returning its body.
+export function HEAD() {
+  return new Response(null, {
+    status: 405,
+    headers: { Allow: 'GET', 'Cache-Control': 'private, no-store' },
+  });
 }

@@ -24,6 +24,7 @@ export const TABLE_PREFIXES = [
 export const EXACT_TABLE_NAMES = [
   'person_virtual_machines',
   'person_vm_audit',
+  'person_vm_scheduled_wakes',
   'person_vm_admission_permits',
   'allrice_model_gateway_calls',
   'allrice_model_gateway_attempts',

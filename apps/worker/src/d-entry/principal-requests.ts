@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   sameDEntryIdentity,
+  ChatSessionSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
   type RequestContext,
@@ -32,6 +33,7 @@ import {
   type ResolvedDEntryNativeOwner,
 } from './native-owner.js';
 import type { DEntryFixedProfileSource } from './released-profile.js';
+import { openFollowAuthority } from './follow-authority.js';
 import { dEntryStartupTiming } from './startup-timing.js';
 
 type Selection = { organizationId: string; selection: DEntrySelectionInput };
@@ -52,6 +54,7 @@ export const dEntryPageHistory = {
 };
 
 const denied = () => new DataAccessError('authorization_denied');
+export class DEntryPageSwitchUnavailable extends Error {}
 function sameRoot(a: DEntryHistoryRootPin, b: DEntryHistoryRootPin) {
   return (
     sameDEntryIdentity(a.identity, b.identity) &&
@@ -74,8 +77,21 @@ export type DEntryPageHandle = Readonly<{
   fixedProfile?: DEntryFixedProfileSource;
   identity: DEntryIdentity;
   root: DEntryHistoryRootPin | null;
+  sessionId: RequestContext['sessionId'];
+  vmBinding: Awaited<
+    ReturnType<typeof currentDEntryNativeOwner>
+  >['view']['receipt']['binding'];
   signal: AbortSignal;
+  confirmThreadSwitch(requestId: string, threadId: string): void;
+  reserveThreadSwitch(
+    requestId: string,
+    threadId: string,
+  ): { drained: Promise<unknown>; release(): void } | undefined;
+  runThreadWrite<T>(invoke: () => Promise<T>): Promise<T>;
   assertCurrent(signal: AbortSignal): Promise<void>;
+  watchFollow(
+    signal: AbortSignal,
+  ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -88,7 +104,9 @@ export type DEntryPageHandle = Readonly<{
     nativeSessionId: string,
     forkSource: DEntryPageForkSource | undefined,
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<
+    Awaited<ReturnType<typeof registerDEntryPageNativeRoot>>['thread']
+  >;
   invokeTerminal(
     call: DEntryPageNativeCall,
     signal: AbortSignal,
@@ -269,6 +287,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     stop: AbortSignal,
     opened: (page: DEntryPageHandle) => Promise<void>,
     revoked: (reason: unknown) => void,
+    previous?: DEntryPageHandle,
   ) {
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
@@ -281,6 +300,19 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           deps.historyRoot(original.context, input.selection),
         )
       : null;
+    if (
+      previous &&
+      (!input.selection.threadId ||
+        !existing ||
+        !previous.root ||
+        existing.rootNativeSessionId === previous.root.rootNativeSessionId ||
+        original.context.sessionId !== previous.sessionId ||
+        !sameDEntryIdentity(original.identity, {
+          ...previous.identity,
+          threadId: input.selection.threadId,
+        }))
+    )
+      throw new DEntryPageSwitchUnavailable();
     signal.throwIfAborted();
     const data = deps.data();
     if (!data) throw new DEntryNativeUnavailable();
@@ -308,6 +340,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         ),
       );
       if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
+      if (
+        previous &&
+        (previous.signal.aborted ||
+          current.view.bindingRef !== previous.bindingRef ||
+          !sameDEntryVmBinding(
+            current.view.receipt.binding,
+            previous.vmBinding,
+          ) ||
+          existing?.vmId !== previous.vmBinding.vmId)
+      )
+        throw new DEntryPageSwitchUnavailable();
       async function assertHost(caller: AbortSignal) {
         const next = await currentDEntryRequest(deps, token, input, caller);
         if (
@@ -392,6 +435,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const lifetime = AbortSignal.any([admitted, ended.signal]);
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
+          const threadWrites = new Set<Promise<unknown>>();
+          let switching = false;
+          let switchProof:
+            { requestId: string; threadId: string; until: number } | undefined;
           let running: Promise<void> | undefined;
           let principal: DEntryPrincipalActivity | undefined;
           let scope: DEntryPrincipalControlScope | undefined;
@@ -433,7 +480,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             return closing;
           }
           function stopPage() {
-            fence();
+            fence(stop.reason);
           }
           admitted.addEventListener('abort', lost, { once: true });
           stop.addEventListener('abort', stopPage, { once: true });
@@ -545,7 +592,54 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   fixedProfile: current.owner.fixedProfile,
                   identity: auth.identity,
                   root: pin,
+                  sessionId: auth.context.sessionId,
+                  vmBinding: current.view.receipt.binding,
                   signal: lifetime,
+                  confirmThreadSwitch(requestId, threadId) {
+                    lifetime.throwIfAborted();
+                    if (switching || !pin) throw denied();
+                    switchProof = {
+                      requestId,
+                      threadId,
+                      until: performance.now() + 10_000,
+                    };
+                  },
+                  reserveThreadSwitch(requestId, threadId) {
+                    if (
+                      switching ||
+                      switchProof?.requestId !== requestId ||
+                      switchProof.threadId !== threadId ||
+                      switchProof.until <= performance.now()
+                    )
+                      return;
+                    switchProof = undefined;
+                    switching = true;
+                    return {
+                      drained: Promise.allSettled(threadWrites),
+                      release() {
+                        switching = false;
+                      },
+                    };
+                  },
+                  async runThreadWrite(invoke) {
+                    lifetime.throwIfAborted();
+                    if (switching) throw denied();
+                    const task = Promise.resolve().then(invoke);
+                    threadWrites.add(task);
+                    try {
+                      return await task;
+                    } finally {
+                      threadWrites.delete(task);
+                    }
+                  },
+                  async watchFollow(caller) {
+                    if (!authority.observation) return;
+                    return openFollowAuthority(
+                      authority.observation,
+                      AbortSignal.any([caller, lifetime]),
+                      (signal) => page.assertCurrent(signal),
+                    );
+                  },
                   async assertCurrent(caller) {
                     const active = AbortSignal.any([lifetime, caller]);
                     try {
@@ -598,7 +692,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       if (!sameRoot(forkSource.root, confirmed.root))
                         throw denied();
                     }
-                    await (deps.registerRoot ?? pageRootStore.registerRoot)(
+                    const registered = await (
+                      deps.registerRoot ?? pageRootStore.registerRoot
+                    )(
                       auth.context,
                       auth.identity,
                       {
@@ -613,6 +709,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       active,
                     );
                     await assertCurrent(active);
+                    const thread = ChatSessionSchema.parse(registered.thread);
+                    if (thread.id !== registered.identity.threadId)
+                      throw denied();
+                    return thread;
                   },
                   async invokeTerminal(call, active) {
                     active.throwIfAborted();

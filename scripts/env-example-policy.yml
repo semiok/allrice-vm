@@ -94,7 +94,7 @@ auditSources:
   apps/web/server/portal-hosts.mjs: e1aac7dc0735860478e564ff33dc77799452589d35ad4fd7744af5f74cf90901
   apps/worker/src/harness/dsh-egress-environment.ts: 315fc969e7e880f139ea06e3be3c8208e0f411fb6fa760e583bbccb6aefa5594
   apps/worker/src/harness/dsh-native-artifact.ts: ffe6bdf780cf13b1cc40666a5233d2a3e8b18df657195e9492a0bba56f5f71fe
-  apps/worker/src/index.ts: 57416970f5cd6fe415e0af4af20ef07fbaa796d7e46a689946990c8acaf1afbb
+  apps/worker/src/index.ts: 4b6ee3ce935a85ee4f183ca03d989f3892b794f7ea2653269080b0817a11e957
   packages/dsh-web-composition/build.mjs: 56422f0d218971943b05588bcd58a7c4a4e16859eb147e577601fcf58badca88
   packages/dsh-web-composition/build-web-entry.mjs: 6858ff9e9a02772a4782eb05a89be4c059eb521ed026b08c3a18acb7acb4a0d3
   packages/contracts/src/project-resolution-script.ts: d4261249ef18115e6293d804a0d14a770e2c0df5b14a5a6db133444dd76ff9ee
@@ -103,5 +103,5 @@ auditSources:
   packages/database/src/bootstrap-identity.ts: 1257cdfbc66c5c6038a5f780871a1f653663581a0584a96336cd8b188b9dcaf5
   packages/project-runtime/src/project-service-supervisor.ts: 1ce6b79bcadabceb4b9bf47cb5ce809fe580d3dfc542d22a769f1d57d83223d0
   packages/project-runtime/src/project-supervisor.ts: 7a832d1e0d549be9568485816708d6e274d1fa0bfe0b3544ac6f01e0603b73f2
-  packages/vm-memory/src/guest-config.ts: 10d670311cb7f29c8f2fffcf38133d7361dbccf6f4d198f58005ba8a5947851d
+  packages/vm-memory/src/guest-config.ts: 524deb38156aadf8d1b30b23af5d2a5e7f7009e976957ffbed18ebe496403a65
   scripts/dev-environment.mjs: e9daa5931b43ea6c4db01bb91a6295e0caf4000e2682635205b666525efe19d3

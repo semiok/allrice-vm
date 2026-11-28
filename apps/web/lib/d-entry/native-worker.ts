@@ -37,6 +37,7 @@ export async function requestDEntryWorker(
   fields: Record<string, unknown> = {},
 ) {
   input.signal.throwIfAborted();
+  const prewarm = path === 'native-prewarm';
   const response = await requestWorker(
     input.signal,
     new URL(`/internal/d-entry/${path}`, workerBase()),
@@ -52,7 +53,7 @@ export async function requestDEntryWorker(
         selection: input.selection,
       }),
     },
-    { short: path === 'native-prewarm' },
+    { short: prewarm, allowExpired: prewarm },
   );
   return response;
 }
@@ -106,7 +107,7 @@ export function requestDEntryProfile(
     selection: DEntrySelectionInput;
     signal: AbortSignal;
   },
-  type: 'bootstrap' | 'assets' | 'events',
+  type: 'bootstrap' | 'assets' | 'events' | 'switch',
   selectors: Record<string, string>,
   request?: 'document' | 'static',
 ) {
@@ -118,7 +119,7 @@ export function requestDEntryProfile(
     organizationId: input.context.organizationId,
   }).toString();
   return requestWorker(input.signal, target, {
-    method: 'GET',
+    method: type === 'switch' ? 'POST' : 'GET',
     headers: {
       authorization: `Bearer ${input.token}`,
       ...(request && { 'x-allrice-profile-request': request }),

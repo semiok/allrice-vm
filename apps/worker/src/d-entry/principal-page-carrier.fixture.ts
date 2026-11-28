@@ -97,6 +97,11 @@ export async function fixture(
   const roots = new Map([
     [f.selection.threadId, selected.root.nativeSessionId],
   ]);
+  const otherEmployees = new Map<
+    string,
+    { identity: typeof f.identity; owner: typeof f.owner }
+  >();
+  const threadRevocations = new Map<string, AbortController>();
   const pageSelection = rootless
     ? {
         workspaceId: f.selection.workspaceId,
@@ -107,10 +112,19 @@ export async function fixture(
     const id = 'root-' + threadId;
     roots.set(threadId, id);
     host.catalog.items.push(summary(id));
+    const revoked = new AbortController();
+    threadRevocations.set(threadId, revoked);
+    return revoked;
   };
   const selectionIdentity = (value: unknown) => {
     const selection = DEntrySelectionInputSchema.parse(value);
     const threadId = selection.threadId;
+    const other = threadId && otherEmployees.get(threadId);
+    if (
+      other &&
+      other.identity.employeeInstanceId === selection.employeeInstanceId
+    )
+      return other.identity;
     return threadId && roots.has(threadId)
       ? { ...f.identity, threadId }
       : rootless
@@ -189,6 +203,60 @@ export async function fixture(
           release.read(reference, signal),
       },
     });
+  async function registerOtherEmployee() {
+    const identity = {
+      ...f.identity,
+      employeeInstanceId: randomUUID(),
+      threadId: randomUUID(),
+    };
+    const root = selected.root.nativeSessionId;
+    roots.set(identity.threadId, root);
+    const other = await hostFixture({ ...selected, identity });
+    other.catalog.items = other.catalog.items.map((row) =>
+      String(row.sessionId) === root
+        ? { ...row, blank: true, cwd: '/work' }
+        : row,
+    );
+    closes.push(() => other.close());
+    const otherControl = createDEntryPrincipalControl(other.node, {
+      carrier: carrier.signal,
+      cleanupTimeoutMs: 3000,
+    });
+    closes.push(() => otherControl.close());
+    const endpoint = {
+      ...f.owner.endpoint,
+      employeeInstanceId: identity.employeeInstanceId,
+    };
+    const owner = {
+      ...f.owner,
+      endpoint,
+      bindingRef: f.owner.bindingRef + '-other',
+      receipt: { ...f.owner.receipt, endpoints: [endpoint] },
+      acquirePrincipal: (
+        _context: unknown,
+        input: Parameters<typeof otherControl.acquire>[0],
+        active: AbortSignal,
+      ) => otherControl.acquire(input, active),
+      async readSessions() {
+        return { ok: true as const, value: { items: other.catalog.items } };
+      },
+      ...(release && {
+        fixedProfile: {
+          revoked: profileSource.signal,
+          async readImmutableGraph() {
+            return release.graph;
+          },
+          readImmutableBundle: (
+            reference: string,
+            _bytes: number,
+            signal: AbortSignal,
+          ) => release.read(reference, signal),
+        },
+      }),
+    } satisfies typeof f.owner;
+    otherEmployees.set(identity.threadId, { identity, owner });
+    return { identity, bindingRef: owner.bindingRef };
+  }
   const otherSession = { ...f.context, sessionId: randomUUID() };
   const authenticate = vi.fn(async (token: string) =>
     token === sessionToken
@@ -200,21 +268,59 @@ export async function fixture(
   const historyIdentity = vi.fn(async (_context: unknown, selection: unknown) =>
     selectionIdentity(selection),
   );
+  const registeredRoots = new Map<
+    string,
+    Awaited<ReturnType<typeof registerDEntryPageNativeRoot>>
+  >();
+  const rememberRoot = (
+    root: Awaited<ReturnType<typeof registerDEntryPageNativeRoot>>,
+  ) => {
+    roots.set(root.thread.id, root.rootNativeSessionId);
+    registeredRoots.set(root.thread.id, root);
+  };
   const selectedRoot = async (_context: unknown, selection: unknown) => {
     const root = await f.root();
     const identity = selectionIdentity(selection);
-    return {
-      ...root,
-      identity,
-      rootNativeSessionId: roots.get(identity.threadId!)!,
-    };
+    return (
+      registeredRoots.get(identity.threadId!) ?? {
+        ...root,
+        identity,
+        rootNativeSessionId: roots.get(identity.threadId!)!,
+      }
+    );
   };
   let pinned = !newRoot;
   const prepareEditorRoot = vi.fn(async () => {
     pinned = true;
     return selectedRoot(f.context, f.selection);
   });
-  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
+  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>(
+    async (_context, identity, receipt) => {
+      const threadId = randomUUID();
+      const timestamp = '2026-01-01T00:00:00.000Z';
+      return {
+        identity: { ...identity, threadId },
+        rootNativeSessionId: receipt.nativeSessionId,
+        rootOriginDigest: 'registered-root-origin',
+        rootBindingRef: receipt.host.bindingRef,
+        vmId: receipt.host.binding.vmId,
+        thread: {
+          id: threadId,
+          ownerId: identity.personId,
+          organizationId: identity.organizationId,
+          workspaceId: identity.workspaceId,
+          employeeInstanceId: identity.employeeInstanceId,
+          employeeAssignmentId: randomUUID(),
+          employeeVersionId: identity.employeeVersionId,
+          visibility: 'private' as const,
+          title: 'New native conversation',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: null,
+        },
+      };
+    },
+  );
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
   const watchTerminal = vi.fn<
     NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
@@ -224,8 +330,29 @@ export async function fixture(
   });
   const pages = createDEntryPageRequests({
     ...f.deps,
+    owners: {
+      async resolve(_context, identity) {
+        const other =
+          identity.threadId && otherEmployees.get(identity.threadId);
+        return other &&
+          identity.employeeInstanceId === other.identity.employeeInstanceId
+          ? other.owner
+          : f.deps.owners.resolve();
+      },
+    },
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
     authenticate,
+    async watch(_context, selection) {
+      const authority = await f.deps.watch();
+      const { threadId } = DEntrySelectionInputSchema.parse(selection);
+      const revoked = threadId && threadRevocations.get(threadId);
+      return revoked
+        ? {
+            ...authority,
+            revoked: AbortSignal.any([authority.revoked, revoked.signal]),
+          }
+        : authority;
+    },
     async identity(_context, selection) {
       return selectionIdentity(selection);
     },
@@ -241,7 +368,7 @@ export async function fixture(
   const mux = createDEntryPageMux(
     {
       ...pages,
-      own(token, selection, active, stop, opened, revoked) {
+      own(token, selection, active, stop, opened, revoked, previous) {
         return pages.own(
           token,
           selection,
@@ -252,6 +379,7 @@ export async function fixture(
             return opened(page);
           },
           revoked,
+          previous,
         );
       },
     },
@@ -338,10 +466,13 @@ export async function fixture(
   >(async (target) => {
     const requested = new URL(target);
     expect(requested.pathname).toBe('/api/v1/d-entry/identity');
+    const selection = DEntrySelectionInputSchema.parse(
+      Object.fromEntries(requested.searchParams),
+    );
     return Response.json({
       identity: {
-        ...f.identity,
-        threadId: requested.searchParams.get('threadId'),
+        ...selectionIdentity(selection),
+        threadId: selection.threadId ?? null,
       },
     });
   });
@@ -416,7 +547,7 @@ export async function fixture(
       },
     });
   function profileUrl(
-    kind: 'bootstrap' | 'assets' | 'events',
+    kind: 'bootstrap' | 'assets' | 'events' | 'switch',
     scopeId: string,
     selectors: Record<string, string> = {},
   ) {
@@ -445,10 +576,31 @@ export async function fixture(
       },
     });
   }
+  function proveSwitch(
+    scopeId: string,
+    targetThreadId: string,
+    requestId: string,
+    token = sessionToken,
+    selection: Record<string, string> = {},
+  ) {
+    return fetch(
+      profileUrl('switch', scopeId, {
+        ...selection,
+        targetThreadId,
+        requestId,
+      }),
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + token },
+      },
+    );
+  }
   return {
     ...f,
+    proveSwitch,
     prepareEditorRoot,
     registerRoot,
+    rememberRoot,
     findRoot,
     watchTerminal,
     host,
@@ -458,6 +610,7 @@ export async function fixture(
     probe,
     publish,
     registerThread,
+    registerOtherEmployee,
     selectionIdentity,
     invokeThread,
     profileBorrows,
@@ -465,6 +618,7 @@ export async function fixture(
     profileFailures,
     profileSource,
     profileUrl,
+    authenticate,
     historyIdentity,
     pageSignals,
     profileCompletion,

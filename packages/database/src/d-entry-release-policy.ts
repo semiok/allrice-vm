@@ -21,6 +21,7 @@ import {
   getEmployeeInstance,
   readEmployeeVersionPublication,
 } from './employees/employee-instances.ts';
+import { assertNativeWebRolloutCapacity } from './employees/native-web-capacity.ts';
 import { requireCurrentPlatformAdmin } from './platform-authority.ts';
 
 // The existing platform release store is shared by Web and Worker. No process
@@ -76,12 +77,28 @@ export async function updateDEntryReleasePolicy(
     const actor = await requireCurrentPlatformAdmin(context, tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
     await requireCurrentPlatformAdmin(context, tx, false);
-    if (
-      options.compareRevision &&
-      (await readDEntryReleasePolicy(tx)).revision !== parsed.revision
-    )
-      throw new DEntryPersonRolloutConflict();
-    const settingId = await writeReleasePolicy(tx, actor, policy);
+    const [stored] = await tx`select value from allrice_settings
+      where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}`;
+    const previous = DEntryRolloutPolicySchema.safeParse(
+      stored?.value ?? disabledPolicy,
+    );
+    const current =
+      previous.success && previous.data.defaultGeneration === '3.x'
+        ? previous.data
+        : undefined;
+    if (options.compareRevision) {
+      if (!current) throw new Error('D entry published policy is unavailable');
+      if (current.revision !== parsed.revision)
+        throw new DEntryPersonRolloutConflict();
+    }
+    // A valid replacement submitted without CAS can repair an unreadable
+    // policy. Check every candidate selection as a new release in that case.
+    const settingId = await writeReleasePolicy(
+      tx,
+      actor,
+      current ?? disabledPolicy,
+      policy,
+    );
     await tx`insert into allrice_audit_events
       (organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
       values(${context.organizationId},${context.workspaceId},${actor},'d_entry_release.update',
@@ -94,8 +111,10 @@ export async function updateDEntryReleasePolicy(
 async function writeReleasePolicy(
   tx: postgres.TransactionSql,
   actor: string,
+  previous: DEntryRolloutPolicy,
   policy: DEntryRolloutPolicy,
 ) {
+  await assertNativeWebRolloutCapacity(tx, previous, policy);
   const [setting] = await tx<{ id: string }[]>`
     insert into allrice_settings(scope_type,key,value,updated_by)
     values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})
@@ -182,7 +201,7 @@ export async function updateDEntryPersonRollout(
     let revision = current.revision;
     if (enabled !== wasEnabled) {
       revision = randomUUID();
-      await writeReleasePolicy(tx, actor, {
+      await writeReleasePolicy(tx, actor, current, {
         ...current,
         revision,
         selections: enabled

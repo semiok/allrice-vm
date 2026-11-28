@@ -3,6 +3,7 @@ import {
   employeeAccessTransaction,
 } from './employee-access-cancellation.ts';
 import { randomUUID } from 'node:crypto';
+import type { TransactionSql } from 'postgres';
 
 import {
   CreateEmployeeEvalSuiteInputSchema,
@@ -21,6 +22,8 @@ import {
 } from '@allrice/contracts';
 
 import { DataAccessError } from '../data.ts';
+import { captureNativeWebRosterChange } from './native-web-capacity.ts';
+import { requireCurrentPlatformAdmin } from '../platform-authority.ts';
 import { canAdministerEmployees } from './employeehub.ts';
 import { getDatabase } from '../core/client.ts';
 import { resolveWorkspaceId } from '../workspace/service.ts';
@@ -138,13 +141,11 @@ export function evaluateEmployeeReleaseGate(input: {
   return { passed: failures.length === 0, failures };
 }
 
-async function ensureQualityDefaults(input: {
-  context: RequestContext;
-  workspaceId: string;
-  actorId: string;
-}) {
-  const sql = getDatabase();
-  await sql.begin(async (transaction) => {
+async function ensureQualityDefaults(
+  input: { context: RequestContext; workspaceId: string; actorId: string },
+  tx?: TransactionSql,
+) {
+  const initialize = async (transaction: TransactionSql) => {
     const employees = await transaction<
       { employee_id: string; version_id: string; name: string }[]
     >`
@@ -185,7 +186,9 @@ async function ensureQualityDefaults(input: {
         )
       `;
     }
-  });
+  };
+  if (tx) await initialize(tx);
+  else await getDatabase().begin(initialize);
 }
 
 export async function createEmployeeEvalSuite(
@@ -306,13 +309,15 @@ export async function recordEmployeeEvalRun(
   return { id, status: gate.passed ? 'passed' : 'failed', ...gate };
 }
 
-async function latestGatePassed(input: {
-  organizationId: string;
-  workspaceId: string;
-  employeeId: string;
-  versionId: string;
-}) {
-  const sql = getDatabase();
+async function latestGatePassed(
+  input: {
+    organizationId: string;
+    workspaceId: string;
+    employeeId: string;
+    versionId: string;
+  },
+  sql: TransactionSql,
+) {
   const rows = await sql<{ status: 'passed' | 'failed' }[]>`
     select status from allrice_employee_eval_runs
     where organization_id = ${input.organizationId}
@@ -332,73 +337,80 @@ export async function updateEmployeeRelease(
   const workspaceId = await resolveWorkspaceId(context, update.workspaceId);
   const actor = await requireAdmin(context, workspaceId);
   const sql = getDatabase();
-  await ensureQualityDefaults({ context, workspaceId, actorId: actor });
-  const rows = await sql<
-    {
-      employee_key: string;
-      stable_version_id: string;
-      candidate_version_id: string | null;
-      stage: string;
-    }[]
-  >`
-    select e.employee_key, r.stable_version_id, r.candidate_version_id, r.stage
-    from allrice_employee_releases r
-    join allrice_employees e on e.id = r.employee_id
-    where r.organization_id = ${context.organizationId}
-      and r.workspace_id = ${workspaceId}
-      and r.employee_id = ${update.employeeId}
-    for update
-  `;
-  const current = rows[0];
-  if (!current) throw new EmployeeQualityError('not_found');
-  if (
-    update.action === 'disable' &&
-    current.employee_key === 'default-assistant'
-  ) {
-    throw new EmployeeQualityError('default_protected');
-  }
-  const candidate =
-    update.candidateVersionId ?? current.candidate_version_id ?? undefined;
-  if (
-    ['begin_internal_test', 'start_canary', 'promote'].includes(
-      update.action,
-    ) &&
-    !candidate
-  ) {
-    throw new EmployeeQualityError('invalid_transition');
-  }
-  if (
-    (update.action === 'start_canary' || update.action === 'promote') &&
-    !(await latestGatePassed({
-      organizationId: context.organizationId,
-      workspaceId,
-      employeeId: update.employeeId,
-      versionId: candidate!,
-    }))
-  ) {
-    throw new EmployeeQualityError('release_gate_blocked');
-  }
-  const stage =
-    update.action === 'begin_internal_test'
-      ? 'internal_test'
-      : update.action === 'start_canary'
-        ? 'canary'
-        : update.action === 'promote' || update.action === 'rollback'
-          ? 'production'
-          : 'disabled';
-  const stableVersionId =
-    update.action === 'promote' ? candidate! : current.stable_version_id;
-  const candidateVersionId =
-    update.action === 'rollback' || update.action === 'promote'
-      ? null
-      : (candidate ?? null);
-  const trafficPercentage =
-    update.action === 'start_canary'
-      ? (update.trafficPercentage ?? 10)
-      : stage === 'production'
-        ? 100
-        : 0;
   await employeeAccessTransaction(sql, async (transaction) => {
+    await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
+    await ensureQualityDefaults(
+      { context, workspaceId, actorId: actor },
+      transaction,
+    );
+    const rows = await transaction<
+      {
+        employee_key: string;
+        stable_version_id: string;
+        candidate_version_id: string | null;
+        stage: string;
+      }[]
+    >`
+      select e.employee_key, r.stable_version_id, r.candidate_version_id, r.stage
+      from allrice_employee_releases r
+      join allrice_employees e on e.id = r.employee_id
+      where r.organization_id = ${context.organizationId}
+        and r.workspace_id = ${workspaceId}
+        and r.employee_id = ${update.employeeId}
+      for update
+    `;
+    const current = rows[0];
+    if (!current) throw new EmployeeQualityError('not_found');
+    if (
+      update.action === 'disable' &&
+      current.employee_key === 'default-assistant'
+    ) {
+      throw new EmployeeQualityError('default_protected');
+    }
+    const candidate =
+      update.candidateVersionId ?? current.candidate_version_id ?? undefined;
+    if (
+      ['begin_internal_test', 'start_canary', 'promote'].includes(
+        update.action,
+      ) &&
+      !candidate
+    ) {
+      throw new EmployeeQualityError('invalid_transition');
+    }
+    if (
+      (update.action === 'start_canary' || update.action === 'promote') &&
+      !(await latestGatePassed(
+        {
+          organizationId: context.organizationId,
+          workspaceId,
+          employeeId: update.employeeId,
+          versionId: candidate!,
+        },
+        transaction,
+      ))
+    ) {
+      throw new EmployeeQualityError('release_gate_blocked');
+    }
+    const stage =
+      update.action === 'begin_internal_test'
+        ? 'internal_test'
+        : update.action === 'start_canary'
+          ? 'canary'
+          : update.action === 'promote' || update.action === 'rollback'
+            ? 'production'
+            : 'disabled';
+    const stableVersionId =
+      update.action === 'promote' ? candidate! : current.stable_version_id;
+    const candidateVersionId =
+      update.action === 'rollback' || update.action === 'promote'
+        ? null
+        : (candidate ?? null);
+    const trafficPercentage =
+      update.action === 'start_canary'
+        ? (update.trafficPercentage ?? 10)
+        : stage === 'production'
+          ? 100
+          : 0;
     const validVersions = await transaction<{ id: string }[]>`
       select id from allrice_employee_versions
       where id in ${transaction(
@@ -416,6 +428,31 @@ export async function updateEmployeeRelease(
     if (validVersions.length !== expected) {
       throw new EmployeeQualityError('not_found');
     }
+    const prospectiveGrants =
+      stage === 'disabled'
+        ? []
+        : await transaction<{ user_id: string }[]>`
+        select user_id from allrice_employee_assignments
+        where organization_id=${context.organizationId} and workspace_id=${workspaceId}
+          and employee_id=${update.employeeId} and not active`;
+    const checkRoster = prospectiveGrants.length
+      ? await captureNativeWebRosterChange(
+          transaction,
+          {
+            organizationId: context.organizationId,
+            workspaceId,
+            personIds: prospectiveGrants.map(({ user_id }) => user_id),
+          },
+          {
+            lockBeforeRead: true,
+            whenEnabled: true,
+            recheckWriter: async () => {
+              await resolveWorkspaceId(context, workspaceId, transaction);
+              await requireCurrentPlatformAdmin(context, transaction, false);
+            },
+          },
+        )
+      : undefined;
     await transaction`
       update allrice_employee_releases set
         stable_version_id = ${stableVersionId},
@@ -432,19 +469,32 @@ export async function updateEmployeeRelease(
         and employee_id = ${update.employeeId}
     `;
     if (stage !== 'disabled') {
-      await transaction`
-        update allrice_employee_assignments
-        set employee_version_id = case
-          when ${stage} = 'canary'
-            and mod(abs(hashtext(user_id::text)), 100) < ${trafficPercentage}
-            then ${candidateVersionId}::uuid
-          else ${stableVersionId}::uuid
-        end,
-        active = true, updated_at = now()
-        where organization_id = ${context.organizationId}
-          and workspace_id = ${workspaceId}
-          and employee_id = ${update.employeeId}
+      const granted = await transaction<{ id: string; user_id: string }[]>`
+        with prior as (
+          select id,active,user_id from allrice_employee_assignments
+          where organization_id = ${context.organizationId}
+            and workspace_id = ${workspaceId}
+            and employee_id = ${update.employeeId}
+          order by id for no key update
+        ), changed as (
+          update allrice_employee_assignments a
+          set employee_version_id = case
+            when ${stage} = 'canary'
+              and mod(abs(hashtext(prior.user_id::text)), 100) < ${trafficPercentage}
+              then ${candidateVersionId}::uuid
+            else ${stableVersionId}::uuid
+          end,
+          active = true, updated_at = now()
+          from prior where a.id=prior.id
+          returning a.id,prior.user_id,not prior.active as granted
+        )
+        select id,user_id from changed where granted
       `;
+      await checkRoster?.({
+        employeeId: update.employeeId,
+        grantedPeople: new Set(granted.map(({ user_id }) => user_id)),
+        assignmentIds: new Set(granted.map(({ id }) => id)),
+      });
       await transaction`
         update allrice_chat_sessions session
         set employee_version_id = assignment.employee_version_id

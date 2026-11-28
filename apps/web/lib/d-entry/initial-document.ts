@@ -6,6 +6,64 @@ import {
   pageStartupFailed,
 } from './page-messages.ts';
 
+export const profileBundleTimeoutMs = 30_000;
+
+// These options are only for content-addressed JS from the verified release
+// index. A page refresh should reuse these bytes even if other requests recheck.
+export const sealedProfileBundleFetch = {
+  cache: 'force-cache',
+  credentials: 'omit',
+  redirect: 'error',
+} as const;
+
+const publicBundlePath =
+  /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/bundles\/[a-f0-9]{64}\.js$/;
+
+export function publicStartupBundleUrls(
+  {
+    graph,
+    injections,
+  }: {
+    graph: { batches: readonly { phase: string; url: string; rev: string }[] };
+    injections: readonly { kind: string; src?: string }[];
+  },
+  release: {
+    root: string;
+    bundles: readonly { reference: string; revision: string; sha256: string }[];
+  },
+) {
+  const batches = [
+    graph.batches.find(({ phase }) => phase === 'bootstrap'),
+    graph.batches.find(
+      ({ phase, url }) =>
+        phase === 'application' &&
+        injections.some(
+          ({ kind, src }) => kind === 'script-preload' && src === url,
+        ),
+    ),
+  ];
+  return [
+    ...new Set(
+      batches.flatMap((batch) => {
+        const sealed =
+          batch &&
+          release.bundles.find(
+            ({ reference, revision }) =>
+              reference === batch.url && revision === batch.rev,
+          );
+        if (!sealed) return [];
+        const url = release.root + 'bundles/' + sealed.sha256 + '.js';
+        return publicBundlePath.test(url) ? [url] : [];
+      }),
+    ),
+  ];
+}
+
+export type EarlyProfileBundles = {
+  take(): ReadonlyMap<string, Promise<ArrayBuffer>>;
+  cancel(): void;
+};
+
 /** Inline in the authenticated document, before the browser sees any asset. */
 export const initialDocumentLifecycle = `(() => {
   const protocol = ${JSON.stringify({
@@ -15,8 +73,48 @@ export const initialDocumentLifecycle = `(() => {
     revoke: pageRevoked,
     fail: pageStartupFailed,
   })};
-  const scopeId = document.currentScript.dataset.scopeId;
+  const { scopeId, publicStartupBundles } = document.currentScript.dataset;
   const controller = new AbortController();
+  const earlyRequest = new AbortController();
+  const reads = new Map();
+  const pending = new Set();
+  // The publisher matched the graph and the sealed index. The early fetch
+  // carries no credentials and leaves execution to the native loader.
+  const pattern = new RegExp(${JSON.stringify(publicBundlePath.source)});
+  let urls;
+  try { urls = JSON.parse(publicStartupBundles || '[]'); }
+  catch { urls = []; }
+  if (Array.isArray(urls) && urls.length <= 2) for (const url of urls) {
+    if (typeof url !== 'string' || !pattern.test(url) || reads.has(url)) continue;
+    const bytes = (async () => {
+      const signal = AbortSignal.any([
+        controller.signal, earlyRequest.signal, AbortSignal.timeout(${profileBundleTimeoutMs}),
+      ]);
+      const response = await fetch(url, { ...${JSON.stringify(sealedProfileBundleFetch)}, signal });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw Error('Employee profile bundle unavailable');
+      }
+      const bytes = await response.arrayBuffer();
+      signal.throwIfAborted();
+      return bytes;
+    })();
+    reads.set(url, bytes);
+    pending.add(bytes);
+    const settled = () => pending.delete(bytes);
+    void bytes.then(settled, settled);
+  }
+  const earlyBundles = reads.size ? Object.freeze({
+    take() {
+      const taken = new Map(reads);
+      reads.clear();
+      return taken;
+    },
+    cancel() {
+      reads.clear();
+      earlyRequest.abort();
+    },
+  }) : undefined;
   let claimed = false;
   let complete = false;
   const send = (type, state) =>
@@ -50,7 +148,10 @@ export const initialDocumentLifecycle = `(() => {
     window.removeEventListener('error', error, true);
     window.removeEventListener('pagehide', stop);
     window.removeEventListener('load', loaded);
-    send(protocol.complete, state);
+    if (earlyBundles) {
+      earlyBundles.cancel();
+      void Promise.allSettled(pending).then(() => send(protocol.complete, state));
+    } else send(protocol.complete, state);
   };
   window.addEventListener('error', error, true);
   window.addEventListener('message', received);
@@ -59,6 +160,7 @@ export const initialDocumentLifecycle = `(() => {
   globalThis.__ALLRICE_EMPLOYEE_DOCUMENT__ = Object.freeze({
     scopeId,
     signal: controller.signal,
+    earlyBundles,
     claim() {
       if (controller.signal.aborted) return false;
       claimed = true;

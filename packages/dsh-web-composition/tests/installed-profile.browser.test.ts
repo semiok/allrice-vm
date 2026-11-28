@@ -28,7 +28,17 @@ suite('installed AllRice native Web composition', () => {
   const errors: string[] = [];
 
   beforeAll(async () => {
-    host = await startInstalledProfile();
+    host = await startInstalledProfile(undefined, {
+      hostFixture: {
+        source: new URL('./fixtures/conversation-host.js', import.meta.url),
+        patch: [
+          {
+            id: 'agent-default-model',
+            config: { provider: 'r2-browser-fixture', model: 'fixture-sol' },
+          },
+        ],
+      },
+    });
     const { origin, authUrl } = host;
     // The generated Web token stays in memory; no credential file is read/copied.
     browser = await chromium.launch({
@@ -119,18 +129,10 @@ suite('installed AllRice native Web composition', () => {
               .count(),
           ).toBe(0);
           expect(
-            await page
-              .locator('button:visible')
-              .filter({
-                hasText: /^(完全访问|选择模型|Full access|Select model)$/,
-              })
-              .count(),
-          ).toBe(0);
-          expect(
             await page.getByRole('button', { name: /上下文已用/ }).isVisible(),
           ).toBe(true); // documented upstream gap
-          expect(await page.locator('body').innerText()).not.toMatch(
-            /Open In|(?:Usage|Cache|用量|缓存)\s*[\d:]/,
+          expect(await page.locator('body').innerText()).not.toContain(
+            'Open In',
           );
           expect(
             await page.evaluate(
@@ -227,6 +229,98 @@ suite('installed AllRice native Web composition', () => {
           await page.locator('body').innerText(),
         );
       }
+      throw error;
+    }
+  }, 60_000);
+  it('renders native controls and live work from a real rc.2 turn', async () => {
+    try {
+      await page.evaluate(
+        (id) => window.__allriceCompositionTest!.openSession(id),
+        processSession,
+      );
+      await writeFile(
+        join(host.root, 'workspace', 'visible-tool-witness.txt'),
+        'R2 工具在这次测试中读取了原生工作区。',
+      );
+      const permission = page.getByRole('button', { name: /访问模式，当前/ });
+      const model = page.getByRole('button', {
+        name: /^请?选择模型/,
+      });
+      await model.waitFor();
+      await page
+        .getByRole('button', { name: '访问模式，当前：完全权限', exact: true })
+        .click();
+      await page
+        .getByRole('menuitem', { name: '仅可查看', exact: true })
+        .click();
+      await page
+        .getByRole('button', { name: '访问模式，当前：仅可查看', exact: true })
+        .and(page.locator('button:enabled'))
+        .waitFor();
+      await model.click();
+      await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
+      await page.getByRole('button', { name: /当前 Fixture Nova/ }).waitFor();
+
+      const composer = page
+        .locator('textarea:visible,[contenteditable=true]:visible')
+        .first();
+      await composer.fill('请读取当前工作区的测试文件。');
+      await composer.press('Enter');
+      const running = page.getByText(/深度求索中.*用时/);
+      await running.waitFor();
+      await writeFile(join(host.root, 'fixture-plugin', 'issue-tool'), '');
+      await page
+        .getByRole('button', {
+          name: '读取 visible-tool-witness.txt',
+          exact: true,
+        })
+        .waitFor();
+      expect(await running.isVisible()).toBe(true);
+      const capture = async (name: string) => {
+        if (!process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) return;
+        const target = resolve(
+          process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
+        );
+        await mkdir(target, { recursive: true });
+        await page.screenshot({
+          path: join(target, `controls-${name}.png`),
+          fullPage: true,
+          animations: 'disabled',
+        });
+      };
+      await capture('running');
+      await writeFile(join(host.root, 'fixture-plugin', 'finish-turn'), '');
+      await page
+        .getByText('R2 浏览器收到原生回合结果。', { exact: true })
+        .waitFor();
+      await running.waitFor({ state: 'hidden' });
+
+      const activity = page
+        .getByRole('button', { name: /\d+ 轮 \d+ 步.*tok\/s/ })
+        .last();
+      const usage = page.getByRole('button', { name: /tok.*缓存命中/ }).last();
+      for (const width of [1440, 390])
+        for (const theme of ['light', 'dark'] as const) {
+          await page.setViewportSize({ width, height: 1000 });
+          await page.evaluate(
+            (mode) => window.__allriceCompositionTest!.setTheme(mode),
+            theme,
+          );
+          await permission.waitFor();
+          await model.waitFor();
+          await activity.waitFor();
+          await usage.waitFor();
+          expect(
+            await page.evaluate(() => document.documentElement.scrollWidth),
+          ).toBeLessThanOrEqual(width);
+          await capture(`${width}-${theme}`);
+        }
+      expect(errors).toEqual([]);
+    } catch (error) {
+      console.info(
+        'R2 isolated conversation browser state:\n' +
+          (await page.locator('body').ariaSnapshot()).slice(0, 10000),
+      );
       throw error;
     }
   }, 60_000);
