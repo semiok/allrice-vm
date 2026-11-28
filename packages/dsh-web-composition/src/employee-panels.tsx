@@ -836,7 +836,7 @@ export function apply(ctx: Context) {
     (scope) => {
       const binding = scope.allriceEmployeePanels;
       scope.inject(
-        ['uiConversation', 'sessions', 'remote'],
+        ['uiConversation', 'sessions', 'remote', 'remote.session'],
         (deliveryScope) => {
           deliveryScope.effect(() =>
             deliveryScope.sidebarRightTabs.register({

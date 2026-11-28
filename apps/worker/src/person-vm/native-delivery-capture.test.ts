@@ -5,6 +5,7 @@ import { expect, it } from 'vitest';
 
 it.runIf(process.platform === 'linux')(
   'keeps native delivery bytes and acknowledgements inside the Linux file and live-owner boundaries',
+  { tags: ['platform:linux'] },
   async () => {
     const harness = fileURLToPath(
       new URL(

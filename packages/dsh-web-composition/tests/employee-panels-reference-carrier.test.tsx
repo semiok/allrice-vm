@@ -613,11 +613,11 @@ it('registers a callable contribution in real Cordis/slot lifetimes and releases
       true,
     ),
   );
-  expect(registered).toEqual([
-    'allrice-native-delivery',
-    ...referenceKinds.map((kind) => 'allrice-employee-panels.' + kind),
-  ]);
-  expect(ctx.slots.entries('sidebar.right.pane.tab')).toHaveLength(5);
+  expect(registered).toEqual(
+    referenceKinds.map((kind) => 'allrice-employee-panels.' + kind),
+  );
+  // This fixture does not provide a native conversation or remote history.
+  expect(ctx.slots.entries('sidebar.right.pane.tab')).toHaveLength(4);
   const ref = window.__allricePanelsReference!;
   ref.open(['files']);
   expect(ref.evidence().activeKind).toBe('allrice-employee-panels.files');

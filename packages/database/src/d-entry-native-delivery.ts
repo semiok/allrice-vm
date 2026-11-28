@@ -426,7 +426,9 @@ export async function sweepDEntryNativeDeliveryReservations(
       });
     } catch {
       signal.throwIfAborted();
-      // Keep this tombstone eligible for retry without starving other rows.
+      // Retry behind other tombstones, including ones on the next page.
+      await db`update allrice_storage_objects set updated_at=clock_timestamp()
+        where id=${row.id} and state='deleted'`;
       continue;
     }
     await db`insert into allrice_audit_events
