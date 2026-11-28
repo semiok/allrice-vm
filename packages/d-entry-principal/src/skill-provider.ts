@@ -131,6 +131,7 @@ export function installPrincipalSkillProvider(
   >();
   const turns = new WeakMap<Agent, { turn: number; scope: Scope }>();
   let registry: SkillProviderControl | undefined;
+  let discovery = Promise.resolve();
   const invalidate = () => registry?.invalidate();
   const bound = (scope: Scope | undefined) =>
     scope?.active &&
@@ -138,15 +139,35 @@ export function installPrincipalSkillProvider(
     scope.issue.access !== 'history'
       ? scope
       : undefined;
-  const run = <T>(
+  const run = async <T>(
     scope: Scope | undefined,
     signal: AbortSignal,
     next: () => T,
     page = false,
   ) => {
-    invalidate();
-    const accepted = bound(scope);
-    return current.run(accepted && { scope: accepted, signal, page }, next);
+    // rc.2 reuses a catalog by cwd and native scope, which can be shared by
+    // multiple logins to the same conversation. Serialize its native list,
+    // pre-step and skill tool entry points. Discard the cache before giving
+    // another principal a turn, including when this lookup is cancelled.
+    const previous = discovery;
+    let release!: () => void;
+    discovery = new Promise<void>((done) => (release = done));
+    await previous;
+    try {
+      signal.throwIfAborted();
+      invalidate();
+      const accepted = bound(scope);
+      return await current.run(
+        accepted && { scope: accepted, signal, page },
+        next,
+      );
+    } finally {
+      try {
+        invalidate();
+      } finally {
+        release();
+      }
+    }
   };
   const read = (request: PrincipalSkillRead, signal?: AbortSignal) => {
     const claim = current.getStore();
@@ -166,11 +187,10 @@ export function installPrincipalSkillProvider(
           name: 'allrice-capabilities',
           async list({ signal }) {
             const result = await read({ kind: 'list' }, signal);
-            // The public registry's cache key does not include the
-            // authenticated principal. Permit this lookup's candidates, but
-            // never allow them to become a reusable process-wide snapshot.
+            // The native model catalog updates only for a complete observation.
+            // A successful Worker reply is complete within this discovery turn.
             return {
-              complete: false,
+              complete: result?.kind === 'catalog',
               candidates:
                 result?.kind === 'catalog'
                   ? result.entries.map(

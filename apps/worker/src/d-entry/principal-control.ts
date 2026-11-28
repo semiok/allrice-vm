@@ -480,8 +480,17 @@ export function createDEntryPrincipalControl(
                           const watch = await watchSkills(skillSource);
                           if (read.kind === 'list' && read.page)
                             catalog ??= '[]';
-                          const generation = skillGeneration;
-                          if (!feedLost) {
+                          // A same-VM notification need not change this page's
+                          // catalog. Give the picker one fresh cut before rc.2
+                          // caches an empty result for this connection.
+                          const attempts =
+                            read.kind === 'list' && read.page ? 2 : 1;
+                          for (
+                            let attempt = 0;
+                            attempt < attempts && !feedLost;
+                            attempt++
+                          ) {
+                            const generation = skillGeneration;
                             const readResult = await skillSource.read(
                               read,
                               active,
@@ -489,8 +498,10 @@ export function createDEntryPrincipalControl(
                             // This listener cut joins commits during the SQL
                             // reads, before a catalog or body can escape.
                             await watch.throughCommit(active);
-                            if (!feedLost && generation === skillGeneration)
+                            if (!feedLost && generation === skillGeneration) {
                               result = boundedSkillResult(read, readResult);
+                              break;
+                            }
                           }
                         }
                       } catch {

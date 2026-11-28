@@ -910,7 +910,8 @@ export function EmployeeNativePage({
             navigating ||
             detached ||
             remoteRevoked ||
-            refreshedScopeId !== resourceScopeId
+            (refreshedScopeId !== resourceScopeId &&
+              refreshedScopeId !== switching?.scopeId)
           )
             return;
           frame.current?.contentWindow?.postMessage(
