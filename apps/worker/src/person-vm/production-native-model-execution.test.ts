@@ -3,6 +3,7 @@ import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
+import type * as Database from '@allrice/database';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -24,8 +25,8 @@ const mocks = vi.hoisted(() => ({
   watch: vi.fn(),
   query: vi.fn(),
 }));
-vi.mock(import('@allrice/database'), async (original) => ({
-  ...(await original()),
+vi.mock('@allrice/database', async (original) => ({
+  ...(await original<typeof Database>()),
   getDEntryNativeRootPin: mocks.pin,
   getDatabase: () =>
     Object.assign(mocks.query, { json: (value: unknown) => value }),
