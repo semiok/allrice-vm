@@ -1098,30 +1098,39 @@ suite(
             (reference) => reference.fileName === deletedName,
           );
           expect(deleted?.publication?.origin).toBe('upload');
-          await p.client.changePublication(
-            {
-              sourceId: deleted!.sourceId,
-              body: {
-                workspaceId: p.selection.workspaceId,
-                expectedRevision: deleted!.publication!.audienceRevision,
-                requestId: randomUUID(),
-                action: 'delete',
+          const preDelete = holdReceipt(deletedRequest, 'beforeReply');
+          try {
+            await openUpload();
+            await preDelete.arrived();
+            await p.client.changePublication(
+              {
+                sourceId: deleted!.sourceId,
+                body: {
+                  workspaceId: p.selection.workspaceId,
+                  expectedRevision: deleted!.publication!.audienceRevision,
+                  requestId: randomUUID(),
+                  action: 'delete',
+                },
               },
-            },
-            signal(),
-          );
-          const [archivedReceipt] = await Promise.all([
-            page.waitForResponse(receiptResponse(deletedRequest)),
-            openUpload(),
-          ]);
-          expect(await archivedReceipt.json()).toMatchObject({
-            status: 'recorded',
-            archived: true,
-            result: { sourceId: deleted!.sourceId },
-          });
-          await selectFile(deletedName, deletedContent);
-          await publishMaterial();
-          await material.waitFor({ state: 'hidden' });
+              signal(),
+            );
+            // Keep the pre-delete reply held, but let the new receipt GET
+            // reach PostgreSQL after deletion.
+            receiptGate = undefined;
+            await selectFile(deletedName, deletedContent);
+            const [archivedReceipt] = await Promise.all([
+              page.waitForResponse(receiptResponse(deletedRequest)),
+              publishMaterial(),
+            ]);
+            expect(await archivedReceipt.json()).toMatchObject({
+              status: 'recorded',
+              archived: true,
+              result: { sourceId: deleted!.sourceId },
+            });
+            await material.waitFor({ state: 'hidden' });
+          } finally {
+            preDelete.close();
+          }
           expect(publishWrites).toHaveLength(5);
           expect(publishWrites.at(-1)).not.toBe(deletedRequest);
           const replacement = await p.client.readWriteReceipt(

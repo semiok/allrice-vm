@@ -568,9 +568,15 @@ function PublicationForm({
               )?.outcome === 'recorded',
           );
         if (prior) {
-          // An unknown response never authorizes a second write. The normal
-          // publish button checks the exact saved request instead.
-          const resolution = await reconcile(prior);
+          // Recheck the original request after the click. A background read
+          // might have started before the material was deleted.
+          const resolution = await checkPublication(
+            data,
+            workspaceId,
+            receiptKey,
+            prior,
+            controller.signal,
+          ).catch(() => undefined);
           if (
             !alive.current ||
             controller.signal.aborted ||
