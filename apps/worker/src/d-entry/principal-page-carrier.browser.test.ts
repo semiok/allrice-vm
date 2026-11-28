@@ -67,10 +67,21 @@ function walletInterference(
       if (bursts === 40) clearInterval(timer);
     }, 10);
     if (!${child}) return;
+    const errorListeners = new Set();
+    const add = window.addEventListener;
+    const remove = window.removeEventListener;
+    window.addEventListener = function (type, listener, options) {
+      if (type === 'error' && options === undefined) errorListeners.add(listener);
+      return add.call(this, type, listener, options);
+    };
+    window.removeEventListener = function (type, listener, options) {
+      if (type === 'error' && options === undefined) errorListeners.delete(listener);
+      return remove.call(this, type, listener, options);
+    };
     const append = Element.prototype.append;
     Element.prototype.append = function (...nodes) {
       const registration = nodes.find(node => node instanceof HTMLScriptElement && node.textContent);
-      if (this !== document.head || !registration ||
+      if (this !== document.head || !registration || errorListeners.size === 0 ||
           document.documentElement.hasAttribute('data-wallet-registration-noise'))
         return append.apply(this, nodes);
       document.documentElement.dataset.walletRegistrationNoise = '1';
@@ -78,15 +89,17 @@ function walletInterference(
         registration.textContent += "\n;throw Error('Owned bundle registration failed');";
         return append.apply(this, nodes);
       }
-      const scopeId = document.getElementById('app').dataset.scopeId;
-      parent.dispatchEvent(new MessageEvent('message', {
-        origin: location.origin, source: window,
-        data: { type: 'allrice:d-entry:startup-failed', scopeId },
-      }));
-      window.dispatchEvent(new MessageEvent('message', {
-        origin: location.origin, source: parent,
-        data: { type: 'allrice:d-entry:revoked', scopeId },
-      }));
+      if (${denied}) {
+        const scopeId = document.getElementById('app').dataset.scopeId;
+        parent.dispatchEvent(new MessageEvent('message', {
+          origin: location.origin, source: window,
+          data: { type: 'allrice:d-entry:startup-failed', scopeId },
+        }));
+        window.dispatchEvent(new MessageEvent('message', {
+          origin: location.origin, source: parent,
+          data: { type: 'allrice:d-entry:revoked', scopeId },
+        }));
+      }
       const injected = document.createElement('script');
       injected.textContent = "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
       append.call(this, injected);
@@ -1264,11 +1277,21 @@ it
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
     if (scenario === 'wallet-owned-error') {
-      await page
-        .getByRole('heading', { name: '暂时打不开工作台' })
-        .waitFor({ timeout: 15_000 });
-      expect(errors).toContain('Owned bundle registration failed');
-      expect(workspaceBaselines).toHaveLength(0);
+      try {
+        await page.getByRole('alert').waitFor({ timeout: 12_000 });
+        expect(errors).toContain('Owned bundle registration failed');
+        expect(workspaceBaselines).toHaveLength(0);
+      } catch (cause) {
+        throw Error(
+          JSON.stringify({
+            errors,
+            heading: await page.getByRole('heading').allInnerTexts(),
+            scopedBundleReads,
+            workspaces: workspaceBaselines.length,
+          }),
+          { cause },
+        );
+      }
       await context.close();
       return;
     }
