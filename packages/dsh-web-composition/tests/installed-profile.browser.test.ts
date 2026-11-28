@@ -308,7 +308,16 @@ suite('installed AllRice native Web composition', () => {
               exact: true,
             });
             await stop.waitFor();
-            const button = await stop.evaluate((element) => {
+            const button = await stop.evaluate(async (element) => {
+              // The native button animates background-color when its token changes.
+              await Promise.all(
+                element.getAnimations().flatMap((animation) =>
+                  animation instanceof CSSTransition &&
+                  animation.transitionProperty === 'background-color'
+                    ? [animation.finished]
+                    : [],
+                ),
+              );
               const css = getComputedStyle(element);
               return {
                 token: css
