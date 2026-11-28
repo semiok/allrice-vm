@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   EmployeeProfileBundleTimeout,
@@ -21,9 +22,9 @@ it('uses a public digest only for the exact graph resource and revision', () => 
   };
   const data = { publicAssetRoot: root, publicBundles: JSON.stringify([row]) };
   const resolve = releasedBundleResolver(data);
-  expect(resolve({ url: row.reference, rev: row.revision })).toBe(
-    root + 'bundles/' + sha256 + '.js',
-  );
+  expect(resolve({ url: row.reference, rev: row.revision })).toEqual({
+    url: root + 'bundles/' + sha256 + '.js',
+  });
   expect(resolve({ url: row.reference, rev: 'r2' })).toBeUndefined();
   expect(
     resolve({ url: 'plugins/??other/client.js&rev=r1', rev: 'r1' }),
@@ -33,6 +34,72 @@ it('uses a public digest only for the exact graph resource and revision', () => 
       ...data,
       publicAssetRoot: 'https://other.example/',
     })({ url: row.reference, rev: 'r1' }),
+  ).toBeUndefined();
+});
+
+it('uses the same verified public packet after relocation and reconstructs the admitted native order', async () => {
+  const root = '/_next/static/dsh-profile/' + 'a'.repeat(64) + '/';
+  const rev = '1'.repeat(12);
+  const firstId = '@dsh/client.js-first';
+  const secondId = '@dsh/second';
+  const url = `plugins/??${secondId}/client.js,${firstId}/client.js&rev=${rev}`;
+  const first = 'first("中");\n';
+  const second = 'second();\n';
+  const bytes = new TextEncoder().encode(first + second + 'sealed trailer');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const data = {
+    publicAssetRoot: root,
+    publicBundles: JSON.stringify([
+      {
+        reference: 'sealed',
+        revision: 'build',
+        sha256,
+        layout: {
+          phase: 'application',
+          byteLength: bytes.length,
+          entries: [
+            { id: firstId, offset: 0, length: Buffer.byteLength(first) },
+            {
+              id: secondId,
+              offset: Buffer.byteLength(first),
+              length: Buffer.byteLength(second),
+            },
+          ],
+        },
+      },
+    ]),
+  };
+  const resolve = releasedBundleResolver(data);
+  const batch = {
+    url,
+    rev,
+    phase: 'application',
+    entries: [secondId, firstId],
+  };
+  const packet = resolve(batch)!;
+  expect(packet.url).toBe(root + 'bundles/' + sha256 + '.js');
+  const received = await packet.assemble!(bytes.buffer);
+  expect(new TextDecoder().decode(received)).toBe(
+    second +
+      first +
+      `//# sourceMappingURL=??${secondId}/client.js.map,${firstId}/client.js.map&rev=${rev}\n`,
+  );
+  const changed = bytes.slice();
+  changed[0] = 0;
+  await expect(packet.assemble!(changed.buffer)).rejects.toThrow(
+    'Invalid public profile packet digest',
+  );
+  await expect(packet.assemble!(bytes.slice(0, -1).buffer)).rejects.toThrow(
+    'Invalid public profile packet length',
+  );
+  expect(resolve({ ...batch, phase: 'bootstrap' })).toBeUndefined();
+  expect(resolve({ ...batch, entries: [firstId, secondId] })).toBeUndefined();
+  expect(
+    resolve({
+      ...batch,
+      entries: ['@dsh/third'],
+      url: `plugins/??@dsh/third/client.js&rev=${rev}`,
+    }),
   ).toBeUndefined();
 });
 
@@ -191,4 +258,63 @@ it('bounds a stalled public bundle plus its scoped fallback', async () => {
   await vi.advanceTimersByTimeAsync(60_000);
   await rejected;
   expect(request).toHaveBeenCalledTimes(2);
+});
+
+it('keeps receiving a progressing bundle past thirty seconds without restarting', async () => {
+  vi.useFakeTimers();
+  let body!: ReadableStreamDefaultController<Uint8Array>;
+  const request = vi.fn(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            body = controller;
+          },
+        }),
+      ),
+  );
+  vi.stubGlobal('fetch', request);
+  const result = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    new AbortController().signal,
+  );
+  for (let i = 0; i < 4; i++) {
+    await vi.advanceTimersByTimeAsync(15_000);
+    body.enqueue(Uint8Array.of(65 + i));
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  body.close();
+  expect(new TextDecoder().decode(await result)).toBe('ABCD');
+  expect(request).toHaveBeenCalledOnce();
+});
+
+it('bounds even a continuously progressing download', async () => {
+  vi.useFakeTimers();
+  const bodies: ReadableStreamDefaultController<Uint8Array>[] = [];
+  const request = vi.fn(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            bodies.push(controller);
+          },
+        }),
+      ),
+  );
+  vi.stubGlobal('fetch', request);
+  const result = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    new AbortController().signal,
+    '/public.js',
+  );
+  for (let i = 0; i < 7; i++) {
+    await vi.advanceTimersByTimeAsync(15_000);
+    bodies[0]!.enqueue(Uint8Array.of(65));
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(request).toHaveBeenCalledTimes(2);
+  bodies[1]!.enqueue(Uint8Array.of(66));
+  bodies[1]!.close();
+  expect(new TextDecoder().decode(await result)).toBe('B');
 });

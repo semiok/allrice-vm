@@ -9,6 +9,7 @@ import {
   findDEntryCreationWorkspace,
   findDEntryEmployee,
 } from '../../../lib/d-entry/entry-threads';
+import { readStartupProfileAssetUrls } from '../../../lib/d-entry/released-profile-assets';
 import { getRequestContext } from '../../../lib/identity/session';
 import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
@@ -89,6 +90,9 @@ export default async function EmployeeNativeEntryPage({
       return (
         <EmployeeNativePage
           query={selection ? new URLSearchParams(selection).toString() : ''}
+          startupAssetUrls={
+            selection ? await readStartupProfileAssetUrls() : []
+          }
           prepare
         />
       );
@@ -96,5 +100,11 @@ export default async function EmployeeNativeEntryPage({
       return <EmployeeNativePage query="" initialUnavailable prepare />;
     }
   }
-  return <EmployeeNativePage query={query.toString()} prepare />;
+  return (
+    <EmployeeNativePage
+      query={query.toString()}
+      startupAssetUrls={await readStartupProfileAssetUrls()}
+      prepare
+    />
+  );
 }
