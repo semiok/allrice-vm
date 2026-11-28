@@ -441,7 +441,8 @@ export function createDEntryPrincipalControl(
                       try {
                         if (skillSource) {
                           const watch = await watchSkills(skillSource);
-                          if (read.kind === 'list') catalog ??= '[]';
+                          if (read.kind === 'list' && read.page)
+                            catalog ??= '[]';
                           const generation = skillGeneration;
                           if (!feedLost) {
                             const readResult = await skillSource.read(
@@ -459,7 +460,11 @@ export function createDEntryPrincipalControl(
                         // Only the fixed unavailable result crosses the owner wire.
                       }
                       if (!active.aborted) {
-                        if (result.kind === 'catalog')
+                        if (
+                          read.kind === 'list' &&
+                          read.page &&
+                          result.kind === 'catalog'
+                        )
                           catalog = JSON.stringify(result.entries);
                         handle.send({ type: 'skill-result', id, result });
                       }

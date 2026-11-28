@@ -109,7 +109,7 @@ export function installPrincipalSkillProvider(
   scopes: ReadonlyMap<string, Scope>,
 ) {
   const current = new AsyncLocalStorage<
-    { scope: Scope; signal: AbortSignal } | undefined
+    { scope: Scope; signal: AbortSignal; page: boolean } | undefined
   >();
   const turns = new WeakMap<Agent, { turn: number; scope: Scope }>();
   let registry: SkillProviderControl | undefined;
@@ -124,16 +124,19 @@ export function installPrincipalSkillProvider(
     scope: Scope | undefined,
     signal: AbortSignal,
     next: () => T,
+    page = false,
   ) => {
     invalidate();
     const accepted = bound(scope);
-    return current.run(accepted && { scope: accepted, signal }, next);
+    return current.run(accepted && { scope: accepted, signal, page }, next);
   };
   const read = (request: PrincipalSkillRead, signal?: AbortSignal) => {
     const claim = current.getStore();
     if (!claim || !bound(claim.scope)) return;
     return claim.scope.skills.read(
-      request,
+      request.kind === 'list' && claim.page
+        ? { kind: 'list', page: true }
+        : request,
       signal ? AbortSignal.any([claim.signal, signal]) : claim.signal,
     );
   };
@@ -145,18 +148,25 @@ export function installPrincipalSkillProvider(
           name: 'allrice-capabilities',
           async list({ signal }) {
             const result = await read({ kind: 'list' }, signal);
-            if (result?.kind !== 'catalog')
-              return { candidates: [], complete: false };
-            return result.entries.map(
-              ({ name, description, revision, ...invocation }) => ({
-                name,
-                description,
-                invocation,
-                ...source,
-                locator: revision,
-                rank: BUNDLED_SKILL_RANK,
-              }),
-            );
+            // The public registry's cache key does not include the
+            // authenticated principal. Permit this lookup's candidates, but
+            // never allow them to become a reusable process-wide snapshot.
+            return {
+              complete: false,
+              candidates:
+                result?.kind === 'catalog'
+                  ? result.entries.map(
+                      ({ name, description, revision, ...invocation }) => ({
+                        name,
+                        description,
+                        invocation,
+                        ...source,
+                        locator: revision,
+                        rank: BUNDLED_SKILL_RANK,
+                      }),
+                    )
+                  : [],
+            };
           },
           async get(candidate, { signal }) {
             if (typeof candidate.locator !== 'string') return;

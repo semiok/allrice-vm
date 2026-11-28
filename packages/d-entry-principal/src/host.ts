@@ -1306,7 +1306,7 @@ class PrincipalService extends TypertRemoteService {
             });
           // The registry call above can overlap a catalog refresh.
           value = await (endpoint === 'skills/list'
-            ? this.skills.run(scope, active, dispatch)
+            ? this.skills.run(scope, active, dispatch, true)
             : nativeArgs === args
               ? dispatch()
               : scope.current(dispatch, active));

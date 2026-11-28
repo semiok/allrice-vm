@@ -50,7 +50,7 @@ export type CloseCommand = 'close';
 /** Only the authenticated Node owner exchanges these frames. A browser
  * principal never receives a locator, body or capability credential. */
 export type PrincipalSkillRead =
-  | Readonly<{ kind: 'list' }>
+  | Readonly<{ kind: 'list'; page?: true }>
   | Readonly<{ kind: 'body'; name: string; revision: string }>;
 export type PrincipalSkillSummary = Readonly<{
   name: string;

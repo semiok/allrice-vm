@@ -332,7 +332,7 @@ suite(
 
     it.skipIf(!nativeSkillCli)(
       'lists a real PG binding over the locked CLI owner duplex and observes a committed withdrawal',
-      { timeout: 120_000, tags: ['manual:ALLRICE_NATIVE_WEB_TEST_CLI'] },
+      { timeout: 120_000, tags: ['manual:NATIVE_SKILL_POSTGRES'] },
       async () => {
         const { context, identity, installed } = await prepareProduction();
         const roots: string[] = [],
