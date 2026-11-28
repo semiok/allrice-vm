@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
 import { ScheduleId } from '@deepseek-ai/dsh-schedule';
@@ -1677,7 +1678,22 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   );
   expect(plan.initialize).toBe(f.memory.initialize);
   expect(plan.launcher).toBe(f.memory.launcher);
-  expect(plan.files).toHaveLength(1 + 5 * f.web.receipt.endpoints.length);
+  expect(plan.files).toHaveLength(1 + 6 * f.web.receipt.endpoints.length);
+  const deliveryCapture = await readFile(
+    new URL('../../dsh/allrice-native-delivery-capture.mjs', import.meta.url),
+    'utf8',
+  );
+  expect(
+    plan.files.filter(({ path }) =>
+      path.endsWith('/allrice-native-delivery-capture.mjs'),
+    ),
+  ).toEqual(
+    f.web.receipt.endpoints.map(({ employeeInstanceId }) => ({
+      path: `/work/.allrice/employees/${employeeInstanceId}/dsh/native-web/allrice-native-delivery-capture.mjs`,
+      contents: deliveryCapture,
+      mode: 0o600,
+    })),
+  );
   expect(
     plan.files.filter(({ path }) =>
       path.endsWith('/allrice-native-run-journal.mjs'),
@@ -2153,6 +2169,18 @@ it('stages the existing governed Bash overlay for every employee from the same p
             },
           ],
         },
+        ...['preset-standard', 'preset-ptc', 'preset-cordis'].map((id) => ({
+          id,
+          config: {
+            plugins: expect.arrayContaining([
+              expect.objectContaining({
+                id: 'skill-filesystem',
+                disabled: true,
+              }),
+              expect.objectContaining({ id: 'tool-skill' }),
+            ]),
+          },
+        })),
       ]);
       expect(patch.contents).not.toContain(controls.hostDirectory);
     }
