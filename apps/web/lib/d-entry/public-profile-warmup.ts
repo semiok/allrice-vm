@@ -21,7 +21,11 @@ export async function warmPublicProfileAssets(
       await downloadProfileResource(
         unique[next++]!,
         signal,
-        { ...sealedProfileBundleFetch, priority: 'low' },
+        {
+          ...sealedProfileBundleFetch,
+          priority: 'low',
+          referrerPolicy: 'no-referrer',
+        },
         profileDownloadLimits,
         (body) => body.pipeTo(new WritableStream()),
       ).catch(() => {

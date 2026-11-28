@@ -13,7 +13,10 @@ export const sealedProfileBundleFetch = {
 export async function downloadProfileResource<T>(
   url: URL | string,
   parent: AbortSignal,
-  options: Pick<RequestInit, 'credentials' | 'cache' | 'redirect' | 'priority'>,
+  options: Pick<
+    RequestInit,
+    'credentials' | 'cache' | 'redirect' | 'priority' | 'referrerPolicy'
+  >,
   limits: { idleMs: number; totalMs: number },
   consume: (body: ReadableStream<Uint8Array>) => Promise<T>,
   timeoutReason: Error = new DOMException(

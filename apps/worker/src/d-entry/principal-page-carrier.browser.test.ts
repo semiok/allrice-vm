@@ -322,7 +322,7 @@ it
     let readyAt: number | undefined;
     let prewarmAt: number | undefined;
     const operationId = randomUUID();
-    const coldWindow = bench ? 60_000 : 1_500;
+    const coldWindow = bench === 'overlap' ? 3_000 : bench ? 60_000 : 1_500;
     const applicationTransfers: {
       start: number;
       end?: number;
@@ -340,12 +340,13 @@ it
       const client = new AbortController();
       response.once('close', () => client.abort());
       try {
-        for (let offset = 0; offset < bytes.length; offset += 16_384) {
-          const chunk = bytes.subarray(offset, offset + 16_384);
+        const chunkSize = Math.ceil(bytes.length / 100);
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          const chunk = bytes.subarray(offset, offset + chunkSize);
           response.write(chunk);
           transfer.bytes += chunk.byteLength;
           if (offset + chunk.byteLength < bytes.length)
-            await delay(350, undefined, { signal: client.signal });
+            await delay(400, undefined, { signal: client.signal });
         }
         transfer.end = performance.now();
         response.end();
@@ -547,6 +548,8 @@ it
           };
           traffic.push(timing);
           expect(request.headers.cookie).toBeUndefined();
+          if (coldAssets && readyAt === undefined)
+            expect(request.headers.referer).toBeUndefined();
           const bytes = await release.read(
             publicBundle.reference,
             new AbortController().signal,
@@ -583,8 +586,10 @@ it
             response.once('finish', () =>
               coldFinished.set(url.pathname, performance.now()),
             );
-            if (readyAt === undefined)
+            if (readyAt === undefined) {
               expect(request.headers.cookie).toBeUndefined();
+              expect(request.headers.referer).toBeUndefined();
+            }
           }
           const encoded = gzipSync(
             await readFile(join(release.directory, file)),
@@ -869,32 +874,21 @@ it
     );
     if (coldAssets) {
       const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
-      if (bench === 'baseline') {
-        await alert.waitFor({ timeout: 145_000 });
-        expect(applicationTransfers).toHaveLength(2);
-        expect(
-          applicationTransfers.every(
-            (transfer) => transfer.bytes > 0 && !transfer.end,
-          ),
-        ).toBe(true);
-        expect(scopedBundleReads).toBe(1);
-      } else {
-        await editor.fill('冷启动后的草稿', {
-          timeout: bench ? 145_000 : 20_000,
-        });
-        expect(await editor.isEditable()).toBe(true);
-        await expect.poll(() => alert.count()).toBe(0);
-        expect(scopedBundleReads).toBe(0);
-        if (bench !== 'progress')
-          for (const url of coldPaths) {
-            expect(coldFinished.get(url)).toBeLessThan(readyAt!);
-            expect(coldRequests.get(url)).toBe(1);
-          }
-      }
+      const elapsed = bench ? 133_000 : 20_000;
+      const outcome = await Promise.race([
+        alert.waitFor({ timeout: elapsed }).then(() => 'timeout'),
+        editor.waitFor({ timeout: elapsed }).then(() => 'editable'),
+      ]).catch(
+        async () =>
+          'missing: ' + (await page.locator('body').innerText()).slice(0, 300),
+      );
       console.info(
         'COLD_ASSET_BENCH ' +
           JSON.stringify({
             mode: bench || 'warming-test',
+            outcome,
+            errors,
+            scopedBundleReads,
             readyToOutcomeMs: Math.round(performance.now() - readyAt!),
             prewarmToReadyMs: Math.round(readyAt! - prewarmAt!),
             browser: browser.version(),
@@ -910,6 +904,25 @@ it
             ).length,
           }),
       );
+      if (bench === 'baseline') {
+        expect(outcome).toBe('timeout');
+        expect(applicationTransfers).toHaveLength(2);
+        expect(
+          applicationTransfers.every(({ bytes, end }) => bytes > 0 && !end),
+        ).toBe(true);
+        expect(scopedBundleReads).toBe(1);
+      } else {
+        expect(outcome).toBe('editable');
+        await editor.fill('冷启动后的草稿');
+        expect(await editor.isEditable()).toBe(true);
+        expect(scopedBundleReads).toBe(0);
+        if (bench !== 'progress')
+          for (const url of coldPaths) {
+            if (bench !== 'overlap')
+              expect(coldFinished.get(url)).toBeLessThan(readyAt!);
+            expect(coldRequests.get(url)).toBe(1);
+          }
+      }
       await context.close();
       return;
     }
