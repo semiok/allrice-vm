@@ -3034,7 +3034,32 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
   );
   expect(create?.filter((v) => v === '--mount-dir')).toHaveLength(1);
   expect(calls.some((args) => args.includes(prepareDshSandbox))).toBe(false);
-  expect(calls.some((args) => args.includes(verifyDshRuntimeDisk))).toBe(true);
+  const guestJobs = calls.filter(([op]) => op === 'exec');
+  expect(guestJobs).toHaveLength(4);
+  expect(guestJobs[0]).toEqual(
+    expect.arrayContaining(['--workdir', '/bin', '/usr/local/bin/node']),
+  );
+  expect(guestJobs[1]?.slice(-8)).toEqual([
+    '--workdir',
+    '/bin',
+    '--',
+    '/bin/mkdir',
+    '-p',
+    '--',
+    '/run/allrice-command-memory',
+    '/work',
+  ]);
+  expect(guestJobs[1]).toEqual(expect.arrayContaining(['--timeout', '10s']));
+  expect(guestJobs[2]?.slice(-8)).toEqual([
+    expect.stringContaining('/usr/local/bin/node "$1" "$2" || exit "$?"'),
+    'allrice-initialize-dsh-disk',
+    controls.guestDirectory + '/initialize.cjs',
+    commandConfig,
+    verifyDshRuntimeDisk,
+    dsh.guestDirectory,
+    bwrapSha256,
+    cliSha256,
+  ]);
   const dshLaunch = calls.find((args) => args.at(-1) === cli);
   expect(dshLaunch?.slice(-7)).toEqual([
     '/bin/sh',

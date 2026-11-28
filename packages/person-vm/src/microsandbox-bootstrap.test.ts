@@ -144,6 +144,64 @@ it('labels a failed auth artifact read without retaining guest command output', 
   });
 });
 
+it('does not publish a launcher when the joined sealed initialization job fails', async () => {
+  const { scope, binding } = fixture();
+  const controls = '/opt/allrice/command-memory/' + 'a'.repeat(64);
+  const state = '/run/allrice-command-memory';
+  const config = state + '/config.json';
+  const command = vi.fn(async (args: string[]) => {
+    if (args[0] === 'exec')
+      return args.includes('allrice-initialize-dsh-disk')
+        ? 'initialize-and-verify'
+        : 'prepare';
+    if (args[0] === 'wait' && args[3] === 'initialize-and-verify')
+      return JSON.stringify({ code: 75, success: false, timed_out: false });
+    if (args[0] === 'wait') return finished;
+    if (args[0] === 'cp') return '';
+    throw Error('unexpected native verb');
+  });
+
+  await expect(
+    bootstrapMicrosandbox({
+      scope,
+      name: 'allrice-' + binding.vmId,
+      plan: {
+        files: [{ path: config, contents: '{}', mode: 0o600 }],
+        initialize: {
+          executable: 'node',
+          args: [controls + '/initialize.cjs', config],
+        },
+        launcher: controls + '/launch-dsh.sh',
+        env: {
+          BASH_ENV: controls + '/bash-env.sh',
+          ALLRICE_MEMORY_RECEIPT_WRITER: controls + '/command-observer.cjs',
+          ALLRICE_MEMORY_RECEIPT_DIRECTORY: state + '/receipts',
+          ALLRICE_MEMORY_RECEIPT_NODE: '/usr/local/bin/node',
+        },
+      },
+      readonlyCommandMemoryDirectory: controls,
+      dshSandbox: {
+        guestDirectory: '/opt/allrice/dsh/' + 'b'.repeat(64),
+        sha256: 'c'.repeat(64),
+        cliSha256: 'd'.repeat(64),
+      },
+      stagingRoot: root,
+      cleanupTimeoutMs: 2000,
+      command,
+    }),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+    'exec',
+    'wait',
+    'exec',
+    'wait',
+    'cp',
+    'exec',
+    'wait',
+  ]);
+  expect(command.mock.calls.at(-1)?.[0][3]).toBe('initialize-and-verify');
+});
+
 it.each(['10.4.1.10', '172.16.0.6', '192.168.4.2'])(
   'returns exactly one current private assigned guest IPv4 %s after native wait and logs',
   async (address) => {

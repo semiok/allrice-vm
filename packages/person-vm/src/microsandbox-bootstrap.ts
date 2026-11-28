@@ -32,6 +32,15 @@ import { COMMAND_MEMORY_STATE_ROOT } from './readonly-artifact.ts';
 const BASE_IMAGE_PATH =
   '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
+export const MICROSANDBOX_WORK_DIRECTORY = '/work';
+
+// Keep the sealed initializer's public CLI and its native exit code. The
+// following disk proof only reads; neither result escapes a single exact wait.
+const initializeAndVerifyDisk = String.raw`
+/usr/local/bin/node "$1" "$2" || exit "$?"
+shift 2
+exec /usr/local/bin/node -e "$@"
+`;
 
 const readEthernetAddresses = String.raw`
 const interfaces = require('node:os').networkInterfaces();
@@ -443,9 +452,10 @@ export async function bootstrapMicrosandbox(input: {
   async function spawn(
     commandSpec: PersonVmGuestCommand,
     dispatch?: PersonVmGuestLaunchDispatch,
+    executionTimeoutSeconds?: number,
   ): Promise<PersonVmManagedJob> {
     const job = await spawnMicrosandboxJob(
-      input,
+      { ...input, executionTimeoutSeconds },
       commandSpec,
       employee ? 'hot-retained' : 'bootstrap-retained',
       dispatch,
@@ -457,8 +467,11 @@ export async function bootstrapMicrosandbox(input: {
       cancelAndWait: job.cancelAndWait,
     });
   }
-  async function run(commandSpec: PersonVmGuestCommand) {
-    const job = await spawn(commandSpec);
+  async function run(
+    commandSpec: PersonVmGuestCommand,
+    executionTimeoutSeconds?: number,
+  ) {
+    const job = await spawn(commandSpec, undefined, executionTimeoutSeconds);
     let result: PersonVmJobExit;
     try {
       result = await job.wait(scope.signal);
@@ -483,16 +496,28 @@ export async function bootstrapMicrosandbox(input: {
     // Each step has a live fence before its side effects. That fence also
     // closes the preceding joined step. The final step has its own closing
     // fence before it can hand the launcher back to the runtime.
+    const diskProof =
+      !employee && sandbox?.cliSha256 !== undefined
+        ? [sandbox.guestDirectory, sandbox.sha256, sandbox.cliSha256]
+        : undefined;
     if (controls && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
+        // /work does not need to exist for the check and writes under /run.
+        ...(diskProof && { workdir: '/bin' }),
       });
     // cp preserves Unix permissions but doesn't create missing file parents.
-    await run({
-      executable: '/bin/mkdir',
-      args: ['-p', '--', ...new Set(files.map((file) => dirname(file.path)))],
-    });
+    const parents = new Set(files.map((file) => dirname(file.path)));
+    if (diskProof) parents.add(MICROSANDBOX_WORK_DIRECTORY);
+    await run(
+      {
+        executable: '/bin/mkdir',
+        args: ['-p', '--', ...parents],
+        ...(diskProof && { workdir: '/bin' }),
+      },
+      diskProof ? 10 : undefined,
+    );
     for (const [index, file] of files.entries()) {
       await scope.assertCurrent();
       const hostFile = join(stage, String(index));
@@ -502,24 +527,28 @@ export async function bootstrapMicrosandbox(input: {
         scope.signal,
       );
     }
-    if (!employee)
+    if (diskProof)
+      await run({
+        executable: '/bin/sh',
+        args: [
+          '-c',
+          initializeAndVerifyDisk,
+          'allrice-initialize-dsh-disk',
+          ...plan.initialize.args,
+          verifyDshRuntimeDisk,
+          ...diskProof,
+        ],
+      });
+    else if (!employee)
       await run(
         controls
           ? { ...plan.initialize, executable: '/usr/local/bin/node' }
           : plan.initialize,
       );
-    if (sandbox && !employee)
+    if (sandbox && !employee && !diskProof)
       await run({
         executable: '/usr/local/bin/node',
-        args: sandbox.cliSha256
-          ? [
-              '-e',
-              verifyDshRuntimeDisk,
-              sandbox.guestDirectory,
-              sandbox.sha256,
-              sandbox.cliSha256,
-            ]
-          : ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
+        args: ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
       });
     await scope.assertCurrent();
   } catch (error) {

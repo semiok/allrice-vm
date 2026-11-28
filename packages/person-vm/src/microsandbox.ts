@@ -26,6 +26,7 @@ import {
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 import {
   bootstrapMicrosandbox,
+  MICROSANDBOX_WORK_DIRECTORY,
   spawnMicrosandboxManagedProbe,
 } from './microsandbox-bootstrap.ts';
 import {
@@ -68,7 +69,6 @@ import {
 const CANONICAL_SOCKET_HASH_BYTES = 12;
 const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
-const GUEST_WORK_DIRECTORY = '/work';
 type NativePaths = {
   home: string;
   config: string;
@@ -375,7 +375,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         args = [
           ...args.slice(0, separator),
           '--workdir',
-          GUEST_WORK_DIRECTORY,
+          MICROSANDBOX_WORK_DIRECTORY,
           ...args.slice(separator),
         ];
       }
@@ -1015,7 +1015,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       },
       {
         executable: '/bin/mkdir',
-        args: ['-p', '--', GUEST_WORK_DIRECTORY],
+        args: ['-p', '--', MICROSANDBOX_WORK_DIRECTORY],
         workdir: '/bin',
       },
     ).catch((error: unknown) => {
@@ -1486,7 +1486,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       artifact = await this.assertArtifact(scope.binding, scope.signal);
     }
     if (employee) UuidSchema.parse(employee.employeeInstanceId);
-    else await this.ensureWorkDirectory(scope);
+    else if (artifact?.cliSha256 === undefined)
+      await this.ensureWorkDirectory(scope);
     return bootstrapMicrosandbox({
       scope,
       plan,
