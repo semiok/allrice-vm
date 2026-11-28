@@ -342,6 +342,11 @@ export function EmployeeNativeFrameShell({
   }, [pending, pool.visible]);
 
   useLayoutEffect(() => {
+    for (const [id, record] of directory.current) {
+      const root =
+        record.controller.element()?.contentDocument?.documentElement;
+      if (root) root.inert = id !== pool.visible;
+    }
     if (pool.visible === undefined) return;
     const frame = directory.current.get(pool.visible)?.controller.element();
     if (!frame) return;

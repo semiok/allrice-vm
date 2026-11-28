@@ -469,6 +469,8 @@ function EmployeeNativePane({
           exact &&
           child?.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId === scopeId
         ) {
+          if (owner && doc.documentElement)
+            doc.documentElement.inert = !owner.visible();
           documentStarted = true;
           return;
         }
@@ -726,6 +728,8 @@ function EmployeeNativePane({
         }
       }
       if (event.data.type === pageDocumentReady) {
+        const root = frame.current?.contentDocument?.documentElement;
+        if (owner && root) root.inert = !owner.visible();
         documentStarted = true;
         if (replacing || remoteRevoked) send(pageRevoked);
       }
