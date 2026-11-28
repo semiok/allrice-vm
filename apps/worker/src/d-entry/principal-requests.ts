@@ -683,35 +683,39 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     const registered = registeredRoots.get(nativeSessionId);
                     const threadId = registered?.identity.threadId;
                     if (registered && threadId) {
-                      const registeredPin = async () => {
-                        await assertCurrent(active);
+                      const registeredPin = async (caller: AbortSignal) => {
+                        await assertCurrent(caller);
                         const next = await deps.root(auth.context, {
                           ...input.selection,
                           threadId,
                         });
                         if (!sameRoot(next, registered)) throw denied();
-                        active.throwIfAborted();
+                        caller.throwIfAborted();
                         return next;
                       };
-                      await ownThreadWork(() =>
-                        resolveDEntryNativeResource({
+                      await ownThreadWork(async () => {
+                        active.throwIfAborted();
+                        await resolveDEntryNativeResource({
                           ...auth,
                           identity: registered.identity,
                           nativeSessionId,
                           owner: catalog.owner,
-                          signal: active,
-                          root: registeredPin,
-                        }),
-                      );
+                          signal: lifetime,
+                          root: () => registeredPin(lifetime),
+                        });
+                      });
+                      active.throwIfAborted();
                       return async () => {
-                        await registeredPin();
+                        await registeredPin(active);
                       };
                     }
-                    // Any native read already dispatched for opening must
-                    // settle before a normal switch retires the old catalog.
-                    await ownThreadWork(() =>
-                      authorize(nativeSessionId, 'read', active),
-                    );
+                    // A stream cancellation cannot interrupt a dispatched
+                    // catalog read. The page drains it before planned retirement.
+                    await ownThreadWork(async () => {
+                      active.throwIfAborted();
+                      await authorize(nativeSessionId, 'read', lifetime);
+                    });
+                    active.throwIfAborted();
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
                     await assertCurrent(active);

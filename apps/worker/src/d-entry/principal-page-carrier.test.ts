@@ -281,13 +281,59 @@ it('replaces the borrowed root while keeping native employee events on the same 
     type: 'item',
     value: { type: 'snapshot' },
   });
-  expect(
-    (
-      await f.proveSwitch(scopeId, target, requestId, sessionToken, {
-        dispatch: 'direct',
-      })
-    ).status,
-  ).toBe(204);
+  const readStarted = deferred<AbortSignal>();
+  const releaseRead = deferred();
+  const read = vi.mocked(f.owner.readSessions);
+  const readCatalog = read.getMockImplementation()!;
+  read.mockImplementationOnce(async (signal, notDispatched) => {
+    readStarted.resolve(signal);
+    await releaseRead.promise;
+    signal.throwIfAborted();
+    return readCatalog(signal, notDispatched);
+  });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'cancelled-opening',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  try {
+    const readSignal = await readStarted.promise;
+    send(peer, { type: 'cancel', streamId: 'cancelled-opening' });
+    send(peer, {
+      type: 'open',
+      streamId: 'cancel-order',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await receive('cancel-order')).toMatchObject({
+      value: { type: 'ready' },
+    });
+    expect(
+      (
+        await f.proveSwitch(scopeId, target, requestId, sessionToken, {
+          dispatch: 'direct',
+        })
+      ).status,
+    ).toBe(204);
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(3));
+    expect(readSignal.aborted).toBe(false);
+    expect(f.pageSignals.get(scopeId)?.aborted).toBe(false);
+  } finally {
+    releaseRead.resolve();
+  }
   const switched = await receive('life');
   expect(switched).toMatchObject({
     type: 'item',

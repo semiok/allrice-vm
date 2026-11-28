@@ -563,6 +563,32 @@ export function EmployeeNativePage({
         }
       });
     }
+    function restoredSelection(query: string) {
+      const params = new URLSearchParams(query);
+      const selection = DEntrySelectionInputSchema.safeParse(
+        Object.fromEntries(params),
+      );
+      if (
+        selection.success &&
+        params.size === Object.keys(selection.data).length
+      )
+        return selection.data;
+    }
+    function stillSelected(selection: DEntrySelectionInput) {
+      return (
+        selection.threadId === selectedEmployee?.threadId &&
+        selection.workspaceId === selectedEmployee?.workspaceId &&
+        selection.employeeInstanceId === selectedEmployee?.employeeInstanceId
+      );
+    }
+    function restoreUnavailable() {
+      const query = location.search.slice(1);
+      nextQuery.current = query;
+      const selection = restoredSelection(query);
+      if (selection && stillSelected(selection)) {
+        selectedQuery = displayedQuery.current = query;
+      } else applyQuery();
+    }
     function cancelSwitch(target: ThreadHandoff) {
       switching = undefined;
       window.clearTimeout(switchTimer);
@@ -585,10 +611,8 @@ export function EmployeeNativePage({
             return;
           if (!issued) {
             cancelSwitch(target);
-            if (target.restored) {
-              nextQuery.current = location.search.slice(1);
-              if (nextQuery.current !== displayedQuery.current) applyQuery();
-            } else navigate(target.selection);
+            if (target.restored) restoreUnavailable();
+            else navigate(target.selection);
             return;
           }
           target.scopeId = issued.scopeId;
@@ -637,10 +661,7 @@ export function EmployeeNativePage({
       switchTimer = window.setTimeout(() => {
         if (switching !== target) return;
         cancelSwitch(target);
-        if (target.restored) {
-          nextQuery.current = location.search.slice(1);
-          if (nextQuery.current !== displayedQuery.current) applyQuery();
-        }
+        if (target.restored) restoreUnavailable();
       }, liveSwitchWaitMs);
       frame.current?.contentWindow?.postMessage(
         { type: pageThreadSwitchPrepare, scopeId, requestId: target.requestId },
@@ -819,20 +840,9 @@ export function EmployeeNativePage({
         if (navigating) nextQuery.current = query;
         return;
       }
-      const params = new URLSearchParams(query);
-      const selection = DEntrySelectionInputSchema.safeParse(
-        Object.fromEntries(params),
-      );
-      if (
-        selection.success &&
-        params.size === Object.keys(selection.data).length
-      ) {
-        const restored = selection.data;
-        if (
-          restored.threadId === selectedEmployee?.threadId &&
-          restored.workspaceId === selectedEmployee?.workspaceId &&
-          restored.employeeInstanceId === selectedEmployee?.employeeInstanceId
-        ) {
+      const restored = restoredSelection(query);
+      if (restored) {
+        if (stillSelected(restored)) {
           nextQuery.current = query;
           if (!navigating) selectedQuery = displayedQuery.current = query;
           return;
