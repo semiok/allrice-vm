@@ -48,18 +48,19 @@ const manifest = {
       'isolationPolicySha256',
     ].map((name) => [name, hash]),
   ),
-  files: [
-    'state',
-    'memory',
-    'root-disk',
-    'dsh-runtime-disk',
-    'device-topology',
-  ].map((role) => ({
-    role,
-    path: 'checkpoint/' + role,
-    sizeBytes: 1,
-    sha256: hash,
-  })),
+  files: ['state', 'memory', 'root-disk', 'dsh-runtime-disk', 'device-topology']
+    .map((role) => ({
+      role,
+      path: 'checkpoint/state-files/' + role,
+      sizeBytes: 1,
+      sha256: hash,
+    }))
+    .concat({
+      role: 'metadata',
+      path: 'checkpoint/snapshot.json',
+      sizeBytes: 1,
+      sha256: hash,
+    }),
 };
 const computeIdentity = { pid: 1040, startedAt: 'fixture-birth' };
 const stopReceipt = (binding) => ({
@@ -85,6 +86,7 @@ function setup(options = {}) {
   let attempt = 0;
   let clock = 1000;
   let draw = 0;
+  let previousReply;
   const native = {
     inspect: vi.fn(async () => dimensions.state ?? 'absent'),
     restoreStrict: vi.fn(async ({ binding, onNativeDispatch, signal }) => {
@@ -113,6 +115,11 @@ function setup(options = {}) {
       calls.push('prepare');
       await options.prepare?.();
     }),
+    readOwnedReceipts: vi.fn(async () => ({
+      disk: scope.disk,
+      egress: scope.egress,
+      networkFenced: scope.networkFenced,
+    })),
     connectGate: vi.fn(async (compute, signal) => ({
       binding: lease.binding,
       compute,
@@ -123,10 +130,14 @@ function setup(options = {}) {
         calls.push('reseed');
         await options.exchange?.(signal);
         if (options.badReseed) return Buffer.alloc(0);
-        return Buffer.concat([
+        if (options.replayGuest && previousReply)
+          return Buffer.from(previousReply);
+        const reply = Buffer.concat([
           request.subarray(0, 33),
           Buffer.alloc(32, options.sameSample ? 200 : 200 + attempt),
         ]);
+        if (options.replayGuest) previousReply = Buffer.from(reply);
+        return reply;
       },
     })),
     confirmIsolation: vi.fn(async (compute) => ({
@@ -166,7 +177,8 @@ function setup(options = {}) {
     }),
   };
   const probe = createRestoreProbe({
-    qualify: async (seal) => ({ seal, manifest }),
+    qualify: async (seal) => ({ seal, manifest: options.manifest ?? manifest }),
+    gateTimeoutMs: options.gateTimeoutMs,
     reserve: async () => ({
       ...lease,
       binding: (lease.binding = {
@@ -174,7 +186,7 @@ function setup(options = {}) {
         personId: 'person-' + ++attempt,
         vmId: 'vm-' + attempt,
         instanceId: 'instance-' + attempt,
-        leaseEpoch: 1,
+        leaseEpoch: attempt,
       }),
     }),
     openScope: (binding) =>
@@ -211,7 +223,6 @@ function setup(options = {}) {
         seal,
         signal: caller.signal,
         disconnected: transport.signal,
-        cleanupSignal: new AbortController().signal,
         ...overrides,
       });
     },
@@ -326,6 +337,7 @@ describe('isolated Linux snapshot restore', () => {
   it.each([
     [{ sameChallenge: true }, 'CHALLENGE_REUSED'],
     [{ sameSample: true }, 'GUEST_RANDOM_REUSED'],
+    [{ replayGuest: true }, 'GATE_RESEED_UNCONFIRMED'],
   ])('fails hard on a repeated cross-clone proof %#', async (options, code) => {
     const fixture = setup(options);
     expect((await fixture.run()).failure).toBeNull();
@@ -335,6 +347,103 @@ describe('isolated Linux snapshot restore', () => {
       resourcesReleased: true,
     });
     expect(fixture.scope.probeSyntheticEditor).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    'requires a unique signed native descriptor %#',
+    async (duplicate) => {
+      const files = duplicate
+        ? manifest.files.concat({
+            role: 'metadata',
+            path: 'other/snapshot.json',
+            sizeBytes: 1,
+            sha256: hash,
+          })
+        : manifest.files.filter(
+            ({ path }) => path !== 'checkpoint/snapshot.json',
+          );
+      const fixture = setup({ manifest: { ...manifest, files } });
+      expect((await fixture.run()).failure.code).toBe(
+        'SNAPSHOT_DESCRIPTOR_UNPROVED',
+      );
+      expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { gatePeer: { endpoint: '/private/control-old.sock' } },
+    { gatePeer: { binding: { leaseEpoch: 2 } } },
+  ])('rejects a retired endpoint or cross-epoch peer %#', async (options) => {
+    const fixture = setup(options);
+    expect((await fixture.run()).failure.code).toBe('GATE_PEER_UNVERIFIED');
+    expect(fixture.calls).not.toContain('reseed');
+  });
+
+  it.each(['endpoint', 'isolation', 'disk'])(
+    'rejects clone A’s %s in clone B and only stops B for the failure',
+    async (kind) => {
+      const fixture = setup();
+      expect((await fixture.run()).failure).toBeNull();
+      const scopeA = {
+        disk: fixture.scope.disk,
+        endpoint: fixture.scope.control.socketPath,
+        isolationId: fixture.scope.isolationId,
+      };
+      let code;
+      if (kind === 'endpoint') {
+        const connect = fixture.scope.connectGate.getMockImplementation();
+        fixture.scope.connectGate.mockImplementation(async (...args) => ({
+          ...(await connect(...args)),
+          endpoint: scopeA.endpoint,
+        }));
+        code = 'GATE_PEER_UNVERIFIED';
+      } else if (kind === 'isolation') {
+        const read = fixture.scope.confirmIsolation.getMockImplementation();
+        fixture.scope.confirmIsolation.mockImplementation(async (...args) => ({
+          ...(await read(...args)),
+          isolationId: scopeA.isolationId,
+        }));
+        code = 'FRESH_ISOLATION_UNPROVED';
+      } else {
+        const read = fixture.scope.verifyMountedWork.getMockImplementation();
+        fixture.scope.verifyMountedWork.mockImplementation(async (...args) => ({
+          ...(await read(...args)),
+          ownedDisk: scopeA.disk,
+        }));
+        code = 'WORK_MOUNT_UNPROVED';
+      }
+
+      fixture.native.stopAndJoin.mockClear();
+      expect(await fixture.run()).toMatchObject({
+        failure: { code },
+        resourcesReleased: true,
+      });
+      expect(fixture.native.stopAndJoin).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ vmId: 'vm-2', leaseEpoch: 2 }),
+        expect.anything(),
+      );
+      expect(fixture.scope.probeSyntheticEditor).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('expires a silent peer, joins it and only then stops and releases', async () => {
+    let joined = false;
+    const fixture = setup({
+      gateTimeoutMs: 25,
+      exchange: async (signal) => {
+        await new Promise((resolve) =>
+          signal.addEventListener('abort', resolve, { once: true }),
+        );
+        joined = true;
+        signal.throwIfAborted();
+      },
+      stop: () => expect(joined).toBe(true),
+    });
+    expect(await fixture.run()).toMatchObject({
+      failure: { code: 'GATE_DEADLINE_EXPIRED' },
+      resourcesReleased: true,
+    });
+    expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
   });
 
   it('rejects an unsafe mount operand before dispatch', async () => {
@@ -352,11 +461,61 @@ describe('isolated Linux snapshot restore', () => {
     expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
     expect(fixture.native.stopAndJoin).not.toHaveBeenCalled();
     expect(fixture.scope.prepare).not.toHaveBeenCalled();
+    expect(result.resourcesReleased).toBe(false);
+    expect(fixture.lease.release).not.toHaveBeenCalled();
+  });
+
+  it.each(['disk', 'egress'])(
+    'rechecks the %s receipt before dispatch and return',
+    async (kind) => {
+      for (const beforeDispatch of [true, false]) {
+        const fixture = setup();
+        const read = fixture.scope.readOwnedReceipts.getMockImplementation();
+        fixture.scope.readOwnedReceipts.mockImplementation(async () => {
+          const receipt = await read();
+          if (
+            beforeDispatch
+              ? fixture.scope.readOwnedReceipts.mock.calls.length > 1
+              : fixture.scope.verifyMountedWork.mock.calls.length > 0
+          ) {
+            if (kind === 'disk')
+              receipt.disk = { ...receipt.disk, mountId: 'moved' };
+            else receipt.egress = { ...receipt.egress, bindingId: 'retired' };
+          }
+          return receipt;
+        });
+        expect(await fixture.run()).toMatchObject({
+          failure: { code: 'OWNED_RESOURCES_CHANGED' },
+          resourcesReleased: true,
+        });
+        expect(fixture.native.restoreStrict).toHaveBeenCalledTimes(
+          beforeDispatch ? 0 : 1,
+        );
+        expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it('rechecks the live lease before opening the synthetic editor', async () => {
+    const fixture = setup();
+    fixture.lease.assertCurrent.mockImplementation(async () => {
+      if (fixture.scope.verifyMountedWork.mock.calls.length)
+        throw Error('LEASE_LOST');
+    });
+    expect(await fixture.run()).toMatchObject({
+      failure: { stage: 'restore' },
+      resourcesReleased: true,
+    });
+    expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
   });
 
   it('keeps exact disk and lease pinned if a broken driver omits its dispatch receipt', async () => {
     const fixture = setup({ omitDispatch: true });
-    expect(await fixture.run()).toMatchObject({ resourcesReleased: false });
+    expect(await fixture.run()).toMatchObject({
+      failure: { code: 'DISPATCH_UNRECORDED' },
+      resourcesReleased: false,
+    });
+    expect(fixture.scope.connectGate).not.toHaveBeenCalled();
     expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
     expect(fixture.scope.release).not.toHaveBeenCalled();
     expect(fixture.lease.release).not.toHaveBeenCalled();

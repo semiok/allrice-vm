@@ -81,11 +81,12 @@ function inside(path, root) {
 }
 
 function strictRestoreArgs({ template, binding, disk, control }) {
-  const stateFile = template.manifest.files.find(
-    ({ role }) => role === 'state',
+  const descriptors = template.manifest.files.filter(
+    ({ path }) => posix.basename(path) === 'snapshot.json',
   );
+  requireProof(descriptors.length === 1, 'SNAPSHOT_DESCRIPTOR_UNPROVED');
   const snapshotPath = posix.dirname(
-    posix.join(template.seal.templateDirectory, stateFile.path),
+    posix.join(template.seal.templateDirectory, descriptors[0].path),
   );
   requireProof(
     [snapshotPath, disk.workDirectory, control.socketPath].every(hostPath) &&
@@ -130,6 +131,7 @@ async function confirmFreshness({
   scope,
   binding,
   compute,
+  egress,
   signal,
   seen,
   random,
@@ -191,7 +193,7 @@ async function confirmFreshness({
       sameCompute(compute, identity.compute) &&
       identity.endpoint === scope.control.socketPath &&
       identity.isolationId === scope.isolationId &&
-      identity.egressBindingId === scope.egress.bindingId &&
+      identity.egressBindingId === egress.bindingId &&
       identity.blockedBusinessRoutes === true &&
       identity.priorNetworkStateGone === true &&
       identity.freshNetworkIdentity === true &&
@@ -211,7 +213,15 @@ async function confirmFreshness({
  *
  * @returns {PersonVmTemplatePort}
  */
-function scopedTemplatePort(native, scope, seen, random, qualify, timeline) {
+function scopedTemplatePort(
+  native,
+  scope,
+  seen,
+  random,
+  qualify,
+  timeline,
+  gateTimeoutMs,
+) {
   return {
     qualify,
     inspect: (binding, signal) => native.inspect(binding, signal),
@@ -253,15 +263,23 @@ function scopedTemplatePort(native, scope, seen, random, qualify, timeline) {
         'NATIVE_RESTORE_UNPROVED',
       );
       const compute = receipt.computeIdentity;
-      await confirmFreshness({
-        scope,
-        binding,
-        compute,
-        signal,
-        seen,
-        random,
-        timeline,
-      });
+      const deadline = AbortSignal.timeout(gateTimeoutMs);
+      try {
+        await confirmFreshness({
+          scope,
+          binding,
+          compute,
+          egress,
+          seen,
+          random,
+          timeline,
+          signal: AbortSignal.any([signal, deadline]),
+        });
+      } catch (error) {
+        if (!signal.aborted && deadline.aborted)
+          throw new ProbeFailure('GATE_DEADLINE_EXPIRED');
+        throw error;
+      }
       const mount = await scope.verifyMountedWork(compute, signal);
       requireProof(
         sameCompute(compute, mount?.compute) &&
@@ -316,9 +334,10 @@ async function cleanup({
   port,
   nativeAttempted,
   dispatched,
-  cleanupSignal,
+  destinationUnconfirmed,
 }) {
   if (!lease) return true;
+  const cleanupSignal = AbortSignal.timeout(30_000);
   const fenced =
     !scope || (await confirmed(() => scope.fenceAndJoin(cleanupSignal)));
   const stopped =
@@ -342,14 +361,21 @@ async function cleanup({
     (await confirmed(
       async () => (await port.inspect(binding, cleanupSignal)) === 'absent',
     ));
-  if (!fenced || !stopped || !undispatched || cleanupSignal.aborted)
+  if (
+    destinationUnconfirmed ||
+    !fenced ||
+    !stopped ||
+    !undispatched ||
+    cleanupSignal.aborted
+  )
     return false;
   if (scope && !(await confirmed(() => scope.release(cleanupSignal))))
     return false;
   return confirmed(() => lease.release(cleanupSignal));
 }
 
-/** Shares one replay check across all the synthetic clones in a probe batch. */
+/** Shares replay checks across the synthetic clones in a probe batch.
+ * Stream operations must abort and join on their signal before returning. */
 export function createRestoreProbe({
   qualify,
   reserve,
@@ -357,7 +383,14 @@ export function createRestoreProbe({
   native,
   now,
   random = randomBytes,
+  gateTimeoutMs = 5000,
 }) {
+  requireProof(
+    Number.isSafeInteger(gateTimeoutMs) &&
+      gateTimeoutMs > 0 &&
+      gateTimeoutMs <= 30_000,
+    'GATE_DEADLINE_INVALID',
+  );
   const seen = {
     challenges: new Set(),
     entropy: new Set(),
@@ -365,21 +398,17 @@ export function createRestoreProbe({
     controls: new Set(),
     isolation: new Set(),
   };
-  return async ({ seal, signal, disconnected, cleanupSignal }) => {
+  return async ({ seal, signal, disconnected }) => {
     const runSignal = AbortSignal.any(
       disconnected ? [signal, disconnected] : [signal],
     );
-    if (
-      !(cleanupSignal instanceof AbortSignal) ||
-      cleanupSignal === signal ||
-      cleanupSignal === disconnected
-    )
-      throw new Error('SNAPSHOT_CLEANUP_SIGNAL_REQUIRED');
     const timeline = measureRestore(now);
     let lease;
     let binding;
     let scope;
     let port;
+    let resources;
+    let destinationUnconfirmed = false;
     let nativeAttempted = false;
     let dispatched = false;
     let stage = 'admission';
@@ -395,6 +424,19 @@ export function createRestoreProbe({
       const assertCurrent = async (currentSignal) => {
         currentSignal.throwIfAborted();
         await lease.assertCurrent(currentSignal);
+        if (resources) {
+          currentSignal.throwIfAborted();
+          const current = await scope.readOwnedReceipts(currentSignal);
+          requireProof(
+            sameDisk(resources.disk, current?.disk) &&
+              sameBinding(binding, current.egress?.binding) &&
+              current.egress.bindingId === resources.egress.bindingId &&
+              Array.isArray(current.egress.gatewayPorts) &&
+              current.egress.gatewayPorts.length === 0 &&
+              current.networkFenced === true,
+            'OWNED_RESOURCES_CHANGED',
+          );
+        }
         currentSignal.throwIfAborted();
       };
       await assertCurrent(runSignal);
@@ -412,15 +454,18 @@ export function createRestoreProbe({
       timeline.mark('epoch_reserved');
 
       stage = 'host_disk_and_network';
+      destinationUnconfirmed = true;
       requireProof(
         (await native.inspect(binding, runSignal)) === 'absent',
         'DESTINATION_NOT_PROVEN_ABSENT',
       );
+      destinationUnconfirmed = false;
       await assertCurrent(runSignal);
       // openScope only establishes ownership; prepare owns every I/O it starts.
       scope = openScope(binding);
       await scope.prepare(template, runSignal);
-      const { disk, egress } = scope;
+      const { disk, egress, networkFenced } =
+        await scope.readOwnedReceipts(runSignal);
       requireProof(
         sameBinding(binding, disk?.binding) &&
           typeof disk.mountId === 'string' &&
@@ -436,9 +481,21 @@ export function createRestoreProbe({
           egress.gatewayPorts.length === 0 &&
           typeof scope.isolationId === 'string' &&
           scope.isolationId.length > 0 &&
-          scope.networkFenced === true,
+          networkFenced === true,
         'OWNED_RESOURCES_UNPROVED',
       );
+      resources = {
+        disk: Object.freeze({
+          ...disk,
+          binding,
+          image: Object.freeze({ ...disk.image }),
+        }),
+        egress: Object.freeze({
+          ...egress,
+          binding,
+          gatewayPorts: Object.freeze([]),
+        }),
+      };
       timeline.mark('host_disk_net_ready');
 
       stage = 'restore';
@@ -447,9 +504,11 @@ export function createRestoreProbe({
         {
           inspect: native.inspect.bind(native),
           stopAndJoin: native.stopAndJoin.bind(native),
-          restoreStrict(input) {
+          async restoreStrict(input) {
             nativeAttempted = true;
-            return native.restoreStrict(input);
+            const receipt = await native.restoreStrict(input);
+            requireProof(dispatched, 'DISPATCH_UNRECORDED');
+            return receipt;
           },
         },
         scope,
@@ -457,12 +516,12 @@ export function createRestoreProbe({
         random,
         qualify,
         timeline,
+        gateTimeoutMs,
       );
       const restored = await port.restore({
         template,
         binding,
-        disk,
-        egress,
+        ...resources,
         assertCurrent,
         signal: runSignal,
         onNativeDispatch() {
@@ -478,7 +537,6 @@ export function createRestoreProbe({
           dispatched = true;
         },
       });
-      requireProof(dispatched, 'DISPATCH_UNRECORDED');
       stage = 'editor';
       await assertCurrent(runSignal);
       const editor = await scope.probeSyntheticEditor(restored, runSignal);
@@ -512,7 +570,7 @@ export function createRestoreProbe({
       port,
       nativeAttempted,
       dispatched,
-      cleanupSignal,
+      destinationUnconfirmed,
     });
     return {
       evidence: 'synthetic',
