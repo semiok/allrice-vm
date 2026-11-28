@@ -77,6 +77,7 @@ interface EmployeeDetailsDialogProps {
   capabilitiesContent?: ReactNode;
   capabilitiesLayer?: EmployeeSkillLayer | null;
   capabilitiesOwner?: boolean;
+  personaOnly?: boolean;
 }
 
 export function EmployeeDetailsDialog(props: EmployeeDetailsDialogProps) {
@@ -121,7 +122,7 @@ function EmployeeDetailsReader(
   const editWrite = useRef<AbortController | null>(null);
   const writeRequest = useRef<{ payload: string; id: string } | null>(null);
   const sceneCatalog =
-    props.organizationView || !props.instanceId
+    props.personaOnly || props.organizationView || !props.instanceId
       ? undefined
       : props.sceneCatalog;
   const latestSceneCatalog = useRef(sceneCatalog);
@@ -455,7 +456,7 @@ function EmployeeDetailsReader(
     }
   }
   const workflowReadContent =
-    !props.organizationView && props.instanceId ? (
+    !props.personaOnly && !props.organizationView && props.instanceId ? (
       <PersonalSceneReadPanel
         scopeId={props.scopeId}
         instanceId={props.instanceId}
@@ -482,12 +483,12 @@ function EmployeeDetailsReader(
       bodyClassName={
         editor
           ? formCss.editBody
-          : `${css.body} ${sceneCatalog ? css.unifiedBody : ''}`
+          : `${css.body} ${sceneCatalog ? css.unifiedBody : ''} ${props.personaOnly ? css.personaBody : ''}`
       }
       className={
         editor
           ? formCss.editDialog
-          : `${css.dialog} ${!reference ? css.profileDialog : ''} ${sceneCatalog ? css.unifiedDialog : ''}`
+          : `${css.dialog} ${!reference ? css.profileDialog : ''} ${sceneCatalog ? css.unifiedDialog : ''} ${props.personaOnly ? css.personaDialog : ''}`
       }
       onClose={editor ? cancelEdit : props.onClose}
       onBack={editor ? cancelEdit : undefined}
@@ -566,16 +567,18 @@ function EmployeeDetailsReader(
             }
             view={props.organizationView ? 'shared' : 'personal'}
             sceneContent={
-              props.capabilitiesContent ??
-              (sceneCatalog && props.onOpenScene && props.onCreateScene ? (
-                <EmployeeSceneList
-                  controller={sceneCatalog}
-                  employeeName={data.profile.name}
-                  embedded
-                  onChoose={props.onOpenScene}
-                  onCreate={props.onCreateScene}
-                />
-              ) : undefined)
+              props.personaOnly
+                ? null
+                : (props.capabilitiesContent ??
+                  (sceneCatalog && props.onOpenScene && props.onCreateScene ? (
+                    <EmployeeSceneList
+                      controller={sceneCatalog}
+                      employeeName={data.profile.name}
+                      embedded
+                      onChoose={props.onOpenScene}
+                      onCreate={props.onCreateScene}
+                    />
+                  ) : undefined))
             }
             memoryEntry={
               !props.organizationView &&
@@ -591,6 +594,7 @@ function EmployeeDetailsReader(
             }
             workflowReadContent={workflowReadContent}
             workflowContent={
+              !props.personaOnly &&
               !props.organizationView &&
               props.instanceId && (
                 <PersonalSceneFilePanel

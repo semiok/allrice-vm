@@ -388,6 +388,33 @@ export const DEntryNativeRpcRequestSchema = z
     payload: z.unknown(),
   })
   .strict();
+export const DEntrySessionChangeSchema = z.union([
+  z.strictObject({ title: ChatSessionSchema.shape.title.trim().min(1) }),
+  z.strictObject({
+    archived: z.literal(true),
+    stopActivity: z.literal(true).optional(),
+  }),
+  z.strictObject({ archived: z.literal(false) }),
+]);
+export const DEntrySessionChangeRequestSchema =
+  DEntryNativeOwnerRequestSchema.extend({
+    selection: DEntrySelectionInputSchema.extend({ threadId: UuidSchema }),
+    change: DEntrySessionChangeSchema,
+  });
+export const DEntrySessionActivitySchema = z.object({
+  kind: z.string().min(1),
+  items: z
+    .array(z.object({ id: z.string(), label: z.string().optional() }))
+    .optional(),
+});
+export const DEntrySessionChangeResultSchema = z.discriminatedUnion('state', [
+  z.strictObject({ state: z.literal('changed'), session: ChatSessionSchema }),
+  z.strictObject({
+    state: z.literal('active'),
+    activity: z.array(DEntrySessionActivitySchema).min(1),
+  }),
+  z.strictObject({ state: z.literal('employee_archived') }),
+]);
 export const DEntryNativeDiscoverySchema = z
   .object({
     identity: DEntryIdentitySchema,

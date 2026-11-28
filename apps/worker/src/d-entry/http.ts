@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { changeDEntrySession } from './session-change.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -7,6 +8,7 @@ import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   DEntryNativeOwnerRequestSchema,
+  DEntrySessionChangeRequestSchema,
   DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmRequestSchema,
   DEntryNativePrewarmResultSchema,
@@ -219,6 +221,7 @@ export function createDEntryHttpHandler(
         '/internal/d-entry/native-resource',
         '/internal/d-entry/native-rpc',
         '/internal/d-entry/native-root',
+        '/internal/d-entry/session-change',
         '/internal/d-entry/native-prewarm',
         statusPath,
       ].includes(path ?? '')
@@ -311,6 +314,25 @@ export function createDEntryHttpHandler(
       const decoded: unknown = JSON.parse(
         Buffer.concat(chunks).toString('utf8'),
       );
+      if (path === '/internal/d-entry/session-change') {
+        const input = DEntrySessionChangeRequestSchema.parse(decoded);
+        parsedInput = true;
+        const result = await changeDEntrySession(
+          deps,
+          token,
+          input,
+          signal,
+          (error) => cleanupErrors.push(error),
+        );
+        signal.throwIfAborted();
+        response
+          .writeHead(200, {
+            'content-type': 'application/json',
+            'cache-control': 'private, no-store',
+          })
+          .end(JSON.stringify(result));
+        return true;
+      }
       const rpc =
         path === '/internal/d-entry/native-rpc'
           ? dEntryRpcRequestSchema.parse(decoded)

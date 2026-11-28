@@ -47,6 +47,8 @@ export function useSessionArchive({
   selectedSession,
   initialFilter = 'default',
   onShowArchived,
+  entry,
+  lifetime,
 }: {
   selectedSession?: Session;
   workspace: Workspace | null;
@@ -55,6 +57,8 @@ export function useSessionArchive({
   onActivities: (sessions: SessionActivity[], scope: string) => void;
   initialFilter?: ArchivedFilter;
   onShowArchived?: () => void;
+  entry?: '4.0';
+  lifetime?: AbortSignal;
 }) {
   const scope = `${workspace?.organizationId}/${workspace?.workspaceId}/${workspace?.viewerId}`;
   const currentScope = useRef(scope);
@@ -98,7 +102,7 @@ export function useSessionArchive({
     .join(',');
   const load = useCallback(
     async (cursor?: string) => {
-      if (!workspaceId) return;
+      if (!workspaceId || (entry && initialFilter === 'default')) return;
       const cached = pageRef.current;
       const previous =
         cached?.scope === scope && cached.filter === filter ? cached : null;
@@ -125,11 +129,13 @@ export function useSessionArchive({
         const query = new URLSearchParams({
           workspaceId,
           archived: filter === 'only' ? 'only' : String(filter === 'show'),
+          ...(entry && { entry }),
         });
         if (cursor) query.set('cursor', cursor);
         const response = await fetch(`/api/v1/sessions?${query}`, {
           headers,
           cache: 'no-store',
+          signal: lifetime,
         });
         // readJson can navigate on 401 before reading the response body.
         if (!current()) return;
@@ -161,7 +167,7 @@ export function useSessionArchive({
                   if (nextCursor) employeeQuery.set('cursor', nextCursor);
                   const response = await fetch(
                     `/api/v1/sessions?${employeeQuery}`,
-                    { headers, cache: 'no-store' },
+                    { headers, cache: 'no-store', signal: lifetime },
                   );
                   if (!current()) return null;
                   const next = await readJson<Page>(response);
@@ -247,7 +253,16 @@ export function useSessionArchive({
         if (ticket === generation.current) setLoading(false);
       }
     },
-    [filter, headers, scope, workspaceId, onActivities],
+    [
+      filter,
+      headers,
+      scope,
+      workspaceId,
+      onActivities,
+      entry,
+      initialFilter,
+      lifetime,
+    ],
   );
   useEffect(() => {
     void load();
@@ -317,6 +332,7 @@ export function useSessionArchive({
     const cursor = fromStart ? undefined : cursorFor(employeeId);
     if (
       !workspaceId ||
+      (entry && initialFilter === 'default') ||
       loading ||
       (!fromStart && !cursor) ||
       employeeRequests.current.has(employeeId)
@@ -354,11 +370,13 @@ export function useSessionArchive({
         workspaceId,
         employeeInstanceId: employeeId,
         archived: filter === 'only' ? 'only' : String(filter === 'show'),
+        ...(entry && { entry }),
       });
       if (cursor) query.set('cursor', cursor);
       const response = await fetch(`/api/v1/sessions?${query}`, {
         headers,
         cache: 'no-store',
+        signal: lifetime,
       });
       if (!current()) return;
       const result = await readJson<Page>(response);
@@ -394,6 +412,16 @@ export function useSessionArchive({
       if (current()) employeeRequests.current.delete(employeeId);
     }
   }
+  function updateUrl(id: string) {
+    const row = sessions.find((item) => item.id === id);
+    const query = new URLSearchParams({ workspaceId: workspaceId ?? '' });
+    if (entry && row) {
+      query.set('entry', entry);
+      query.set('employeeInstanceId', sessionEmployeeKey(row));
+    }
+    if (entry && !row) throw Error('无法读取对话，请刷新后重试。');
+    return `/api/v1/sessions/${encodeURIComponent(id)}?${query}`;
+  }
   async function mutate(
     sessionId: string,
     archived: boolean,
@@ -404,18 +432,16 @@ export function useSessionArchive({
     pending.current.set(sessionId, operation);
     setError('');
     try {
-      const response = await fetch(
-        `/api/v1/sessions/${sessionId}?workspaceId=${workspaceId}`,
-        {
-          method: 'PATCH',
-          headers: { ...headers, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            archived,
-            ...(stopActivity ? { stopActivity: true } : {}),
-          }),
-        },
-      );
-      if (currentScope.current !== scope) return;
+      const response = await fetch(updateUrl(sessionId), {
+        method: 'PATCH',
+        headers: { ...headers, 'content-type': 'application/json' },
+        signal: lifetime,
+        body: JSON.stringify({
+          archived,
+          ...(stopActivity ? { stopActivity: true } : {}),
+        }),
+      });
+      if (lifetime?.aborted || currentScope.current !== scope) return;
       if (response.status === 409) {
         const body = await response.json();
         if (body.error?.code === 'SESSION_ACTIVE') {
@@ -430,7 +456,7 @@ export function useSessionArchive({
         throw new Error(body.error?.message ?? '归档失败');
       }
       const result = await readJson<{ session: Session }>(response);
-      if (currentScope.current !== scope) return;
+      if (lifetime?.aborted || currentScope.current !== scope) return;
       generation.current++;
       onUpdated(result.session);
       setPage((old) =>
@@ -483,15 +509,13 @@ export function useSessionArchive({
     setEditing(id);
     setError('');
     try {
-      const result = await fetch(
-        `/api/v1/sessions/${id}?workspaceId=${workspaceId}`,
-        {
-          method: 'PATCH',
-          headers: { ...headers, 'content-type': 'application/json' },
-          body: JSON.stringify(update),
-        },
-      ).then(readJson<{ session: Session }>);
-      if (currentScope.current !== scope) return false;
+      const result = await fetch(updateUrl(id), {
+        method: 'PATCH',
+        headers: { ...headers, 'content-type': 'application/json' },
+        signal: lifetime,
+        body: JSON.stringify(update),
+      }).then(readJson<{ session: Session }>);
+      if (lifetime?.aborted || currentScope.current !== scope) return false;
       generation.current++;
       onUpdated(result.session);
       setPage((old) =>
@@ -543,7 +567,7 @@ export function useSessionArchive({
     | 'sidebar.workspaces.session.row.action'
   >['renderSlot'] = (name, props, context) => {
     const session = sessions.find((s) => s.id === props.sessionId);
-    if (session?.ownerId && session.ownerId !== workspace?.viewerId)
+    if ((entry || session?.ownerId) && session?.ownerId !== workspace?.viewerId)
       return null;
     const injected = {
       sessionId: props.sessionId,
@@ -551,7 +575,10 @@ export function useSessionArchive({
         select(archived),
       archiveSession: (id: string) => act(id, true),
       unarchiveSession: (id: string) => act(id, false),
-      t: employeeTranslate,
+      t: (...labels: Parameters<typeof employeeTranslate>) =>
+        entry && labels[0] === 'menu.unarchiveSession'
+          ? '恢复对话'
+          : employeeTranslate(...labels),
     };
     if (
       name === 'sidebar.workspaces.session.row.action' ||
@@ -562,7 +589,7 @@ export function useSessionArchive({
     const closeMenu = () => context.hookContext[1](false);
     return (
       <>
-        {!session.archivedAt ? (
+        {!entry && !session.archivedAt ? (
           <MenuItemButton
             icon={<IconPinOutlineRegular size={14} />}
             disabled={editing === session.id}
@@ -574,30 +601,34 @@ export function useSessionArchive({
             {session.pinnedAt ? '取消置顶' : '置顶对话'}
           </MenuItemButton>
         ) : null}
-        <MenuItemButton
-          icon={<IconEditOutlineRegular size={14} />}
-          disabled={editing === session.id}
-          onSelect={() => {
-            closeMenu();
-            setError('');
-            setRename({ scope, sessionId: session.id, title: session.title });
-          }}
-        >
-          重命名
-        </MenuItemButton>
+        {(!entry || !session.archivedAt) && (
+          <MenuItemButton
+            icon={<IconEditOutlineRegular size={14} />}
+            disabled={editing === session.id}
+            onSelect={() => {
+              closeMenu();
+              setError('');
+              setRename({ scope, sessionId: session.id, title: session.title });
+            }}
+          >
+            重命名
+          </MenuItemButton>
+        )}
         <ArchiveSessionMenuItem
           {...injected}
           useMenuOpenState={() => context.hookContext}
         />
-        <MenuItemButton
-          icon={<IconCopyOutlineRegular size={14} />}
-          onSelect={() => {
-            closeMenu();
-            void copySessionId(session.id);
-          }}
-        >
-          复制对话编号
-        </MenuItemButton>
+        {!entry && (
+          <MenuItemButton
+            icon={<IconCopyOutlineRegular size={14} />}
+            onSelect={() => {
+              closeMenu();
+              void copySessionId(session.id);
+            }}
+          >
+            复制对话编号
+          </MenuItemButton>
+        )}
       </>
     );
   };

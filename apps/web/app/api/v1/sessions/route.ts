@@ -25,6 +25,9 @@ export async function GET(request: Request) {
     if (!workspaceId) throw new DataAccessError('not_found');
     const entry = query.getAll('entry');
     if (entry.length) {
+      const expected = request.headers.get('x-allrice-expected-viewer-id');
+      if (expected && expected !== context.actor.id)
+        throw new DataAccessError('authorization_denied');
       if (
         entry.length !== 1 ||
         entry[0] !== '4.0' ||

@@ -151,6 +151,12 @@ export function createDEntryPageRpc(
                   endpoint === 'session/attachment'
                     ? await authorizeAttachment()
                     : undefined;
+                // These operations must pass the exact business-root writer.
+                if (
+                  endpoint === 'workspace/archiveSession' ||
+                  endpoint === 'workspace/unarchiveSession'
+                )
+                  throw new DataAccessError('authorization_denied');
                 let args = input.payload.args;
                 let forkSource: DEntryPageForkSource | undefined;
                 if (endpoint === 'session/create') {

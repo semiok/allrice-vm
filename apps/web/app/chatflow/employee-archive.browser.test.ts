@@ -234,6 +234,8 @@ suite('U1 employee archive lifecycle', () => {
   async function fixture(
     options: {
       width?: number;
+      native?: boolean;
+      zero?: boolean;
       dark?: boolean;
       archived?: boolean;
       shared?: boolean;
@@ -285,6 +287,9 @@ suite('U1 employee archive lifecycle', () => {
       archivedSessionReads: 0,
       failArchivedSessions: Boolean(options.failArchivedSessions),
       sessionTitles: new Map<string, string>(),
+      sessionArchived: options.sessionArchived ?? false,
+      sessionWrites: [] as unknown[],
+      unsupported: [] as string[],
     };
     const flowName = options.generalEmpty ? '项目助理' : '流程哥';
     if (options.generalEmpty) {
@@ -293,6 +298,18 @@ suite('U1 employee archive lifecycle', () => {
     }
     const currentDetails = (n: number, canArchive = n !== 7) => {
       const data = details(n, canArchive);
+      if (n === 17 && (options.native || options.zero)) {
+        const instance = state.instances[1]!;
+        data.profile.revision = instance.revision;
+        data.profile.name = instance.profile.name ?? '流程哥';
+        data.profile.editableFields = [
+          'name',
+          'appearance',
+          'mission',
+          'workStyle',
+          'expressionStyle',
+        ];
+      }
       if (n === 17 && options.generalEmpty) {
         data.profile.kind = 'general';
         data.profile.name = flowName;
@@ -310,7 +327,7 @@ suite('U1 employee archive lifecycle', () => {
         ...row,
         title: state.sessionTitles.get(row.id) ?? row.title,
         employeeName: n === 17 ? flowName : row.employeeName,
-        archivedAt: n === 17 && options.sessionArchived ? now : null,
+        archivedAt: n === 17 && state.sessionArchived ? now : null,
       };
     };
     page.on('pageerror', (error) => state.errors.push(error.message));
@@ -318,6 +335,13 @@ suite('U1 employee archive lifecycle', () => {
       const request = route.request(),
         url = new URL(request.url()),
         path = url.pathname;
+      if (
+        (options.native || options.zero) &&
+        (path.includes('scene-skills') ||
+          path.includes('scene-files') ||
+          path.includes('scene-reads'))
+      )
+        state.unsupported.push(path);
       const skillCatalog = path.match(
         /^\/api\/v1\/employee-instances\/([^/]+)\/skills$/,
       );
@@ -439,6 +463,13 @@ suite('U1 employee archive lifecycle', () => {
             state.dropReceipt = false;
             return route.abort('failed');
           }
+          return route.fulfill(json({ instance: current }));
+        }
+        if (options.native && request.method() === 'PATCH' && !single[2]) {
+          const { expectedRevision, profile } = request.postDataJSON();
+          expect(expectedRevision).toBe(current.revision);
+          current.profile = EmployeeInstanceSchema.shape.profile.parse(profile);
+          current.revision++;
           return route.fulfill(json({ instance: current }));
         }
         if (request.method() !== 'GET') {
@@ -605,6 +636,10 @@ suite('U1 employee archive lifecycle', () => {
       if (path === '/api/v1/sessions' && request.method() === 'GET') {
         const target = url.searchParams.get('employeeInstanceId');
         const archived = url.searchParams.get('archived');
+        if (options.native || options.zero) {
+          expect(url.searchParams.get('entry')).toBe('4.0');
+          expect(request.headers()['x-allrice-expected-viewer-id']).toBe(id(5));
+        }
         if (archived === 'only') {
           state.archivedSessionReads++;
           if (state.failArchivedSessions)
@@ -639,6 +674,15 @@ suite('U1 employee archive lifecycle', () => {
       const history = /^\/api\/v1\/sessions\/([a-f0-9-]{36})$/.exec(path);
       if (history && request.method() === 'PATCH') {
         const body: unknown = request.postDataJSON();
+        if (options.native) {
+          expect(url.searchParams.get('entry')).toBe('4.0');
+          expect(url.searchParams.get('employeeInstanceId')).toBe(id(17));
+          state.sessionWrites.push(body);
+          if (body && typeof body === 'object' && 'archived' in body) {
+            state.sessionArchived = body.archived === true;
+            return route.fulfill(json({ session: currentSession(17) }));
+          }
+        }
         if (
           !body ||
           typeof body !== 'object' ||
@@ -693,7 +737,7 @@ suite('U1 employee archive lifecycle', () => {
       );
     });
     await page.goto(
-      `${origin}/?session=${id(options.selectedRice ? 2 : 1)}${options.shared ? '&shared=1' : ''}${options.dark ? '&theme=dark' : ''}`,
+      `${origin}/?session=${id(options.selectedRice ? 2 : 1)}${options.shared ? '&shared=1' : ''}${options.dark ? '&theme=dark' : ''}${options.native ? '&native=1' : ''}${options.zero ? '&zero=1' : ''}`,
     );
     const openDetails = async (name = flowName) => {
       // Wait for the real workspace and transcript, not an instantaneous
@@ -744,6 +788,133 @@ suite('U1 employee archive lifecycle', () => {
       },
     };
   }
+
+  it.each([
+    [1440, false],
+    [1440, true],
+    [390, false],
+    [390, true],
+  ] as const)(
+    'wires 4.0 sidebar actions and preserves bottom clearance (%i, dark=%s)',
+    async (width, dark) => {
+      const { page, state, close } = await fixture({
+        width,
+        dark,
+        native: true,
+      });
+      try {
+        const sidebar = page.locator('#chat-sidebar');
+        const row = sidebar.locator(`[data-row-key="session:${id(1)}"]`);
+        const menu = () => row.locator('button[aria-label]').last().click();
+        await row.hover();
+        await menu();
+        expect(await page.getByText('置顶对话', { exact: true }).count()).toBe(
+          0,
+        );
+        expect(
+          await page.getByText('复制对话编号', { exact: true }).count(),
+        ).toBe(0);
+        await page.getByText('重命名', { exact: true }).click();
+        const rename = page.getByRole('dialog', {
+          name: '重命名会话',
+          exact: true,
+        });
+        await rename
+          .getByRole('textbox', { name: '会话名称' })
+          .fill('核对完成');
+        await rename.getByRole('button', { name: '保存' }).click();
+        await row.getByText('核对完成', { exact: true }).waitFor();
+        await row.hover();
+        await menu();
+        await page.getByText('归档会话', { exact: true }).click();
+        await row.waitFor({ state: 'detached' });
+        await sidebar.getByRole('button', { name: '查看归档' }).click();
+        await page.getByRole('tab', { name: '对话', exact: true }).click();
+        const archivedRow = page
+          .getByRole('dialog', { name: '已归档' })
+          .locator(`[data-row-key="session:${id(1)}"]`);
+        await archivedRow.hover();
+        await archivedRow.locator('button[aria-label]').last().click();
+        await page.getByText('恢复对话', { exact: true }).click();
+        await archivedRow.waitFor({ state: 'detached' });
+        await page.getByRole('button', { name: '关闭归档' }).click();
+        await sidebar.getByRole('button', { name: '查看流程哥详情' }).click();
+        const details = page.getByRole('dialog', { name: '流程哥员工详情' });
+        const archive = details.getByRole('button', { name: '归档这个员工' });
+        await archive.waitFor();
+        expect(
+          await details.getByText('本人 Workflow', { exact: true }).count(),
+        ).toBe(0);
+        expect(
+          await details.getByRole('region', { name: '工作场景与内容' }).count(),
+        ).toBe(0);
+        const clearance = await archive.evaluate((button) => {
+          const rect = button.getBoundingClientRect();
+          const dialog = button
+            .closest('[role=dialog]')!
+            .getBoundingClientRect();
+          return {
+            bottom: Math.min(innerHeight, dialog.bottom) - rect.bottom,
+            top: rect.top - dialog.top,
+            height: rect.height,
+          };
+        });
+        expect(clearance.height).toBeGreaterThanOrEqual(36);
+        expect(clearance.bottom).toBeGreaterThanOrEqual(16);
+        expect(clearance.top).toBeGreaterThanOrEqual(0);
+        await page.screenshot({
+          path: resolve(
+            evidence,
+            `4.0-${width}-${dark ? 'dark' : 'light'}-details.png`,
+          ),
+          animations: 'disabled',
+        });
+        await details.getByRole('button', { name: /编辑/ }).click();
+        const edit = page.getByRole('dialog', { name: '编辑人设' });
+        await edit.getByLabel('名字', { exact: true }).fill('财务专员');
+        await edit.getByRole('button', { name: '保存', exact: true }).click();
+        await page.getByRole('dialog', { name: '财务专员员工详情' }).waitFor();
+        expect(state.instances[1]).toMatchObject({
+          revision: 3,
+          profile: { name: '财务专员' },
+        });
+        expect(state.unsupported).toEqual([]);
+        expect(state.sessionWrites).toEqual([
+          { title: '核对完成' },
+          { archived: true },
+          { archived: false },
+        ]);
+        expect(state.errors).toEqual([]);
+      } finally {
+        await close();
+      }
+    },
+    60_000,
+  );
+  it('restores the last employee from the 4.0 no-active-employee page', async () => {
+    const { page, state, close } = await fixture({
+      zero: true,
+      archived: true,
+    });
+    try {
+      await page.route('**/chatflow/4.0', (route) =>
+        route.fulfill({ body: 'Entry rechecked' }),
+      );
+      await page.getByRole('button', { name: '查看归档' }).click();
+      await page
+        .getByRole('heading', { name: '流程哥', exact: true })
+        .waitFor();
+      await page.getByRole('button', { name: '恢复员工' }).click();
+      await page.waitForURL('**/chatflow/4.0');
+      expect(state.instances[1]).toMatchObject({
+        archivedAt: null,
+        revision: 3,
+      });
+      expect(state.writes).toHaveLength(1);
+    } finally {
+      await close();
+    }
+  });
 
   it('uses authoritative capability and never offers owner archive in shared details or Rice', async () => {
     for (const options of [{ cannotArchive: true }, { shared: true }]) {

@@ -118,12 +118,14 @@ async function readPin(
   identity: DEntryIdentity,
   history = false,
   lock = false,
+  privateOnly = false,
 ) {
   const [row] = await sql`select d_entry_native_root from allrice_chat_sessions
     where id=${identity.threadId} and organization_id=${identity.organizationId}
       and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
       and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
       and execution_generation='4.0' and (${history} or archived_at is null)
+      and (not ${privateOnly} or visibility='private')
     ${lock ? sql`for share` : sql``}`;
   if (!row) return deny();
   return row.d_entry_native_root == null
@@ -164,6 +166,24 @@ export async function getDEntryNativeRootPin(
   return pin;
 }
 
+/** An active employee can manage its owned historical roots without opening
+ * an archived thread or granting that thread execution. */
+export async function requireDEntrySessionChangeRoot(
+  context: RequestContext,
+  selection: z.infer<typeof DEntrySelectionInputSchema> & { threadId: string },
+) {
+  const { threadId, ...employee } = selection;
+  const identity = await requireDEntryNativeIdentity(context, employee);
+  const sql = getDatabase();
+  const pin = await readPin(sql, { ...identity, threadId }, true, false, true);
+  if (!pin) return deny();
+  const [vm] = await sql`select vm_id from person_virtual_machines
+    where organization_id=${identity.organizationId} and person_id=${identity.personId}
+      and vm_id=${pin.vmId}`;
+  if (!vm) return deny();
+  return pin;
+}
+
 async function lockRunningVm(
   tx: TransactionSql,
   binding: Omit<
@@ -194,14 +214,60 @@ export function isDEntryNativeTitleRetryable(error: unknown) {
 /** Copy the current native projection into the registered business thread.
  * A row-version compare-and-swap prevents a late read from reverting a newer
  * native rename across pages. Never hold DB locks while reading the Guest. */
-export async function syncDEntryNativeRootTitle(
+type MetadataBinding = Pick<
+  z.infer<typeof hostSchema>['binding'],
+  'instanceId' | 'leaseEpoch'
+>;
+
+export function syncDEntryNativeRootTitle(
   context: RequestContext,
   root: DEntryHistoryRootPin,
-  binding: Pick<
-    z.infer<typeof hostSchema>['binding'],
-    'instanceId' | 'leaseEpoch'
-  >,
+  binding: MetadataBinding,
   readTitle: (signal: AbortSignal) => Promise<string | undefined>,
+  signal: AbortSignal,
+) {
+  return syncDEntryNativeRootMetadata(
+    context,
+    root,
+    binding,
+    'title',
+    async (active) => {
+      const title = ChatSessionSchema.shape.title
+        .optional()
+        .parse(await readTitle(active));
+      return title ? { title } : undefined;
+    },
+    signal,
+  );
+}
+
+export function syncDEntryNativeRootArchive(
+  context: RequestContext,
+  root: DEntryHistoryRootPin,
+  binding: MetadataBinding,
+  readArchived: (signal: AbortSignal) => Promise<boolean>,
+  signal: AbortSignal,
+) {
+  return syncDEntryNativeRootMetadata(
+    context,
+    root,
+    binding,
+    'archive',
+    async (active) => ({
+      archived: await readArchived(active),
+    }),
+    signal,
+  );
+}
+
+async function syncDEntryNativeRootMetadata(
+  context: RequestContext,
+  root: DEntryHistoryRootPin,
+  binding: MetadataBinding,
+  field: 'title' | 'archive',
+  readMetadata: (
+    signal: AbortSignal,
+  ) => Promise<{ title: string } | { archived: boolean } | undefined>,
   signal: AbortSignal,
 ) {
   const { identity } = root;
@@ -227,7 +293,8 @@ export async function syncDEntryNativeRootTitle(
       and organization_id=${identity.organizationId} and workspace_id=${identity.workspaceId}
       and owner_id=${identity.personId}
       and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
-      and execution_generation='4.0' and visibility='private' and archived_at is null
+      and execution_generation='4.0' and visibility='private'
+      and (${field === 'archive'} or archived_at is null)
     ${lock ? db`for no key update` : db``}`;
   const ensureRoot = (value: unknown) => {
     const pin = projectPin(value, identity);
@@ -251,11 +318,9 @@ export async function syncDEntryNativeRootTitle(
     signal.throwIfAborted();
     if (!before) return deny();
     ensureRoot(before.d_entry_native_root);
-    const title = ChatSessionSchema.shape.title
-      .optional()
-      .parse(await readTitle(signal));
+    const metadata = await readMetadata(signal);
     signal.throwIfAborted();
-    if (!title) return;
+    if (!metadata) return;
 
     const applied = await employeeAccessTransaction(
       sql,
@@ -284,9 +349,13 @@ export async function syncDEntryNativeRootTitle(
         await lockRunningVm(tx, { ...binding, vmId: root.vmId }, identity);
         signal.throwIfAborted();
         // Even a rename back to the stored title fences older observations.
-        const [written] =
-          await tx`update allrice_chat_sessions set title=${title}
-        where id=${identity.threadId} returning id`;
+        const update =
+          'title' in metadata
+            ? tx`title=${metadata.title}`
+            : tx`archived_at=case when ${metadata.archived} then coalesce(archived_at, clock_timestamp()) else null end,
+               pinned_at=case when ${metadata.archived} then null else pinned_at end`;
+        const [written] = await tx`update allrice_chat_sessions set ${update}
+          where id=${identity.threadId} returning id`;
         if (!written) return deny();
         signal.throwIfAborted();
         return true;
@@ -294,7 +363,8 @@ export async function syncDEntryNativeRootTitle(
       {
         retryLockBusy: () => !signal.aborted,
         retryDeadlock: true,
-        retrySite: 'd_entry_native_title',
+        retrySite:
+          field === 'title' ? 'd_entry_native_title' : 'd_entry_native_archive',
       },
     ).catch((error: unknown) => {
       signal.throwIfAborted();

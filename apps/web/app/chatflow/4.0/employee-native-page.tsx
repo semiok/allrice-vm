@@ -18,6 +18,7 @@ import {
   pageEditorMounted,
   pageMuxAttach,
   pageNavigate,
+  pageEmployeeArchived,
   pageSwitchReady,
   pageThreadScope,
   pageThreadSwitchCancel,
@@ -740,6 +741,21 @@ export function EmployeeNativePage({
         selectedQuery = query;
         history.replaceState(history.state, '', '/chatflow/4.0?' + query);
       }
+      if (
+        event.data.type === pageEmployeeArchived &&
+        prepare &&
+        !navigating &&
+        !detached &&
+        !remoteRevoked
+      ) {
+        navigating = true;
+        void retire().then((closed) => {
+          if (!closed) setStatus('unknown');
+          else if (!detached && replace.current === applyQuery)
+            location.replace('/chatflow/4.0');
+        });
+        return;
+      }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (
@@ -883,20 +899,52 @@ export function EmployeeNativePage({
         // the outer page goes.
         if (mounted)
           void retire()
-            .then(async () => {
-              if (detached || replace.current !== applyQuery) return;
+            .then(async (closed) => {
+              if (!closed || detached || replace.current !== applyQuery) return;
               const response = await fetch('/api/v1/auth/session', {
                 credentials: 'same-origin',
                 cache: 'no-store',
                 signal: lifetime.signal,
               });
               // The unqualified entry checks the cookie again on navigation.
-              if (
-                response.status === 401 &&
+              const stillCurrent = () =>
                 !detached &&
-                replace.current === applyQuery
-              )
+                !navigating &&
+                !superseded &&
+                replace.current === applyQuery;
+              if (!stillCurrent()) return;
+              if (response.status === 401) {
                 location.replace('/chatflow/4.0');
+                return;
+              }
+              if (!prepare || !response.ok || !mounted || !selectedEmployee)
+                return;
+              // Committed metadata can revoke the old document before the
+              // initiating dialog receives its HTTP reply.
+              const target = selectedEmployee;
+              const next = await readEmployeeEntryIdentity(
+                target,
+                lifetime.signal,
+              ).catch((error: unknown) => {
+                if (
+                  error instanceof EmployeeEntryError &&
+                  [403, 404, 409].includes(error.status) &&
+                  !error.reason
+                )
+                  return null;
+                throw error;
+              });
+              if (!stillCurrent() || target !== selectedEmployee) return;
+              if (!next) location.replace('/chatflow/4.0');
+              else if (
+                next.organizationId === identity.organizationId &&
+                next.personId === identity.personId &&
+                (next.employeeRevision !== identity.employeeRevision ||
+                  next.employeeVersionId !== identity.employeeVersionId)
+              )
+                location.replace(
+                  '/chatflow/4.0?' + new URLSearchParams(target),
+                );
             })
             .catch(() => {});
       });
