@@ -1506,7 +1506,7 @@ it
             new URL(route.request().url()).searchParams.get('scopeId')!,
           );
           await resumeDocument.promise;
-          await route.abort();
+          await route.abort().catch(() => {});
         },
         { times: 1 },
       );
@@ -1523,10 +1523,14 @@ it
       expect(transition?.y).toBeGreaterThanOrEqual(
         header!.y + header!.height - 0.5,
       );
-      await choose(a);
-      resumeDocument.resolve();
-      await pending.waitFor({ state: 'detached' });
-      await expect.poll(() => page.locator('iframe').count()).toBe(1);
+      try {
+        await choose(a);
+        await pending.waitFor({ state: 'detached' });
+        await expect.poll(() => page.locator('iframe').count()).toBe(1);
+        await expect.poll(() => joinedScopes.has(cancelledScope)).toBe(true);
+      } finally {
+        resumeDocument.resolve();
+      }
       expect((await f.invoke(cancelledScope)).status).toBe(404);
       expect(await scope()).toBe(firstScope);
 
