@@ -49,6 +49,7 @@ it
     'cold-assets',
     'stall',
     'switch',
+    'cross-retain',
     'baseline',
     'attached',
     'unattached',
@@ -70,7 +71,8 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const crossRetain = scenario === 'cross-retain';
+    const realShell = switching || nativeCreate || coldAssets || crossRetain;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -107,7 +109,9 @@ it
         ? f.registerThread(otherThread)
         : undefined;
     const cross =
-      scenario === 'switch' ? await f.registerOtherEmployee() : undefined;
+      scenario === 'switch' || crossRetain
+        ? await f.registerOtherEmployee()
+        : undefined;
     const fromComposition = createRequire(
       new URL(
         '../../../../packages/dsh-web-composition/package.json',
@@ -964,10 +968,13 @@ it
             currentVersion: version,
             versions: [version],
           })),
-          sessions: (switching || createAfterSwitch || outerCreated
+          sessions: (switching ||
+          createAfterSwitch ||
+          outerCreated ||
+          crossRetain
             ? [
                 f.selection.threadId,
-                otherThread,
+                ...(crossRetain ? [] : [otherThread]),
                 ...(cross ? [cross.identity.threadId!] : []),
               ]
             : [selection.threadId]
@@ -1189,7 +1196,9 @@ it
       await context.close();
       return;
     }
-    const workbench = page.frameLocator('iframe');
+    const workbench = page.frameLocator(
+      crossRetain ? 'iframe:visible' : 'iframe',
+    );
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
@@ -1320,6 +1329,59 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (crossRetain) {
+      const app = workbench.locator('#app');
+      const firstScope = await app.getAttribute('data-scope-id');
+      expect(firstScope).toBeTruthy();
+      await app.evaluate((node) => {
+        node.dataset.testOriginalDocument = 'first';
+      });
+      const open = async (employeeInstanceId: string, threadId: string) => {
+        const row = workbench.locator(
+          '[data-row-key="session:' + threadId + '"]',
+        );
+        const start = performance.now();
+        await row.press('Enter');
+        await page.waitForURL(
+          (url) =>
+            url.searchParams.get('employeeInstanceId') === employeeInstanceId,
+        );
+        await workbench
+          .locator(
+            '#app[data-employee-instance-id="' + employeeInstanceId + '"]',
+          )
+          .waitFor();
+        expect(await editor.isEditable()).toBe(true);
+        return Math.round(performance.now() - start);
+      };
+      await open(cross!.identity.employeeInstanceId, cross!.identity.threadId!);
+      await editor.fill('第二位员工的独立草稿');
+      const secondScope = await app.getAttribute('data-scope-id');
+      expect(secondScope).not.toBe(firstScope);
+      const warm = await open(
+        f.selection.employeeInstanceId,
+        f.selection.threadId,
+      );
+      console.info(
+        'CROSS_EMPLOYEE_NATIVE_RETURN ' +
+          JSON.stringify({
+            warm,
+            documentLoads,
+            socketCount,
+            originalScopeRetained:
+              (await app.getAttribute('data-scope-id')) === firstScope,
+          }),
+      );
+      expect(await app.getAttribute('data-test-original-document')).toBe(
+        'first',
+      );
+      expect(await app.getAttribute('data-scope-id')).toBe(firstScope);
+      expect(await editor.innerText()).toBe('未发送的原生草稿');
+      expect(documentLoads).toBe(2);
+      expect(socketCount).toBe(2);
+      await context.close();
+      return;
+    }
     const dock = (nativeId: string) =>
       workbench.locator(
         '[data-sidebar-right-session="' +
