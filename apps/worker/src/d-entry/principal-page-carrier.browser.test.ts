@@ -31,6 +31,7 @@ import {
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
 import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
+import { recordRefreshWaterfall } from './refresh-waterfall.fixture.js';
 import {
   fixture,
   buildProfileFixture,
@@ -60,7 +61,13 @@ it
       : []),
   ] as const)(
   'rc.2 workbench composer (%s)',
-  { timeout: process.env.ALLRICE_RUN_ASSET_BENCH ? 200_000 : 120_000 },
+  {
+    timeout:
+      process.env.ALLRICE_RUN_ASSET_BENCH ||
+      process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL
+        ? 240_000
+        : 120_000,
+  },
   async (scenario) => {
     const coldAssets = scenario === 'cold-assets';
     const bench = coldAssets && process.env.ALLRICE_RUN_ASSET_BENCH;
@@ -2345,6 +2352,23 @@ it
           ([path]) => path === '/api/v1/d-entry/native-prewarm',
         ),
       ).toHaveLength(1);
+      if (process.env.ALLRICE_RUN_HOT_REFRESH_WATERFALL === '1') {
+        await refreshCdp.detach();
+        for (let sample = 1; sample <= 3; sample++) {
+          for (const cache of ['cold', 'warm'] as const) {
+            const cdp = await context.newCDPSession(page);
+            await cdp.send('Network.enable');
+            await cdp.send('Network.emulateNetworkConditions', {
+              offline: false,
+              latency: 400,
+              downloadThroughput: 1_250_000,
+              uploadThroughput: 1_250_000,
+            });
+            if (cache === 'cold') await cdp.send('Network.clearBrowserCache');
+            await recordRefreshWaterfall(page, editor, cdp, sample, cache);
+          }
+        }
+      }
     }
     if (!warmRefresh)
       await page.evaluate(async () => {
