@@ -288,6 +288,7 @@ async function readDiskPreparation<T>(
     })());
   const abort = () => void close().catch(() => {});
   active.addEventListener('abort', abort, { once: true });
+  let result: T;
   try {
     await (mode === 'read only'
       ? client`begin read only`
@@ -295,17 +296,17 @@ async function readDiskPreparation<T>(
     active.throwIfAborted();
     await client`set local transaction_timeout = '5s'`;
     active.throwIfAborted();
-    const result = await read(client, active);
+    result = await read(client, active);
     active.throwIfAborted();
     await client`commit`;
-    active.throwIfAborted();
-    return result;
   } finally {
     active.removeEventListener('abort', abort);
     // If the query or commit failed, closing this read-only session is enough.
     // Never issue more SQL on a connection whose state cannot be verified.
     await close();
   }
+  active.throwIfAborted();
+  return result;
 }
 
 /** One committed roster per sweep. Pages are scheduling hints only. */

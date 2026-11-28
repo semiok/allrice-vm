@@ -38,6 +38,7 @@ async function relay(dbUrl: URL, hold: Hold = null) {
     upstream: Socket;
     port?: number;
     held: boolean;
+    upstreamEnded: boolean;
     clientClosed: boolean;
     upstreamClosed: boolean;
   }[] = [];
@@ -59,6 +60,7 @@ async function relay(dbUrl: URL, hold: Hold = null) {
     const peer: (typeof peers)[number] = {
       upstream,
       held: false,
+      upstreamEnded: false,
       clientClosed: false,
       upstreamClosed: false,
     };
@@ -97,7 +99,10 @@ async function relay(dbUrl: URL, hold: Hold = null) {
     });
     // TCP half-close is forwarded without destroying the opposite end.
     clientSocket.once('end', () => upstream.end());
-    upstream.once('end', () => clientSocket.end());
+    upstream.once('end', () => {
+      peer.upstreamEnded = true;
+      clientSocket.end();
+    });
   });
   server.listen(0, loopback);
   await once(server, 'listening');
@@ -123,6 +128,7 @@ type Peer = Relay['peers'][number];
 suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
   let fixture: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   let databaseUrl: URL;
+  let fixtureSchema: string;
   let personId: string;
   let employeeId: string;
 
@@ -133,6 +139,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       { name: string }[]
     >`select current_schema() as name`;
     expect(schema.name).toMatch(/^p25_[a-f0-9]{32}$/);
+    fixtureSchema = schema.name;
     databaseUrl = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
     databaseUrl.searchParams.set('sslmode', 'disable');
     databaseUrl.searchParams.set('options', '-csearch_path=' + schema.name);
@@ -233,7 +240,23 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       if (prev)
         previousFeedClosed.push(prev.clientClosed && prev.upstreamClosed);
       settledReadsAtFeedOpen.push(outcomes.length);
-      return createDEntryAuthorityFeed(feed.url.toString());
+      const source = createDEntryAuthorityFeed(feed.url.toString());
+      return {
+        close: source.close,
+        subscribe({ changed, lost }, signal) {
+          return source.subscribe(
+            {
+              // PostgreSQL NOTIFY spans schemas. Keep other parallel fixtures
+              // from waking this scanner without substituting the real feed.
+              changed(change) {
+                if (change.schema === fixtureSchema) changed(change);
+              },
+              lost,
+            },
+            signal,
+          );
+        },
+      };
     });
     const readRoster = vi.fn(readPersonVmDiskPreparationRoster);
     const prepared = vi.fn<ScannerInput['port']['prepare']>(
@@ -424,6 +447,10 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
             ).toEqual([{ stopped: true }]);
           } else {
             await f.owner.close();
+            // The relay sends EOF to the driver only after the PostgreSQL
+            // side ends. Returning after end(0) alone would fail this check.
+            expect(peer.upstreamEnded || peer.upstreamClosed).toBe(true);
+            expect(f.outcomes).toEqual(['rejected']);
           }
           await closed(peer);
           await expect.poll(() => f.outcomes, poll).toEqual(['rejected']);
