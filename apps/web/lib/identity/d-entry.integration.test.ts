@@ -813,15 +813,15 @@ suite(
 
         // An idempotent native unarchive ACK alone cannot prove a vanished root.
         const invocations = invokePage.mock.calls.length;
-        native.owner.readSessions.mockResolvedValueOnce({
+        vi.mocked(native.owner.readSessions).mockResolvedValueOnce({
           ok: true,
           value: { items: [] },
         });
         expect((await patch({ archived: false })).status).toBe(404);
         expect(invokePage).toHaveBeenCalledTimes(invocations);
 
-        const baselineRead = Promise.withResolvers<void>();
-        const releaseProjection = Promise.withResolvers<void>();
+        const baselineRead = deferred<void>();
+        const releaseProjection = deferred<void>();
         followed.mockImplementationOnce(async () => {
           baselineRead.resolve();
           await releaseProjection.promise;
