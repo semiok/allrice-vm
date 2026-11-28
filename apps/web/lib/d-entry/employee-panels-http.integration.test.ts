@@ -353,10 +353,14 @@ suite(
       vi.unstubAllEnvs();
       if (f) await f.close();
     }, 30000);
-    async function person(role: 'admin' | 'viewer' = 'admin') {
+    async function person(
+      role: 'admin' | 'viewer' = 'admin',
+      organizationSlug = 'panel-' + randomUUID(),
+      employeeKey = 'panels',
+    ) {
       const p = await ensureBootstrapPortalPrincipal(
         {
-          organizationSlug: 'panel-' + randomUUID(),
+          organizationSlug,
           organizationName: 'Panel company',
           workspaceSlug: 'default',
           workspaceName: 'Panel workspace',
@@ -376,13 +380,13 @@ suite(
         versionId = randomUUID(),
         assignmentId = randomUUID();
       const manifest = employeeManifest({
-        key: 'panels',
+        key: employeeKey,
         name: 'Panels',
         description: 'Ordinary file management; no execution',
         toolNames: [],
       });
       await f.db`insert into allrice_employees(id,organization_id,workspace_id,employee_key,name)
-      values(${employeeId},${p.organizationId},${p.workspaceId},'panels','Panels')`;
+      values(${employeeId},${p.organizationId},${p.workspaceId},${employeeKey},'Panels')`;
       await f.db`insert into allrice_employee_versions(id,organization_id,workspace_id,employee_id,version,name,model,system_prompt,capabilities,config_checksum,manifest,provider_snapshot)
       values(${versionId},${p.organizationId},${p.workspaceId},${employeeId},1,'Panels',${manifest.provider.model},${manifest.systemPrompt},${f.db.json(manifest.capabilities)},${employeeManifestChecksum(manifest)},${f.db.json(manifest)},${f.db.json(manifest.provider)})`;
       await f.db`insert into allrice_employee_assignments(id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
@@ -2533,6 +2537,7 @@ suite(
         });
       const chosen = await create();
       const selection = await bindDirectoryThread(p, chosen.id);
+      await f.db`update allrice_chat_sessions set visibility='workspace' where id=${chosen.id}`;
       const expected = [chosen.id];
       for (let index = 0; index < 51; index++) {
         const session = await create();
@@ -2583,9 +2588,12 @@ suite(
       expect(await rows()).toEqual(before);
     });
     it('lists only pinned private 4.0 archives and their counts for the current Cookie owner', async () => {
-      const owner = await person();
-      const other = await person();
-      await release(owner, other);
+      const organizationSlug = 'panel-' + randomUUID();
+      const owner = await person('admin', organizationSlug);
+      const colleague = await person('admin', organizationSlug, 'colleague');
+      const outsider = await person();
+      expect(colleague.selection.workspaceId).toBe(owner.selection.workspaceId);
+      await release(owner, colleague, outsider);
       const seed = async (
         p: typeof owner,
         archived: boolean,
@@ -2599,12 +2607,17 @@ suite(
           await f.db`update allrice_chat_sessions set archived_at=now() where id=${session.id}`;
         return session.id;
       };
-      const visible = await seed(owner, true);
+      const visible: string[] = [];
+      for (let i = 0; i < 52; i++) visible.push(await seed(owner, true));
       const legacy = await seedLegacyThread(owner);
       await f.db`update allrice_chat_sessions set archived_at=now() where id=${legacy}`;
       await seed(owner, false);
       await seed(owner, true, false);
-      await seed(other, true);
+      const shared = await seed(owner, true);
+      const colleagueSession = await seed(colleague, true);
+      await seed(outsider, true);
+      await f.db`update allrice_chat_sessions set visibility='workspace' where id in (${shared},${colleagueSession})`;
+      await f.db`update allrice_employee_instances set archived_at=now() where id=${owner.selection.employeeInstanceId}`;
       const query = new URLSearchParams({
         entry: '4.0',
         workspaceId: owner.selection.workspaceId,
@@ -2618,25 +2631,44 @@ suite(
       const result = await list(owner);
       expect(result.status).toBe(200);
       expect(result.headers.get('cache-control')).toBe('private, no-store');
-      expect(await result.json()).toMatchObject({
-        sessions: [{ id: visible }],
+      const first = await result.json();
+      expect(first).toMatchObject({
+        sessions: expect.any(Array),
         employeeGroups: [
           {
             employeeInstanceId: owner.selection.employeeInstanceId,
-            count: 1,
+            count: visible.length,
           },
         ],
-        nextCursor: null,
+        nextCursor: expect.any(String),
       });
-      query.set('employeeInstanceId', other.selection.employeeInstanceId);
+      expect(first.sessions).toHaveLength(50);
+      query.set('cursor', first.nextCursor);
+      const secondResponse = await list(owner);
+      expect(secondResponse.status).toBe(200);
+      const second = await secondResponse.json();
+      expect(second.employeeGroups).toEqual(first.employeeGroups);
+      expect(second.nextCursor).toBeNull();
+      expect(
+        [...first.sessions, ...second.sessions]
+          .map(({ id }: { id: string }) => id)
+          .sort(),
+      ).toEqual(visible.sort());
+      query.delete('cursor');
+      query.set('employeeInstanceId', colleague.selection.employeeInstanceId);
       expect(await (await list(owner)).json()).toEqual({
         sessions: [],
         nextCursor: null,
       });
-      expect([403, 404]).toContain((await list(other)).status);
+      expect([403, 404]).toContain((await list(outsider)).status);
       expect((await listSessions(request())).status).toBe(401);
-      await release(other);
+      query.delete('employeeInstanceId');
+      query.set('cursor', first.nextCursor);
+      await release(colleague, outsider);
       expect((await list(owner)).status).toBe(403);
+      await release(owner, colleague, outsider);
+      await f.db`update allrice_sessions set revoked_at=now() where id=${owner.context.sessionId}`;
+      expect((await list(owner)).status).toBe(401);
     });
     it('requires real Cookie, same-origin writes and matching viewer without changing stored files', async () => {
       const p = await person();

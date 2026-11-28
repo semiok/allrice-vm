@@ -833,21 +833,21 @@ async function readChatSessionPage(
     : null;
   const limit = Math.min(Math.max(options.limit ?? 30, 1), 100);
   const dEntryFilter = dEntry
-    ? sql`and s.owner_id=${requireUser(context)} and s.visibility='private'
+    ? sql`and s.owner_id=${requireUser(context)}
       and s.execution_generation='4.0'
       and s.d_entry_native_root->>'nativeSessionId' is not null
-      and exists (
-        select 1 from allrice_employee_instances owned
-        where owned.id=coalesce(s.employee_instance_id,s.employee_assignment_id)
-          and owned.organization_id=s.organization_id
-          and owned.workspace_id=s.workspace_id
-          and owned.owner_id=s.owner_id
-      )
       ${
         dEntry.employeeIds
           ? sql`and coalesce(s.employee_instance_id,s.employee_assignment_id)
             = any(${sql.array([...dEntry.employeeIds])}::uuid[])`
-          : sql``
+          : sql`and s.visibility='private'
+            and exists (
+              select 1 from allrice_employee_instances owned
+              where owned.id=coalesce(s.employee_instance_id,s.employee_assignment_id)
+                and owned.organization_id=s.organization_id
+                and owned.workspace_id=s.workspace_id
+                and owned.owner_id=s.owner_id
+            )`
       }`
     : sql``;
   // Bind cursor timestamps as text so postgres.js does not serialize them
