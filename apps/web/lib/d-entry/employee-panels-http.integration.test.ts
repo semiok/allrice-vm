@@ -17,6 +17,7 @@ import {
   DataAccessError,
   addEmployeeInstanceModule,
   createChatSession,
+  createEmployeeInstance,
   ensureDEntryNativeRoot,
   readDEntryEmployeeDirectory,
   requireDEntryNativeIdentity,
@@ -2526,6 +2527,18 @@ suite(
       const p = await person();
       const legacy = await seedLegacyThread(p);
       await release(p);
+      const copies = [];
+      for (const name of ['调查', '整理', '已归档']) {
+        copies.push(
+          await createEmployeeInstance(p.context, {
+            assignmentId: p.selection.employeeInstanceId,
+            workspaceId: p.selection.workspaceId,
+            requestId: randomUUID(),
+            profile: { name },
+          }),
+        );
+      }
+      await f.db`update allrice_employee_instances set archived_at=now() where id=${copies[2]!.id}`;
       const create = () =>
         createChatSession(p.context, p.selection, {
           executionGeneration: '4.0',
@@ -2546,15 +2559,38 @@ suite(
         () => f.db`select id,execution_generation,d_entry_native_root,archived_at
         from allrice_chat_sessions where owner_id=${p.context.actor.id} order by id`;
       const before = await rows();
+      const queries: string[] = [];
+      const originalDebug = f.db.options.debug;
+      f.db.options.debug = (_connection, sql) => queries.push(sql);
+      const started = performance.now();
       const directory = await readDEntryEmployeeDirectory(
         p.context,
         selection,
         signal(),
+      ).finally(() => {
+        f.db.options.debug = originalDebug;
+      });
+      expect(queries.length).toBeGreaterThan(0);
+      console.info(
+        'D_ENTRY_DIRECTORY_WATERFALL ' +
+          JSON.stringify({
+            queries: queries.length,
+            employees: directory.employees.length,
+            sessions: directory.sessions.length,
+            elapsedMs: Math.round(performance.now() - started),
+          }),
       );
       expect(directory.viewerId).toBe(p.context.actor.id);
-      expect(directory.employees.map(({ instanceId }) => instanceId)).toEqual([
-        p.selection.employeeInstanceId,
-      ]);
+      expect(
+        directory.employees.map(({ instanceId }) => instanceId).sort(),
+      ).toEqual(
+        [p.selection.employeeInstanceId, copies[0]!.id, copies[1]!.id].sort(),
+      );
+      expect(
+        directory.employees
+          .map(({ currentVersion }) => currentVersion.manifest.name)
+          .sort(),
+      ).toEqual(['Panels', '调查', '整理'].sort());
       expect(directory.sessions.map(({ id }) => id).sort()).toEqual(
         expected.sort(),
       );
