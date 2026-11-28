@@ -132,7 +132,10 @@ export const initialDocumentLifecycle = `(() => {
     send(protocol.fail);
     stop();
   };
-  const loaded = () => {
+  const leaving = (event) => { if (event.isTrusted) stop(); };
+  const loaded = (event) => {
+    if (!event.isTrusted) return;
+    window.removeEventListener('load', loaded);
     if (controller.signal.aborted && !claimed) finish('closed');
   };
   const finish = (state) => {
@@ -140,7 +143,7 @@ export const initialDocumentLifecycle = `(() => {
     complete = true;
     window.removeEventListener('message', received);
     window.removeEventListener('error', error, true);
-    window.removeEventListener('pagehide', stop);
+    window.removeEventListener('pagehide', leaving);
     window.removeEventListener('load', loaded);
     if (earlyBundles) {
       earlyBundles.cancel();
@@ -149,8 +152,8 @@ export const initialDocumentLifecycle = `(() => {
   };
   window.addEventListener('error', error, true);
   window.addEventListener('message', received);
-  window.addEventListener('pagehide', stop, { once: true });
-  window.addEventListener('load', loaded, { once: true });
+  window.addEventListener('pagehide', leaving);
+  window.addEventListener('load', loaded);
   globalThis.__ALLRICE_EMPLOYEE_DOCUMENT__ = Object.freeze({
     scopeId,
     signal: controller.signal,

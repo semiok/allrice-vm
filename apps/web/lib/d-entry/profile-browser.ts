@@ -577,9 +577,10 @@ export function nativeProfileDocument(
             }).decode(bytes);
             let registrationError: Error | undefined;
             const failed = (event: ErrorEvent) => {
-              // Inline registration errors belong to this document URL.
-              // An injected content script can report its own error here too.
-              if (!event.isTrusted || event.filename !== document.URL) return;
+              // Inline scripts share a document URL. Attribute synchronous
+              // failures to the script actually executing, including when an
+              // extension appends another inline script in the same turn.
+              if (!event.isTrusted || document.currentScript !== script) return;
               registrationError =
                 event.error instanceof Error
                   ? event.error
