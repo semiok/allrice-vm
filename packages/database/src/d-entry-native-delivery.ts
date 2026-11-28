@@ -304,6 +304,9 @@ export async function publishCapturedDEntryDelivery(
         values (${versionId}, ${organizationId}, ${workspaceId}, ${ownerId}, ${runId}, 'file', ${tx.json({ kind: 'tool_result', runId, operationId: null, stepId: candidate.executionId })}, ${requestId}, ${'sha256:' + sha256(JSON.stringify([requestId, object.checksum]))})`;
       await tx`update allrice_storage_objects set state='ready',updated_at=clock_timestamp() where id=${object.id} and state='pending'`;
     }
+    // This check is deliberately after the writes and still before COMMIT.
+    // A native call that canceled during publication cannot acquire a receipt.
+    await current(tx);
     signal.throwIfAborted();
   });
 }
@@ -407,19 +410,25 @@ export async function sweepDEntryNativeDeliveryReservations(
   `;
   for (const row of deleted) {
     signal.throwIfAborted();
-    await storage.delete({
-      id: row.id,
-      organizationId: row.organization_id,
-      workspaceId: row.workspace_id,
-      ownerId: row.owner_id,
-      key: row.object_key,
-      mediaType: row.media_type,
-      checksum: row.checksum,
-      sizeBytes: Number(row.size_bytes),
-      immutable: false,
-      retentionUntil: null,
-      deletedAt: row.deleted_at.toISOString(),
-    });
+    try {
+      await storage.delete({
+        id: row.id,
+        organizationId: row.organization_id,
+        workspaceId: row.workspace_id,
+        ownerId: row.owner_id,
+        key: row.object_key,
+        mediaType: row.media_type,
+        checksum: row.checksum,
+        sizeBytes: Number(row.size_bytes),
+        immutable: false,
+        retentionUntil: null,
+        deletedAt: row.deleted_at.toISOString(),
+      });
+    } catch {
+      signal.throwIfAborted();
+      // Keep this tombstone eligible for retry without starving other rows.
+      continue;
+    }
     await db`insert into allrice_audit_events
       (organization_id, workspace_id, actor_id, action, resource_type, resource_id, decision, reason)
       values (${row.organization_id}, ${row.workspace_id}, ${row.owner_id}, 'artifact.native_delivery.swept', 'storage_object', ${row.id}, 'allowed', 'expired_reservation')`;

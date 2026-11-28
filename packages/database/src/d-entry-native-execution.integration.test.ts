@@ -423,6 +423,34 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       await bounded.end({ timeout: 1 });
     }
 
+    let livenessChecks = 0;
+    const canceled = capture(
+      'canceled-before-commit',
+      'saved but not published',
+      31,
+    );
+    await expect(
+      publishCapturedDEntryDelivery(
+        candidate,
+        canceled,
+        storage,
+        async (tx) => {
+          await assertCurrent(tx);
+          if (++livenessChecks === 3)
+            throw Error('native offer canceled before COMMIT');
+        },
+        signal,
+      ),
+    ).rejects.toThrow('native offer canceled before COMMIT');
+    await expect(
+      findDEntryNativeDelivery(
+        context,
+        selection,
+        pathDigest,
+        coordinate([1, 31, canceled.callId, 0]),
+      ),
+    ).rejects.toThrow();
+
     const abandoned = capture('unacknowledged', 'abandoned bytes');
     await expect(
       publishCapturedDEntryDelivery(
@@ -439,13 +467,15 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         signal,
       ),
     ).rejects.toThrow('storage lost reply');
-    const [expired] =
+    const expired =
       await db`update allrice_storage_objects set updated_at=clock_timestamp()-interval '2 hours'
       where workspace_id=${workspaceId} and state='pending' returning id`;
+    expect(expired).toHaveLength(2);
     await sweepDEntryNativeDeliveryReservations(storage, signal);
-    await db`update allrice_storage_objects set deleted_at=clock_timestamp()-interval '6 minutes' where id=${expired!.id}`;
+    await db`update allrice_storage_objects set deleted_at=clock_timestamp()-interval '6 minutes'
+      where workspace_id=${workspaceId} and state='deleted'`;
     await sweepDEntryNativeDeliveryReservations(storage, signal);
-    expect(stored.has(expired!.id)).toBe(false);
+    for (const { id } of expired) expect(stored.has(id)).toBe(false);
     expect(stored.size).toBe(2);
     await db.unsafe(`
       create function refuse_native_terminal_fixture() returns trigger
