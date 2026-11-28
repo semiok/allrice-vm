@@ -5,7 +5,7 @@ import {
   publicStartupBundleUrls,
   type EarlyProfileBundles,
 } from './initial-document';
-import { pageCompletion } from './page-messages';
+import { pageCompletion, pageRevoked } from './page-messages';
 
 const root = '/_next/static/dsh-profile/' + '1'.repeat(64) + '/';
 const url = root + 'bundles/' + '2'.repeat(64) + '.js';
@@ -104,4 +104,46 @@ it('hands off each download once and waits for an in-flight response to settle b
       'https://allrice.test',
     ),
   );
+});
+
+it('requires the browser load event to confirm an unclaimed document after revocation', () => {
+  const listeners = new Map<string, (event: unknown) => void>();
+  const origin = 'https://allrice.test';
+  const parent = { postMessage: vi.fn() };
+  const stop = vi.fn();
+  runInNewContext(initialDocumentLifecycle, {
+    AbortController,
+    document: {
+      currentScript: { dataset: { scopeId: 'fixture-scope' } },
+      readyState: 'loading',
+    },
+    parent,
+    location: { origin },
+    window: {
+      stop,
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        listeners.set(type, listener);
+      },
+      removeEventListener(type: string) {
+        listeners.delete(type);
+      },
+    },
+  });
+  listeners.get('message')!({
+    isTrusted: true,
+    origin,
+    source: parent,
+    data: { type: pageRevoked, scopeId: 'fixture-scope' },
+  });
+  expect(stop).toHaveBeenCalledOnce();
+  listeners.get('load')!({ isTrusted: false });
+  const completed = {
+    type: pageCompletion,
+    scopeId: 'fixture-scope',
+    state: 'closed',
+  };
+  expect(parent.postMessage).not.toHaveBeenCalledWith(completed, origin);
+  listeners.get('load')!({ isTrusted: true });
+  expect(parent.postMessage).toHaveBeenLastCalledWith(completed, origin);
+  expect(listeners.has('load')).toBe(false);
 });

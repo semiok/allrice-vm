@@ -94,9 +94,19 @@ function walletInterference(
           document.documentElement.hasAttribute('data-wallet-registration-noise'))
         return append.apply(this, nodes);
       document.documentElement.dataset.walletRegistrationNoise = '1';
+      const recordOwnedScript = (event) => {
+        if (event.message?.includes('Owned bundle registration failed'))
+          parent.document.documentElement.dataset.walletErrorOwner =
+            document.currentScript === registration ? 'bundle' : 'unknown';
+      };
       if (${ownedError}) {
         registration.textContent += "\n;throw Error('Owned bundle registration failed');";
-        return append.apply(this, nodes);
+        add.call(window, 'error', recordOwnedScript);
+        try {
+          return append.apply(this, nodes);
+        } finally {
+          remove.call(window, 'error', recordOwnedScript);
+        }
       }
       if (${denied}) {
         const scopeId = document.getElementById('app').dataset.scopeId;
@@ -114,8 +124,18 @@ function walletInterference(
       parent.postMessage({ type: 'allrice:d-entry:startup-failed', scopeId: 'stale' }, location.origin);
       const injected = document.createElement('script');
       injected.textContent = "throw Error('Wallet content script noise');";
-      append.call(this, injected);
-      injected.remove();
+      const recordInjectedScript = (event) => {
+        if (event.message?.includes('Wallet content script noise'))
+          parent.document.documentElement.dataset.walletErrorOwner =
+            document.currentScript === injected ? 'extension' : 'unknown';
+      };
+      add.call(window, 'error', recordInjectedScript);
+      try {
+        append.call(this, injected);
+      } finally {
+        remove.call(window, 'error', recordInjectedScript);
+        injected.remove();
+      }
       const extra = document.createElement('script');
       extra.src = '/wallet-extension-chunk.js';
       append.call(this, extra);
@@ -1293,6 +1313,9 @@ it
       try {
         await page.getByRole('alert').waitFor({ timeout: 12_000 });
         expect(errors).toContain('Owned bundle registration failed');
+        expect(
+          await page.locator('html').getAttribute('data-wallet-error-owner'),
+        ).toBe('bundle');
         expect(workspaceBaselines).toHaveLength(0);
       } catch (cause) {
         throw Error(
@@ -1451,6 +1474,9 @@ it
         JSON.stringify({ errors, scopedBundleReads, earlyUrls }),
       ).toBe('1');
       expect(errors).toContain('Wallet content script noise');
+      expect(
+        await page.locator('html').getAttribute('data-wallet-error-owner'),
+      ).toBe('extension');
       expect(errors).not.toContain(
         'Access to storage is not allowed from this context',
       );
@@ -2724,7 +2750,7 @@ it.skipIf(!browserExecutable)(
     for (const scenario of [
       'navigate',
       'unknown',
-      'child-hides',
+      'synthetic-child-hide',
       'query',
       'query-unknown',
       'query-roundtrip',
@@ -2747,23 +2773,30 @@ it.skipIf(!browserExecutable)(
         f.registerThread(next.threadId);
         if (scenario.startsWith('query')) {
           await select(page, next);
-        } else
-          await frame.evaluate(
-            ({ scenario, scopeId, next }) => {
-              if (scenario === 'child-hides')
-                window.dispatchEvent(new Event('pagehide'));
-              else
-                parent.postMessage(
-                  {
-                    type: 'allrice:d-entry:navigate',
-                    scopeId,
-                    selection: next,
-                  },
-                  location.origin,
-                );
-            },
-            { scenario, scopeId, next },
+        } else if (scenario === 'synthetic-child-hide') {
+          await frame.evaluate(() =>
+            window.dispatchEvent(new Event('pagehide')),
           );
+          expect((await f.invoke(scopeId)).status).toBe(200);
+          expect(blocked.destroyed).toBe(false);
+          await page
+            .locator('iframe')
+            .evaluate((node: HTMLIFrameElement, scopeId) => {
+              node.contentWindow!.postMessage(
+                { type: 'allrice:d-entry:revoked', scopeId },
+                location.origin,
+              );
+            }, scopeId);
+        } else {
+          await frame.evaluate(
+            ({ scopeId, next }) =>
+              parent.postMessage(
+                { type: 'allrice:d-entry:navigate', scopeId, selection: next },
+                location.origin,
+              ),
+            { scopeId, next },
+          );
+        }
         await cancelled.promise;
         expect(blocked.destroyed).toBe(true);
         expect(blocked.writableFinished).toBe(false);
