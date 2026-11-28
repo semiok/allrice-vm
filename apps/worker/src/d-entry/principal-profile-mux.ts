@@ -47,6 +47,24 @@ const denied = () => new DataAccessError('authorization_denied');
 type Frame = ReturnType<typeof parseRemoteStreamClientMessage>;
 type Send = (value: RemoteStreamServerMessage) => Promise<void>;
 
+function followedSessionId(frame: Frame) {
+  if (frame.type !== 'open' || frame.endpoint !== 'session/follow') return;
+  try {
+    const { request } = TYPERT_REMOTE.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(
+        DEntryPageRpcRequestSchema.shape.payload.parse(frame.payload).args,
+      );
+    const { address } = request;
+    return address.kind === 'session'
+      ? address.sessionId
+      : address.childSessionId;
+  } catch {
+    // Malformed opens follow the normal per-stream error path.
+  }
+}
+
 export function pageRemoteFailure(error: unknown) {
   if (error instanceof DEntryNativeRootRejected)
     return {
@@ -146,6 +164,8 @@ async function runOwner(
   let shared: ReturnType<typeof pageStreams> | undefined;
   let handoff: Promise<void> | undefined;
   let restarting: Map<string, Frame> | undefined;
+  let followHandoff:
+    { previousScopeId: string; targetRoot: string } | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false;
   const notify = (error: unknown) => {
@@ -282,6 +302,11 @@ async function runOwner(
         restarting = new Map(
           retiring?.pending.map((opening) => [opening.streamId, opening]),
         );
+        if (shared)
+          followHandoff = {
+            previousScopeId: previousPage.scope.opened.scopeId,
+            targetRoot: root.rootNativeSessionId,
+          };
         endPage(previous);
         await join(previous);
         generation.stop.signal.throwIfAborted();
@@ -430,12 +455,26 @@ async function runOwner(
           (frame.type === 'open'
             ? employeeStreams.has(frame.endpoint)
             : shared.has(id));
-        if (frame.type === 'open' && (local.has(id) || shared?.has(id)))
+        if (
+          frame.type === 'open' &&
+          (local.has(id) || shared?.has(id) || restarting?.has(id))
+        )
           throw denied();
+        // A native selection may dispatch its journal open just as the
+        // old scope retires. Only its exact new root can enter the new scope.
+        const followsTarget =
+          followHandoff &&
+          pageScopeId === followHandoff.previousScopeId &&
+          followedSessionId(frame) === followHandoff.targetRoot;
+        if (followsTarget && restarting) {
+          restarting.set(id, frame);
+          continue;
+        }
         const resources = stable ? shared : local;
         const replaced =
           frame.type === 'open' &&
           !stable &&
+          !followsTarget &&
           (pageScopeId !== undefined || Boolean(shared)) &&
           pageScopeId !== current.page?.scope.opened.scopeId;
         if (resources && !resources.signal.aborted && !replaced)
@@ -538,7 +577,7 @@ function pageStreams(
     let settled = false;
     let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
     let verifyRegistration: (() => Promise<void>) | undefined;
-    let followedId: string | undefined;
+    const followedId = exactRoot ? followedSessionId(frame) : undefined;
     let openingSent = false;
     let buffered = 0;
     let input = Promise.resolve();
@@ -561,20 +600,8 @@ function pageStreams(
     const source = page.use(child, async (child) => {
       if (frame.endpoint === 'session/follow') {
         if (exactRoot) {
-          const { request } = TYPERT_REMOTE.methods['session/follow']
-            .input({ strict: true })
-            .create()
-            .parse(
-              DEntryPageRpcRequestSchema.shape.payload.parse(frame.payload)
-                .args,
-            );
-          const { address } = request;
-          const id =
-            address.kind === 'session'
-              ? address.sessionId
-              : address.childSessionId;
-          followedId = id;
-          verifyRegistration = await page.authorizeFollow(id, child);
+          if (!followedId) throw denied();
+          verifyRegistration = await page.authorizeFollow(followedId, child);
         }
         follow = await page.watchFollow(child);
       }

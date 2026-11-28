@@ -334,6 +334,25 @@ it('replaces the borrowed root while keeping native employee events on the same 
     }),
   );
   expect(await receive('retired-root-follow')).toMatchObject({ type: 'error' });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'late-target-follow',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: 'root-' + target },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('late-target-follow')).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
   expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
     404,
   );
