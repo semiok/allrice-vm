@@ -3037,22 +3037,23 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
   const guestJobs = calls.filter(([op]) => op === 'exec');
   expect(guestJobs).toHaveLength(4);
   expect(guestJobs[0]).toEqual(
-    expect.arrayContaining(['--workdir', '/bin', '/usr/local/bin/node']),
+    expect.arrayContaining(['--timeout', '10s', '--workdir', '/bin']),
   );
-  expect(guestJobs[1]?.slice(-8)).toEqual([
-    '--workdir',
-    '/bin',
-    '--',
-    '/bin/mkdir',
-    '-p',
-    '--',
+  expect(guestJobs[0]?.slice(-4)).toEqual(['/bin/mkdir', '-p', '--', '/work']);
+  expect(guestJobs[1]?.slice(-7)).toEqual([
+    '/bin/sh',
+    '-c',
+    expect.stringContaining('exec /bin/mkdir -p -- "$@"'),
+    'allrice-prepare-dsh-files',
+    expect.stringContaining('untrusted-command-memory-state'),
     '/run/allrice-command-memory',
-    '/work',
+    '/run/allrice-command-memory',
   ]);
-  expect(guestJobs[1]).toEqual(expect.arrayContaining(['--timeout', '10s']));
-  expect(guestJobs[2]?.slice(-8)).toEqual([
-    expect.stringContaining('/usr/local/bin/node "$1" "$2" || exit "$?"'),
+  expect(guestJobs[1]).not.toContain('--timeout');
+  expect(guestJobs[2]?.slice(-9)).toEqual([
+    expect.stringContaining('"$node" "$2" "$3" || exit "$?"'),
     'allrice-initialize-dsh-disk',
+    '/usr/local/bin/node',
     controls.guestDirectory + '/initialize.cjs',
     commandConfig,
     verifyDshRuntimeDisk,

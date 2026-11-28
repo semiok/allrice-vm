@@ -32,14 +32,22 @@ import { COMMAND_MEMORY_STATE_ROOT } from './readonly-artifact.ts';
 const BASE_IMAGE_PATH =
   '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
-export const MICROSANDBOX_WORK_DIRECTORY = '/work';
+
+// The trusted state directory is checked before mkdir handles any other
+// parents. No file transfer is part of this job.
+const prepareStateAndParents = String.raw`
+/usr/local/bin/node -e "$1" "$2" || exit "$?"
+shift 2
+exec /bin/mkdir -p -- "$@"
+`;
 
 // Keep the sealed initializer's public CLI and its native exit code. The
 // following disk proof only reads; neither result escapes a single exact wait.
 const initializeAndVerifyDisk = String.raw`
-/usr/local/bin/node "$1" "$2" || exit "$?"
-shift 2
-exec /usr/local/bin/node -e "$@"
+node="$1"
+"$node" "$2" "$3" || exit "$?"
+shift 3
+exec "$node" -e "$@"
 `;
 
 const readEthernetAddresses = String.raw`
@@ -452,10 +460,9 @@ export async function bootstrapMicrosandbox(input: {
   async function spawn(
     commandSpec: PersonVmGuestCommand,
     dispatch?: PersonVmGuestLaunchDispatch,
-    executionTimeoutSeconds?: number,
   ): Promise<PersonVmManagedJob> {
     const job = await spawnMicrosandboxJob(
-      { ...input, executionTimeoutSeconds },
+      input,
       commandSpec,
       employee ? 'hot-retained' : 'bootstrap-retained',
       dispatch,
@@ -467,11 +474,8 @@ export async function bootstrapMicrosandbox(input: {
       cancelAndWait: job.cancelAndWait,
     });
   }
-  async function run(
-    commandSpec: PersonVmGuestCommand,
-    executionTimeoutSeconds?: number,
-  ) {
-    const job = await spawn(commandSpec, undefined, executionTimeoutSeconds);
+  async function run(commandSpec: PersonVmGuestCommand) {
+    const job = await spawn(commandSpec);
     let result: PersonVmJobExit;
     try {
       result = await job.wait(scope.signal);
@@ -500,24 +504,31 @@ export async function bootstrapMicrosandbox(input: {
       !employee && sandbox?.cliSha256 !== undefined
         ? [sandbox.guestDirectory, sandbox.sha256, sandbox.cliSha256]
         : undefined;
-    if (controls && !employee)
+    const parents = [...new Set(files.map((file) => dirname(file.path)))];
+    if (diskProof)
+      await run({
+        executable: '/bin/sh',
+        args: [
+          '-c',
+          prepareStateAndParents,
+          'allrice-prepare-dsh-files',
+          prepareCommandMemoryState,
+          COMMAND_MEMORY_STATE_ROOT,
+          ...parents,
+        ],
+      });
+    else if (controls && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
-        // /work does not need to exist for the check and writes under /run.
-        ...(diskProof && { workdir: '/bin' }),
       });
     // cp preserves Unix permissions but doesn't create missing file parents.
-    const parents = new Set(files.map((file) => dirname(file.path)));
-    if (diskProof) parents.add(MICROSANDBOX_WORK_DIRECTORY);
-    await run(
-      {
+    // The sealed path has already joined the combined preparation above.
+    if (!diskProof)
+      await run({
         executable: '/bin/mkdir',
         args: ['-p', '--', ...parents],
-        ...(diskProof && { workdir: '/bin' }),
-      },
-      diskProof ? 10 : undefined,
-    );
+      });
     for (const [index, file] of files.entries()) {
       await scope.assertCurrent();
       const hostFile = join(stage, String(index));
@@ -534,6 +545,7 @@ export async function bootstrapMicrosandbox(input: {
           '-c',
           initializeAndVerifyDisk,
           'allrice-initialize-dsh-disk',
+          '/usr/local/bin/node',
           ...plan.initialize.args,
           verifyDshRuntimeDisk,
           ...diskProof,

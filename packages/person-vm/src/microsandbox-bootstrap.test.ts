@@ -1,5 +1,6 @@
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -144,25 +145,55 @@ it('labels a failed auth artifact read without retaining guest command output', 
   });
 });
 
-it('does not publish a launcher when the joined sealed initialization job fails', async () => {
-  const { scope, binding } = fixture();
-  const controls = '/opt/allrice/command-memory/' + 'a'.repeat(64);
-  const state = '/run/allrice-command-memory';
-  const config = state + '/config.json';
-  const command = vi.fn(async (args: string[]) => {
-    if (args[0] === 'exec')
-      return args.includes('allrice-initialize-dsh-disk')
-        ? 'initialize-and-verify'
-        : 'prepare';
-    if (args[0] === 'wait' && args[3] === 'initialize-and-verify')
-      return JSON.stringify({ code: 75, success: false, timed_out: false });
-    if (args[0] === 'wait') return finished;
-    if (args[0] === 'cp') return '';
-    throw Error('unexpected native verb');
-  });
+it.each([
+  { initialize: 75, verify: 0, exit: 75 },
+  { initialize: 0, verify: 24, exit: 24 },
+  { initialize: 0, verify: 0, exit: 0 },
+])(
+  'requires the actual shell sequence to join successfully ($initialize, $verify)',
+  async ({ initialize, verify, exit }) => {
+    const { scope, binding } = fixture();
+    const controls = '/opt/allrice/command-memory/' + 'a'.repeat(64);
+    const state = '/run/allrice-command-memory';
+    const config = state + '/config.json';
+    const initializer = join(root, 'test initializer.cjs');
+    await writeFile(initializer, `process.exit(${initialize});`);
+    let status: number | null = null;
+    const command = vi.fn(async (args: string[]) => {
+      if (args[0] === 'exec') {
+        const initializerJob = args.indexOf('allrice-initialize-dsh-disk');
+        if (initializerJob === -1) return 'prepare';
+        const result = spawnSync(
+          '/bin/sh',
+          [
+            '-c',
+            args[initializerJob - 1]!,
+            args[initializerJob]!,
+            process.execPath,
+            initializer,
+            'config file.json',
+            `console.log('verifier ran'); process.exit(${verify});`,
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(result.error).toBeUndefined();
+        expect(result.stdout).toBe(initialize === 0 ? 'verifier ran\n' : '');
+        expect(result.status).toBe(exit);
+        status = result.status;
+        return 'initialize-and-verify';
+      }
+      if (args[0] === 'wait' && args[3] === 'initialize-and-verify')
+        return JSON.stringify({
+          code: status,
+          success: status === 0,
+          timed_out: false,
+        });
+      if (args[0] === 'wait') return finished;
+      if (args[0] === 'cp') return '';
+      throw Error('unexpected native verb');
+    });
 
-  await expect(
-    bootstrapMicrosandbox({
+    const bootstrap = bootstrapMicrosandbox({
       scope,
       name: 'allrice-' + binding.vmId,
       plan: {
@@ -188,19 +219,26 @@ it('does not publish a launcher when the joined sealed initialization job fails'
       stagingRoot: root,
       cleanupTimeoutMs: 2000,
       command,
-    }),
-  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
-  expect(command.mock.calls.map(([args]) => args[0])).toEqual([
-    'exec',
-    'wait',
-    'exec',
-    'wait',
-    'cp',
-    'exec',
-    'wait',
-  ]);
-  expect(command.mock.calls.at(-1)?.[0][3]).toBe('initialize-and-verify');
-});
+    });
+    if (exit === 0)
+      await expect(bootstrap).resolves.toHaveProperty(
+        'launch',
+        expect.any(Function),
+      );
+    else
+      await expect(bootstrap).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+    expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+      'exec',
+      'wait',
+      'cp',
+      'exec',
+      'wait',
+    ]);
+    expect(command.mock.calls.at(-1)?.[0][3]).toBe('initialize-and-verify');
+  },
+);
 
 it.each(['10.4.1.10', '172.16.0.6', '192.168.4.2'])(
   'returns exactly one current private assigned guest IPv4 %s after native wait and logs',
