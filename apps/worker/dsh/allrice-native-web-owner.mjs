@@ -417,6 +417,10 @@ const nativeToolBodyClaims = new Map();
 const witnessedNativeTools = new WeakSet();
 const publishedMemoryTools = new WeakMap();
 const hostMemoryTools = new WeakSet();
+const unknownMemoryCandidate = Object.freeze({
+  outcome: 'unknown',
+  text: 'Memory candidate outcome is unconfirmed. Do not retry. Check Pending memories before taking further action.',
+});
 
 // Only the exact, sealed registration may opt in. A successful around-dispatch
 // result, on its own, cannot mark entry into the registered implementation.
@@ -1006,6 +1010,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
         sealedVersion = version;
         if (publishedMemoryTools.has(wrapped)) {
           const toolId = wrapped.name.slice('mcp__allrice__'.length);
+          const inHost = hostMemoryTools.has(wrapped);
           if (
             !currentMemoryTools(attempt.memoryToolWitness) ||
             attempt.memoryTools?.[toolId] !== wrapped
@@ -1017,6 +1022,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
             claimed.messageId !== attempt.human.occurrence.messageId
           )
             return false;
+          const remember = inHost && toolId === 'memory_remember';
+          if (remember && observer.rememberOutcomeUnknown)
+            return unknownMemoryCandidate;
           return observer
             .publishMemoryCall(
               {
@@ -1032,8 +1040,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 dispatch: { kind: 'sealed-handler', version },
               },
               exec.signal,
-              hostMemoryTools.has(wrapped) ? { value: args } : undefined,
+              inHost ? { value: args } : undefined,
             )
+            .catch(() => null)
             .then((ref) => {
               if (
                 capture() &&
@@ -1041,8 +1050,13 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 attempts.get(session) === attempt &&
                 inboxClaims.get(session) === claimed &&
                 currentMemoryTools(attempt.memoryToolWitness)
-              )
+              ) {
+                if (remember && ref?.outcome !== 'result') {
+                  observer.rememberOutcomeUnknown = true;
+                  return unknownMemoryCandidate;
+                }
                 return ref;
+              }
               return null;
             });
         }
@@ -1156,6 +1170,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
           (ref !== null ||
             !result ||
             typeof result.text !== 'string' ||
+            (result.outcome !== 'result' && result.outcome !== 'unknown') ||
             Buffer.byteLength(result.text) > 10_000)) ||
         !observer.memoryReplies.get(value.ticket)?.(result ?? ref)
       )
@@ -1210,6 +1225,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
           handlerRecords: 0,
           registryResult: false,
           memoryReplies: new Map(),
+          rememberOutcomeUnknown: false,
           async publishMemoryCall(fact, nativeSignal, argumentsFromTool) {
             if (value.memoryCalls !== true) return null;
             const ticket = randomUUID();

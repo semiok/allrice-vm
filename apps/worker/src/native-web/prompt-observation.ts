@@ -97,11 +97,15 @@ const nativeMemoryToolObservation = nativeToolObservation.extend({
 export type NativeMemoryToolObservation = z.infer<
   typeof nativeMemoryToolObservation
 >;
+export type NativeMemoryToolResult = Readonly<{
+  outcome: 'result' | 'unknown';
+  text: string;
+}>;
 export type PublishNativeMemoryCall = (
   fact: NativeMemoryToolObservation,
   signal: AbortSignal,
   argumentsFromTool?: { value: unknown },
-) => Promise<string | { text: string } | null>;
+) => Promise<string | NativeMemoryToolResult | null>;
 const memoryCallFrame = z
   .object({
     ticket: UuidSchema,

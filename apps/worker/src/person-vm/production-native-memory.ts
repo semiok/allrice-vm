@@ -8,6 +8,7 @@ import {
 import { createNativeEmployeeMemoryHost } from '@allrice/database';
 import type { ModelDispatchAuthority } from '@allrice/model-gateway';
 import { z } from 'zod';
+import type { NativeMemoryToolResult } from '../native-web/prompt-observation.js';
 import type { NativeExecutionBuild } from './production-native-execution-evidence.js';
 
 export type MemoryRootObservation = Readonly<
@@ -67,7 +68,7 @@ export type MemoryHostPublication = Readonly<{
     start: (root: {
       executionRef: string;
       memoryIndexDocument: string;
-    }) => void,
+    }) => Promise<void>,
   ): Promise<void>;
   call(
     context: RequestContext,
@@ -126,17 +127,26 @@ export async function executeProductionNativeMemoryTool(
   target: Parameters<typeof tools.readOrdinal>[1],
   input: unknown,
   signal: AbortSignal,
-) {
+): Promise<NativeMemoryToolResult> {
   if (toolId === 'memory_read')
-    return tools.readOrdinal(context, target, input, signal);
+    return {
+      outcome: 'result',
+      text: await tools.readOrdinal(context, target, input, signal),
+    };
   const candidate = RememberPersonalMemoryInputSchema.parse(input);
   try {
-    return JSON.stringify(
-      await tools.remember(context, target, candidate, signal),
-    );
+    return {
+      outcome: 'result',
+      text: JSON.stringify(
+        await tools.remember(context, target, candidate, signal),
+      ),
+    };
   } catch {
     // Once the writer is entered, a missing receipt does not prove rollback.
-    return 'Memory candidate outcome is unconfirmed. Do not retry. Check Pending memories before taking further action.';
+    return {
+      outcome: 'unknown',
+      text: 'Memory candidate outcome is unconfirmed. Do not retry. Check Pending memories before taking further action.',
+    };
   }
 }
 

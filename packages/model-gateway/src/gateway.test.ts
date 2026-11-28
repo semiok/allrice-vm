@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
 import { request } from 'node:http';
+import { Agent, buildConnector } from 'undici';
 import {
   createAssistantMessage,
   createToolResultMessage,
@@ -107,7 +108,7 @@ it.each([
       async withTrustedContext(_binding, _signal, _route, dispatch) {
         phases.push('dispatch');
         if (archived) throw new ModelGatewayError('AUTHORIZATION_DENIED');
-        dispatch(index);
+        await dispatch(index);
       },
     });
     cleanup.push(() => f.close());
@@ -158,7 +159,7 @@ it('does not send the sealed index if the selected route is revoked while waitin
     async withTrustedContext(_binding, _signal, _route, dispatch) {
       entered.resolve();
       await released.promise;
-      dispatch(index);
+      await dispatch(index);
     },
   });
   cleanup.push(() => f.close());
@@ -175,6 +176,110 @@ it('does not send the sealed index if the selected route is revoked while waitin
     { dispatchObserved: false, outcome: 'failed', httpStatus: null },
   ]);
   expect(store.slots.get(f.binding.vm.personId)?.size).toBe(0);
+});
+it('defers memory authorization until a queued real connection can write HTTP', async () => {
+  const upstream = await upstreamFixture();
+  cleanup.push(() => upstream.close());
+  let wireBytes = 0;
+  upstream.server.on('connection', (socket) => {
+    socket.on('data', (chunk) => {
+      wireBytes += chunk.byteLength;
+    });
+  });
+  const native = await nativeProviderFixture(upstream.url);
+  cleanup.push(() => native.close());
+  const connected = deferred();
+  const admitted = deferred();
+  const connect = buildConnector({ allowH2: false });
+  const dispatcher = new Agent({
+    allowH2: false,
+    connect(options, done) {
+      connect(options, (error, socket) => {
+        if (error) {
+          done(error, null);
+          return;
+        }
+        connected.resolve();
+        void admitted.promise.then(() => done(null, socket!));
+      });
+    },
+  });
+  cleanup.push(() => dispatcher.destroy());
+  let revoked = false;
+  const store = new FixtureStore();
+  const withTrustedContext = vi.fn(async () => {
+    expect(revoked).toBe(true);
+    throw new ModelGatewayError('AUTHORIZATION_DENIED');
+  });
+  const f = await gatewayFixture({
+    store,
+    provider: {
+      ...native.provider,
+      fetchOwned(fetch, request, init) {
+        const owned = { ...init, dispatcher };
+        return fetch(request, owned);
+      },
+    },
+    readTrustedContext: async () => 'confirmed memory only',
+    withTrustedContext,
+  });
+  cleanup.push(() => f.close());
+  const result = f.collect();
+  try {
+    await Promise.race([
+      connected.promise,
+      result.then(() => {
+        throw Error('Attempt finished before wire readiness');
+      }),
+    ]);
+    expect(withTrustedContext).not.toHaveBeenCalled();
+    expect(wireBytes).toBe(0);
+    revoked = true;
+  } finally {
+    admitted.resolve();
+  }
+  await result;
+  expect(withTrustedContext).toHaveBeenCalledTimes(1);
+  expect(upstream.requests).toHaveLength(0);
+  expect(wireBytes).toBe(0);
+  expect([...store.rows.values()]).toMatchObject([
+    { dispatchObserved: false, outcome: 'failed', httpStatus: null },
+  ]);
+});
+
+it('releases the memory guard after a confirmed body write while upstream response is held', async () => {
+  const upstream = await upstreamFixture({ hold: true });
+  cleanup.push(() => upstream.close());
+  const native = await nativeProviderFixture(upstream.url);
+  cleanup.push(() => native.close());
+  const authorized = deferred();
+  const index = 'confirmed memory only';
+  const f = await gatewayFixture({
+    provider: native.provider,
+    readTrustedContext: async () => index,
+    async withTrustedContext(_binding, _signal, _route, dispatch) {
+      await dispatch(index);
+      authorized.resolve();
+    },
+  });
+  cleanup.push(() => f.close());
+  const result = f.collect();
+  await Promise.race([
+    Promise.all([authorized.promise, upstream.whenCount(1)]),
+    result.then(() => {
+      throw Error('Attempt finished before guarded wire write');
+    }),
+  ]);
+  try {
+    expect(JSON.stringify(upstream.requests[0]?.body)).toContain(index);
+    expect(upstream.active).toBe(1);
+  } finally {
+    upstream.complete(0);
+  }
+  await result;
+  expect([...f.store.rows.values()]).toMatchObject([
+    { dispatchObserved: true, outcome: 'closed', httpStatus: 200 },
+  ]);
 });
 it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
   const f = await setup();

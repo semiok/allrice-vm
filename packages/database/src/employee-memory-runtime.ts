@@ -554,7 +554,7 @@ async function restoreNativeEmployeeMemoryContext(
   assembly?: MemoryRuntimeAssembly,
   dispatch?: {
     codex?: NativeMemoryCodexRoute;
-    start(document: string): void;
+    start(document: string): Promise<void> | void;
   },
 ) {
   const target = NativeMemoryRestoreTargetSchema.parse(input);
@@ -583,7 +583,7 @@ async function restoreNativeEmployeeMemoryContext(
         if (dispatch.codex)
           await lockNativeMemoryCodexDispatch(bound.tx, dispatch.codex);
         signal.throwIfAborted();
-        dispatch.start(saved.document);
+        await dispatch.start(saved.document);
       }
       return saved.document;
     },
@@ -790,7 +790,7 @@ export function createNativeEmployeeMemoryHost() {
       start: (root: {
         executionRef: string;
         memoryIndexDocument: string;
-      }) => void,
+      }) => Promise<void> | void,
     ) {
       const { workspaceId, employeeInstanceId, threadId } = input;
       const runId = UuidSchema.parse(input.runId);

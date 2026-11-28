@@ -108,6 +108,7 @@ function value() {
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
       terminalEnabled: true,
+      nativeMemoryEnabled: false,
     },
     lifecycle: {
       leaseTtlMs: 30000,
@@ -525,7 +526,10 @@ describe('private production Host configuration', () => {
   });
   it('enables native employee memory only with the sealed web opt-in', async () => {
     const config = value();
-    await seal(config);
+    await seal({
+      ...config,
+      web: { ...config.web, nativeMemoryEnabled: undefined },
+    });
     const defaults = await readProductionHostConfiguration(signal());
     expect(defaults.configuration.web.nativeMemoryEnabled).toBe(false);
     await seal({

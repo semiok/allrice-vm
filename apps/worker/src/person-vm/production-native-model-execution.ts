@@ -495,7 +495,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           start(root: {
             executionRef: string;
             memoryIndexDocument: string;
-          }): void;
+          }): Promise<void>;
         },
       ) {
         if (
@@ -562,7 +562,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             (issued) => {
               scope.assertObservedNow();
               assertIssued(issued);
-              start(issued);
+              return start(issued);
             },
           );
           return;
@@ -659,7 +659,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               threadId: receipt.origin.threadId,
               nativeRequestRef,
             };
-            const text = await executeProductionNativeMemoryTool(
+            const toolResult = await executeProductionNativeMemoryTool(
               memory.tools,
               toolId,
               prompt.context,
@@ -669,7 +669,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             );
             prompt.assertObservedNow();
             active.throwIfAborted();
-            return { text };
+            return toolResult;
           },
         );
       }
@@ -1947,7 +1947,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         phase: 'seal' | 'dispatch',
         dispatch?: {
           authority: ModelDispatchAuthority;
-          start(document: string): void;
+          start(document: string): Promise<void>;
         },
       ) {
         const entry = calls.get(call.native.callId);
@@ -1995,7 +1995,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               authority,
               start(issued) {
                 assertOriginal(issued.executionRef);
-                start(issued.memoryIndexDocument);
+                return start(issued.memoryIndexDocument);
               },
             },
           );

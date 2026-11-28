@@ -220,6 +220,7 @@ it.skipIf(
       const results = deferredPromptFact<void>();
       const delivered = new Map<string, { id: string; value: unknown }>();
       const rememberCallId = randomUUID();
+      const retryCallId = randomUUID();
       const callbackInputs = new Map<
         string,
         Parameters<MemoryHostPublication['call']>[1]
@@ -506,6 +507,14 @@ it.skipIf(
           ) {
             const title = request.url.endsWith('/session-title');
             if (!title && assistantCalls < 2) await sealRequest();
+            if (!title && assistantCalls === 2) {
+              const attempt = await owner.readNativeAttemptFor(
+                context,
+                { kind: 'session', sessionId: nativeSessionId },
+                signal,
+              );
+              expect(attempt?.observation?.proofState).toBe('adopted');
+            }
             const reference = randomBytes(32).toString('base64url');
             references.set(reference, title);
             response
@@ -525,10 +534,19 @@ it.skipIf(
             expect(modelInput).toContain(
               'Memory candidate outcome is unconfirmed. Do not retry.',
             );
+          }
+          if (!title && assistantCalls === 4) {
+            const modelInput = Buffer.concat(chunks).toString('utf8');
+            expect(modelInput).toContain(retryCallId);
+            expect(
+              modelInput.match(
+                /Memory candidate outcome is unconfirmed\. Do not retry\./g,
+              )?.length,
+            ).toBeGreaterThanOrEqual(2);
             results.resolve();
           }
           const called =
-            title || assistantCalls > 2
+            title || assistantCalls > 3
               ? []
               : assistantCalls === 1
                 ? tools
@@ -537,7 +555,12 @@ it.skipIf(
             ? called.map(({ id, args }, index) => ({
                 type: 'tool-call-delta',
                 index,
-                id: id === 'memory_remember' ? rememberCallId : randomUUID(),
+                id:
+                  id === 'memory_remember'
+                    ? assistantCalls === 3
+                      ? retryCallId
+                      : rememberCallId
+                    : randomUUID(),
                 name: 'mcp__allrice__' + id,
                 argumentsDelta: JSON.stringify(args),
               }))
@@ -663,7 +686,7 @@ it.skipIf(
                         },
                       }
                     : host;
-                  const text = await executeProductionNativeMemoryTool(
+                  const result = await executeProductionNativeMemoryTool(
                     toolActions,
                     toolId,
                     context,
@@ -676,10 +699,16 @@ it.skipIf(
                     value: unknownWrite
                       ? null
                       : toolId === 'memory_read'
-                        ? text
-                        : JSON.parse(text),
+                        ? result.text
+                        : JSON.parse(result.text),
                   });
-                  return { text };
+                  if (unknownWrite) {
+                    expect(result.outcome).toBe('unknown');
+                    // The database commit happened, but the private response
+                    // carries no authoritative result to the waiting tool.
+                    return null;
+                  }
+                  return result;
                 } catch (cause) {
                   error.reject(cause);
                   throw cause;

@@ -231,7 +231,7 @@ export function createModelGateway(options: {
     binding: ModelCallBinding,
     signal: AbortSignal,
     authority: ModelDispatchAuthority | void,
-    dispatch: (document: string) => void,
+    dispatch: (document: string) => Promise<void>,
   ): Promise<void>;
   confirmTransportStopped?(
     ownerId: string,
@@ -469,7 +469,7 @@ export function createModelGateway(options: {
                               throw new ModelGatewayError(
                                 'AUTHORIZATION_DENIED',
                               );
-                            dispatch();
+                            return dispatch();
                           },
                         );
                       },

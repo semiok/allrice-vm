@@ -4,6 +4,7 @@ import {
   prepareDeepSeekChatRequest,
 } from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { addAbortListener } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
 import type {
@@ -26,6 +27,27 @@ import {
 import { createOwnedModelTransport } from './owned-transport.ts';
 
 type Fetch = typeof globalThis.fetch;
+async function waitForWire(
+  observed: Promise<void>,
+  sending: Promise<Response>,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const stopped = Promise.withResolvers<never>();
+  const abort = addAbortListener(signal, () => stopped.reject(signal.reason));
+  try {
+    await Promise.race([
+      observed,
+      stopped.promise,
+      sending.then(() => {
+        throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+      }),
+    ]);
+    signal.throwIfAborted();
+  } finally {
+    abort[Symbol.dispose]();
+  }
+}
 type FetchScope = {
   authTransaction<T>(operation: () => Promise<T>): Promise<T>;
   fetch(
@@ -165,7 +187,7 @@ export function createMeteredTransport(options: {
   withContextCurrent?(
     signal: AbortSignal,
     authority: ModelDispatchAuthority | void,
-    dispatch: () => void,
+    dispatch: () => Promise<void>,
   ): Promise<void>;
   activate(): Promise<void>;
 }) {
@@ -365,46 +387,91 @@ export function createMeteredTransport(options: {
         };
         const authority =
           await options.provider.assertDispatchCurrent?.(requestSignal);
-        let sending: Promise<Response> | undefined;
-        let authorizationOpen = true;
-        const dispatch = () => {
-          if (!authorizationOpen || dispatched)
-            throw new ModelGatewayError('AUTHORIZATION_DENIED');
-          requestSignal.throwIfAborted();
-          authority?.assertCurrent();
-          dispatched = true;
+        const send = (init: RequestInit) =>
           // Disable redirects and hidden 421 replay. Each later SDK fetch
           // gets its own durable attempt.
-          sending = nativeClose.run(() =>
+          nativeClose.run(() =>
             options.provider.fetchOwned
-              ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
-              : nativeFetch(request, dispatchInit),
+              ? options.provider.fetchOwned(nativeFetch, request, init)
+              : nativeFetch(request, init),
           );
-          void sending.catch(() => {});
-        };
+        let response: Response;
         if (contextStop && options.withContextCurrent) {
+          if (!request.body)
+            throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+          const source = request.body.getReader();
+          const releaseBody = Promise.withResolvers<void>();
+          let receivedBody = false;
+          const body = new ReadableStream(
+            {
+              async pull(controller) {
+                await releaseBody.promise;
+                requestSignal.throwIfAborted();
+                const chunk = await source.read();
+                requestSignal.throwIfAborted();
+                if (chunk.done) {
+                  if (!receivedBody)
+                    throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+                  controller.close();
+                } else {
+                  receivedBody ||= chunk.value.byteLength > 0;
+                  controller.enqueue(chunk.value);
+                }
+              },
+              cancel: (reason) => source.cancel(reason),
+            },
+            { highWaterMark: 0 },
+          );
+          const sending = send({ ...dispatchInit, body });
+          void sending.catch(() => {});
+          let authorized = false;
           try {
-            // Start the native fetch while both authorities are still held.
-            // Release the DB transaction before waiting for the response.
+            // The pinned HTTP/1 driver transitions into its body iterator
+            // after obtaining the socket. It writes neither headers nor body
+            // while the first nonempty chunk is withheld.
+            await waitForWire(nativeClose.headersReady, sending, requestSignal);
             await options.withContextCurrent(
               requestSignal,
               authority,
-              dispatch,
+              async () => {
+                requestSignal.throwIfAborted();
+                authority?.assertCurrent();
+                if (authorized)
+                  throw new ModelGatewayError('AUTHORIZATION_DENIED');
+                authorized = true;
+                releaseBody.resolve();
+                try {
+                  await waitForWire(
+                    nativeClose.bodyWritten,
+                    sending,
+                    AbortSignal.any([requestSignal, AbortSignal.timeout(3000)]),
+                  );
+                } catch (error) {
+                  // Stop the wire before unwinding the SQL locks.
+                  contextStop.abort(error);
+                  throw error;
+                }
+              },
             );
+            if (!nativeClose.wroteBody)
+              throw new ModelGatewayError('AUTHORIZATION_DENIED');
+            dispatched = true;
           } catch (error) {
-            if (sending) {
-              contextStop.abort(error);
-              await sending
-                .then((value) => value.body?.cancel(error))
-                .catch(() => {});
-            }
+            contextStop.abort(error);
+            releaseBody.resolve();
+            dispatched = nativeClose.wroteBody;
+            await sending
+              .then((value) => value.body?.cancel(error))
+              .catch(() => {});
             throw error;
-          } finally {
-            authorizationOpen = false;
           }
-        } else dispatch();
-        if (!sending) throw new ModelGatewayError('AUTHORIZATION_DENIED');
-        const response = await sending;
+          response = await sending;
+        } else {
+          requestSignal.throwIfAborted();
+          authority?.assertCurrent();
+          dispatched = true;
+          response = await send(dispatchInit);
+        }
         status = response.status;
         if (!response.body) {
           if (
@@ -561,7 +628,7 @@ export function createMeteredTransport(options: {
         await finish(
           dispatched && !transportJoined
             ? 'unknown'
-            : requestSignal.aborted
+            : callerSignal.aborted
               ? 'canceled'
               : 'failed',
         );
