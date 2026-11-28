@@ -272,6 +272,47 @@ it.each(['close', 'disconnect'] as const)(
   },
 );
 
+it.each(['close', 'disconnect'] as const)(
+  'reports incomplete qualification socket cleanup when a recheck overlaps %s',
+  async (action) => {
+    const f = fixture();
+    const releaseRead = latch();
+    const releasePrepare = latch();
+    const cleanup = new PersonVmError('CLEANUP_INCOMPLETE');
+    f.input.port.prepare.mockImplementationOnce(async () => {
+      await releasePrepare.promise;
+      return 'deferred';
+    });
+    const owner = f.start(false);
+    try {
+      await vi.waitFor(() =>
+        expect(f.input.port.prepare).toHaveBeenCalledOnce(),
+      );
+      const readCount = f.input.readTarget.mock.calls.length;
+      f.input.readTarget.mockImplementationOnce(async () => {
+        await releaseRead.promise;
+        throw cleanup;
+      });
+      f.subscribers[0]?.changed(hint('allrice_settings'));
+      await vi.waitFor(() =>
+        expect(f.input.readTarget).toHaveBeenCalledTimes(readCount + 1),
+      );
+      if (action === 'disconnect') f.subscribers[0]?.lost(Error('feed lost'));
+      else void owner.close();
+    } finally {
+      releasePrepare.resolve();
+      releaseRead.resolve();
+      if (action === 'disconnect')
+        await vi.waitFor(() =>
+          expect(f.input.observe).toHaveBeenCalledWith('cleanup-incomplete'),
+        );
+      await expect(owner.close()).rejects.toBe(cleanup);
+    }
+    expect(f.feed.close).toHaveBeenCalledOnce();
+    expect(f.input.openFeed).toHaveBeenCalledOnce();
+  },
+);
+
 it.each(['readTarget', 'foregroundBusy'] as const)(
   'stops the entire pass and joins the feed after %s fails',
   async (source) => {

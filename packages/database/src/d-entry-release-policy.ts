@@ -246,7 +246,12 @@ async function readDiskPreparation<T>(
   signal: AbortSignal,
   read: (sql: postgres.Sql, active: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  const active = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
+  const lost = new AbortController();
+  const active = AbortSignal.any([
+    signal,
+    lost.signal,
+    AbortSignal.timeout(8_000),
+  ]);
   active.throwIfAborted();
   // postgres 3.4.9 can reject its internal type discovery outside the caller
   // when the owned connection is ended mid-startup. These reads use scalar
@@ -256,17 +261,18 @@ async function readDiskPreparation<T>(
   const socketClosed = new Promise<void>((resolve) => {
     confirmSocketClosed = resolve;
   });
+  let closing: Promise<void> | undefined;
   const client = createDedicatedDatabase({
     options: {
       ...options,
       fetch_types: false,
       onclose(id) {
         confirmSocketClosed();
+        if (!closing) lost.abort(Error('DISK_PREPARATION_CONNECTION_CLOSED'));
         options.onclose?.(id);
       },
     },
   });
-  let closing: Promise<void> | undefined;
   const close = () =>
     (closing ??= (async () => {
       await client.end({ timeout: 0 });
@@ -290,15 +296,21 @@ async function readDiskPreparation<T>(
   active.addEventListener('abort', abort, { once: true });
   let result: T;
   try {
+    // Bind every statement to the original session. An idle disconnect
+    // between statements cannot resume the same transaction on a new socket.
+    const sql = new Proxy(await client.reserve(), {
+      apply(target, receiver, args) {
+        active.throwIfAborted();
+        return Reflect.apply(target, receiver, args);
+      },
+    });
     await (mode === 'read only'
-      ? client`begin read only`
-      : client`begin isolation level repeatable read read only`);
+      ? sql`begin read only`
+      : sql`begin isolation level repeatable read read only`);
+    await sql`set local transaction_timeout = '5s'`;
     active.throwIfAborted();
-    await client`set local transaction_timeout = '5s'`;
-    active.throwIfAborted();
-    result = await read(client, active);
-    active.throwIfAborted();
-    await client`commit`;
+    result = await read(sql, active);
+    await sql`commit`;
   } finally {
     active.removeEventListener('abort', abort);
     // If the query or commit failed, closing this read-only session is enough.

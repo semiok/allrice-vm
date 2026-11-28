@@ -12,6 +12,7 @@ import {
   readPersonVmDiskPreparationTarget,
 } from '@allrice/database';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import * as content from '../../../../packages/database/src/content-maintenance.ts';
 import * as client from '../../../../packages/database/src/core/client.ts';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.ts';
@@ -207,6 +208,15 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       .poll(() => [peer.clientClosed, peer.upstreamClosed], poll)
       .toEqual([true, true]);
     await expect.poll(() => backends(peer), poll).toEqual([]);
+  }
+
+  async function terminate(peer: Peer, pid: number) {
+    expect(peer.port).toBeTypeOf('number');
+    const stopped = await fixture.db`select pg_terminate_backend(pid) as stopped
+      from pg_stat_activity where pid=${pid}
+        and datname=current_database() and usename=current_user
+        and client_addr='127.0.0.1'::inet and client_port=${peer.port!}`;
+    expect(stopped).toEqual([{ stopped: true }]);
   }
 
   async function withScanner(
@@ -408,6 +418,49 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     );
   }, 20_000);
 
+  it('does not resume a qualification transaction on a new socket after an idle disconnect', async () => {
+    const waiting = deferred<void>();
+    const resume = deferred<void>();
+    const read = content.readContentPrincipal;
+    const paused = vi
+      .spyOn(content, 'readContentPrincipal')
+      .mockImplementationOnce(async (...args) => {
+        waiting.resolve();
+        await resume.promise;
+        return read(...args);
+      });
+    try {
+      await withScanner(null, async (f) => {
+        try {
+          await waiting.promise;
+          const peer = f.reads.peers[1]!;
+          const [backend] = await backends(peer);
+          expect(backend?.state).toBe('idle in transaction');
+          await terminate(peer, backend!.pid);
+          await closed(peer);
+          expect(f.outcomes).toEqual([]);
+          expect(f.openFeed).toHaveBeenCalledTimes(1);
+        } finally {
+          resume.resolve();
+        }
+        await expect
+          .poll(() => f.prepared.mock.results[0]?.value, poll)
+          .toBe('prepared');
+        expect(f.outcomes[0]).toBe('rejected');
+        expect(f.settledReadsAtFeedOpen).toEqual([0, 1]);
+        expect(f.previousFeedClosed).toEqual([true]);
+        // The replacement starts with a new roster before qualification can
+        // succeed again. The first callback and its transaction ended together.
+        expect(f.readRoster).toHaveBeenCalledTimes(2);
+        await f.owner.close();
+        await Promise.all([...f.feed.peers, ...f.reads.peers].map(closed));
+      });
+    } finally {
+      resume.resolve();
+      paused.mockRestore();
+    }
+  }, 20_000);
+
   it.each(['disconnect', 'close'] as const)(
     'settles the blocked qualification transaction and sockets on %s',
     async (action) => {
@@ -440,12 +493,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
           expect(f.outcomes).toEqual([]);
           expect(f.prepared).not.toHaveBeenCalled();
           if (action === 'disconnect') {
-            expect(
-              await fixture.db`select pg_terminate_backend(pid) as stopped
-                from pg_stat_activity where pid=${heldPid!}
-                  and datname=current_database() and usename=current_user
-                  and client_addr='127.0.0.1'::inet and client_port=${peer.port!}`,
-            ).toEqual([{ stopped: true }]);
+            await terminate(peer, heldPid!);
           } else {
             await f.owner.close();
             // The relay sends EOF to the driver only after the PostgreSQL

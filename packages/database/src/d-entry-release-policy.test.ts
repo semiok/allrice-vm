@@ -112,7 +112,7 @@ function fixture(
   data.createDedicatedDatabase.mockImplementation(
     ({ options }: { options: { onclose(): void } }) => {
       socketClosed = options.onclose;
-      return Object.assign(sql, { end });
+      return { reserve: async () => sql, end };
     },
   );
   return { end, seen, sql };
