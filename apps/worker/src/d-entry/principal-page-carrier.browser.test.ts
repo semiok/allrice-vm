@@ -72,6 +72,7 @@ it
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const warmRefresh = scenario === 'refresh';
+    const usePublicFiles = coldAssets || warmRefresh;
     const realShell = switching || nativeCreate || coldAssets || warmRefresh;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
@@ -864,7 +865,7 @@ it
           else response.end(encoded);
           return;
         }
-        if (coldAssets && url.pathname.startsWith(publicRoot)) {
+        if (usePublicFiles && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
           if (
             !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
@@ -1019,8 +1020,8 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          ${coldAssets ? nativeStyles : ''}
-          <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
+          ${usePublicFiles ? nativeStyles : ''}
+          <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
@@ -1030,7 +1031,7 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
+          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
       } catch {
         response.writeHead(500).end();
       }
