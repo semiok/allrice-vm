@@ -214,7 +214,7 @@ it('keeps sensitive Host effects and file preview unavailable even when register
   }
 });
 
-it('protects the loaded default model entry under its profile ID while leaving ordinary settings available', () => {
+it('protects managed model and permission settings while leaving ordinary settings available', () => {
   const { providerSettings, pluginSettings } = pageSettingsNamespaces(
     [
       {
@@ -222,6 +222,14 @@ it('protects the loaded default model entry under its profile ID while leaving o
           options: {
             id: 'profile-model',
             name: '@deepseek-ai/dsh-agent-default-model',
+          },
+        },
+      },
+      {
+        entry: {
+          options: {
+            id: 'permission',
+            name: '@deepseek-ai/dsh-permission-presets',
           },
         },
       },
@@ -239,7 +247,7 @@ it('protects the loaded default model entry under its profile ID while leaving o
   for (const method of ['update', 'replace', 'mutate']) {
     const native = descriptor('settings', method);
     const endpoint = `settings/${method}`;
-    for (const ns of ['profile-model', 'configured-provider']) {
+    for (const ns of ['profile-model', 'configured-provider', 'permission']) {
       expect(() =>
         requirePageNativeMethod(
           { get: () => native },

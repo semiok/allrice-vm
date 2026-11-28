@@ -51,7 +51,8 @@ export function pageSettingsNamespaces(
       providerSettings?.add(options.id);
     if (
       options.name === '@deepseek-ai/dsh-plugin-market' ||
-      options.name === '@deepseek-ai/dsh-plugin-manager'
+      options.name === '@deepseek-ai/dsh-plugin-manager' ||
+      options.name === '@deepseek-ai/dsh-permission-presets'
     )
       pluginSettings.add(options.id);
   }

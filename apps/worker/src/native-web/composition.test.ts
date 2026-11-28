@@ -2181,6 +2181,24 @@ it('stages the existing governed Bash overlay for every employee from the same p
             ]),
           },
         })),
+        {
+          id: 'sandbox-policy',
+          config: { mode: 'workspace-write', workspaceRoot: '/work' },
+        },
+        { id: 'approval', config: { policy: 'never' } },
+        {
+          id: 'permission',
+          config: {
+            defaultPreset: 'workspace-write',
+            presets: {
+              'read-only': { sandbox: 'read-only', approval: 'never' },
+              'workspace-write': {
+                sandbox: 'workspace-write',
+                approval: 'never',
+              },
+            },
+          },
+        },
       ]);
       expect(patch.contents).not.toContain(controls.hostDirectory);
     }
