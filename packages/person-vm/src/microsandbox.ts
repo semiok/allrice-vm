@@ -482,6 +482,19 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       },
     };
   }
+  /** Warm the same verifier used by artifact() without allocating a VM. */
+  async prewarmReadonlyDshRuntimeDisk(signal: AbortSignal): Promise<void> {
+    const { readonlyDshRuntimeDisk, readonlyDshDirectory, image } =
+      this.options;
+    if (readonlyDshRuntimeDisk && readonlyDshDirectory)
+      await this.verifyRuntimeDisk(
+        readonlyDshRuntimeDisk,
+        readonlyDshDirectory,
+        image,
+        signal,
+      );
+  }
+
   private async artifact(
     binding: PersonVmBinding,
     signal: AbortSignal,
