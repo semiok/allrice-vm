@@ -2842,13 +2842,20 @@ it
           }
         }
       }
-      const releaseProof = deferred();
-      let checkingWarmProof = false;
-      const verifyWarmEditor = f.confirmVerifiedEditor.getMockImplementation()!;
-      f.confirmVerifiedEditor.mockImplementationOnce(async () => {
-        checkingWarmProof = true;
-        await releaseProof.promise;
-        return verifyWarmEditor();
+      const releaseOpen = deferred();
+      let openingPrincipal = false;
+      const acquire = vi.mocked(f.owner.acquirePrincipal);
+      const openPrincipal = acquire.getMockImplementation()!;
+      acquire.mockImplementationOnce((...args) => {
+        const activity = openPrincipal(...args);
+        return {
+          ...activity,
+          async run(signal) {
+            openingPrincipal = true;
+            await releaseOpen.promise;
+            return activity.run(signal);
+          },
+        };
       });
       await page.addInitScript((asset) => {
         if (window !== parent) return;
@@ -2873,7 +2880,7 @@ it
       try {
         await page.reload({ waitUntil: 'commit' });
         await page.locator('html[data-warm-asset="pending"]').waitFor();
-        await expect.poll(() => checkingWarmProof).toBe(true);
+        await expect.poll(() => openingPrincipal).toBe(true);
         await page
           .getByRole('button', { name: '取消等待', exact: true })
           .click();
@@ -2881,7 +2888,7 @@ it
           timeout: 5_000,
         });
       } finally {
-        releaseProof.resolve();
+        releaseOpen.resolve();
       }
     }
     if (!warmRefresh)
