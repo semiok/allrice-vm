@@ -470,7 +470,7 @@ it('only requires authenticated VM authority for employee-wide read streams', as
     }),
   ).rejects.toBeInstanceOf(DataAccessError);
   f.group.abort(Error('employee transport retired'));
-  await expect(streams.assertCurrent(f.signal)).rejects.toThrow(
+  expect(() => streams.assertCurrent(f.signal)).toThrow(
     'employee transport retired',
   );
 });
