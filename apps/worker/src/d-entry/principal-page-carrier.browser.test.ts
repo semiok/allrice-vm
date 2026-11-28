@@ -306,6 +306,10 @@ it
     );
     const materials = createSyntheticPanelsData();
     const reference = materials.references[0]!;
+    const panelViewer = {
+      viewerId: f.identity.personId,
+      workspaceId: f.identity.workspaceId,
+    };
     const late = deferred();
     const reads: unknown[] = [];
     const materialReads: string[] = [];
@@ -355,10 +359,34 @@ it
             ),
           );
         }
-        if (url.pathname === panelPath + 'materials') {
+        if (
+          url.pathname === panelPath + 'materials' ||
+          url.pathname ===
+            panelPath +
+              'materials/revisions/' +
+              reference.revisionId +
+              '/selection'
+        ) {
           const thread = url.searchParams.get('threadId');
           if (thread) materialReads.push(thread);
-          return await copy(Response.json(materials.catalog));
+          if (url.pathname.endsWith('/selection'))
+            return await copy(
+              Response.json({
+                ...materials.selection(reference.revisionId),
+                ...panelViewer,
+                canReference: true,
+              }),
+            );
+          return await copy(
+            Response.json({
+              ...materials.catalog,
+              viewerId: panelViewer.viewerId,
+              options: {
+                ...materials.options,
+                workspaceId: panelViewer.workspaceId,
+              },
+            }),
+          );
         }
         if (url.pathname === panelPath + 'materials/options') {
           return await copy(
@@ -894,7 +922,7 @@ it
         })
         .click();
       await expect.poll(() => editor.textContent()).toContain(file);
-      expect(materialReads.slice(before)).toEqual([threadId]);
+      expect(materialReads.slice(before)).toEqual([threadId, threadId]);
       await closeWorkbenchPane(nativeId, '企业资料');
     }
     async function checkR3SelectedRoot(nativeId: string, threadId: string) {
