@@ -171,7 +171,7 @@ function saveError(error: unknown, upload: boolean) {
   ) {
     return 'code' in failure && failure.code === 'QUOTA_EXCEEDED'
       ? '企业资料存储空间不足。'
-      : fileSizeError;
+      : '服务器拒绝接收此文件，请换一个更小的文件重试。';
   }
   return upload ? uploadError : publishError;
 }
@@ -202,14 +202,15 @@ async function checkPublication(
   const saved = response.result;
   if (
     response.status !== 'recorded' ||
-    response.ready === false ||
     !saved ||
-    !('sourceId' in saved)
+    !('sourceId' in saved) ||
+    (receipt.operation !== 'change-publication' &&
+      (response.ready !== true || !('revisionId' in saved)))
   )
     return;
-  const result = { outcome: 'recorded', saved } as const;
-  settlePublication(key, receipt, result);
-  return result;
+  // A background read can refresh the list, but only a matching submission
+  // can acknowledge the result and retire its intent.
+  return { outcome: 'recorded', saved } as const;
 }
 
 function refreshPublishedFiles() {
@@ -575,8 +576,11 @@ function PublicationForm({
             edits.current !== formVersion
           )
             return;
-          if (resolution?.outcome === 'recorded') onSaved(resolution.saved);
-          else setError(target.kind === 'upload' ? uploadError : publishError);
+          if (resolution?.outcome === 'recorded') {
+            settlePublication(receiptKey, prior, resolution);
+            onSaved(resolution.saved);
+          } else
+            setError(target.kind === 'upload' ? uploadError : publishError);
           return;
         }
         requestId = proposed;

@@ -332,10 +332,10 @@ suite(
         await choose();
         expect(await limit.count()).toBe(0);
         await page.evaluate(() =>
-          window.__panelDataFixture.rejectNextPublication(413),
+          window.__panelDataFixture.rejectNextPublication(400),
         );
         await publish.click();
-        await limit.waitFor();
+        await dialog.getByText('上传中断，请重试。', { exact: true }).waitFor();
         await page.evaluate(() => window.__panelDataFixture.holdPublication());
         await publish.click();
         const publishing = dialog.getByRole('button', {
@@ -439,26 +439,31 @@ suite(
         );
         await page.reload();
         await chooseMaterials();
+        await page.evaluate(() => window.__panelDataFixture.holdReceipt());
         await open();
         await expect.poll(inquiries).toEqual([b!.requestId, a!.requestId]);
         expect(await writes()).toEqual([]);
-        // Change one identity field from the saved request at a time.
+        // Keep the original reads held while replacing the dialog identity.
         for (const scope of [
           { employee: uid(99), thread: uid(7), viewer: uid(1) },
           { employee: uid(3), thread: uid(98), viewer: uid(1) },
           { employee: uid(3), thread: uid(7), viewer: uid(97) },
         ]) {
+          const previous = await dialog.elementHandle();
           await page.evaluate(({ employee, thread, viewer }) => {
             window.__panelDataFixture.selectReceiptScope(employee, thread);
             window.__panelDataFixture.selectReceiptViewer(viewer);
           }, scope);
           await expect
-            .poll(() =>
-              dialog.getByRole('button', { name: /核对结果/ }).count(),
-            )
-            .toBe(0);
+            .poll(() => previous!.evaluate((node) => node.isConnected))
+            .toBe(false);
+          await previous?.dispose();
+          expect(await dialog.getByRole('alert').count()).toBe(0);
           expect(await inquiries()).toEqual([b!.requestId, a!.requestId]);
         }
+        await page.evaluate(() => window.__panelDataFixture.finishReceipt());
+        expect(await dialog.getByRole('alert').count()).toBe(0);
+        expect(await writes()).toEqual([]);
       } finally {
         await page.close();
       }
@@ -493,6 +498,9 @@ suite(
         await dialog.getByRole('button', { name: '取消', exact: true }).click();
         await page.evaluate(() => {
           window.__panelDataFixture.holdReceipt();
+          window.addEventListener('allrice:workbench-files-changed', () => {
+            document.body.dataset.publicationListRefreshed = 'true';
+          });
           const original = crypto.subtle.digest.bind(crypto.subtle);
           crypto.subtle.digest = async (algorithm, bytes) => {
             document.body.dataset.publicationHashHeld = 'true';
@@ -521,16 +529,9 @@ suite(
           () => document.body.dataset.publicationHashHeld === 'true',
         );
         await page.evaluate(() => window.__panelDataFixture.finishReceipt());
-        await expect
-          .poll(async () =>
-            page.evaluate(
-              () =>
-                Object.keys(sessionStorage).filter((key) =>
-                  key.startsWith('allrice:publication-receipts:v2:'),
-                ).length,
-            ),
-          )
-          .toBe(0);
+        await page.waitForFunction(
+          () => document.body.dataset.publicationListRefreshed === 'true',
+        );
         await page.evaluate(() =>
           window.dispatchEvent(new Event('release-publication-hash')),
         );
@@ -538,15 +539,13 @@ suite(
         const calls = (await evidence(page)).calls;
         const writes = calls.filter((call) => call.method === 'publishUpload');
         expect(writes).toHaveLength(1);
+        const originalRequest = (writes[0]!.input as { requestId: string })
+          .requestId;
         expect(
-          calls.filter((call) => call.method === 'readWriteReceipt'),
-        ).toMatchObject([
-          {
-            input: {
-              requestId: (writes[0]!.input as { requestId: string }).requestId,
-            },
-          },
-        ]);
+          calls
+            .filter((call) => call.method === 'readWriteReceipt')
+            .map((call) => (call.input as { requestId: string }).requestId),
+        ).toEqual([originalRequest, originalRequest]);
         await expect.poll(() => dialog.getByRole('alert').count()).toBe(0);
       } finally {
         await page.close();

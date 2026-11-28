@@ -887,21 +887,6 @@ suite(
           expect(
             await f.db`select status from allrice_knowledge_sources where id=${sourceId}`,
           ).toEqual([{ status: 'archived' }]);
-          await page.addInitScript((sourceId) => {
-            const remove = Storage.prototype.removeItem;
-            Storage.prototype.removeItem = function (key) {
-              const prefix = 'allrice:publication-receipts:v2:';
-              if (
-                key.startsWith(prefix) &&
-                JSON.parse(key.slice(prefix.length)).at(-1) === sourceId
-              )
-                throw new DOMException(
-                  'Storage cleanup is unavailable',
-                  'QuotaExceededError',
-                );
-              remove.call(this, key);
-            };
-          }, sourceId);
           const previousReceipts = receiptReads.length;
           const ongoingReceipt = holdReceipt(withdrawnId, 'beforeReply');
           let allowUnread!: () => void;
@@ -946,26 +931,6 @@ suite(
           expect(
             await page.getByText(withdrawnId, { exact: false }).count(),
           ).toBe(0);
-          expect(
-            await page.evaluate(
-              (requestId) =>
-                Object.keys(sessionStorage).some(
-                  (key) =>
-                    key.startsWith('allrice:publication-receipts:v2:') &&
-                    (
-                      JSON.parse(sessionStorage.getItem(key)!) as {
-                        requestId: string;
-                        outcome: string;
-                      }[]
-                    ).some(
-                      (entry) =>
-                        entry.requestId === requestId &&
-                        entry.outcome === 'recorded',
-                    ),
-                ),
-              withdrawnId,
-            ),
-          ).toBe(true);
 
           const storage = runtimeFixtureStorage(f.db);
           const put = storage.put.bind(storage);
@@ -1076,18 +1041,25 @@ suite(
             .waitFor();
           expect(browserPublicationAttempts).toHaveLength(beforeRetry);
 
-          // Finish the already-written reserved bytes and click the same
-          // primary action. Recovery selects the real revision and sends no POST.
+          // Complete the original upload. The quiet panel refresh must not
+          // consume its intent, even before an entirely new form opens.
           await completeReferenceUpload(
             p.context,
             p.selection.workspaceId,
             storedA.result.revisionId,
           );
-          const [readyRetry] = await Promise.all([
+          const [readyInPanel] = await Promise.all([
             page.waitForResponse(receiptResponse(pendingId)),
-            publishMaterial(),
+            closeUpload(),
           ]);
-          expect(await readyRetry.json()).toMatchObject({ ready: true });
+          expect(await readyInPanel.json()).toMatchObject({ ready: true });
+          await page
+            .getByRole('button', { name: '资料选项 ' + nameA })
+            .waitFor();
+          await openUpload();
+          expect(await material.getByRole('alert').count()).toBe(0);
+          await selectFile(nameA, contentA);
+          await publishMaterial();
           await material.waitFor({ state: 'hidden' });
           expect(browserPublicationAttempts).toHaveLength(beforeRetry);
           expect(publishWrites).toHaveLength(3);
@@ -1095,6 +1067,38 @@ suite(
           await page
             .getByRole('button', { name: '‹ 企业资料', exact: true })
             .waitFor();
+          await materials();
+          await openUpload();
+          await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
+          await page.route(
+            '**' + publicationPath + '?*',
+            (route) =>
+              route.fulfill({ status: 413, body: 'Payload Too Large' }),
+            { times: 1 },
+          );
+          await publishMaterial();
+          await material
+            .getByText('服务器拒绝接收此文件，请换一个更小的文件重试。', {
+              exact: true,
+            })
+            .waitFor();
+          const unknownId = browserPublicationAttempts.at(-1)!;
+          expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
+          expect(publishWrites).toHaveLength(3);
+          const [unknown] = await Promise.all([
+            page.waitForResponse(receiptResponse(unknownId)),
+            publishMaterial(),
+          ]);
+          expect(await unknown.json()).toMatchObject({
+            requestId: unknownId,
+            status: 'unknown',
+            result: null,
+          });
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          expect(browserPublicationAttempts).toHaveLength(beforeRetry + 1);
+          await assertQuiet(unknownId);
           expect(referenceWrites).toBe(0);
           await page.unrouteAll({ behavior: 'wait' });
           await context.close();
