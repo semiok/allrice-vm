@@ -285,6 +285,15 @@ it
     );
     const publicEntry = publicRoot + 'managed/employee-web-entry.js';
     const publicStyle = publicRoot + 'managed/employee-web-entry.css';
+    const nativeStyles = manifest.files
+      .filter(({ path }) =>
+        /^native\/assets\/(index|vendor)-[\w-]+\.css$/.test(path),
+      )
+      .map(
+        ({ path }) =>
+          '<link rel="stylesheet" href="' + publicRoot + path + '">',
+      )
+      .join('');
     let coldPaths: string[] = [];
     let stagedPaths: Set<string> | undefined;
     if (coldAssets && bench !== 'baseline') {
@@ -321,6 +330,7 @@ it
     const coldFinished = new Map<string, number>();
     let readyAt: number | undefined;
     let prewarmAt: number | undefined;
+    let frameApplicationAt: number | undefined;
     const operationId = randomUUID();
     const coldWindow = bench === 'overlap' ? 3_000 : bench ? 60_000 : 1_500;
     const applicationTransfers: {
@@ -726,6 +736,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
+          ${coldAssets ? nativeStyles : ''}
           <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
@@ -749,6 +760,18 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (bench === 'overlap') {
+      const href =
+        f.origin +
+        publicRoot +
+        'bundles/' +
+        bundles.find((bundle) => bundle.phase === 'application')!.sha256 +
+        '.js';
+      page.on('request', (request) => {
+        if (request.url() === href && request.frame() !== page.mainFrame())
+          frameApplicationAt ??= performance.now();
+      });
+    }
     if (bench) {
       const cdp = await context.newCDPSession(page);
       await cdp.send('Network.enable');
@@ -874,7 +897,10 @@ it
     );
     if (coldAssets) {
       const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
-      const elapsed = bench ? 133_000 : 20_000;
+      await expect
+        .poll(() => readyAt ?? 0, { timeout: bench ? 105_000 : 20_000 })
+        .toBeGreaterThan(0);
+      const elapsed = bench ? 82_000 : 20_000;
       const outcome = await Promise.race([
         alert.waitFor({ timeout: elapsed }).then(() => 'timeout'),
         editor.waitFor({ timeout: elapsed }).then(() => 'editable'),
@@ -892,6 +918,13 @@ it
             readyToOutcomeMs: Math.round(performance.now() - readyAt!),
             prewarmToReadyMs: Math.round(readyAt! - prewarmAt!),
             browser: browser.version(),
+            applicationStartsRelativeToReadyMs: applicationTransfers.map(
+              ({ start }) => Math.round(start - readyAt!),
+            ),
+            iframeApplicationRelativeToReadyMs:
+              frameApplicationAt === undefined
+                ? null
+                : Math.round(frameApplicationAt - readyAt!),
             initialTransferMs: applicationTransfers.map(({ start, end }) =>
               end === undefined ? null : Math.round(end - start),
             ),
@@ -916,6 +949,14 @@ it
         await editor.fill('冷启动后的草稿');
         expect(await editor.isEditable()).toBe(true);
         expect(scopedBundleReads).toBe(0);
+        if (bench === 'overlap') {
+          expect(applicationTransfers).toHaveLength(1);
+          expect(applicationTransfers[0]!.start).toBeLessThan(readyAt!);
+          expect(frameApplicationAt).toBeGreaterThan(readyAt!);
+          expect(frameApplicationAt).toBeLessThan(
+            applicationTransfers[0]!.end!,
+          );
+        }
         if (bench !== 'progress')
           for (const url of coldPaths) {
             if (bench !== 'overlap')
