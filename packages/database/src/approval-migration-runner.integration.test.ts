@@ -121,8 +121,8 @@ suite('outbound approval migration through the global CLI (PostgreSQL)', () => {
     );
     previousRelease = join(temporary, 'previous');
     currentGateRelease = join(temporary, 'current-gate');
-    // The runner/client are unchanged by this PR. An actual pre-0252 migration
-    // directory builds the old ledger; no synthetic applied rows are inserted.
+    // The current runner builds the old ledger from a pre-0252 migration
+    // directory without inserting synthetic applied rows.
     const previousDatabase = join(previousRelease, 'packages/database');
     await mkdir(join(previousDatabase, 'src/core'), { recursive: true });
     await mkdir(join(previousDatabase, 'migrations'));
@@ -132,7 +132,11 @@ suite('outbound approval migration through the global CLI (PostgreSQL)', () => {
         join(previousDatabase, 'migrations', name),
       );
     }
-    for (const source of ['migrate.ts', 'core/client.ts']) {
+    for (const source of [
+      'migrate.ts',
+      'core/client.ts',
+      'core/notification-client.ts',
+    ]) {
       await copyFile(
         new URL(source, import.meta.url),
         join(previousDatabase, 'src', source),
