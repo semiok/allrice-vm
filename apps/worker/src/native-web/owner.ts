@@ -61,9 +61,12 @@ import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
   deferredPromptFact,
   NativePromptOccurrenceSchema,
+  NativeRequestObservationSchema,
   observeNativePrompt,
   waitForPromptFact,
   type NativePromptObservation,
+  type NativeToolObservation,
+  type PublishNativeMemoryCall,
 } from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
@@ -193,7 +196,11 @@ export async function openNativeWebOwner(input: {
           requestId: string;
           mode: 'queue' | 'steer';
           child?: { sessionId: string; parentSessionId: string };
-          observe(signal: AbortSignal): NativePromptObservation;
+          observe(
+            signal: AbortSignal,
+            onTool?: (fact: NativeToolObservation) => void,
+            onMemoryCall?: PublishNativeMemoryCall,
+          ): NativePromptObservation;
         }
       | {
           endpoint: 'session/updateQueue';
@@ -1017,7 +1024,7 @@ export async function openNativeWebOwner(input: {
                     ? call.args.request.delivery
                     : call.args.request.mode,
                 child,
-                observe(current) {
+                observe(current, onTool, onMemoryCall) {
                   observed = observeNativePrompt(
                     transport,
                     {
@@ -1029,6 +1036,8 @@ export async function openNativeWebOwner(input: {
                     },
                     AbortSignal.any([signal, current]),
                     input.launch.auth.timeoutMs,
+                    onTool,
+                    onMemoryCall,
                   );
                   own(observed.settled);
                   return observed;
@@ -1368,6 +1377,7 @@ export async function openNativeWebOwner(input: {
                   rootSessionId: null,
                   delegated: false,
                   inheritedPromptIndexes: [] as number[],
+                  observation: null,
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -1377,6 +1387,7 @@ export async function openNativeWebOwner(input: {
                       ? address.sessionId
                       : address.childSessionId,
                   purpose: kind,
+                  ...(kind === 'assistant' && { nativeAttemptId: attempt.id }),
                   cursor: attempt.cursor,
                   turn: attempt.turn,
                 }),
@@ -1391,6 +1402,7 @@ export async function openNativeWebOwner(input: {
                 rootSessionId?: unknown;
                 delegated?: unknown;
                 inheritedPromptIndexes?: unknown;
+                observation?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
               const prompts = nativePrompts.safeParse(value?.prompts);
@@ -1402,7 +1414,8 @@ export async function openNativeWebOwner(input: {
                 !id.success ||
                 typeof value.recipient !== 'string' ||
                 !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
-                Object.keys(value).length !== 7 ||
+                Object.keys(value).length !==
+                  (Object.hasOwn(value, 'observation') ? 8 : 7) ||
                 !Number.isSafeInteger(value.sourceTurn) ||
                 (attempt.turn !== null && value.sourceTurn !== attempt.turn) ||
                 typeof value.rootSessionId !== 'string' ||
@@ -1420,6 +1433,10 @@ export async function openNativeWebOwner(input: {
                   !inherited.data.length)
               )
                 throw new PersonVmError('PROVIDER_FAILED');
+              const observation =
+                NativeRequestObservationSchema.nullable().safeParse(
+                  value.observation ?? null,
+                );
               const references = new Set(inherited.data);
               if (
                 references.size !== inherited.data.length ||
@@ -1446,6 +1463,7 @@ export async function openNativeWebOwner(input: {
                 rootSessionId: value.rootSessionId,
                 delegated: value.delegated,
                 inheritedPromptIndexes: inherited.data,
+                observation: observation.success ? observation.data : null,
                 promptIds: prompts.data.map(({ requestId }) => requestId),
                 prompts: prompts.data,
               };

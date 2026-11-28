@@ -5,6 +5,7 @@ import type {
   SessionIdOf,
 } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
+import type {} from '@deepseek-ai/dsh-client-ui-input-trigger/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type {} from '@deepseek-ai/dsh-client-ui-theme/client';
@@ -16,14 +17,24 @@ import type {
 } from '../../../src/employee-panels-port';
 import type * as PanelsProduct from '../../../src/employee-panels';
 import { syntheticMainKey, syntheticPanelSnapshot } from './presentation';
-import { createSyntheticPanelsData, type PanelsState } from './data';
+import {
+  createSyntheticPanelsData,
+  panelsEmployee,
+  panelsViewer,
+  panelsWorkspace,
+  uid,
+  type PanelsState,
+} from './data';
 import { legacyEmployeePanelDataClient } from '../../../../../apps/web/lib/chatflow/employee-panel-data-legacy';
 
 export const panelSessionA =
   'session-00000000-0000-4000-8000-000000000036' as SessionIdOf;
 export const panelSessionB =
   'session-00000000-0000-4000-8000-000000000038' as SessionIdOf;
-type Product = Pick<typeof PanelsProduct, 'bindEmployeePanels'>;
+type Product = Pick<
+  typeof PanelsProduct,
+  'bindEmployeePanels' | 'bindEmployeePanelsHttp'
+>;
 
 /** Loaded as a separate test package, excluded from the actual product tarball.
  * Only the business owner is synthetic. Native registry/layout/input are real. */
@@ -39,6 +50,7 @@ export function createFixture(require: (name: string) => unknown) {
       'uiWorkspace',
       'sidebarRight',
       'conversation',
+      'inputTriggers',
     ],
     apply(ctx: Context) {
       installSyntheticPanelsOwner(ctx, product);
@@ -47,6 +59,16 @@ export function createFixture(require: (name: string) => unknown) {
 }
 
 function installSyntheticPanelsOwner(ctx: Context, product: Product) {
+  const formal =
+    typeof document === 'object' &&
+    document.getElementById('app')?.dataset.scopeId === uid(11);
+  const formalOrganization = uid(4);
+  const formalScope = [
+    formalOrganization,
+    panelsViewer,
+    panelsWorkspace,
+    uid(11),
+  ].join('/');
   let revision = 1,
     state: PanelsState = 'list',
     available = true,
@@ -86,7 +108,7 @@ function installSyntheticPanelsOwner(ctx: Context, product: Product) {
         return null;
       if (!snapshots.has(id)) {
         const value = syntheticPanelSnapshot(
-          `synthetic/person/employee/${revision}/${id}`,
+          formal ? formalScope : `synthetic/person/employee/${revision}/${id}`,
           state,
           event,
           (signal) => {
@@ -105,6 +127,20 @@ function installSyntheticPanelsOwner(ctx: Context, product: Product) {
         snapshots.set(id, {
           ...value,
           filesUnread: unknownCount ? null : value.filesUnread,
+          ...(formal && {
+            publicationManagement: {
+              organizationId: formalOrganization,
+              employeeInstanceId: panelsEmployee,
+              threadId: uid(7),
+            },
+            materials: { ...value.materials, readOnly: true },
+            files: {
+              ...value.files,
+              currentEmployee: { id: panelsEmployee, name: '虚拟哥' },
+              employees: [{ id: panelsEmployee, name: '虚拟哥' }],
+              readOnly: true,
+            },
+          }),
         });
       }
       return snapshots.get(id)!;
@@ -168,12 +204,28 @@ function installSyntheticPanelsOwner(ctx: Context, product: Product) {
   // Test-only compatibility fixture for the existing 3.x HTTP server. The
   // production 4.0 binder always rejects absent data, including on rebind.
   const bindFixtureOwner = () =>
-    product.bindEmployeePanels(ctx, port, (_id, snapshot) =>
-      legacyEmployeePanelDataClient(
-        snapshot.files.headers,
-        snapshot.files.viewerId,
-      ),
-    );
+    formal
+      ? product.bindEmployeePanelsHttp(
+          ctx,
+          { ...port, useReference: undefined },
+          (id) =>
+            id === panelSessionA
+              ? {
+                  selection: {
+                    workspaceId: panelsWorkspace,
+                    employeeInstanceId: panelsEmployee,
+                    threadId: uid(7),
+                  },
+                  viewerId: panelsViewer,
+                }
+              : null,
+        )
+      : product.bindEmployeePanels(ctx, port, (_id, snapshot) =>
+          legacyEmployeePanelDataClient(
+            snapshot.files.headers,
+            snapshot.files.viewerId,
+          ),
+        );
   let owner = bindFixtureOwner();
   let ownerBinding: EmployeePanelsBinding | undefined;
   ctx.inject(['allriceEmployeePanels'], (scope) => {
@@ -253,6 +305,17 @@ function installSyntheticPanelsOwner(ctx: Context, product: Product) {
         .for(binding.ctx)
         .state.getSnapshot();
       return { draft, occurrences: [...occurrences], draftRev };
+    },
+    serializeReference: (index: number) => {
+      const id = ctx.sidebarRight.mounted.getSnapshot();
+      const binding = id && bindings.get(id);
+      if (!binding) throw Error('No retained input for the formal codec test');
+      const ref = ctx.conversation.input.for(binding.ctx).state.getSnapshot()
+        .occurrences[index];
+      if (!ref) throw Error('No inserted reference');
+      return ctx.inputTriggers
+        .sessionOf(binding.ctx)
+        .serializeReference(ref.source, ref.ref, new AbortController().signal);
     },
     clearInput: () => {
       const id = ctx.sidebarRight.mounted.getSnapshot();

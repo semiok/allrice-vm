@@ -1,6 +1,8 @@
 import type { TransactionSql } from 'postgres';
 import {
   ContentOwnershipSchema,
+  UuidSchema,
+  type Visibility,
   type ContentPrincipal,
   type WorkbenchFileSharing,
 } from '@allrice/contracts';
@@ -23,6 +25,47 @@ export async function workbenchFileSchemaReady(sql: FilePolicyDatabase) {
 
 export type FilePolicyDatabase =
   ReturnType<typeof getDatabase> | TransactionSql;
+export interface StorageObjectRow {
+  id: string;
+  organization_id: string;
+  workspace_id: string;
+  owner_id: string;
+  object_key: string;
+  category: string;
+  media_type: string;
+  size_bytes: number | string;
+  checksum: string;
+  visibility: Visibility;
+  state: 'pending' | 'ready' | 'deleted';
+  retention_until: Date | null;
+  immutable: boolean;
+  created_at: Date;
+  deleted_at: Date | null;
+}
+
+/** The same scoped, ordinary-file lookup used by getStoredFile. Callers
+ * still check current file policy before using this metadata. */
+export async function readOrdinaryReadyStorageObject(
+  context: Pick<ContentIdentity, 'organizationId' | 'workspaceId'>,
+  objectId: string,
+  sql: FilePolicyDatabase,
+) {
+  const rows = await sql<StorageObjectRow[]>`
+    select * from allrice_storage_objects
+    where id = ${UuidSchema.parse(objectId)}
+      and organization_id = ${context.organizationId}
+      and (${context.workspaceId}::uuid is null or workspace_id = ${context.workspaceId})
+      and state = 'ready'
+      and deleted_at is null
+      and (retention_until is null or retention_until>clock_timestamp())
+      and not exists(select 1 from allrice_company_asset_revisions r where r.snapshot_object_id=allrice_storage_objects.id)
+      and not exists(select 1 from allrice_knowledge_revisions retained where retained.file_object_id=allrice_storage_objects.id)
+      and not exists(select 1 from allrice_company_asset_materials m where m.object_id=allrice_storage_objects.id)
+      and not exists(select 1 from allrice_company_run_assets r where r.material_object_id=allrice_storage_objects.id)
+  `;
+  return rows[0];
+}
+
 export interface WorkbenchFilePolicy {
   object_id: string;
   organization_id: string;

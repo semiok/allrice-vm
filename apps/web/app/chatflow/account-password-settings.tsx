@@ -13,7 +13,15 @@ import styles from './sidebar-settings.module.css';
 const resultUnknown = '修改结果待确认，请重新登录，确认新密码是否生效。';
 const empty = { currentPassword: '', newPassword: '', confirmPassword: '' };
 
-export function AccountPasswordSettings() {
+type AccountPasswordScope = {
+  readonly sessionId: string;
+  readonly signal: AbortSignal;
+  readonly onChanged: () => Promise<void>;
+};
+
+export function AccountPasswordSettings({
+  scope,
+}: { scope?: AccountPasswordScope } = {}) {
   const [open, setOpen] = useState(false);
   // Kept here so folding the section does not clear what was typed.
   const [values, setValues] = useState(empty);
@@ -27,6 +35,7 @@ export function AccountPasswordSettings() {
   });
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (scope?.signal.aborted || pending) return;
     if (values.newPassword !== values.confirmPassword) {
       setError('两次输入的新密码不一致。');
       return;
@@ -36,12 +45,17 @@ export function AccountPasswordSettings() {
     try {
       const response = await fetch('/api/v1/auth/password', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...(scope && { 'x-allrice-expected-session-id': scope.sessionId }),
+        },
+        signal: scope?.signal,
         body: JSON.stringify({
           currentPassword: values.currentPassword,
           newPassword: values.newPassword,
         }),
       });
+      if (scope?.signal.aborted) return;
       if (!response.ok) {
         setError(
           response.status === 401
@@ -52,11 +66,12 @@ export function AccountPasswordSettings() {
         );
         return;
       }
-      window.location.assign('/login');
+      if (scope) await scope.onChanged();
+      else window.location.assign('/login');
     } catch {
-      setError(resultUnknown);
+      if (!scope?.signal.aborted) setError(resultUnknown);
     } finally {
-      setPending(false);
+      if (!scope?.signal.aborted) setPending(false);
     }
   }
   return (

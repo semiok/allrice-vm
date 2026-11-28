@@ -366,3 +366,236 @@ suite(
     });
   },
 );
+
+suite('production settings owner in the installed rc.2 workbench', () => {
+  let host: Awaited<ReturnType<typeof startInstalledProfile>>;
+  let browser: Browser;
+  let artifacts: string;
+  const id = (index: number) =>
+    '10000000-0000-4000-8000-' + String(index).padStart(12, '0');
+  const loginSessionId = id(6);
+
+  beforeAll(async () => {
+    artifacts = await createBrowserArtifacts();
+    host = await startInstalledProfile(
+      new URL('./fixtures/settings-workbench-client.js', import.meta.url),
+    );
+    browser = await chromium.launch({
+      headless: true,
+      ...(process.env.ALLRICE_BROWSER_EXECUTABLE
+        ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
+        : {}),
+    });
+  }, 90_000);
+  afterAll(async () => {
+    try {
+      await browser?.close();
+    } finally {
+      await host?.close();
+    }
+  });
+
+  it('opens the two approved settings entries, calls native General and sends account actions for the exact login', async () => {
+    const context = await browser.newContext({
+      reducedMotion: 'reduce',
+      viewport: { width: 1440, height: 1000 },
+      deviceScaleFactor: 1,
+    });
+    try {
+      await context.addInitScript((origin) => {
+        if (location.origin !== origin || location.pathname !== '/') return;
+        const lifetime = new AbortController();
+        Object.assign(window, {
+          __ALLRICE_D_ENTRY_LIFETIME__: lifetime.signal,
+        });
+      }, host.origin);
+      const page = await context.newPage();
+      const errors: string[] = [];
+      page.on('pageerror', (error) => errors.push(error.message));
+      await page.goto(host.authUrl);
+      const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
+      await proceed.waitFor({ timeout: 5_000 }).catch(() => {});
+      if (await proceed.isVisible()) await proceed.click();
+      const employee = createSidebarFixtureData().employees[1]!;
+      employee.currentVersion.manifest.name = '虚拟哥';
+      const roster = {
+        organizationId: id(1),
+        workspaceId: id(2),
+        viewerId: id(3),
+        employees: [{ ...employee, id: id(4), employeeId: id(4) }],
+        sessions: [
+          {
+            ...createSidebarFixtureData().sessions[1],
+            id: id(5),
+            ownerId: id(3),
+            employeeInstanceId: id(4),
+            employeeAssignmentId: id(4),
+            executionGeneration: '4.0',
+          },
+        ],
+      };
+      const documentOwner = `        <div hidden id="app" data-organization-id="${id(1)}" data-workspace-id="${id(2)}" data-viewer-id="${id(3)}" data-employee-instance-id="${id(4)}" data-thread-id="${id(5)}" data-login-session-id="${loginSessionId}" data-scope-id="${id(7)}" data-native-session-id="session-00000000-0000-4000-8000-000000000036"></div>
+        <script id="allrice-employee-directory" type="application/json">${JSON.stringify(roster).replaceAll('<', '\\u003c')}</script>`;
+      await page.route('**/api/v1/d-entry/panels/**', (route) =>
+        route.fulfill({ status: 403, json: {} }),
+      );
+      await page.route('**/api/v1/auth/password', (route) => {
+        expect(route.request().method()).toBe('POST');
+        expect(route.request().headers()['x-allrice-expected-session-id']).toBe(
+          loginSessionId,
+        );
+        return route.fulfill({ status: 401 });
+      });
+      await page.route('**/api/v1/auth/logout', (route) => {
+        expect(route.request().method()).toBe('POST');
+        expect(route.request().headers()['x-allrice-expected-session-id']).toBe(
+          loginSessionId,
+        );
+        return route.fulfill({ status: 204 });
+      });
+      await page.route('**/api/v1/auth/session', (route) =>
+        route.fulfill({ status: 401 }),
+      );
+      const entryUrl = host.origin + '/chatflow/4.0';
+      await page.route(entryUrl, (route) =>
+        route.fulfill({ body: 'synthetic 4.0 entry' }),
+      );
+      await page.goto(host.origin);
+      await page.waitForFunction(() =>
+        Object.hasOwn(window, '__allriceSettingsWorkbench'),
+      );
+      await page.evaluate(
+        (markup) =>
+          (
+            window as unknown as {
+              __allriceSettingsWorkbench: {
+                mount(markup: string): Promise<void>;
+              };
+            }
+          ).__allriceSettingsWorkbench.mount(markup),
+        documentOwner,
+      );
+      const workbench = page;
+      const conversation = workbench.getByText(
+        '请核对三条销售记录，计算合计，并简要说明结果。',
+        { exact: true },
+      );
+      await conversation.waitFor();
+      await workbench
+        .locator('#chat-sidebar')
+        .getByRole('button', { name: '自动化任务', exact: true })
+        .click();
+      await conversation.waitFor({ state: 'hidden' });
+      const trigger = workbench.locator('#chat-sidebar').getByRole('button', {
+        name: '设置',
+        exact: true,
+      });
+      await trigger.click({ timeout: 12_000 }).catch(async (error) => {
+        await page.screenshot({
+          path: join(artifacts, 'production-settings-first-failure.png'),
+        });
+        throw new Error(
+          'Settings launcher was not visible: ' +
+            JSON.stringify({
+              errors,
+              artifacts,
+              frames: page
+                .frames()
+                .map((frame) => new URL(frame.url()).pathname),
+            }),
+          { cause: error },
+        );
+      });
+      const pane = workbench.getByRole('region', { name: '设置', exact: true });
+      await pane.waitFor();
+      await conversation.waitFor();
+      expect(await pane.getByRole('button').allTextContents()).toEqual([
+        'AllRice 账号',
+        '通用设置 ↗',
+      ]);
+      console.info('Production settings screenshots: ' + artifacts);
+      const capture = async (width: number) => {
+        await page.setViewportSize({
+          width,
+          height: width === 1440 ? 1000 : 844,
+        });
+        for (const theme of ['light', 'dark'] as const) {
+          await workbench.locator('body').evaluate((_, theme) => {
+            const fixture = window as unknown as {
+              __allriceSettingsWorkbench: { setTheme: (theme: string) => void };
+            };
+            fixture.__allriceSettingsWorkbench.setTheme(theme);
+          }, theme);
+          await workbench
+            .locator('body')
+            .evaluate(
+              () =>
+                new Promise<void>((resolve) =>
+                  requestAnimationFrame(() =>
+                    requestAnimationFrame(() => resolve()),
+                  ),
+                ),
+            );
+          await pane.waitFor();
+          expect(
+            await pane.evaluate(
+              (node) =>
+                node.getBoundingClientRect().right <=
+                document.documentElement.clientWidth,
+            ),
+          ).toBe(true);
+          await page.screenshot({
+            path: join(artifacts, `production-settings-${width}-${theme}.png`),
+            animations: 'disabled',
+          });
+        }
+      };
+      await capture(1440);
+      await pane
+        .getByRole('button', { name: '通用设置 ↗', exact: true })
+        .click();
+      const native = workbench.locator('[data-shortcut-modal="settings"]');
+      await native.waitFor({ state: 'visible' });
+      expect(
+        await native
+          .getByRole('button', { name: '通用设置', exact: true })
+          .count(),
+      ).toBe(1);
+      for (const name of ['我的电脑', '工作方式', '已链接应用'])
+        expect(
+          await native.getByRole('button', { name, exact: true }).count(),
+        ).toBe(0);
+      await page.keyboard.press('Escape');
+      await native.waitFor({ state: 'hidden' });
+      await capture(390);
+      await pane
+        .getByRole('button', { name: 'AllRice 账号', exact: true })
+        .click();
+      await pane.getByText('修改登录密码', { exact: true }).click();
+      await page.setViewportSize({ width: 390, height: 395 });
+      await expect
+        .poll(() =>
+          pane.evaluate((node) => node.scrollHeight > node.clientHeight),
+        )
+        .toBe(true);
+      await pane
+        .getByLabel('当前密码', { exact: true })
+        .fill('old-test-password');
+      await pane
+        .getByLabel('新密码', { exact: true })
+        .fill('new-test-password');
+      await pane
+        .getByLabel('确认新密码', { exact: true })
+        .fill('new-test-password');
+      await pane.getByRole('button', { name: '修改密码并重新登录' }).click();
+      await pane
+        .getByRole('alert')
+        .getByText('当前密码不正确，或登录已过期。')
+        .waitFor();
+      await pane.getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.waitForURL(entryUrl);
+    } finally {
+      await context.close();
+    }
+  }, 45_000);
+});

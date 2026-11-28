@@ -19,6 +19,7 @@ import type {
   EmployeeSettingsSection,
 } from './employee-settings-port';
 import styles from './employee-settings.module.css';
+import { applyEmployeeSettingsPane } from './employee-settings-pane';
 
 export { bindEmployeeSettings } from './employee-settings-port';
 export type * from './employee-settings-port';
@@ -237,6 +238,10 @@ export function apply(ctx: Context, options: EmployeeSettingsOptions = {}) {
       Hidden,
     ),
   );
+  if (options.workbench) {
+    applyEmployeeSettingsPane(ctx);
+    return;
+  }
   ctx.inject(['allriceEmployeeSettings'], (scope) => {
     const model = new EmployeeSettingsModel(
       scope.allriceEmployeeSettings,

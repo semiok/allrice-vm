@@ -893,6 +893,8 @@ export async function manageEmployeeAssignments(
   const sql = getDatabase();
   await employeeAccessTransaction(sql, async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
+    // Keep assignment changes serialized while allowing memory INSERT to
+    // check the unchanged employee key.
     const employees = await transaction<
       {
         id: string;
@@ -911,7 +913,7 @@ export async function manageEmployeeAssignments(
       where e.id = ${update.employeeId}
         and e.organization_id = ${context.organizationId}
         and e.workspace_id = ${workspaceId}
-      for update of e
+      for no key update of e
     `;
     const employee = employees[0];
     if (!employee || employee.status !== 'active') {
@@ -1077,6 +1079,8 @@ export async function updateEmployeeStatus(
   const sql = getDatabase();
   await employeeAccessTransaction(sql, async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
+    // The employee key stays unchanged. Keep status writers serialized while
+    // allowing the memory INSERT's foreign-key check to take KEY SHARE.
     const employees = await transaction<
       { id: string; employee_key: string; status: string }[]
     >`
@@ -1084,7 +1088,7 @@ export async function updateEmployeeStatus(
       where id = ${employeeId}
         and organization_id = ${context.organizationId}
         and workspace_id = ${workspaceId}
-      for update
+      for no key update
     `;
     const employee = employees[0];
     if (!employee) throw new EmployeeHubError('not_found');

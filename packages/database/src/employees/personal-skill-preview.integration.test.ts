@@ -18,6 +18,7 @@ import {
   EmployeeSkillCatalogSchema,
   PersonalSkillPreviewResponseSchema,
   PersonalSkillConfirmResponseSchema,
+  PersonalSkillRemoveResponseSchema,
   type RequestContext,
   type StoragePort,
 } from '@allrice/contracts';
@@ -26,6 +27,8 @@ import { SkillPreviewTokens, parsePersonalSkill } from '@allrice/skill-import';
 import * as client from '../core/client.ts';
 import * as data from '../data.ts';
 import * as browserWriter from './personal-skill-browser.ts';
+import * as panelAccess from '../employee-panels-access.ts';
+import { updateDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import { loadPlatformContentCatalog } from '../platform-content/catalog.ts';
 import { synchronizePlatformContent } from '../platform-content/sync.ts';
 import { previewPersonalSkillUpdateTarget } from './personal-skill-versions.ts';
@@ -43,7 +46,10 @@ import {
   listAdminTenantEmployees,
   changeAdminTenantEmployee,
 } from '../tenant-employees.ts';
-import { getEmployeeWorkspace } from '../workspace/service.ts';
+import {
+  createChatSession,
+  getEmployeeWorkspace,
+} from '../workspace/service.ts';
 import { createEmployeeInstance } from './employee-instances.ts';
 import {
   savePlatformEmployeeDraft,
@@ -78,6 +84,10 @@ const root = 'https://github.com/acme/skills';
 // like the existing personal-scene and personal-skill HTTP regressions.
 const routePath =
   '../../../../apps/web/app/api/v1/employee-instances/[id]/skills/preview/route.ts';
+const panelConfirmRoute =
+  '../../../../apps/web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/confirm/route.ts';
+const panelDisableRoute =
+  '../../../../apps/web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/[installationId]/route.ts';
 
 suite('browser Skill source preview and confirmation', () => {
   let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
@@ -233,6 +243,294 @@ suite('browser Skill source preview and confirmation', () => {
       { params: Promise.resolve({ id }) },
     );
   }
+
+  async function setPanelRelease(context?: RequestContext) {
+    return updateDEntryReleasePolicy(admin, {
+      revision: randomUUID(),
+      defaultGeneration: '3.x',
+      selections: context
+        ? [
+            {
+              organizationId: context.organizationId,
+              personId: context.actor.id,
+            },
+          ]
+        : [],
+    });
+  }
+
+  async function panelWrite(
+    s: Awaited<ReturnType<typeof setup>>,
+    threadId: string | null,
+    body: object,
+    options: {
+      viewerId?: string | null;
+      origin?: string;
+      context?: RequestContext;
+      instanceId?: string;
+      installationId?: string;
+    } = {},
+  ) {
+    browser.context = options.context ?? s.owner.context;
+    const url = new URL('https://allrice.test/');
+    const panelEmployeeInstanceId = options.instanceId ?? s.assigned.id;
+    const { installationId } = options;
+    url.pathname = `/api/v1/d-entry/panels/${panelEmployeeInstanceId}/skills/${installationId ?? 'confirm'}`;
+    url.searchParams.set('workspaceId', s.owner.workspaceId);
+    if (threadId) url.searchParams.set('threadId', threadId);
+    const viewerId =
+      options.viewerId === undefined ? s.owner.user.id : options.viewerId;
+    const request = new Request(url, {
+      method: installationId ? 'DELETE' : 'POST',
+      headers: {
+        origin: options.origin ?? url.origin,
+        'content-type': 'application/json',
+        ...(viewerId ? { 'x-allrice-expected-viewer-id': viewerId } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    if (installationId) {
+      const { DELETE } = await import(panelDisableRoute);
+      return DELETE(request, {
+        params: Promise.resolve({ panelEmployeeInstanceId, installationId }),
+      }) as Promise<Response>;
+    }
+    const { POST } = await import(panelConfirmRoute);
+    return POST(request, {
+      params: Promise.resolve({ panelEmployeeInstanceId }),
+    }) as Promise<Response>;
+  }
+
+  async function panelWrites(s: Awaited<ReturnType<typeof setup>>) {
+    const ownerId = s.owner.user.id;
+    return (
+      await f.db`select
+      (select count(*)::int from allrice_storage_objects where owner_id=${ownerId} and state<>'deleted') files,
+      (select count(*)::int from allrice_personal_skill_installations where owner_id=${ownerId}) installs,
+      (select count(*)::int from allrice_personal_skill_versions where owner_id=${ownerId}) versions,
+      (select count(*)::int from allrice_personal_skill_bindings where owner_id=${ownerId}) bindings,
+      (select count(*)::int from allrice_personal_skill_receipts where owner_id=${ownerId}) receipts,
+      (select count(*)::int from allrice_employee_runs) runs`
+    )[0]!;
+  }
+
+  async function panelPreview(
+    s: Awaited<ReturnType<typeof setup>>,
+    target?: unknown,
+    fileName?: string,
+  ) {
+    const response = await send(
+      s.owner.context,
+      s.assigned.id,
+      s.owner.workspaceId,
+      await zip(),
+      undefined,
+      target,
+      fileName,
+    );
+    expect(response.status).toBe(200);
+    const preview = PersonalSkillPreviewResponseSchema.parse(
+      await response.json(),
+    );
+    return {
+      workspaceId: s.owner.workspaceId,
+      requestId: randomUUID(),
+      previewId: preview.previewId,
+      digest: preview.digest,
+    };
+  }
+
+  async function panelThread(
+    s: Awaited<ReturnType<typeof setup>>,
+    executionGeneration: '3.x' | '4.0' = '4.0',
+  ) {
+    return (
+      await createChatSession(
+        s.owner.context,
+        {
+          workspaceId: s.owner.workspaceId,
+          employeeInstanceId: s.assigned.id,
+          title: 'Skill publication fixture',
+        },
+        { executionGeneration },
+      )
+    ).id;
+  }
+
+  it('4.0 rejects cross-origin, stale viewer, wrong generation, and read-only confirmation before Skill writes', async () => {
+    const s = await setup(true);
+    const sibling = await createEmployeeInstance(s.owner.context, {
+      workspaceId: s.owner.workspaceId,
+      assignmentId: s.assigned.id,
+      requestId: randomUUID(),
+      profile: { name: 'Other employee' },
+    });
+    const input = await panelPreview(s);
+    const legacy = await panelThread(s, '3.x');
+    const threadId = await panelThread(s);
+    await setPanelRelease(s.owner.context);
+    try {
+      const before = await panelWrites(s);
+      const attempts = await Promise.all([
+        panelWrite(s, null, input),
+        panelWrite(s, threadId, input, { viewerId: null }),
+        panelWrite(s, threadId, input, { viewerId: randomUUID() }),
+        panelWrite(s, threadId, input, { origin: 'https://foreign.test' }),
+        panelWrite(s, legacy, input),
+        panelWrite(s, threadId, input, { instanceId: sibling.id }),
+        panelWrite(s, threadId, { ...input, workspaceId: randomUUID() }),
+      ]);
+      expect(attempts.map((response) => response.status)).toEqual([
+        403, 403, 409, 403, 403, 403, 403,
+      ]);
+      const peer = await panelWrite(s, threadId, input, {
+        context: s.peer.context,
+        viewerId: s.peer.user.id,
+      });
+      expect([403, 404]).toContain(peer.status);
+      await f.db`update allrice_memberships set role='viewer' where user_id=${s.owner.user.id}`;
+      // Both the request context captured before downgrade and existing ownership
+      // remain present. The writer must require the current writable role.
+      expect((await panelWrite(s, threadId, input)).status).toBe(403);
+      expect(await panelWrites(s)).toEqual(before);
+    } finally {
+      await setPanelRelease();
+    }
+  });
+
+  it('4.0 rechecks release inside final publication and removes bytes staged before revocation', async () => {
+    const s = await setup();
+    const input = await panelPreview(s);
+    const threadId = await panelThread(s);
+    const before = await panelWrites(s);
+    await setPanelRelease(s.owner.context);
+    const storage = browser.storage!;
+    const put = storage.put.bind(storage);
+    const stage = vi
+      .spyOn(storage, 'put')
+      .mockImplementationOnce(async (...args) => {
+        await put(...args);
+        await setPanelRelease();
+      });
+    try {
+      const denied = await panelWrite(s, threadId, input);
+      expect(denied.status).toBe(403);
+      expect(stage).toHaveBeenCalledOnce();
+      expect(await panelWrites(s)).toEqual(before);
+      const [archive] =
+        await f.db`select state,immutable,object_key from allrice_storage_objects where owner_id=${s.owner.user.id}`;
+      expect(archive).toMatchObject({ state: 'deleted', immutable: false });
+      await expect(
+        access(join(f.storageRoot, archive!.object_key)),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      stage.mockRestore();
+      await setPanelRelease();
+    }
+  });
+
+  it('4.0 retains the signed target and disable CAS, including transaction-time release and exact binding epoch', async () => {
+    const s = await setup(true);
+    const sibling = await createEmployeeInstance(s.owner.context, {
+      workspaceId: s.owner.workspaceId,
+      assignmentId: s.assigned.id,
+      requestId: randomUUID(),
+      profile: { name: 'Shared Skill employee' },
+    });
+    const input = await panelPreview(s);
+    const threadId = await panelThread(s);
+    await setPanelRelease(s.owner.context);
+    try {
+      const confirmed = await panelWrite(s, threadId, input);
+      expect(confirmed.status).toBe(200);
+      const first = PersonalSkillConfirmResponseSchema.parse(
+        await confirmed.json(),
+      );
+      expect(first.receipt).toMatchObject({
+        operation: 'install',
+        requestId: input.requestId,
+        instanceId: s.assigned.id,
+      });
+      expect(await (await panelWrite(s, threadId, input)).json()).toEqual(
+        first,
+      );
+      const { result: shared } = await installWeb(s, sibling.id);
+      const expected = shared.skill;
+      const update = await panelPreview(
+        s,
+        {
+          operation: 'update',
+          installationId: expected.id,
+          expectedRevision: expected.revision,
+          expectedVersionId: expected.versionId,
+        },
+        'updated-source.zip',
+      );
+      const before = await panelWrites(s);
+      expect((await panelWrite(s, threadId, update)).status).toBe(403);
+      expect(await panelWrites(s)).toEqual(before);
+
+      const remove = {
+        workspaceId: s.owner.workspaceId,
+        requestId: randomUUID(),
+        expectedRevision: expected.revision,
+      };
+      const options = { installationId: expected.id };
+      expect(
+        (
+          await panelWrite(
+            s,
+            threadId,
+            { ...remove, expectedRevision: expected.revision - 1 },
+            options,
+          )
+        ).status,
+      ).toBe(409);
+      const requireAccess = panelAccess.requireEmployeePanelsAccess;
+      const revoke = vi
+        .spyOn(panelAccess, 'requireEmployeePanelsAccess')
+        .mockImplementation(async (...args) => {
+          if (args[2]) await setPanelRelease();
+          return requireAccess(...args);
+        });
+      try {
+        expect((await panelWrite(s, threadId, remove, options)).status).toBe(
+          403,
+        );
+        expect(revoke.mock.calls.filter((args) => args[2])).toHaveLength(1);
+      } finally {
+        revoke.mockRestore();
+      }
+      expect(await panelWrites(s)).toEqual(before);
+      expect((await listPersonalSkills(s.owner.context))[0]).toEqual(expected);
+      await setPanelRelease(s.owner.context);
+      const response = await panelWrite(s, threadId, remove, options);
+      expect(response.status).toBe(200);
+      const { receipt } = PersonalSkillRemoveResponseSchema.parse(
+        await response.json(),
+      );
+      expect(receipt).toMatchObject({
+        operation: 'disable',
+        scope: 'instance',
+        requestId: remove.requestId,
+        instanceId: s.assigned.id,
+        versionId: expected.versionId,
+        revision: expected.revision + 1,
+        binding: { enabled: false, epoch: first.skill.bindings[0]!.epoch + 1 },
+      });
+      expect(
+        (await listPersonalSkills(s.owner.context))[0]?.bindings.find(
+          (b) => b.instanceId === sibling.id,
+        ),
+      ).toEqual(expected.bindings.find((b) => b.instanceId === sibling.id));
+      expect(await panelWrites(s)).toEqual({
+        ...before,
+        receipts: before.receipts + 1,
+      });
+    } finally {
+      await setPanelRelease();
+    }
+  });
   async function installWeb(
     s: Awaited<ReturnType<typeof setup>>,
     id = s.assigned.id,

@@ -119,13 +119,39 @@ export async function readEmployeeSkills(
   scope: EmployeeSkillScope,
   signal?: AbortSignal,
 ) {
+  return readSkillCatalog(
+    scope,
+    `${endpoint(scope)}?${new URLSearchParams({ workspaceId: scope.workspaceId })}`,
+    { signal },
+  );
+}
+
+export function readDEntryEmployeeSkills(
+  scope: EmployeeSkillScope,
+  {
+    threadId,
+    expectedViewerId,
+  }: { threadId: string; expectedViewerId: string },
+  signal: AbortSignal,
+) {
+  const query = new URLSearchParams({
+    workspaceId: scope.workspaceId,
+    threadId,
+  });
+  return readSkillCatalog(
+    scope,
+    `/api/v1/d-entry/panels/${encodeURIComponent(scope.instanceId)}/skills?${query}`,
+    { signal, headers: { 'x-allrice-expected-viewer-id': expectedViewerId } },
+  );
+}
+
+async function readSkillCatalog(
+  scope: EmployeeSkillScope,
+  path: string,
+  options: RequestInit,
+) {
   const parsed = EmployeeSkillCatalogSchema.safeParse(
-    await read(
-      scope,
-      'catalog',
-      `${endpoint(scope)}?${new URLSearchParams({ workspaceId: scope.workspaceId })}`,
-      { signal },
-    ),
+    await read(scope, 'catalog', path, options),
   );
   if (
     !parsed.success ||

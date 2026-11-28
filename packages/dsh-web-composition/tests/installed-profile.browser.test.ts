@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startInstalledProfile } from './installed-profile';
+import { registerSubagentPanelBrowserTest } from './subagent-panel-browser';
 import {
   deliveryName,
   documentSession,
@@ -22,6 +23,7 @@ const suite =
   process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
     ? describe
     : describe.skip;
+suite('installed rc.2 subagent sidebar', registerSubagentPanelBrowserTest);
 suite('installed AllRice native Web composition', () => {
   let browser: Browser, page: Page;
   let host: Awaited<ReturnType<typeof startInstalledProfile>>;

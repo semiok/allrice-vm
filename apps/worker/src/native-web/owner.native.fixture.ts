@@ -21,7 +21,7 @@ import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { expect, vi } from 'vitest';
-import type { RequestContext } from '@allrice/contracts';
+import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import { readReleasedGuestProfile } from '../d-entry/released-profile.js';
 import {
   PersonVmError,
@@ -162,6 +162,9 @@ export async function setupNativeWebFixture(
   isolated?: {
     resetProbe?: boolean;
     onPublicationDiagnostic?: (text: string) => void;
+    nativeToolEvidenceProbe?: string;
+    identity?: Omit<DEntryIdentity, 'threadId'>;
+    loginSessionId?: string;
   },
   managedModel?: NativeWebModelAdapter,
   beforePrompt?: Parameters<typeof openNativeWebOwner>[0]['beforePrompt'],
@@ -205,6 +208,10 @@ export async function setupNativeWebFixture(
   const releaseSignal = new AbortController().signal;
   const profile = await readReleasedGuestProfile(seal, releaseSignal);
   const dshHome = join(root, 'dsh');
+  const toolEvidenceProbe = join(
+    dshHome,
+    'native-web/fixture-tool-evidence.mjs',
+  );
   await expect(access(dshHome)).rejects.toMatchObject({ code: 'ENOENT' });
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -214,16 +221,16 @@ export async function setupNativeWebFixture(
   const binding = {
     vmId: randomUUID(),
     instanceId: randomUUID(),
-    personId: randomUUID(),
-    organizationId: randomUUID(),
+    personId: isolated?.identity?.personId ?? randomUUID(),
+    organizationId: isolated?.identity?.organizationId ?? randomUUID(),
     leaseEpoch: 1,
   };
   // Test-owned endpoint facts; no production roster or authority is manufactured.
   const principalProfile = {
-    workspaceId: randomUUID(),
-    employeeInstanceId: randomUUID(),
-    employeeRevision: 1,
-    employeeVersionId: randomUUID(),
+    workspaceId: isolated?.identity?.workspaceId ?? randomUUID(),
+    employeeInstanceId: isolated?.identity?.employeeInstanceId ?? randomUUID(),
+    employeeRevision: isolated?.identity?.employeeRevision ?? 1,
+    employeeVersionId: isolated?.identity?.employeeVersionId ?? randomUUID(),
   };
   const configuration = {
     origin: `http://127.0.0.1:${port}/`,
@@ -268,12 +275,25 @@ export async function setupNativeWebFixture(
             },
           ],
         });
+        if (isolated.nativeToolEvidenceProbe)
+          patch.push({
+            insert: [
+              {
+                id: 'fixture-tool-evidence',
+                name: pathToFileURL(toolEvidenceProbe).href,
+              },
+            ],
+          });
         contents = JSON.stringify(patch);
       }
       await writeFile(file.path, contents, { mode: file.mode });
     }
   }
   await stage(launch);
+  if (isolated?.nativeToolEvidenceProbe)
+    await writeFile(toolEvidenceProbe, isolated.nativeToolEvidenceProbe, {
+      mode: 0o600,
+    });
   const tracePath = join(root, 'profile-patch-reads');
   const profileDirectory = join(dshHome, 'profiles/allrice-web');
   const profilePatch = join(
@@ -580,7 +600,7 @@ export async function setupNativeWebFixture(
   };
   const context: RequestContext = {
     requestId: randomUUID(),
-    sessionId: randomUUID(),
+    sessionId: isolated?.loginSessionId ?? randomUUID(),
     actor: { type: 'user', id: binding.personId },
     organizationId: binding.organizationId,
     workspaceId: principalProfile.workspaceId,

@@ -22,10 +22,13 @@ import {
 import type { z } from 'zod';
 import { DataAccessError } from './data.ts';
 import {
+  EmployeeMemoryWriteOutcomeUnknown,
   issueNativeEmployeeMemoryContext,
   readNativeEmployeeMemoryOrdinal,
   rememberNativeEmployeeMemory,
   reconcileNativeEmployeeMemory,
+  type NativeMemoryRestoreTarget,
+  type NativeMemoryTarget,
 } from './employee-memory-runtime.ts';
 import {
   getAdminEmployeeMemory,
@@ -41,6 +44,10 @@ import {
   deleteManagedEmployeeMemory,
   promoteManagedEmployeeMemory,
 } from './workspace/service.ts';
+export {
+  createNativeEmployeeMemoryHost,
+  EmployeeMemoryWriteOutcomeUnknown,
+} from './employee-memory-runtime.ts';
 
 type ListQuery = z.input<typeof EmployeeMemoryListQuerySchema>;
 type CreateCommand = z.input<typeof CreatePersonalEmployeeMemoryInputSchema>;
@@ -65,9 +72,28 @@ export interface EmployeeMemoryModuleQualification {
  * transaction. Their missing production current/B/call/source assembly is
  * closed; no host-supplied SQL or test assembly appears in these options. */
 export interface EmployeeMemoryPort {
-  issueContext: typeof issueNativeEmployeeMemoryContext;
-  readOrdinal: typeof readNativeEmployeeMemoryOrdinal;
-  remember: typeof rememberNativeEmployeeMemory;
+  issueContext(
+    context: RequestContext,
+    input: NativeMemoryTarget,
+    signal: AbortSignal,
+  ): Promise<string>;
+  restoreContext(
+    context: RequestContext,
+    input: NativeMemoryRestoreTarget,
+    signal: AbortSignal,
+  ): Promise<string>;
+  readOrdinal(
+    context: RequestContext,
+    target: NativeMemoryTarget,
+    ordinal: unknown,
+    signal: AbortSignal,
+  ): ReturnType<typeof readNativeEmployeeMemoryOrdinal>;
+  remember(
+    context: RequestContext,
+    target: NativeMemoryTarget,
+    input: unknown,
+    signal: AbortSignal,
+  ): ReturnType<typeof rememberNativeEmployeeMemory>;
   reconcileRemember: typeof reconcileNativeEmployeeMemory;
   source(
     context: RequestContext,
@@ -114,18 +140,6 @@ export interface EmployeeMemoryPort {
     input: MemoryAdminDetailQueryProjection,
     signal: AbortSignal,
   ): Promise<DetailResult>;
-}
-
-/** The owner write has completed, but its result was not delivered. Retain the
- * original operation key for reconciliation; this is not a definitive denial.
- * The ordinary Error maps through existing HTTP INTERNAL_ERROR (500), while
- * cause preserves the original validation/access/cancellation failure locally.
- * Native cancellation remains on the caller's unchanged AbortSignal. */
-export class EmployeeMemoryWriteOutcomeUnknown extends Error {
-  constructor(cause: unknown) {
-    super('employee_memory_write_outcome_unknown', { cause });
-    this.name = 'EmployeeMemoryWriteOutcomeUnknown';
-  }
 }
 
 /** Await the actual owner transaction even when the caller has canceled. An
@@ -208,8 +222,12 @@ export function createEmployeeMemoryPort(
   }
 
   return {
-    issueContext: issueNativeEmployeeMemoryContext,
-    readOrdinal: readNativeEmployeeMemoryOrdinal,
+    issueContext: (context, input, signal) =>
+      issueNativeEmployeeMemoryContext(context, input, signal, 'issue'),
+    restoreContext: (context, input, signal) =>
+      issueNativeEmployeeMemoryContext(context, input, signal, 'restore'),
+    readOrdinal: (context, input, ordinal, signal) =>
+      readNativeEmployeeMemoryOrdinal(context, input, ordinal, signal),
     async remember(context, target, input, signal) {
       const receipt = await rememberNativeEmployeeMemory(
         context,

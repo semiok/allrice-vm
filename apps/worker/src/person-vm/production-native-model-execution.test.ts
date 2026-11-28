@@ -12,15 +12,22 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
 import { installDEntryNativeOwnerPort } from '../d-entry/native-owner.js';
+import { selectNativeMemoryConfiguration } from './production-native-memory.js';
 import {
   createProductionNativeModelExecution,
   nativeRunExecutionIds,
   readNativePromptContributors,
 } from './production-native-model-execution.js';
 
-const mocks = vi.hoisted(() => ({ pin: vi.fn(), watch: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  pin: vi.fn(),
+  watch: vi.fn(),
+  query: vi.fn(),
+}));
 vi.mock('@allrice/database', () => ({
   getDEntryNativeRootPin: mocks.pin,
+  getDatabase: () =>
+    Object.assign(mocks.query, { json: (value: unknown) => value }),
   watchDEntryNativeRosterAuthority: mocks.watch,
 }));
 
@@ -69,6 +76,7 @@ const login = (sessionId = randomUUID()): RequestContext => ({
   authenticatedAt: new Date().toISOString(),
 });
 beforeEach(() => {
+  mocks.query.mockReset();
   mocks.pin.mockReset().mockResolvedValue({
     identity,
     vmId: binding.vmId,
@@ -83,6 +91,7 @@ beforeEach(() => {
         revoked: signal,
         close: vi.fn(async () => {}),
         assertObserved: vi.fn(async () => {}),
+        assertObservedNow: vi.fn(),
         assertCurrent: vi.fn(async () => {}),
       }),
     );
@@ -130,6 +139,95 @@ it('checks the exact adopted message occurrence for billing after the native tur
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
   }
   await observer.close();
+});
+
+it('fences the private call result and joins actual publication when the native body cancels', async () => {
+  const source = {
+    adapterId: 'native-fixture',
+    sessionId: issue.root.nativeSessionId,
+    scopeId: issue.scopeId,
+    requestId: 'native-request',
+  };
+  const ticket = randomUUID();
+  const adopted = { messageId: 'native-message', turn: 2 };
+  const frame = {
+    ticket,
+    fact: {
+      attemptId: 'native-attempt',
+      assistantSequence: 4,
+      callId: 'native-call',
+      name: 'mcp__allrice__memory_read',
+      sequence: 5,
+      executionSessionRef: source.sessionId,
+      executionParentRef: null,
+      dispatch: { kind: 'sealed-handler', version: 'fixture-memory' },
+      human: {
+        occurrence: {
+          sessionId: source.sessionId,
+          requestId: source.requestId,
+          scopeId: source.scopeId,
+          ...adopted,
+        },
+        kind: 'ordinary-human-message',
+        sequence: 2,
+        digest: 'sha256:' + 'a'.repeat(64),
+      },
+    },
+  };
+  const start = deferredPromptFact<AbortSignal>();
+  const release = deferredPromptFact<void>();
+  const finish = deferredPromptFact<void>();
+  const send = deferredPromptFact<(chunk: Buffer) => void>();
+  const reply = vi.fn();
+  const observe = observeNativePrompt(
+    {
+      async readManagedModelProof(body, _signal, _image, receive) {
+        if (!receive) {
+          reply(body);
+          return null;
+        }
+        expect(JSON.parse(body)).toMatchObject({ memoryCalls: true });
+        receive(
+          Buffer.from(
+            `ready\ninserted ${JSON.stringify({ messageId: adopted.messageId })}\nclaimed ${JSON.stringify(adopted)}\n`,
+          ),
+        );
+        send.resolve(receive);
+        await finish.promise;
+        return null;
+      },
+    },
+    source,
+    new AbortController().signal,
+    5_000,
+    undefined,
+    async (fact, signal) => {
+      expect(fact).toEqual(frame.fact);
+      start.resolve(signal);
+      await release.promise;
+      return 'already-issued-ref';
+    },
+  );
+  try {
+    await observe.ready;
+    const receive = await send.promise;
+    receive(Buffer.from(`memory-call ${JSON.stringify(frame)}\n`));
+    const active = await start.promise;
+    receive(Buffer.from(`memory-call-cancel ${ticket}\nended\n`));
+    expect(active.aborted).toBe(true);
+    finish.resolve();
+    const settled = vi.fn();
+    void observe.settled.then(settled);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    await expect(observe.settled).resolves.toBe('ended');
+    expect(reply).not.toHaveBeenCalled();
+  } finally {
+    finish.resolve();
+    release.resolve();
+    await observe.close();
+  }
 });
 
 it.each([
@@ -200,7 +298,11 @@ function nativeFacts() {
   };
 }
 
-async function setup(withWebSearch = false, scopedRouting = false) {
+async function setup(
+  nativeMemory?: Parameters<Attach>[0]['nativeMemory'],
+  withWebSearch = false,
+  scopedRouting = false,
+) {
   const lifetime = new AbortController();
   let observed!: Observer;
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
@@ -240,6 +342,7 @@ async function setup(withWebSearch = false, scopedRouting = false) {
   const attached = await createProductionNativeModelExecution().attach(
     {
       lifetime: lifetime.signal,
+      nativeMemory,
       providers: { applicationBuild: { manifestDigest: 'fixture-build' } },
       startup: {
         installModelAdapter: () => () => {},
@@ -326,8 +429,155 @@ async function setup(withWebSearch = false, scopedRouting = false) {
   };
 }
 
+it('in a new Host, selects the persisted B only after a newly adopted steer proves the same native turn', async () => {
+  const publication = { root: vi.fn(), call: vi.fn() };
+  const build = {
+    sourceSha: 'a'.repeat(40),
+    sourceTree: 'b'.repeat(40),
+    manifestDigest: 'sha256:' + 'c'.repeat(64),
+    webBuildId: 'fixture',
+  };
+  const source = {
+    publication,
+    toolVersions: { memory_read: 'read-v1', memory_remember: 'remember-v1' },
+  };
+  const memory = selectNativeMemoryConfiguration(source, build);
+  expect(
+    selectNativeMemoryConfiguration(source, build).moduleConfigRevisionRef,
+  ).toBe(memory.moduleConfigRevisionRef);
+  expect(
+    selectNativeMemoryConfiguration(
+      {
+        ...source,
+        toolVersions: { ...source.toolVersions, memory_read: 'read-v2' },
+      },
+      build,
+    ).moduleConfigRevisionRef,
+  ).not.toBe(memory.moduleConfigRevisionRef);
+  const f = await setup(memory);
+  const context = login();
+  const root = SessionId(issue.root.nativeSessionId);
+  const signal = new AbortController().signal;
+  const uninstall = installDEntryNativeOwnerPort({
+    async resolve() {
+      return {
+        ...f.profile,
+        controlReady: () => true,
+        assertCurrent: async () => {},
+        acquirePrincipal: () => {
+          throw Error('Unexpected scope creation');
+        },
+        async readSessions() {
+          return {
+            ok: true,
+            value: {
+              items: [
+                {
+                  sessionId: root,
+                  updatedAt: 1,
+                  blank: false,
+                  running: true,
+                  agentAvailable: true,
+                },
+              ],
+            },
+          };
+        },
+      };
+    },
+  });
+  try {
+    const prior = {
+      sessionId: root,
+      scopeId: randomUUID(),
+      requestId: 'original-prompt',
+      messageId: 'original-adoption',
+      turn: 1,
+    };
+    const steer = {
+      ...prior,
+      scopeId: issue.scopeId,
+      requestId: 'steer-request',
+      messageId: 'steer-adoption',
+    };
+    const native = nativeFacts();
+    const admission = await f.admit(context, steer.requestId, native, 'steer');
+    native.insert(steer.messageId);
+    admission.accepted();
+    const recipient = 'r'.repeat(43);
+    const attempt = {
+      kind: 'assistant',
+      id: randomUUID(),
+      turn: 1,
+      sourceTurn: 1,
+      cursor: 18,
+      recipient,
+      rootSessionId: root,
+      delegated: false,
+      inheritedPromptIndexes: [],
+      prompts: [prior, steer],
+      observation: {
+        proofState: 'adopted',
+        firstMemoryAttempt: false,
+        memoryToolVersions: source.toolVersions,
+        originalHuman: {
+          occurrence: prior,
+          sequence: 3,
+          digest: 'sha256:' + 'a'.repeat(64),
+        },
+        human: {
+          kind: 'adopted-steering',
+          occurrence: steer,
+          sequence: 14,
+          digest: 'sha256:' + 'b'.repeat(64),
+        },
+      },
+    };
+    f.readNativeAttemptFor.mockResolvedValue(attempt);
+    const resolve = () => {
+      const body = Buffer.from(
+        JSON.stringify({ ...f.selection, sessionId: root, recipient }),
+      );
+      const request = Object.assign(Readable.from([body]), {
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      });
+      return f.resolveReference!(
+        request as unknown as IncomingMessage,
+        binding,
+        signal,
+      );
+    };
+    const b = randomUUID();
+    mocks.query.mockResolvedValueOnce([{ id: b }]);
+    await expect(resolve()).resolves.toMatchObject({ context });
+    expect(f.bindReference.mock.lastCall?.[0].execution.runId).toBe(b);
+    expect(native.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      steer,
+    );
+    expect(mocks.query.mock.lastCall).toContainEqual(
+      expect.objectContaining({
+        loginSessionId: context.sessionId,
+        nativeRequestId: prior.requestId,
+      }),
+    );
+    mocks.query.mockResolvedValueOnce([]);
+    await expect(resolve()).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(publication.root).not.toHaveBeenCalled();
+  } finally {
+    uninstall();
+    await f.close();
+  }
+});
+
 it('keeps standalone R2 Search closed for a scoped VM even when the Host configured its provider', async () => {
-  const f = await setup(true, true);
+  const f = await setup(undefined, true, true);
   try {
     const resolve = f.resolveSearch;
     if (!resolve) throw Error('Native Search service unavailable');
@@ -347,7 +597,7 @@ it('keeps standalone R2 Search closed for a scoped VM even when the Host configu
 });
 
 it('binds Search to the exact root occurrence when a child shares its request ID', async () => {
-  const f = await setup(true);
+  const f = await setup(undefined, true);
   const context = login();
   const root = SessionId(issue.root.nativeSessionId);
   const child = { sessionId: SessionId('native-child'), parentSessionId: root };

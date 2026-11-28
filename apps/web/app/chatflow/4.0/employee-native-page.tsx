@@ -38,6 +38,7 @@ import {
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
 import { warmPublicProfileAssets } from '../../../lib/d-entry/public-profile-warmup';
+import { createEmployeeMemoryPageWrites } from '../../../lib/memory/employee-memory-page-writes';
 import styles from './employee-native-page.module.css';
 
 const noStartupAssets: readonly string[] = [];
@@ -171,6 +172,7 @@ export function EmployeeNativePage({
   const frame = useRef<HTMLIFrameElement>(null);
   const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
+  const [bindMemoryWrites] = useState(createEmployeeMemoryPageWrites);
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
     initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
@@ -234,6 +236,7 @@ export function EmployeeNativePage({
     const lifetime = activation.warmup?.lifetime ?? new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
+    let unbindMemoryWrites: (() => void) | undefined;
     let resourceScopeId: string | undefined;
     let navigating = false;
     let navigationClosed = false;
@@ -870,10 +873,32 @@ export function EmployeeNativePage({
       lifetime.signal.throwIfAborted();
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
+        unbindMemoryWrites?.();
         send(pageRevoked);
         if (!prepare && !lifetime.signal.aborted) setFailed(true);
         // Before issuance, ready's rejection is handled by setting below.
         if (prepare && mounted) finish('failed');
+        // Password changes and logout can revoke this carrier before their
+        // responses reach the iframe. Only the current cookie decides where
+        // the outer page goes.
+        if (mounted)
+          void retire()
+            .then(async () => {
+              if (detached || replace.current !== applyQuery) return;
+              const response = await fetch('/api/v1/auth/session', {
+                credentials: 'same-origin',
+                cache: 'no-store',
+                signal: lifetime.signal,
+              });
+              // The unqualified entry checks the cookie again on navigation.
+              if (
+                response.status === 401 &&
+                !detached &&
+                replace.current === applyQuery
+              )
+                location.replace('/chatflow/4.0');
+            })
+            .catch(() => {});
       });
       const issued = (await carrier.ready).scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
@@ -882,6 +907,7 @@ export function EmployeeNativePage({
       selectedEmployee = selection;
       frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
+      unbindMemoryWrites = bindMemoryWrites(window, issued.scopeId, identity);
       mounted = true;
       const documentUrl = '/chatflow/4.0/document?' + params;
       const retainedWindow = activation.retainFrame
@@ -912,6 +938,7 @@ export function EmployeeNativePage({
       window.clearTimeout(switchTimer);
       if (warmup) warmup.progress.show = undefined;
       leaving();
+      unbindMemoryWrites?.();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
       cancel.current = undefined;
@@ -920,7 +947,7 @@ export function EmployeeNativePage({
       window.removeEventListener('pagehide', leaving);
       window.removeEventListener('popstate', restoreQuery);
     };
-  }, [activation, activeQuery, prepare, initialUnavailable]);
+  }, [activation, activeQuery, bindMemoryWrites, prepare, initialUnavailable]);
 
   useEffect(() => {
     if (nextQuery.current !== displayedQuery.current) replace.current?.();

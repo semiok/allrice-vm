@@ -673,6 +673,9 @@ export async function gatewayFixture(options: {
   admission?: FixtureAdmission;
   ownerId?: string;
   nextBinding?: (index: number) => ModelCallBinding;
+  readTrustedContext?: Parameters<
+    typeof createModelGateway
+  >[0]['readTrustedContext'];
 }) {
   const store = options.store ?? new FixtureStore();
   const binding = options.binding ?? modelBinding();
@@ -701,6 +704,7 @@ export async function gatewayFixture(options: {
     authority,
     store,
     provider: options.provider,
+    readTrustedContext: options.readTrustedContext,
     admission: admission.injection,
   });
   let index = 0;

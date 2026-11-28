@@ -12,8 +12,10 @@ import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
+import { brandMediaModule, brandMediaRelease } from '@allrice/contracts';
 import {
   DataAccessError,
+  addEmployeeInstanceModule,
   createChatSession,
   ensureDEntryNativeRoot,
   readDEntryEmployeeDirectory,
@@ -21,6 +23,8 @@ import {
   updateDEntryReleasePolicy,
   type BuiltinModuleId,
 } from '@allrice/database';
+import { GET as readCapabilityModules } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/modules/route';
+import { GET as readCapabilityBrandMedia } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/brand-media/route';
 import { authorizeFixturePlatformAdministrator } from '../../../../packages/database/src/platform-authority.fixture.ts';
 import * as database from '../../../../packages/database/src/core/client.ts';
 import {
@@ -57,21 +61,30 @@ import {
   EmployeePanelsWriteRejectedError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
+import { GET as manageMemory } from '../../app/api/v1/memories/manage/route';
+import { GET as readMemory } from '../../app/api/v1/memories/[id]/route';
+import { GET as readMemorySource } from '../../app/api/v1/memories/[id]/source/route';
+import { POST as confirmMemory } from '../../app/api/v1/memories/[id]/promote/route';
+import { seedPersonalMemoryPair } from '../../../../packages/database/src/workspace/employee-memory-pair.fixture.ts';
 
 // Next's request-local Cookie carrier is replaced, not authentication. The
 // real production session adapter, opaque token and current DB readers run.
-const cookieBridge = vi.hoisted(() => ({ read: (): string => '' }));
+const cookieBridge = vi.hoisted(() => ({
+  read: (): string | Promise<string> => '',
+}));
 vi.mock('next/headers', () => ({
-  cookies: async () => ({
-    get(name: string) {
-      const part = cookieBridge
-        .read()
-        .split(';')
-        .map((value) => value.trim())
-        .find((value) => value.startsWith(name + '='));
-      return part ? { value: part.slice(name.length + 1) } : undefined;
-    },
-  }),
+  async cookies() {
+    const cookie = await cookieBridge.read();
+    return {
+      get(name: string) {
+        const part = cookie
+          .split(';')
+          .map((value) => value.trim())
+          .find((value) => value.startsWith(name + '='));
+        return part ? { value: part.slice(name.length + 1) } : undefined;
+      },
+    };
+  },
 }));
 const cookieScope = new AsyncLocalStorage<string>();
 cookieBridge.read = () => cookieScope.getStore() ?? '';
@@ -194,6 +207,26 @@ suite(
                 'content-type': 'text/html; charset=utf-8',
               });
               outgoing.end(fixtureDocument);
+              return;
+            }
+            if (url.pathname.startsWith('/api/v1/memories/')) {
+              const [, , , , id, operation] = url.pathname.split('/');
+              const target = { params: Promise.resolve({ id: id! }) };
+              const response =
+                request.method === 'GET' && id === 'manage'
+                  ? await manageMemory(request)
+                  : request.method === 'GET' && operation === 'source'
+                    ? await readMemorySource(request, target)
+                    : request.method === 'GET' && !operation
+                      ? await readMemory(request, target)
+                      : request.method === 'POST' && operation === 'promote'
+                        ? await confirmMemory(request, target)
+                        : new Response(null, { status: 405 });
+              outgoing.writeHead(
+                response.status,
+                Object.fromEntries(response.headers),
+              );
+              outgoing.end(Buffer.from(await response.arrayBuffer()));
               return;
             }
             const pieces = url.pathname.split('/').slice(5);
@@ -387,6 +420,17 @@ suite(
       };
       await f.db`insert into allrice_settings(scope_type,key,value) values('system','d_entry_rollout_policy',${f.db.json(policy)})
       on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    }
+    async function seedLegacyThread(p: Awaited<ReturnType<typeof person>>) {
+      const id = randomUUID();
+      // A preexisting thread supplies the durable generation without admitting legacy execution.
+      await f.db`insert into allrice_chat_sessions(
+        id, organization_id, workspace_id, owner_id, title, employee_assignment_id,
+        employee_instance_id, employee_version_id, execution_generation
+      ) values(${id},${p.context.organizationId},${p.selection.workspaceId},
+        ${p.context.actor.id},'Legacy thread',${p.selection.employeeInstanceId},
+        ${p.selection.employeeInstanceId},${p.versionId},'3.x')`;
+      return id;
     }
     const signal = () => new AbortController().signal;
     async function bindDirectoryThread(
@@ -676,7 +720,108 @@ suite(
               }),
             });
           });
+          const memory = await seedPersonalMemoryPair(f.db, p.context, {
+            workspaceId: p.selection.workspaceId,
+            instanceId: p.selection.employeeInstanceId,
+            summary: '发布前先复核摘要',
+            details: '这是仅本人可见的记忆正文',
+          });
+          let sourceReads = 0;
+          page.on('request', (request) => {
+            if (
+              new URL(request.url()).pathname ===
+              `/api/v1/memories/${memory.id}/source`
+            )
+              sourceReads++;
+          });
           await page.goto(base + '/fixture/panels');
+          const draft = page.getByRole('textbox', { name: '对话草稿' });
+          await draft.fill('未发送的原对话草稿');
+          const openMemory = page.getByRole('button', {
+            name: '记忆',
+            exact: true,
+          });
+          await openMemory.click();
+          const memoryPane = page.getByRole('region', { name: '个人记忆' });
+          const pending = memoryPane.getByRole('region', { name: '待确认' });
+          await pending.getByText(memory.summary, { exact: true }).click();
+          const memoryDialog = page.getByRole('dialog');
+          await memoryDialog
+            .getByText(memory.details!, { exact: true })
+            .waitFor();
+          expect(sourceReads).toBe(0);
+          const actualSource = page.waitForResponse(
+            (r) =>
+              new URL(r.url()).pathname ===
+              `/api/v1/memories/${memory.id}/source`,
+          );
+          await memoryDialog
+            .getByRole('button', { name: '来源', exact: true })
+            .click();
+          const sourceReceipt = await actualSource;
+          expect(sourceReceipt.status()).toBe(200);
+          expect(await sourceReceipt.json()).toEqual({
+            sourceType: 'user',
+            sourceLabel: expect.any(String),
+            capturedAt: memory.capturedAt,
+          });
+          await memoryDialog
+            .getByRole('region', { name: '记忆来源' })
+            .locator('time')
+            .waitFor();
+          expect(sourceReads).toBe(1);
+          await memoryDialog
+            .getByRole('button', { name: '关闭', exact: true })
+            .click();
+          const confirmation = `**/api/v1/memories/${memory.id}/promote?*`;
+          let releaseConfirmation!: () => void;
+          const heldConfirmation = new Promise<void>((done) => {
+            releaseConfirmation = done;
+          });
+          await page.route(
+            confirmation,
+            async (route) => {
+              await heldConfirmation;
+              await route.continue();
+            },
+            { times: 1 },
+          );
+          try {
+            await Promise.all([
+              page.waitForRequest((request) =>
+                new URL(request.url()).pathname.endsWith(
+                  `/${memory.id}/promote`,
+                ),
+              ),
+              pending
+                .getByRole('button', { name: '确认', exact: true })
+                .click(),
+            ]);
+            await page
+              .getByRole('button', { name: '关闭记忆', exact: true })
+              .click();
+            await memoryPane.waitFor({ state: 'detached' });
+            expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+            await openMemory.click();
+            await pending.getByText(memory.summary, { exact: true }).waitFor();
+            releaseConfirmation();
+            await memoryPane
+              .getByRole('region', { name: '生效中' })
+              .getByText(memory.summary, { exact: true })
+              .waitFor();
+            // A receipt from the closed tab invalidates the new tab's list.
+            expect(
+              await pending.getByText(memory.summary, { exact: true }).count(),
+            ).toBe(0);
+            expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+          } finally {
+            releaseConfirmation();
+            await page.unroute(confirmation);
+          }
+          await page
+            .getByRole('button', { name: '交付成果', exact: true })
+            .click();
+
           const files = page.getByRole('region', { name: '交付成果' });
           await files
             .getByRole('alert')
@@ -2379,15 +2524,7 @@ suite(
     });
     it('selects only authenticated current 4.0 threads across the private directory cursor', async () => {
       const p = await person();
-      const legacy = randomUUID();
-      // Preexisting legacy row. This directory test only needs its durable
-      // writer generation, not a 3.x execution artifact or provider.
-      await f.db`insert into allrice_chat_sessions(
-        id, organization_id, workspace_id, owner_id, title, employee_assignment_id,
-        employee_instance_id, employee_version_id, execution_generation
-      ) values(${legacy},${p.context.organizationId},${p.selection.workspaceId},
-        ${p.context.actor.id},'Legacy thread',${p.selection.employeeInstanceId},
-        ${p.selection.employeeInstanceId},${p.versionId},'3.x')`;
+      const legacy = await seedLegacyThread(p);
       await release(p);
       const create = () =>
         createChatSession(p.context, p.selection, {
@@ -2496,6 +2633,102 @@ suite(
       );
       expect(list.files).toEqual([]);
       expect(list.viewerId).toBe(p.context.actor.id);
+    });
+    it('reads the exact database module binding only from a current 4.0 thread and withholds saved brand data after revocation', async () => {
+      const p = await person();
+      const legacy = await seedLegacyThread(p);
+      await release(p);
+      const native = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const instanceId = p.selection.employeeInstanceId;
+      const cookie = `allrice_session=${p.login.token}`;
+      const read = (route: 'modules' | 'brand-media', threadId = native.id) => {
+        const query = new URLSearchParams({
+          workspaceId: p.selection.workspaceId,
+          threadId,
+        });
+        if (route === 'brand-media') query.set('view', 'topics');
+        const handler =
+          route === 'modules'
+            ? readCapabilityModules
+            : readCapabilityBrandMedia;
+        return cookieScope.run(cookie, () =>
+          handler(
+            new Request(
+              `${base}/api/v1/d-entry/panels/${instanceId}/${route}?${query}`,
+              {
+                headers: {
+                  'x-allrice-expected-viewer-id': p.context.actor.id,
+                  'x-allrice-organization-id': p.context.organizationId,
+                  'x-allrice-workspace-id': p.selection.workspaceId,
+                },
+              },
+            ),
+            {
+              params: Promise.resolve({ panelEmployeeInstanceId: instanceId }),
+            },
+          ),
+        );
+      };
+      expect((await read('brand-media')).status).toBe(403);
+      const { binding } = await addEmployeeInstanceModule(p.context, {
+        instanceId,
+        workspaceId: p.selection.workspaceId,
+        release: brandMediaRelease,
+        requestId: randomUUID(),
+      });
+      const installed = await read('modules');
+      expect(installed.status).toBe(200);
+      expect(await installed.json()).toEqual({
+        instanceId,
+        modules: [
+          {
+            displayName: brandMediaModule.displayName,
+            release: binding.release,
+            revision: binding.revision,
+          },
+        ],
+      });
+      expect((await read('modules', legacy)).status).toBe(403);
+      const topics = await read('brand-media');
+      expect(topics.status).toBe(200);
+      expect(await topics.json()).toEqual({
+        view: 'topics',
+        items: [],
+        nextCursor: null,
+      });
+
+      let cookieReads = 0;
+      const originalRead = cookieBridge.read;
+      cookieBridge.read = async () => {
+        const value = await originalRead();
+        // The third check is the page authority recheck after the first binding read.
+        if (value === cookie && ++cookieReads === 3) {
+          const changed =
+            await f.db`update allrice_employee_module_bindings set revoked_at=clock_timestamp(),revision=revision+1
+            where organization_id=${p.context.organizationId} and workspace_id=${p.selection.workspaceId}
+              and owner_id=${p.context.actor.id} and instance_id=${instanceId} and module_id=${brandMediaRelease.moduleId}
+            returning revision`;
+          expect(changed).toEqual([{ revision: binding.revision + 1 }]);
+        }
+        return value;
+      };
+      try {
+        const lateRevocation = await read('modules');
+        expect(lateRevocation.status).toBe(403);
+        expect(await lateRevocation.json()).not.toHaveProperty('modules');
+        expect(cookieReads).toBe(3);
+      } finally {
+        cookieBridge.read = originalRead;
+      }
+      const revoked = await read('brand-media');
+      expect(revoked.status).toBe(403);
+      expect(await revoked.json()).not.toHaveProperty('items');
+      expect(await (await read('modules')).json()).toEqual({
+        instanceId,
+        modules: [],
+      });
     });
     it('rejects retained Cookie after actual session or membership revocation', async () => {
       for (const kind of ['session', 'membership'] as const) {

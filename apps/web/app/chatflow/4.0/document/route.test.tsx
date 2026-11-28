@@ -188,6 +188,7 @@ it('requires the issued scope in the document address and leaves the two exact n
   authenticated.mockResolvedValue({
     actor: { type: 'user', id: '00000000-0000-4000-8000-000000000004' },
     organizationId: '00000000-0000-4000-8000-000000000005',
+    sessionId: '00000000-0000-4000-8000-000000000006',
   });
   const claims = {
     bindingRef: 'leased-profile',
@@ -282,6 +283,10 @@ it('requires the issued scope in the document address and leaves the two exact n
       '.js&quot;]"',
   );
   expect(html).toContain('data-native-session-id="real-native-root"');
+  expect(html).toContain(
+    'data-login-session-id="00000000-0000-4000-8000-000000000006"',
+  );
+  expect(html).not.toContain(cookie.value);
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
   expect(releasedAssets).toHaveBeenCalledExactlyOnceWith(claims.manifestSha256);
   expect(html).toContain(

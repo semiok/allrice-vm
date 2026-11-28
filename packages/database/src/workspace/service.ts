@@ -75,7 +75,11 @@ import {
   insertMemoryRevision,
   type MemoryRow,
 } from './employee-memory-mutation.ts';
-import { requirePendingNativeMemorySource } from '../memory-native-source.ts';
+import {
+  preparePendingNativeMemorySource,
+  requireLegacyMemorySessionSource,
+  requirePendingNativeMemorySource,
+} from '../memory-native-source.ts';
 import { assertEmployeeChatHumanSource } from '../employees/employee-chat-authority.ts';
 import { employeeAccessTransaction } from '../employees/employee-access-cancellation.ts';
 import { captureReferenceSelections } from '../reference-runtime.ts';
@@ -3027,20 +3031,20 @@ async function assertPendingMemorySource(
   context: RequestContext,
   scope: EmployeeMemoryScope,
   current: MemoryRow,
+  nativeSource: Awaited<ReturnType<typeof preparePendingNativeMemorySource>>,
 ) {
-  if (await requirePendingNativeMemorySource(tx, context, scope, current))
+  if (
+    await requirePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      current,
+      nativeSource,
+    )
+  )
     return;
   if (['message', 'checkpoint'].includes(current.source_type)) {
-    const [source] = await tx`select s.id from allrice_chat_sessions s
-      where s.organization_id=${scope.organizationId} and s.workspace_id=${scope.workspaceId}
-        and s.owner_id=${scope.ownerId} and coalesce(s.employee_instance_id,s.employee_assignment_id)=${scope.instanceId}
-        and s.archived_at is null
-        and ((${current.source_type}='message' and exists(select 1 from allrice_messages m
-          where m.id=${current.source_id} and m.organization_id=s.organization_id and m.workspace_id=s.workspace_id and m.owner_id=s.owner_id and m.session_id=s.id))
-          or (${current.source_type}='checkpoint' and exists(select 1 from allrice_context_checkpoints cp
-            where cp.id=${current.source_id} and cp.organization_id=s.organization_id and cp.workspace_id=s.workspace_id and cp.owner_id=s.owner_id and cp.session_id=s.id)))
-      for share of s`;
-    if (!source) throw new DataAccessError('authorization_denied');
+    await requireLegacyMemorySessionSource(tx, scope, current);
   } else if (current.source_type === 'file') {
     if (!current.source_id) throw new DataAccessError('not_found');
     await tx`select id from allrice_storage_objects where id=${current.source_id} and organization_id=${scope.organizationId} and workspace_id=${scope.workspaceId} for share`;
@@ -3119,6 +3123,12 @@ async function correctEmployeeMemoryRecord<
       tx,
       true,
     );
+    const nativeSource = await preparePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      memoryId,
+    );
     await lockEmployeeMemoryOrder(tx, scope);
     await lockPersonalMemorySource(tx, scope, memoryId);
     return memoryOperation(
@@ -3142,7 +3152,13 @@ async function correctEmployeeMemoryRecord<
           current.lifecycle_state !== 'durable' ||
           current.trust_level !== 'user_confirmed'
         ) {
-          await assertPendingMemorySource(tx, context, scope, current);
+          await assertPendingMemorySource(
+            tx,
+            context,
+            scope,
+            current,
+            nativeSource,
+          );
           await assertEmployeeMemoryAdmission(tx, scope);
         }
         const [row] = await tx<MemoryRow[]>`update allrice_memories
@@ -3211,6 +3227,12 @@ async function promoteEmployeeMemoryRecord<
       tx,
       true,
     );
+    const nativeSource = await preparePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      memoryId,
+    );
     await lockEmployeeMemoryOrder(tx, scope);
     await lockPersonalMemorySource(tx, scope, memoryId);
     return memoryOperation(
@@ -3235,7 +3257,13 @@ async function promoteEmployeeMemoryRecord<
           current.trust_level === 'user_confirmed'
         )
           return map(current, tx, scope);
-        await assertPendingMemorySource(tx, context, scope, current);
+        await assertPendingMemorySource(
+          tx,
+          context,
+          scope,
+          current,
+          nativeSource,
+        );
         await assertEmployeeMemoryAdmission(tx, scope);
         const [row] = await tx<MemoryRow[]>`update allrice_memories
           set lifecycle_state='durable',revision=revision+1,trust_level='user_confirmed',expires_at=null,

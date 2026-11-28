@@ -1,13 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { RequestContext } from '@allrice/contracts';
+import type {
+  ApplicationBuiltinModulesProjection,
+  RequestContext,
+} from '@allrice/contracts';
+import {
+  selectNativeMemoryConfiguration,
+  type ProductionNativeMemorySource,
+} from './production-native-memory.js';
 import {
   confirmDEntryEmployeeArchive,
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   createPostgresPersonVmScheduledWakeStore,
   getDatabase,
+  readApplicationBuiltinModules,
   readContentPrincipal,
   readPersonNativeWebRoster,
   readPersonVmDiskPreparationForegroundBusy,
@@ -130,6 +138,8 @@ export type ProductionPersonVmHostSources = Readonly<{
     current: Current;
     lifetime: AbortSignal;
     modelOwnerId: string;
+    nativeExecutionBuild: ApplicationBuiltinModulesProjection['applicationBuild'];
+    nativeMemory?: ReturnType<typeof selectNativeMemoryConfiguration>;
     reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
     issueReference<T>(
       call: ModelCallBinding,
@@ -164,6 +174,11 @@ export type ProductionPersonVmHostSources = Readonly<{
         ownerId: string,
         signal: AbortSignal,
       ): Promise<string>;
+      readMemoryIndex?(
+        call: ModelCallBinding,
+        signal: AbortSignal,
+        phase: 'seal' | 'dispatch',
+      ): Promise<string | undefined>;
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
@@ -221,12 +236,35 @@ export interface ProductionPersonVmHost {
 export function createProductionPersonVmHost(input: {
   lifetime: AbortSignal;
   sources?: ProductionPersonVmHostSources;
+  nativeMemory?: ProductionNativeMemorySource;
 }): Promise<ProductionPersonVmHost> {
   if (!input.sources)
     return Promise.reject(
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
     );
   const sources = input.sources;
+  const memory =
+    input.nativeMemory &&
+    Object.freeze({
+      toolVersions: Object.freeze({ ...input.nativeMemory.toolVersions }),
+      publication: Object.freeze({
+        root: input.nativeMemory.publication.root.bind(
+          input.nativeMemory.publication,
+        ),
+        call: input.nativeMemory.publication.call.bind(
+          input.nativeMemory.publication,
+        ),
+      }),
+    });
+  if (
+    memory &&
+    [memory.toolVersions.memory_read, memory.toolVersions.memory_remember].some(
+      (value) => typeof value !== 'string' || !value || value.length > 256,
+    )
+  )
+    return Promise.reject(
+      new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
+    );
   const stopped = new AbortController();
   const lifetime = AbortSignal.any([input.lifetime, stopped.signal]);
   let finishConstruction: () => void = () => {
@@ -1044,6 +1082,18 @@ export function createProductionPersonVmHost(input: {
           },
         },
       });
+      const verifiedBuild = await readApplicationBuiltinModules('worker').catch(
+        () => null,
+      );
+      lifetime.throwIfAborted();
+      const build = verifiedBuild?.applicationBuild;
+      const nativeExecutionBuild =
+        build &&
+        build.sourceSha === providers.applicationBuild.sourceSha &&
+        build.sourceTree === providers.applicationBuild.sourceTree &&
+        build.manifestDigest === providers.applicationBuild.manifestDigest
+          ? build
+          : null;
       bound = await sources.bind({
         vm,
         admission,
@@ -1052,6 +1102,11 @@ export function createProductionPersonVmHost(input: {
         providers,
         lifetime,
         modelOwnerId,
+        nativeExecutionBuild,
+        nativeMemory:
+          nativeExecutionBuild && memory
+            ? selectNativeMemoryConfiguration(memory, nativeExecutionBuild)
+            : undefined,
         async issueReference(call, signal, issue) {
           if (!model?.issueReference)
             throw new ProductionPersonVmHostUnavailable(
@@ -1081,6 +1136,7 @@ export function createProductionPersonVmHost(input: {
             modelSource.transport?.beforeDispatch,
             modelSource.scopeStream,
           ),
+        readTrustedContext: memory && modelSource.readMemoryIndex,
         store: storeModel,
         confirmTransportStopped:
           modelSource.confirmTransportStopped ??

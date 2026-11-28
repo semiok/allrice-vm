@@ -65,6 +65,7 @@ it('observes its provided panels owner through real Cordis injection across unlo
   ctx.provide('layout', {});
   ctx.provide('theme', {});
   ctx.provide('conversation', {});
+  ctx.provide('inputTriggers', {});
   vi.stubGlobal('window', {});
   const fixture = createFixture(() => ({ bindEmployeePanels }));
   // This provider must be able to start before its own service exists.

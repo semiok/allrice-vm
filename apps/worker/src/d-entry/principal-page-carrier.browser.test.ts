@@ -17,11 +17,14 @@ import {
   type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
+  ReferenceLibraryOptionsSchema,
+  ReferenceRevisionSchema,
 } from '@allrice/contracts';
 import {
   deferred,
   summary,
 } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { skillTestCatalog } from '../../../web/test/employee-skills-host-data.js';
 import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
@@ -75,10 +78,21 @@ it
     const live = independentlyInstalled ? await buildProfileFixture() : release;
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
-      source: { head: string };
+      source: {
+        head: string;
+        contributionInputs: { path: string; sha256: string }[];
+      };
       files: { path: string }[];
       profile: { files: { reference: string; sha256: string }[] };
     } = JSON.parse(sealed.toString());
+    const ownerPath =
+      'packages/dsh-web-composition/src/employee-product-owner.ts';
+    expect(manifest.source.contributionInputs).toContainEqual({
+      path: ownerPath,
+      sha256: createHash('sha256')
+        .update(await readFile(ownerPath))
+        .digest('hex'),
+    });
     const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
     const mime: Record<string, string> = {
       '.js': 'text/javascript',
@@ -473,6 +487,72 @@ it
     let browserBootstrapReads = 0;
     let scopedBundleReads = 0;
     let documentLoads = 0;
+    const panelPath = `/api/v1/d-entry/panels/${f.identity.employeeInstanceId}/`;
+    const skillsPath = panelPath + 'skills';
+    const legacySkillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
+    const catalog = skillTestCatalog(
+      f.identity.employeeInstanceId,
+      f.identity.workspaceId,
+    );
+    const panelViewer = {
+      viewerId: f.identity.personId,
+      workspaceId: f.identity.workspaceId,
+    };
+    const materialPin = {
+      sourceId: randomUUID(),
+      revisionId: randomUUID(),
+      revision: 1,
+      ownership: {
+        scope: 'company',
+        organizationId: f.identity.organizationId,
+      },
+      fileName: '第四季度销售口径说明.pdf',
+      purpose: '核对销售统计口径',
+      checksum: 'sha256:' + 'a'.repeat(64),
+    };
+    const reference = ReferenceRevisionSchema.parse({
+      ...materialPin,
+      status: 'active',
+      processing: 'ready',
+      failure: null,
+      canMaintain: true,
+      canReference: true,
+      publication: {
+        origin: 'upload',
+        publisherId: panelViewer.viewerId,
+        publisherName: '我',
+        audience: { scope: 'company', departmentIds: [] },
+        audienceRevision: 1,
+      },
+      sizeBytes: 1024,
+      mediaType: 'application/pdf',
+      createdAt: '2026-11-27T12:00:00.000Z',
+      origin: null,
+    });
+    const materialOptions = ReferenceLibraryOptionsSchema.parse({
+      workspaceId: panelViewer.workspaceId,
+      platformMaintainer: false,
+      maintenanceLevel: 'company',
+      writable: true,
+      departmentId: null,
+      departments: [],
+    });
+    const materialCatalog = {
+      references: [reference],
+      matches: [],
+      nextCursor: null,
+      fullTextCoverage: { ready: 1, unavailable: 0 },
+      viewerId: panelViewer.viewerId,
+      options: materialOptions,
+    };
+    const late = deferred();
+    const reads: unknown[] = [];
+    const materialReads: {
+      kind: 'catalog' | 'selection';
+      threadId: string | null;
+      workspaceId: string | null;
+      viewerId: string | string[] | undefined;
+    }[] = [];
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -489,6 +569,69 @@ it
       };
       try {
         const scopeId = url.searchParams.get('scopeId');
+        if (url.pathname === skillsPath || url.pathname === legacySkillsPath) {
+          const ordinal = reads.push({
+            method: request.method,
+            path: url.pathname,
+            workspace: url.searchParams.get('workspaceId'),
+            thread: url.searchParams.get('threadId'),
+            expectedViewer: request.headers['x-allrice-expected-viewer-id'],
+            organization: request.headers['x-allrice-organization-id'],
+            workspaceHeader: request.headers['x-allrice-workspace-id'],
+          });
+          if (scenario === 'attached' && ordinal === 1) {
+            await late.promise;
+            return await copy(
+              Response.json({
+                ...catalog,
+                personalSkills: catalog.personalSkills.map((skill) => ({
+                  ...skill,
+                  displayName: '已关闭访次的技能',
+                })),
+              }),
+            );
+          }
+          return await copy(
+            Response.json(
+              scenario === 'attached' && ordinal === 2
+                ? skillTestCatalog(randomUUID(), f.identity.workspaceId)
+                : catalog,
+            ),
+          );
+        }
+        if (
+          url.pathname === panelPath + 'materials' ||
+          url.pathname ===
+            panelPath +
+              'materials/revisions/' +
+              reference.revisionId +
+              '/selection'
+        ) {
+          const selectionRead = url.pathname.endsWith('/selection');
+          materialReads.push({
+            kind: selectionRead ? 'selection' : 'catalog',
+            threadId: url.searchParams.get('threadId'),
+            workspaceId: url.searchParams.get('workspaceId'),
+            viewerId: request.headers['x-allrice-expected-viewer-id'],
+          });
+          if (selectionRead)
+            return await copy(
+              Response.json({
+                ...panelViewer,
+                selection: { ...materialPin, digest: materialPin.checksum },
+                canReference: true,
+              }),
+            );
+          return await copy(Response.json(materialCatalog));
+        }
+        if (url.pathname === panelPath + 'materials/options') {
+          return await copy(
+            Response.json({
+              viewerId: panelViewer.viewerId,
+              options: materialOptions,
+            }),
+          );
+        }
         if (realShell) {
           if (url.pathname === '/api/v1/d-entry/identity') {
             return await copy(
@@ -864,6 +1007,7 @@ it
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
+            data-login-session-id="${f.context.sessionId}"
             data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${published.graph.rev}"
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
@@ -877,7 +1021,9 @@ it
       executablePath: browserExecutable,
     });
     closes.push(() => browser.close());
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+    });
     await context.addCookies([
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
@@ -899,6 +1045,37 @@ it
         uploadThroughput: 228_000,
       });
     }
+    // Keep the first test response deliverable after abort so we exercise the
+    // Reader's late-result guard, independently of browser fetch cancellation.
+    if (scenario === 'attached')
+      await page.addInitScript((path) => {
+        const original = window.fetch.bind(window);
+        let held = false;
+        window.fetch = async (input, init) => {
+          if (
+            held ||
+            typeof input !== 'string' ||
+            !input.startsWith(path + '?')
+          )
+            return original(input, init);
+          held = true;
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              document.documentElement.dataset.skillReadAborted = 'true';
+            },
+            { once: true },
+          );
+          const reply = await original(input, { ...init, signal: undefined });
+          const parse = reply.json.bind(reply);
+          reply.json = async () => {
+            const result: unknown = await parse();
+            document.documentElement.dataset.lateSkillRead = 'true';
+            return result;
+          };
+          return reply;
+        };
+      }, skillsPath);
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
       await page.addInitScript(
@@ -1143,6 +1320,105 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    const dock = (nativeId: string) =>
+      workbench.locator(
+        '[data-sidebar-right-session="' +
+          nativeId +
+          '"][data-sidebar-right-panel]',
+      );
+    async function openWorkbenchPane(nativeId: string, name: string) {
+      const entries = workbench.getByLabel('工作台入口', { exact: true });
+      const entry = entries.getByRole('button', { name, exact: true });
+      if (await entry.isVisible()) {
+        await entry.click();
+      } else {
+        await workbench
+          .locator('[data-conversation-header-corner]')
+          .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
+          .click();
+        await dock(nativeId)
+          .getByRole('button')
+          .filter({
+            has: workbench.locator('strong').getByText(name, { exact: true }),
+          })
+          .click();
+      }
+    }
+    async function closeWorkbenchPane(nativeId: string, name: string) {
+      await dock(nativeId)
+        .getByRole('tab', { name: new RegExp(name) })
+        .getByRole('button', { name: /^(关闭|Close)$/ })
+        .click();
+    }
+    async function useMaterial(nativeId: string, threadId: string) {
+      const before = materialReads.length;
+      const right = dock(nativeId);
+      await openWorkbenchPane(nativeId, '企业资料');
+      await right
+        .locator(`[data-file-id="${reference.revisionId}"]`)
+        .getByRole('button', { name: '引用到对话', exact: true })
+        .click();
+      const expectedScope = {
+        threadId,
+        workspaceId: f.identity.workspaceId,
+        viewerId: f.identity.personId,
+      };
+      await expect
+        .poll(() => materialReads.slice(before))
+        .toEqual([
+          { kind: 'catalog', ...expectedScope },
+          { kind: 'selection', ...expectedScope },
+        ]);
+      const chip = editor.locator(
+        '[data-composer-chip="allrice-panel-reference"]',
+      );
+      try {
+        await chip.waitFor({ state: 'visible', timeout: 5_000 });
+      } catch (cause) {
+        const alerts = await right.getByRole('alert').allTextContents();
+        throw Error(
+          'Native reference insertion did not render: ' +
+            JSON.stringify(alerts),
+          { cause },
+        );
+      }
+      expect(await chip.textContent()).toContain(reference.fileName);
+      await closeWorkbenchPane(nativeId, '企业资料');
+    }
+    async function checkR3SelectedRoot(nativeId: string, threadId: string) {
+      const before = reads.length;
+      await workbench
+        .locator('#chat-sidebar')
+        .getByRole('button', {
+          name: '设置',
+          exact: true,
+        })
+        .click();
+      await dock(nativeId)
+        .getByRole('button', {
+          name: 'AllRice 账号',
+          exact: true,
+        })
+        .waitFor();
+      await closeWorkbenchPane(nativeId, '设置');
+      await openWorkbenchPane(nativeId, '能力');
+      await dock(nativeId)
+        .getByRole('button', {
+          name: '翻译校对',
+          exact: true,
+        })
+        .waitFor();
+      expect(reads.slice(before)).toEqual([
+        expect.objectContaining({
+          method: 'GET',
+          path: skillsPath,
+          thread: threadId,
+          expectedViewer: f.identity.personId,
+        }),
+      ]);
+      await closeWorkbenchPane(nativeId, '能力');
+      await useMaterial(nativeId, threadId);
+    }
     if (switching) {
       const frame = page.locator('iframe');
       const mark = randomUUID();
@@ -1204,6 +1480,10 @@ it
           expect(socketCount).toBe(1);
         }
         if (attempt === 0) await editor.fill('另一条会话的原生草稿');
+        if (scenario === 'switch' && attempt === 0) {
+          await checkR3SelectedRoot(nativeId, target!);
+          await editor.fill('另一条会话的原生草稿');
+        }
       }
       expect(await editor.innerText()).toBe('未发送的原生草稿');
       expect(await frame.count()).toBe(1);
@@ -1595,6 +1875,7 @@ it
         ).toBe(mark);
       }
       expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
+      await checkR3SelectedRoot(createdNativeId, createdThread);
       if (outerCreate) {
         await workbench
           .locator('[data-row-key="session:' + f.selection.threadId + '"]')
@@ -1705,6 +1986,113 @@ it
     for (const handler of blockedHandlers)
       expect(handler).not.toHaveBeenCalled();
     expect(unary).not.toContain('session/prompt');
+    if (scenario === 'attached') {
+      const dock = workbench.locator(
+        '[data-sidebar-right-session="root"][data-sidebar-right-panel]',
+      );
+      // rc.2 keeps the corner on blank sessions while omitting title actions.
+      // Closing the guide's sole replacement collapses the original Dock again.
+      const openAbilities = async () => {
+        await workbench
+          .locator('[data-conversation-header-corner]')
+          .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
+          .click({ timeout: 5000 });
+        await dock
+          .getByRole('button', { name: /^能力\s*打开这位员工的业务工作台$/ })
+          .click({ timeout: 5000 });
+      };
+      const panel = dock.getByRole('region', {
+        name: 'Fixture employee · 能力',
+      });
+      const closeAbilityTab = () =>
+        dock
+          .getByRole('tab', { name: /能力/ })
+          .getByRole('button', { name: /^(关闭|Close)$/ })
+          .click();
+      try {
+        expect(
+          await workbench.locator('html').evaluate(() => innerWidth),
+        ).toBeGreaterThan(760);
+        expect(
+          await workbench.locator('[aria-label="工作台入口"]').count(),
+        ).toBe(0);
+        expect(reads).toHaveLength(0);
+        await openAbilities();
+        await expect.poll(() => reads.length).toBe(1);
+        await closeAbilityTab();
+        await workbench.locator('html[data-skill-read-aborted]').waitFor();
+        await panel.waitFor({ state: 'hidden' });
+
+        await openAbilities();
+        await panel.getByText('技能读取失败，请重试。').waitFor();
+        expect(
+          await panel.getByRole('button', { name: '翻译校对' }).count(),
+        ).toBe(0);
+        await panel.getByRole('button', { name: '重试', exact: true }).click();
+        await panel
+          .getByRole('button', { name: '翻译校对', exact: true })
+          .click();
+        await panel
+          .getByText('translation-review.zip', { exact: true })
+          .waitFor();
+        await panel.getByText('v0.3.0', { exact: true }).waitFor();
+        expect(
+          await panel
+            .getByRole('button', { name: /添加|更新|卸载|开始工作/ })
+            .count(),
+        ).toBe(0);
+        await panel
+          .getByRole('button', { name: '返回能力列表', exact: true })
+          .click();
+        late.resolve();
+        await workbench.locator('html[data-late-skill-read]').waitFor();
+        await panel
+          .getByRole('button', { name: '翻译校对', exact: true })
+          .waitFor();
+        expect(await panel.getByText('已关闭访次的技能').count()).toBe(0);
+        expect(
+          await panel.getByRole('button', { name: '添加技能' }).count(),
+        ).toBe(0);
+        expect(await panel.getByText('品牌自媒体').count()).toBe(0);
+        await closeAbilityTab();
+        expect((await editor.innerText()).trim()).toBe('未发送的原生草稿');
+        expect(unary).not.toContain('session/prompt');
+        expect(reads).toEqual(
+          Array.from({ length: 3 }, () => ({
+            method: 'GET',
+            path: skillsPath,
+            workspace: f.identity.workspaceId,
+            thread: f.selection.threadId,
+            expectedViewer: f.identity.personId,
+            organization: f.identity.organizationId,
+            workspaceHeader: f.identity.workspaceId,
+          })),
+        );
+        await editor.fill('');
+        await useMaterial('root', f.selection.threadId!);
+      } catch (error) {
+        const state = await workbench.locator('html').evaluate(() => ({
+          viewportWidth: innerWidth,
+          toolbar: Boolean(document.querySelector('[aria-label="工作台入口"]')),
+          corner: document
+            .querySelector('[data-sidebar-right-expand]')
+            ?.getAttribute('aria-label'),
+          dock: document
+            .querySelector('[data-sidebar-right-panel]')
+            ?.getAttribute('data-sidebar-right-panel'),
+          tabs: [
+            ...document.querySelectorAll(
+              '[data-sidebar-right-panel] [role="tab"]',
+            ),
+          ].map((tab) => tab.textContent),
+        }));
+        throw Error(JSON.stringify({ state, reads: reads.length, errors }), {
+          cause: error,
+        });
+      } finally {
+        late.resolve();
+      }
+    }
     await page.evaluate(async () => {
       const finish: unknown = Reflect.get(window, 'finishCarrier');
       if (typeof finish !== 'function')

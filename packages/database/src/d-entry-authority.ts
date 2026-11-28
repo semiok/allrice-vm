@@ -352,6 +352,7 @@ export type DEntryPrincipalAuthoritySubscription = DEntryAuthoritySubscription &
 type ObservedAuthority = DEntryPrincipalAuthoritySubscription &
   Readonly<{
     assertObserved(signal: AbortSignal): Promise<void>;
+    assertObservedNow(): void;
     assertTicketThread?: (signal: AbortSignal) => Promise<void>;
   }>;
 type NativeRosterChecks = Readonly<{
@@ -438,11 +439,13 @@ async function watchDEntryAuthority(
   };
   let authorityPending = false;
   let rosterPending = false;
+  let unsettled = 0;
   const enqueue = (roster: boolean) => {
     if (stopped) return;
     rosterPending ||= roster;
     if (authorityPending) return;
     authorityPending = true;
+    unsettled++;
     checks = checks
       .then(async () => {
         authorityPending = false;
@@ -450,12 +453,16 @@ async function watchDEntryAuthority(
         rosterPending = false;
         await recheck(recheckRoster);
       })
-      .catch(invalidate);
+      .catch(invalidate)
+      .finally(() => {
+        unsettled--;
+      });
   };
   let bindingPending = false;
   const enqueueBinding = () => {
     if (!nativeChecks || stopped || bindingPending) return;
     bindingPending = true;
+    unsettled++;
     checks = checks
       .then(async () => {
         bindingPending = false;
@@ -464,7 +471,10 @@ async function watchDEntryAuthority(
         await nativeChecks.verifyBinding(revoked);
         revoked.throwIfAborted();
       })
-      .catch(invalidate);
+      .catch(invalidate)
+      .finally(() => {
+        unsettled--;
+      });
   };
   const joinChecks = async () => {
     // A notification can append another real read while the preceding read is
@@ -553,6 +563,11 @@ async function watchDEntryAuthority(
         active.throwIfAborted();
         revoked.throwIfAborted();
         if (stopped) throw new DataAccessError('authorization_denied');
+      },
+      assertObservedNow() {
+        revoked.throwIfAborted();
+        if (stopped || unsettled > 0)
+          throw new DataAccessError('authorization_denied');
       },
       async assertCurrent(active: AbortSignal) {
         active.throwIfAborted();

@@ -26,6 +26,7 @@ import {
   GET as technicalDetail,
   PATCH as updateTechnicalIssue,
 } from '../../app/api/v1/admin/technical-assistant/issues/[id]/route';
+import { POST as logout } from '../../app/api/v1/auth/logout/route';
 import { POST as password } from '../../app/api/v1/auth/password/route';
 import { getRequestContext } from './session';
 import { resolvePortal } from '../portal/config';
@@ -365,6 +366,52 @@ integration('shared portal HTTP identity with real PostgreSQL', () => {
       await getRequestContext(request('/api/v1/auth/session', undefined, host)),
     ).toBeNull();
   });
+  it('only lets the originating workbench login change its password or log out', async () => {
+    const a = await employee();
+    const credentials = { username: a.name, password: 'admin@321' };
+    const loginRequest = () => request('/api/v1/auth/login', credentials);
+    const currentLogin = () =>
+      getRequestContext(request('/api/v1/auth/session'));
+    expect((await signIn(loginRequest())).status).toBe(200);
+    const old = (await currentLogin())!.sessionId;
+    expect((await signIn(loginRequest())).status).toBe(200);
+    const active = (await currentLogin())!.sessionId;
+    expect(active).not.toBe(old);
+    const accountRequest = (
+      action: 'password' | 'logout',
+      sessionId: string,
+    ) => {
+      const base = request(
+        '/api/v1/auth/' + action,
+        action === 'password'
+          ? {
+              currentPassword: credentials.password,
+              newPassword: 'new-test-password',
+            }
+          : undefined,
+      );
+      const headers = new Headers(base.headers);
+      headers.set('x-allrice-expected-session-id', sessionId);
+      return new Request(base, { method: 'POST', headers });
+    };
+
+    expect((await password(accountRequest('password', old))).status).toBe(401);
+    expect((await logout(accountRequest('logout', old))).status).toBe(401);
+    expect((await currentLogin())?.sessionId).toBe(active);
+    const originalCookie = jar.get('allrice_session');
+    expect((await logout(accountRequest('logout', active))).status).toBe(204);
+    expect(jar.get('allrice_session')).toBe(originalCookie);
+    expect(await currentLogin()).toBeNull();
+    expect((await signIn(loginRequest())).status).toBe(200);
+    const renewed = (await currentLogin())!.sessionId;
+    expect((await password(accountRequest('password', renewed))).status).toBe(
+      204,
+    );
+    expect(jar.get('allrice_session')?.value).not.toBe('');
+    expect(await currentLogin()).toBeNull();
+    expect((await signIn(loginRequest())).status).toBe(401);
+  });
+
   it('rejects unauthenticated password changes', async () => {
     expect(
       (

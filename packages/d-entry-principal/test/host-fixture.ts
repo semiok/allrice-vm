@@ -308,7 +308,7 @@ class Catalog extends TypertRemoteService {
       // Session content is fixture data; the descriptor, resource guard,
       // cancellableStream and codec are the actual public native path.
       const records = this.snapshotRecords?.(sessionId) ?? [];
-      const cursor = records.at(-1)?.event.seq ?? 0;
+      const cursor = records.at(-1)?.event.seq ?? -1;
       yield {
         type: 'snapshot',
         header: { version: 1, id: sessionId, createdAt: 1, isSeeded: false },

@@ -62,7 +62,16 @@ export interface EmployeeSettingsPort {
   notificationPreferences?: EmployeeNotificationPreferencesPort;
 }
 
+/** Production account and native launcher for one authenticated document. */
+export interface EmployeeWorkbenchSettingsPort {
+  readonly signal: AbortSignal;
+  readonly loginSessionId: string;
+  isCurrentRoot(id: string): boolean;
+  subscribe(listener: () => void): () => void;
+}
+
 export interface EmployeeSettingsOptions {
+  workbench?: boolean;
   /** M1 defaults to hidden. Enabling requires a real named preference port. */
   notifications?: boolean;
   /** Optional owner UI; actions become active only for the committed binding. */
@@ -72,10 +81,16 @@ export interface EmployeeSettingsOptions {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     allriceEmployeeSettings: EmployeeSettingsPort;
+    allriceEmployeeWorkbenchSettings: EmployeeWorkbenchSettingsPort;
   }
 }
 
 /** Bind only from the authenticated owner plugin's Cordis lifetime. */
-export function bindEmployeeSettings(ctx: Context, port: EmployeeSettingsPort) {
-  ctx.provide('allriceEmployeeSettings', port);
+export function bindEmployeeSettings(
+  ctx: Context,
+  port: EmployeeSettingsPort | EmployeeWorkbenchSettingsPort,
+) {
+  if ('loginSessionId' in port)
+    ctx.provide('allriceEmployeeWorkbenchSettings', port);
+  else ctx.provide('allriceEmployeeSettings', port);
 }

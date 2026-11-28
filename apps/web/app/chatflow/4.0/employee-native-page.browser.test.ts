@@ -475,6 +475,7 @@ suite('4.0 browser cold entry', () => {
             firstRetry.resolve(response);
             return;
           }
+          // The foreground upgrade adds one ticket before switching chats.
           if (warmCalls.length >= 4 && warmCalls.length <= 6)
             return response
               .writeHead(202, { 'content-type': 'application/json' })
@@ -1140,6 +1141,17 @@ suite('4.0 browser cold entry', () => {
       }
 
       await exerciseMultiEmployeeNavigation(browser, f.origin, f.identity);
+      await page.route('**/api/v1/auth/session', (route) =>
+        route.fulfill({ status: 401 }),
+      );
+      await page.route(f.origin + '/chatflow/4.0', (route) =>
+        route.fulfill({ status: 307, headers: { location: '/login' } }),
+      );
+      await page.route('**/login', (route) =>
+        route.fulfill({ body: 'synthetic login' }),
+      );
+      f.identityRevoked.abort();
+      await page.waitForURL(f.origin + '/login');
     },
   );
 });
