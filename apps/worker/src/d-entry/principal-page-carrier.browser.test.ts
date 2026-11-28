@@ -15,10 +15,11 @@ import {
   type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
+  ReferenceLibraryOptionsSchema,
+  ReferenceRevisionSchema,
 } from '@allrice/contracts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { skillTestCatalog } from '../../../web/test/employee-skills-host-data.js';
-import { createSyntheticPanelsData } from '../../../../packages/dsh-web-composition/tests/fixtures/employee-panels/data.js';
 import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
@@ -304,11 +305,56 @@ it
       f.identity.employeeInstanceId,
       f.identity.workspaceId,
     );
-    const materials = createSyntheticPanelsData();
-    const reference = materials.references[0]!;
     const panelViewer = {
       viewerId: f.identity.personId,
       workspaceId: f.identity.workspaceId,
+    };
+    const materialPin = {
+      sourceId: randomUUID(),
+      revisionId: randomUUID(),
+      revision: 1,
+      ownership: {
+        scope: 'company',
+        organizationId: f.identity.organizationId,
+      },
+      fileName: '第四季度销售口径说明.pdf',
+      purpose: '核对销售统计口径',
+      checksum: 'a'.repeat(64),
+    };
+    const reference = ReferenceRevisionSchema.parse({
+      ...materialPin,
+      status: 'active',
+      processing: 'ready',
+      failure: null,
+      canMaintain: true,
+      canReference: true,
+      publication: {
+        origin: 'upload',
+        publisherId: panelViewer.viewerId,
+        publisherName: '我',
+        audience: { scope: 'company', departmentIds: [] },
+        audienceRevision: 1,
+      },
+      sizeBytes: 1024,
+      mediaType: 'application/pdf',
+      createdAt: '2026-11-27T12:00:00.000Z',
+      origin: null,
+    });
+    const materialOptions = ReferenceLibraryOptionsSchema.parse({
+      workspaceId: panelViewer.workspaceId,
+      platformMaintainer: false,
+      maintenanceLevel: 'company',
+      writable: true,
+      departmentId: null,
+      departments: [],
+    });
+    const materialCatalog = {
+      references: [reference],
+      matches: [],
+      nextCursor: null,
+      fullTextCoverage: { ready: 1, unavailable: 0 },
+      viewerId: panelViewer.viewerId,
+      options: materialOptions,
     };
     const late = deferred();
     const reads: unknown[] = [];
@@ -382,30 +428,18 @@ it
           if (selectionRead)
             return await copy(
               Response.json({
-                ...materials.selection(reference.revisionId),
                 ...panelViewer,
+                selection: { ...materialPin, digest: materialPin.checksum },
                 canReference: true,
               }),
             );
-          return await copy(
-            Response.json({
-              ...materials.catalog,
-              viewerId: panelViewer.viewerId,
-              options: {
-                ...materials.options,
-                workspaceId: panelViewer.workspaceId,
-              },
-            }),
-          );
+          return await copy(Response.json(materialCatalog));
         }
         if (url.pathname === panelPath + 'materials/options') {
           return await copy(
             Response.json({
-              viewerId: f.identity.personId,
-              options: {
-                ...materials.options,
-                workspaceId: f.identity.workspaceId,
-              },
+              viewerId: panelViewer.viewerId,
+              options: materialOptions,
             }),
           );
         }
