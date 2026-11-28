@@ -56,6 +56,7 @@ export function openNativePageCarrier(
   identity: DEntryIdentity,
   selection: DEntrySelectionInput,
   onRevoked: () => void,
+  beginWithUpgrade = false,
 ) {
   const ready =
     pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
@@ -64,9 +65,9 @@ export function openNativePageCarrier(
   void ready.promise.catch(() => {});
   void joined.promise.catch(() => {});
   const id = crypto.randomUUID();
-  const socket = new WebSocket(
-    nativeMuxUrl(location.origin, identity.organizationId, selection),
-  );
+  const url = nativeMuxUrl(location.origin, identity.organizationId, selection);
+  if (beginWithUpgrade) url.searchParams.set('openId', id);
+  const socket = new WebSocket(url);
   let scopeId: string | undefined;
   let carrierSelection = selection;
   let nativeMux: MessagePort | undefined;
@@ -114,6 +115,17 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'open',
     () => {
+      if (beginWithUpgrade) {
+        dispatched = true;
+        if (requested) {
+          try {
+            end();
+          } catch (error) {
+            failure = fail(error);
+          }
+        }
+        return;
+      }
       if (requested) return;
       try {
         send({
@@ -177,8 +189,6 @@ export function openNativePageCarrier(
             if (value.type === 'switched') {
               scopeId = value.scopeId;
               carrierSelection = { ...selection, threadId: value.threadId };
-              nativeMux?.close();
-              nativeMux = undefined;
             }
             result.resolve(value.type === 'switched' ? value : undefined);
             return;
@@ -235,7 +245,8 @@ export function openNativePageCarrier(
       closeMux();
       ready.reject(new DOMException('Page closed', 'AbortError'));
       if (socket.readyState === WebSocket.OPEN) end();
-      if (socket.readyState === WebSocket.CONNECTING) socket.close();
+      if (socket.readyState === WebSocket.CONNECTING && !beginWithUpgrade)
+        socket.close();
     }
     return joined.promise;
   }
@@ -262,6 +273,7 @@ export function openNativePageCarrier(
         scopeId,
         requestId,
         targetThreadId: threadId,
+        dispatch: 'direct',
       });
       // A current same-origin cookie must prove that this is the login owning
       // the published scope, independently of the token captured by the socket.
@@ -275,15 +287,6 @@ export function openNativePageCarrier(
         .then((response) => {
           if (response.status !== 204)
             throw new EmployeeEntryError(response.status);
-          if (switching?.id !== requestId || requested) return;
-          try {
-            send({
-              type: 'item',
-              value: { type: 'switch', requestId, threadId },
-            });
-          } catch (error) {
-            failure = fail(error);
-          }
         })
         .catch((error: unknown) => {
           if (switching?.id !== requestId || requested) return;
@@ -326,7 +329,14 @@ export function openNativePageCarrier(
             (frame.type === 'open' && frame.endpoint === '$d-entry/page')
           )
             throw Error('A borrowed mux cannot control its page');
-          socket.send(event.data.data);
+          if (frame.type === 'open')
+            socket.send(
+              JSON.stringify({
+                ...frame,
+                pageScopeId: event.data.resourceScopeId,
+              }),
+            );
+          else socket.send(event.data.data);
         } catch (error) {
           failure = fail(error);
         }

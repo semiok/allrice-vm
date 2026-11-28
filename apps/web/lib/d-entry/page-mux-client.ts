@@ -13,6 +13,7 @@ export function borrowPageMux(
   scopeId: string,
   resourceScopeId = scopeId,
   canSendInput: () => boolean = () => true,
+  currentScope: () => string = () => resourceScopeId,
 ): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
@@ -60,7 +61,11 @@ export function borrowPageMux(
           'Native resource mux is unavailable',
           'InvalidStateError',
         );
-      port1.postMessage({ type: 'frame', data });
+      port1.postMessage({
+        type: 'frame',
+        data,
+        resourceScopeId: currentScope(),
+      });
     },
     close() {
       if (readyState === WebSocket.CLOSED) return;

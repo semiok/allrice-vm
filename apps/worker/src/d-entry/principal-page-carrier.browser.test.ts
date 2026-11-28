@@ -351,6 +351,7 @@ it
     }
     const unary: string[] = [];
     const startupReplies = new Map<string, unknown>();
+    let nativeEventOpens = 0;
     const startupMethods = new Set([
       'session/list',
       'dynamicCordisRunner/inventory',
@@ -1129,6 +1130,8 @@ it
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
+        if (frame.type === 'open' && frame.endpoint === '$events')
+          nativeEventOpens++;
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
@@ -1424,7 +1427,27 @@ it
       const mark = randomUUID();
       await workbench.locator('#app').evaluate((node, value) => {
         node.dataset.fixtureDocument = value;
+        const flashes = /重新连接中|连接成功|Reconnecting/u;
+        const observe = new MutationObserver((mutations) => {
+          if (
+            mutations.some(
+              ({ target, addedNodes }) =>
+                (target.nodeType === Node.TEXT_NODE &&
+                  flashes.test(target.textContent ?? '')) ||
+                Array.from(addedNodes).some((added) =>
+                  flashes.test(added.textContent ?? ''),
+                ),
+            )
+          )
+            node.dataset.fixtureConnectionFlash = 'yes';
+        });
+        observe.observe(document.body, {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
       }, mark);
+      const initialNativeEvents = nativeEventOpens;
       const cdp = await context.newCDPSession(page);
       await cdp.send('Network.enable');
       await cdp.send('Network.emulateNetworkConditions', {
@@ -1507,8 +1530,21 @@ it
             samples,
             documentLoads,
             socketCount,
+            nativeEventOpens: nativeEventOpens - initialNativeEvents,
+            flashed: await workbench
+              .locator('#app')
+              .getAttribute('data-fixture-connection-flash'),
           }),
       );
+      if (scenario === 'switch') {
+        expect(initialNativeEvents).toBeGreaterThan(0);
+        expect(nativeEventOpens).toBe(initialNativeEvents);
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-fixture-connection-flash'),
+        ).toBeNull();
+      }
       if (cross) {
         const before = { documentLoads, socketCount };
         const original = [...f.pageSignals].find(

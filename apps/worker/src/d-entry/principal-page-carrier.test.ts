@@ -216,22 +216,28 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   await next.receive();
 });
 
-it('replaces the bound root on the same page socket and only the target watch remains live', async () => {
+it('replaces the borrowed root while keeping native employee events on the same channel', async () => {
   const f = await fixture();
   const target = randomUUID();
   const revoked = f.registerThread(target);
   const { peer, scopeId, receive } = await open(f);
   const requestId = randomUUID();
-  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
   send(peer, {
-    type: 'item',
-    streamId: 'life',
-    value: {
-      type: 'switch',
-      requestId,
-      threadId: target,
-    },
+    type: 'open',
+    streamId: 'employee-events',
+    endpoint: '$events',
+    payload: { args: {} },
   });
+  expect(await receive('employee-events')).toMatchObject({
+    value: { type: 'ready' },
+  });
+  expect(
+    (
+      await f.proveSwitch(scopeId, target, requestId, sessionToken, {
+        dispatch: 'direct',
+      })
+    ).status,
+  ).toBe(204);
   const switched = await receive('life');
   expect(switched).toMatchObject({
     type: 'item',
@@ -244,6 +250,19 @@ it('replaces the bound root on the same page socket and only the target watch re
   });
   const nextScope = switched.value.scopeId as string;
   expect(nextScope).not.toBe(scopeId);
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'stale-follow',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: { args: {} },
+    }),
+  );
+  expect(await receive('stale-follow')).toMatchObject({
+    type: 'error',
+    error: { code: 'gateway/cancelled' },
+  });
   expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
     404,
   );

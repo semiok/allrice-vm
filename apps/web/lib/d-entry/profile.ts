@@ -158,7 +158,7 @@ export async function profileStaticFile(
 export async function profileSwitch(request: Request) {
   try {
     const context = await authenticateNativeRequest(request);
-    const { scopeId, requestId, targetThreadId, ...selection } =
+    const { scopeId, requestId, targetThreadId, dispatch, ...selection } =
       DEntryPageSwitchProofSchema.parse(exactProfileQuery(request.url));
     const input = await currentNativeRequest(
       request,
@@ -171,6 +171,7 @@ export async function profileSwitch(request: Request) {
         scopeId,
         requestId,
         targetThreadId,
+        ...(dispatch && { dispatch }),
       }),
     );
   } catch (error) {

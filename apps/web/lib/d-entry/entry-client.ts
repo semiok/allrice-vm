@@ -1,4 +1,6 @@
 import {
+  dEntryWarmIdentityHeader,
+  type DEntryIdentity,
   DEntryIdentityResultSchema,
   DEntryNativePrewarmStatusSchema,
   DEntryNativePrewarmTicketSchema,
@@ -47,8 +49,13 @@ export async function readEmployeeEntryIdentity(
     { signal, cache: 'no-store', credentials: 'same-origin' },
   );
   if (!response.ok) throw new EmployeeEntryError(response.status);
-  const { identity } = DEntryIdentityResultSchema.parse(await response.json());
+  const body: unknown = await response.json();
   signal.throwIfAborted();
+  return validateEntryIdentity(body, selection);
+}
+
+function validateEntryIdentity(body: unknown, selection: DEntrySelectionInput) {
+  const { identity } = DEntryIdentityResultSchema.parse(body);
   if (
     identity.workspaceId !== selection.workspaceId ||
     identity.employeeInstanceId !== selection.employeeInstanceId ||
@@ -134,6 +141,7 @@ export async function prewarmEmployeeEntry(
     ticket?: DEntryNativePrewarmTicket;
     trigger?: DEntryNativePrewarmTrigger;
     accepted?(ticket: DEntryNativePrewarmTicket): void;
+    ready?(identity: DEntryIdentity): void;
     progress?(state: EmployeePrewarmProgress, activeLimit?: number): void;
   } = {},
 ) {
@@ -145,7 +153,12 @@ export async function prewarmEmployeeEntry(
       AbortSignal.any([signal, AbortSignal.timeout(prewarmRequestMs)]),
     );
     signal.throwIfAborted();
-    if (warm.status === 204) return;
+    if (warm.status === 204) {
+      const identity = warm.headers.get(dEntryWarmIdentityHeader);
+      if (identity && options.ready)
+        options.ready(validateEntryIdentity(JSON.parse(identity), selection));
+      return;
+    }
     if (warm.status !== 202) throw new EmployeeEntryError(warm.status);
     ticket = DEntryNativePrewarmTicketSchema.parse(await warm.json());
   }

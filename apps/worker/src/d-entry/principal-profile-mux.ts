@@ -113,6 +113,14 @@ type OwnedPage = {
   operation: Promise<void>;
 };
 
+// These are employee-wide read streams in the existing rc.2 page profile.
+// Session follow and every other stream stay with the currently issued page.
+const employeeStreams = new Set([
+  '$events',
+  'session/control',
+  'workspace/follow',
+]);
+
 async function runOwner(
   pages: ReturnType<typeof createDEntryPageRequests>,
   token: string,
@@ -127,6 +135,8 @@ async function runOwner(
   let streamId: string | undefined;
   let current: OwnedPage | undefined;
   let staged: OwnedPage | undefined;
+  let transport: OwnedPage | undefined;
+  let shared: ReturnType<typeof pageStreams> | undefined;
   let handoff: Promise<void> | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false;
@@ -171,6 +181,18 @@ async function runOwner(
           if (!requestedClose && !stop.signal.aborted) fail(error);
         },
         previous,
+        (requestId, threadId) => {
+          if (current !== generation || !streamId || requestedClose) return;
+          void Promise.resolve()
+            .then(() =>
+              switchThread(
+                { type: 'switch', requestId, threadId },
+                streamId!,
+                true,
+              ),
+            )
+            .catch(fail);
+        },
       ),
     };
     return generation;
@@ -210,6 +232,7 @@ async function runOwner(
   function switchThread(
     command: ReturnType<typeof DEntryPageSwitchSchema.parse>,
     id: string,
+    direct = false,
   ) {
     const previous = current;
     const previousPage = previous?.page;
@@ -225,6 +248,7 @@ async function runOwner(
     const reserved = previousPage.reserveThreadSwitch(
       command.requestId,
       command.threadId,
+      direct,
     );
     if (!reserved) return decline();
     staged = begin(
@@ -241,8 +265,14 @@ async function runOwner(
         );
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
-        endPage(previous);
-        await join(previous);
+        await Promise.all([
+          previousPage.retireBorrows(),
+          previous.resources?.retire(),
+        ]);
+        if (previous !== transport) {
+          endPage(previous);
+          await join(previous);
+        }
         generation.stop.signal.throwIfAborted();
         await page.assertCurrent(page.signal);
         page.signal.throwIfAborted();
@@ -285,6 +315,16 @@ async function runOwner(
     // rejection listener until the generation itself terminates.
   }
 
+  async function joinPages() {
+    const generations = new Set([transport, current, staged]);
+    const results = await Promise.allSettled([
+      shared?.close(),
+      ...[...generations].map(join),
+    ]);
+    for (const result of results)
+      if (result.status === 'rejected') throw result.reason;
+  }
+
   try {
     for await (const [message, binary] of on(peer, 'message', {
       signal: connected,
@@ -293,7 +333,14 @@ async function runOwner(
       lowWaterMark: 1,
     })) {
       if (binary) throw denied();
-      const frame = parseRemoteStreamClientMessage(String(message));
+      const decoded: unknown = JSON.parse(String(message));
+      const pageScopeId =
+        decoded && typeof decoded === 'object' && 'pageScopeId' in decoded
+          ? decoded.pageScopeId
+          : undefined;
+      if (decoded && typeof decoded === 'object' && 'pageScopeId' in decoded)
+        delete decoded.pageScopeId;
+      const frame = parseRemoteStreamClientMessage(JSON.stringify(decoded));
       if (
         !streamId &&
         frame.type === 'open' &&
@@ -303,6 +350,12 @@ async function runOwner(
         const id = (streamId = frame.streamId);
         current = begin(input.selection, async (generation, page) => {
           mount(generation, page);
+          transport = generation;
+          shared = pageStreams(
+            page,
+            send,
+            AbortSignal.any([connected, generation.stop.signal, page.signal]),
+          );
           await send({
             type: 'item',
             streamId: id,
@@ -318,7 +371,32 @@ async function runOwner(
         });
       } else if (frame.streamId !== streamId) {
         if (!current?.resources || requestedClose) throw denied();
-        if (!current.stop.signal.aborted) current.resources.accept(frame);
+        const local = current.resources;
+        const id = frame.streamId;
+        const stable =
+          frame.type === 'open'
+            ? employeeStreams.has(frame.endpoint)
+            : shared?.has(id);
+        if (frame.type === 'open' && (local.has(id) || shared?.has(id)))
+          throw denied();
+        const resources = stable ? shared : local;
+        const replaced =
+          frame.type === 'open' &&
+          !stable &&
+          pageScopeId !== undefined &&
+          pageScopeId !== current.page?.scope.opened.scopeId;
+        if (resources && !resources.signal.aborted && !replaced)
+          resources.accept(frame);
+        else if (frame.type === 'open')
+          await send({
+            type: 'error',
+            streamId: id,
+            error: {
+              code: 'gateway/cancelled',
+              message: 'Native session selection changed',
+              details: {},
+            },
+          });
       } else if (
         frame.type === 'item' &&
         frame.value === 'close' &&
@@ -328,6 +406,7 @@ async function runOwner(
         const reason = new DOMException('Page closed', 'AbortError');
         endPage(current, reason);
         endPage(staged, reason);
+        endPage(transport, reason);
       } else if (frame.type === 'item' && !requestedClose) {
         await switchThread(
           DEntryPageSwitchSchema.parse(frame.value),
@@ -337,9 +416,7 @@ async function runOwner(
         if (!requestedClose) break;
         const scopeId = current?.page?.scope.opened.scopeId;
         try {
-          const joins = await Promise.allSettled([join(staged), join(current)]);
-          for (const result of joins)
-            if (result.status === 'rejected') throw result.reason;
+          await joinPages();
           connected.throwIfAborted();
           if (!scopeId) {
             await send({
@@ -372,11 +449,13 @@ async function runOwner(
   } catch (error) {
     endPage(current, error);
     endPage(staged, error);
+    endPage(transport, error);
     await notify(error);
   } finally {
     endPage(current, connected.reason);
     endPage(staged, connected.reason);
-    await Promise.allSettled([join(current), join(staged), handoff, terminal]);
+    endPage(transport, connected.reason);
+    await Promise.allSettled([joinPages(), handoff, terminal]);
   }
 }
 
@@ -387,6 +466,7 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
       cancel(): void;
       sendInput(input: DEntryPageInput): void;
       work: Promise<void>;
+      isOpen(): boolean;
     }
   >();
   const scopeId = page.scope.opened.scopeId;
@@ -507,6 +587,7 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     streams.set(id, {
       work,
       cancel: () => controller.abort(),
+      isOpen: () => !settled && !child.aborted,
       sendInput(command) {
         if (settled || child.aborted) return;
         const bytes = Buffer.byteLength(JSON.stringify(command));
@@ -540,8 +621,13 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     });
     void work.catch((error) => stop.abort(error));
   }
+  async function close() {
+    stop.abort();
+    await Promise.allSettled([...streams.values()].map(({ work }) => work));
+  }
   return {
     signal: active,
+    has: (id: string) => streams.has(id),
     accept(frame: Frame) {
       active.throwIfAborted();
       const prior = streams.get(frame.streamId);
@@ -561,9 +647,12 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
         });
       }
     },
-    async close() {
-      stop.abort();
-      await Promise.allSettled([...streams.values()].map(({ work }) => work));
+    close,
+    async retire() {
+      const open = [...streams].filter(([, entry]) => entry.isOpen());
+      await close();
+      signal.throwIfAborted();
+      for (const [streamId] of open) await send({ type: 'end', streamId });
     },
   };
 }
@@ -641,7 +730,9 @@ export function createDEntryPageMux(
             workspaceId,
             employeeInstanceId,
             threadId,
-          } = DEntryPageMuxQuerySchema.parse(Object.fromEntries(searchParams));
+          } = DEntryPageMuxQuerySchema.omit({ openId: true }).parse(
+            Object.fromEntries(searchParams),
+          );
           const input = {
             organizationId,
             selection: {

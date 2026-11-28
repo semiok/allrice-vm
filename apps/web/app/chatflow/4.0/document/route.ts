@@ -6,10 +6,7 @@ import { requireRequestContext } from '../../../../lib/identity/session';
 import { currentNativeRequest } from '../../../../lib/d-entry/native-request';
 import { DEntryDependencyUnavailable } from '../../../../lib/d-entry/release-policy';
 import { resolveDEntryIdentity } from '../../../../lib/d-entry/identity';
-import {
-  exactProfileQuery,
-  profileAddress,
-} from '../../../../lib/d-entry/profile';
+import { exactProfileQuery } from '../../../../lib/d-entry/profile';
 import { renderEmployeeDocument } from '../../../../lib/d-entry/employee-document';
 import { dEntryErrorResponse } from '../../../../lib/d-entry/responses';
 
@@ -36,8 +33,7 @@ export async function GET(request: Request) {
       context,
       'history',
     );
-    const address = await profileAddress(input, scopeId);
-    response = await renderEmployeeDocument(request, input, address, true);
+    response = await renderEmployeeDocument(request, input, scopeId);
   } catch (error) {
     response = dEntryErrorResponse(error);
   }

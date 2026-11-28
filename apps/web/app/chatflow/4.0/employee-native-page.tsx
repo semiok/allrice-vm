@@ -80,7 +80,8 @@ type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
   stopAssetDownloads(): void;
-  readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
+  readIdentity():
+    Awaited<ReturnType<typeof readEmployeeEntryIdentity>> | undefined;
   progress: {
     current?: { state: EmployeePrewarmProgress; activeLimit?: number };
     ticket?: DEntryNativePrewarmTicket;
@@ -97,19 +98,14 @@ function startEntryWarmup(
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
   const assets = new AbortController();
-  let lookup:
-    | {
-        read: ReturnType<typeof readEmployeeEntryIdentity>;
-        cancel: AbortController;
-      }
-    | undefined;
+  let identity: ReturnType<EntryWarmup['readIdentity']>;
   const result = prewarmEmployeeEntry(selection, lifetime.signal, {
     ticket,
     trigger: foregroundOpen ? 'open' : 'page',
+    ready(checked) {
+      if (selection.threadId) identity = checked;
+    },
     accepted(accepted) {
-      // A cold or resumed operation needs a fresh identity after ready.
-      lookup?.cancel.abort();
-      lookup = undefined;
       progress.ticket = accepted;
       void warmPublicProfileAssets(
         startupAssetUrls,
@@ -122,22 +118,13 @@ function startEntryWarmup(
     },
   });
   void result.catch(() => {}); // setup reports the result for this selection.
-  if (selection.threadId && !ticket) {
-    const cancel = new AbortController();
-    const read = readEmployeeEntryIdentity(
-      selection,
-      AbortSignal.any([lifetime.signal, cancel.signal]),
-    );
-    void read.catch(() => {}); // hot ready can retry an earlier miss.
-    lookup = { read, cancel };
-  }
   return {
     selection,
     lifetime,
     result,
     progress,
     stopAssetDownloads: () => assets.abort(),
-    readIdentity: () => lookup?.read,
+    readIdentity: () => identity,
   };
 }
 
@@ -866,40 +853,45 @@ export function EmployeeNativePage({
       if (selection.threadId && !entry.selection.threadId)
         params.set('threadId', selection.threadId);
       if (prepare && selection.threadId) selectedQuery = params.toString();
-      const speculative = await warmup?.readIdentity()?.catch(() => undefined);
+      const warmIdentity = warmup?.readIdentity();
       const identity =
-        speculative ??
+        warmIdentity ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(identity, selection, () => {
-        remoteRevoked = true;
-        unbindMemoryWrites?.();
-        send(pageRevoked);
-        if (!prepare && !lifetime.signal.aborted) setFailed(true);
-        // Before issuance, ready's rejection is handled by setting below.
-        if (prepare && mounted) finish('failed');
-        // Password changes and logout can revoke this carrier before their
-        // responses reach the iframe. Only the current cookie decides where
-        // the outer page goes.
-        if (mounted)
-          void retire()
-            .then(async () => {
-              if (detached || replace.current !== applyQuery) return;
-              const response = await fetch('/api/v1/auth/session', {
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: lifetime.signal,
-              });
-              // The unqualified entry checks the cookie again on navigation.
-              if (
-                response.status === 401 &&
-                !detached &&
-                replace.current === applyQuery
-              )
-                location.replace('/chatflow/4.0');
-            })
-            .catch(() => {});
-      });
+      carrier = openNativePageCarrier(
+        identity,
+        selection,
+        () => {
+          remoteRevoked = true;
+          unbindMemoryWrites?.();
+          send(pageRevoked);
+          if (!prepare && !lifetime.signal.aborted) setFailed(true);
+          // Before issuance, ready's rejection is handled by setting below.
+          if (prepare && mounted) finish('failed');
+          // Password changes and logout can revoke this carrier before their
+          // responses reach the iframe. Only the current cookie decides where
+          // the outer page goes.
+          if (mounted)
+            void retire()
+              .then(async () => {
+                if (detached || replace.current !== applyQuery) return;
+                const response = await fetch('/api/v1/auth/session', {
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: lifetime.signal,
+                });
+                // The unqualified entry checks the cookie again on navigation.
+                if (
+                  response.status === 401 &&
+                  !detached &&
+                  replace.current === applyQuery
+                )
+                  location.replace('/chatflow/4.0');
+              })
+              .catch(() => {});
+        },
+        Boolean(warmIdentity),
+      );
       const issued = (await carrier.ready).scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();

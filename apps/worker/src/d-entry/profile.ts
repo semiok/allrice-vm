@@ -7,6 +7,7 @@ import {
   DEntryProfileAssetSchema,
   DEntryProfileBindingSchema,
   DEntryProfileBootstrapSchema,
+  DEntryProfileDocumentSchema,
   DEntryProfileFilePathSchema,
   UuidSchema,
 } from '@allrice/contracts';
@@ -218,7 +219,10 @@ export function createDEntryProfile(
         // existing Web→Worker trust boundary. Only Web sets this header.
         if (
           mode !== undefined &&
-          !(operation === 'bootstrap' && mode === 'document') &&
+          !(
+            operation === 'bootstrap' &&
+            (mode === 'document' || mode === 'inline-document')
+          ) &&
           !(operation === 'assets' && mode === 'static')
         )
           throw new SyntaxError('Invalid profile request');
@@ -233,21 +237,25 @@ export function createDEntryProfile(
         const { organizationId, scopeId, ...selection } = base;
         const token = dEntryBearer(request);
         if (operation === 'switch') {
-          const { requestId, targetThreadId } =
+          const { requestId, targetThreadId, dispatch } =
             DEntryPageSwitchProofSchema.extend({
               organizationId: UuidSchema,
             }).parse(query);
-          await pages.borrow(
+          const activate = await pages.borrow(
             token,
             { organizationId, selection },
             scopeId,
             signal,
             async (page, active) => {
               active.throwIfAborted();
-              page.confirmThreadSwitch(requestId, targetThreadId);
+              return page.confirmThreadSwitch(
+                requestId,
+                targetThreadId,
+                dispatch === 'direct',
+              );
             },
           );
-          await send(signal, {}, () => response.end(), 204);
+          if (await send(signal, {}, () => response.end(), 204)) activate?.();
           return true;
         }
         if (operation === 'bootstrap') bootstrapQuery.parse(query);
@@ -383,20 +391,37 @@ export function createDEntryProfile(
                     });
                     const baseline = await readBaseline(latestAccess);
                     await verify();
+                    const bootstrap = DEntryProfileBootstrapSchema.parse({
+                      version: 1,
+                      scopeReference: { scopeId },
+                      bindingRef: page.bindingRef,
+                      graph: release.graph,
+                      injections: [
+                        ...release.injections,
+                        {
+                          kind: 'global',
+                          name: '__DSH_REMOTE_ACCESS__',
+                          value: baseline,
+                        },
+                      ],
+                    });
+                    if (mode !== 'inline-document') {
+                      body = JSON.stringify(bootstrap);
+                      return;
+                    }
+                    if (!page.root) throw new DEntryNativeUnavailable();
+                    const nativeSessionId = page.root.rootNativeSessionId;
+                    await page.authorize(nativeSessionId, 'read', active);
+                    await verify();
                     body = JSON.stringify(
-                      DEntryProfileBootstrapSchema.parse({
-                        version: 1,
-                        scopeReference: { scopeId },
-                        bindingRef: page.bindingRef,
-                        graph: release.graph,
-                        injections: [
-                          ...release.injections,
-                          {
-                            kind: 'global',
-                            name: '__DSH_REMOTE_ACCESS__',
-                            value: baseline,
-                          },
-                        ],
+                      DEntryProfileDocumentSchema.parse({
+                        address: {
+                          bindingRef: page.bindingRef,
+                          graphRev: release.graph.rev,
+                          manifestSha256: release.manifestSha256,
+                          nativeSessionId,
+                        },
+                        bootstrap,
                       }),
                     );
                   },

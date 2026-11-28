@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
+import { dEntryWarmIdentityHeader } from '@allrice/contracts';
 import { describe, expect, it } from 'vitest';
 import {
   closes,
@@ -64,6 +65,7 @@ suite('4.0 browser entry with a running employee', () => {
       let readyPolls = 0;
       let hotTransient = false;
       let hotIdentities = 0;
+      let useWarmReceipt = true;
       let exerciseNavigation = false;
       const ticket = randomUUID();
       f.web.on('request', async (request, response) => {
@@ -101,7 +103,20 @@ suite('4.0 browser entry with a running employee', () => {
                     pollAfterMs: 1000,
                   }),
                 );
-            return response.writeHead(204).end();
+            return response
+              .writeHead(
+                204,
+                useWarmReceipt
+                  ? {
+                      [dEntryWarmIdentityHeader]: JSON.stringify({
+                        identity: f.selectionIdentity(
+                          timing.selection as typeof f.selection,
+                        ),
+                      }),
+                    }
+                  : {},
+              )
+              .end();
           }
           case '/api/v1/d-entry/native-prewarm/status':
             readyPolls++;
@@ -117,12 +132,12 @@ suite('4.0 browser entry with a running employee', () => {
               selection: Object.fromEntries(address.searchParams),
             };
             requests.push(timing);
-            const reject = cold && ++coldIdentities === 2;
-            const earlyFailure = hotTransient && ++hotIdentities === 1;
+            const reject = cold && ++coldIdentities === 1;
+            if (hotTransient) hotIdentities++;
             await delay(240);
             timing.end = performance.now();
             if (reject) return response.writeHead(403).end();
-            if (earlyFailure) return response.writeHead(503).end();
+            if (hotTransient) return response.writeHead(503).end();
             return response
               .writeHead(200, { 'content-type': 'application/json' })
               .end(
@@ -239,6 +254,24 @@ suite('4.0 browser entry with a running employee', () => {
       const samples: unknown[] = [];
       for (let attempt = 0; attempt < 3; attempt++) {
         const page = await context.newPage();
+        const cdp = await context.newCDPSession(page);
+        await cdp.send('Network.enable');
+        await cdp.send('Network.emulateNetworkConditions', {
+          offline: false,
+          latency: 400,
+          downloadThroughput: 1_250_000,
+          uploadThroughput: 1_250_000,
+        });
+        const openingIds: (string | null)[] = [];
+        const browserOpens: string[] = [];
+        page.on('websocket', (socket) => {
+          openingIds.push(new URL(socket.url()).searchParams.get('openId'));
+          socket.on('framesent', ({ payload }) => {
+            const frame = JSON.parse(payload.toString());
+            if (frame.type === 'open' && frame.endpoint === '$d-entry/page')
+              browserOpens.push(frame.streamId);
+          });
+        });
         try {
           for (const mode of ['warm-open', 'refresh']) {
             const offset = requests.length;
@@ -260,27 +293,21 @@ suite('4.0 browser entry with a running employee', () => {
             const phases = requests.slice(offset);
             expect(phases.map(({ phase }) => phase).sort()).toEqual([
               'document',
-              'identity',
               'prewarm',
             ]);
             const prewarm = phases.find(({ phase }) => phase === 'prewarm')!;
-            const identity = phases.find(({ phase }) => phase === 'identity')!;
             const documentRequest = phases.find(
               ({ phase }) => phase === 'document',
             )!;
-            expect(documentRequest.start).toBeGreaterThanOrEqual(
-              Math.max(prewarm.end!, identity.end!),
-            );
-            expect(identity.start).toBeLessThan(prewarm.end!);
+            expect(documentRequest.start).toBeGreaterThanOrEqual(prewarm.end!);
+            expect(openingIds.at(-1)).toMatch(/^[a-f0-9-]{36}$/u);
+            expect(browserOpens).toEqual([]);
             samples.push({
               attempt: attempt + 1,
               mode,
               editableMs: Math.round(editableMs),
-              identityOverlapped: identity.start < prewarm.end!,
               prewarmStartMs: Math.round(prewarm.start - start),
               prewarmEndMs: Math.round(prewarm.end! - start),
-              identityStartMs: Math.round(identity.start - start),
-              identityEndMs: Math.round(identity.end! - start),
               documentStartMs: Math.round(documentRequest.start - start),
             });
           }
@@ -293,10 +320,12 @@ suite('4.0 browser entry with a running employee', () => {
         'HOT_OUTER_BENCHMARK ' +
           JSON.stringify({
             browser: browser.version(),
-            rttMs: { prewarm: 300, identity: 240 },
+            networkLatencyMs: 400,
+            fixturePrewarmMs: 300,
             samples,
           }),
       );
+      useWarmReceipt = false;
       exerciseNavigation = true;
       for (let attempt = 0; attempt < 3; attempt++) {
         const page = await context.newPage();
@@ -398,7 +427,7 @@ suite('4.0 browser entry with a running employee', () => {
                 ? ['document', 'identity', 'prewarm']
                 : ['document', 'identity', 'new-thread', 'prewarm'],
             );
-            expect(identity.start < prewarm.end!).toBe(reopen);
+            expect(identity.start).toBeGreaterThanOrEqual(prewarm.end!);
             expect(carriers.map(({ event }) => event)).toEqual([
               'closed',
               'connect',
@@ -539,20 +568,21 @@ suite('4.0 browser entry with a running employee', () => {
       denied.on('websocket', (socket) => deniedSockets.push(socket.url()));
       await denied.goto(url);
       await denied.getByRole('alert').waitFor();
-      expect(coldIdentities).toBe(2);
+      expect(coldIdentities).toBe(1);
       expect(readyPolls).toBe(1);
       expect(
         requests
           .slice(offset)
           .map(({ phase }) => phase)
           .sort(),
-      ).toEqual(['identity', 'identity', 'prewarm']);
+      ).toEqual(['identity', 'prewarm']);
       expect(await denied.locator('iframe').count()).toBe(0);
       expect(deniedSockets).toEqual([]);
       await denied.close();
 
       cold = false;
       hotTransient = true;
+      useWarmReceipt = true;
       const retryOffset = requests.length;
       const recovered = await context.newPage();
       await recovered.goto(url);
@@ -560,19 +590,12 @@ suite('4.0 browser entry with a running employee', () => {
         .frameLocator('iframe[title="员工工作区"]')
         .getByRole('textbox', { name: '消息' })
         .fill('验证热态早期瞬时失败后能打开');
-      expect(hotIdentities).toBe(2);
+      expect(hotIdentities).toBe(0);
       const recovery = requests.slice(retryOffset);
       expect(recovery.map(({ phase }) => phase).sort()).toEqual([
         'document',
-        'identity',
-        'identity',
         'prewarm',
       ]);
-      expect(
-        recovery.filter(({ phase }) => phase === 'identity')[1]!.start,
-      ).toBeGreaterThanOrEqual(
-        recovery.find(({ phase }) => phase === 'prewarm')!.end!,
-      );
       await context.close();
     },
   );

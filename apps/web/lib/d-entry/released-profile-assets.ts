@@ -12,7 +12,7 @@ const index = z.strictObject({
   bundles: publicProfileBundles,
 });
 
-async function readLocalProfileAssets(entrypoint = process.argv[1]) {
+export async function readLocalProfileAssets(entrypoint = process.argv[1]) {
   if (!entrypoint?.endsWith('/apps/web/server.mjs')) return undefined;
   try {
     const { stamp, paths, bundles, startup } = index.parse(

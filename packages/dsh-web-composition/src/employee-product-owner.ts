@@ -2,7 +2,6 @@ import type { Context } from '@deepseek-ai/cordis';
 import { ChatSessionSchema } from '@allrice/contracts';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import { employeeSkillHostCopy } from '../../../apps/web/app/chatflow/employee-skill-host-copy';
 import { readDEntryEmployeeSkills } from '../../../apps/web/app/chatflow/employee-skills-api';
@@ -287,83 +286,68 @@ export function installEmployeeProductOwner(ctx: Context) {
       };
     }, 'AllRice employee native root');
   });
-  ctx.inject(
-    ['uiWorkspace', 'sessions', 'connection', 'sidebarRight'],
-    (native) => {
-      native.effect(() => {
-        // rc.2 exports the browser handle without augmenting Cordis Context.
-        // This effect is installed only while Cordis injects that service.
-        const { connection } = native as Context & {
-          connection: ConnectionHandle;
-        };
-        let pending:
-          | {
-              scope: PageThreadScope;
-              oldGeneration: ReturnType<
-                typeof connection.generation.getSnapshot
-              >;
-              opened: boolean;
-            }
-          | undefined;
-        const update = () => {
-          if (!pending || signal.aborted) return;
-          const request = pending;
-          const generation = connection.generation.getSnapshot();
-          if (!generation || generation === pending.oldGeneration) return;
-          const root = native.sessions.list
-            .getSnapshot()
-            .ids.find((id) => id === pending?.scope.nativeSessionId);
-          if (!root) return;
-          if (!pending.opened) {
-            pending.opened = true;
-            native.uiWorkspace.openSession(root);
+  ctx.inject(['uiWorkspace', 'sessions', 'sidebarRight'], (native) => {
+    native.effect(() => {
+      let pending:
+        | {
+            scope: PageThreadScope;
+            opened: boolean;
           }
-          if (pending !== request) return;
-          if (native.sidebarRight.mounted.getSnapshot() !== root) return;
-          const next = pending.scope;
-          pending = undefined;
-          switchingScope = false;
-          activeNativeSession = next.nativeSessionId;
-          selectThread(next.threadId);
-          parent.postMessage(
-            {
-              type: pageThreadSelected,
-              scopeId,
-              resourceScopeId: next.scopeId,
-            },
-            location.origin,
-          );
+        | undefined;
+      const update = () => {
+        if (!pending || signal.aborted) return;
+        const request = pending;
+        const root = native.sessions.list
+          .getSnapshot()
+          .ids.find((id) => id === pending?.scope.nativeSessionId);
+        if (!root) return;
+        if (!pending.opened) {
+          pending.opened = true;
+          native.uiWorkspace.openSession(root);
+        }
+        if (pending !== request) return;
+        if (native.sidebarRight.mounted.getSnapshot() !== root) return;
+        const next = pending.scope;
+        pending = undefined;
+        switchingScope = false;
+        activeNativeSession = next.nativeSessionId;
+        selectThread(next.threadId);
+        parent.postMessage(
+          {
+            type: pageThreadSelected,
+            scopeId,
+            resourceScopeId: next.scopeId,
+          },
+          location.origin,
+        );
+      };
+      const onScope = (event: Event) => {
+        if (signal.aborted) return;
+        const next = (event as CustomEvent<PageThreadScope>).detail;
+        resourceScopeId = next.scopeId;
+        registered.set(next.nativeSessionId, {
+          threadId: next.threadId,
+          scopeId: next.scopeId,
+        });
+        switchingScope = true;
+        pending = {
+          scope: next,
+          opened: false,
         };
-        const onScope = (event: Event) => {
-          if (signal.aborted) return;
-          const next = (event as CustomEvent<PageThreadScope>).detail;
-          resourceScopeId = next.scopeId;
-          registered.set(next.nativeSessionId, {
-            threadId: next.threadId,
-            scopeId: next.scopeId,
-          });
-          switchingScope = true;
-          pending = {
-            scope: next,
-            oldGeneration: connection.generation.getSnapshot(),
-            opened: false,
-          };
-          connection.reconnect();
-        };
-        document.addEventListener(pageThreadScope, onScope);
-        const cleanup = [
-          connection.generation.subscribe(update),
-          native.sessions.list.subscribe(update),
-          native.sidebarRight.mounted.subscribe(update),
-        ];
-        parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
-        return () => {
-          document.removeEventListener(pageThreadScope, onScope);
-          cleanup.forEach((unsubscribe) => unsubscribe());
-        };
-      }, 'AllRice authorized thread selection');
-    },
-  );
+        update();
+      };
+      document.addEventListener(pageThreadScope, onScope);
+      const cleanup = [
+        native.sessions.list.subscribe(update),
+        native.sidebarRight.mounted.subscribe(update),
+      ];
+      parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
+      return () => {
+        document.removeEventListener(pageThreadScope, onScope);
+        cleanup.forEach((unsubscribe) => unsubscribe());
+      };
+    }, 'AllRice authorized thread selection');
+  });
 
   const workspaceTask = Promise.resolve().then(() => {
     const embedded = document.getElementById(

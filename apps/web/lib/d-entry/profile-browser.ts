@@ -311,15 +311,12 @@ export function nativeProfileDocument(
         return;
       const next = result.data;
       switching = undefined;
-      const old = peer;
-      peer = undefined;
       authority.lifetime.abort();
       authority = {
         scopeId: next.scopeId,
         selection: { ...selection, threadId: next.threadId },
         lifetime: new AbortController(),
       };
-      old?.close();
       try {
         onThreadScope(next);
       } catch {
@@ -498,6 +495,7 @@ export function nativeProfileDocument(
                 scopeId,
                 authority.scopeId,
                 () => !switching?.drainsComplete,
+                () => authority.scopeId,
               )
             : new WebSocket(
                 nativeMuxUrl(

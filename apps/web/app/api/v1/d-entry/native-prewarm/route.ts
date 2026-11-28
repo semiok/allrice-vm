@@ -1,4 +1,5 @@
 import {
+  dEntryWarmIdentityHeader,
   DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmInputSchema,
   DEntryNativePrewarmResultSchema,
@@ -62,7 +63,12 @@ export async function POST(request: Request) {
       });
     return new Response(null, {
       status: 204,
-      headers: { 'cache-control': 'private, no-store' },
+      headers: {
+        'cache-control': 'private, no-store',
+        [dEntryWarmIdentityHeader]: JSON.stringify({
+          identity: result.identity,
+        }),
+      },
     });
   } catch (error) {
     return dEntryErrorResponse(error);
