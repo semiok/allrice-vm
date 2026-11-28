@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createConnection, createServer, type Socket } from 'node:net';
 import {
+  authenticateSession,
   createDEntryAuthorityFeed,
   createEmployeeInstance,
+  createSession,
   ensureBootstrapPortalPrincipal,
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
@@ -138,7 +140,8 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     const [schema] = await db<
       { name: string }[]
     >`select current_schema() as name`;
-    expect(schema.name).toMatch(/^p25_[a-f0-9]{32}$/);
+    if (!schema || !/^p25_[a-f0-9]{32}$/.test(schema.name))
+      throw Error('Dedicated fixture schema required');
     fixtureSchema = schema.name;
     databaseUrl = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
     databaseUrl.searchParams.set('sslmode', 'disable');
@@ -164,20 +167,18 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       })},${personId})`;
     const dbSetup = vi.spyOn(client, 'getDatabase').mockReturnValue(db);
     try {
-      const employee = await createEmployeeInstance(
-        {
-          actor: { type: 'user', id: personId },
-          organizationId: owner.organizationId,
-          workspaceId: owner.workspaceId,
-          requestId: randomUUID(),
-        },
-        {
-          workspaceId: owner.workspaceId,
-          expectedOwnerId: personId,
-          requestId: randomUUID(),
-          profile: { name: 'Synthetic employee' },
-        },
-      );
+      const login = await createSession(personId);
+      const context = await authenticateSession(login.token, {
+        organizationId: owner.organizationId,
+        workspaceId: owner.workspaceId,
+      });
+      if (!context) throw Error('Synthetic employee owner required');
+      const employee = await createEmployeeInstance(context, {
+        workspaceId: owner.workspaceId,
+        expectedOwnerId: personId,
+        requestId: randomUUID(),
+        profile: { name: 'Synthetic employee' },
+      });
       employeeId = employee.id;
     } finally {
       dbSetup.mockRestore();
