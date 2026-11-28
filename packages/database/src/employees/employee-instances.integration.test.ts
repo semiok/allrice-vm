@@ -297,18 +297,24 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
       await expect(
         read(entry, { ...binding, personId: f.b.user.id }),
       ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
-      const locked = Promise.withResolvers<void>();
-      const release = Promise.withResolvers<void>();
+      let acquired!: () => void;
+      let release!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        acquired = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
       const locker = fixture.db.begin(async (tx) => {
         await tx`lock table allrice_employee_instances in access exclusive mode`;
-        locked.resolve();
-        await release.promise;
+        acquired();
+        await held;
       });
       try {
-        await Promise.race([locked.promise, locker]);
+        await Promise.race([locked, locker]);
         await expect(read()).rejects.toMatchObject({ code: '57014' });
       } finally {
-        release.resolve();
+        release();
         await locker;
       }
       const revised = await updateEmployeeInstance(f.a.context, employee.id, {
