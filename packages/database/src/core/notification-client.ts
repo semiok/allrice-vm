@@ -1,3 +1,4 @@
+import { Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, escapeIdentifier } from 'pg';
 
@@ -7,7 +8,11 @@ export function openPostgresNotifications(
   databaseUrl: string,
   channels: readonly string[],
   receive: (channel: string, payload: string) => void,
-  options: { applicationName?: string; onListen?(): void } = {},
+  options: {
+    applicationName?: string;
+    keepAliveMs?: number;
+    onListen?(): void;
+  } = {},
 ) {
   const stopped = new AbortController();
   let endCurrent: (() => Promise<void>) | undefined;
@@ -19,14 +24,31 @@ export function openPostgresNotifications(
   });
   const run = (async () => {
     while (!stopped.signal.aborted) {
+      const socket = new Socket();
+      const closed = new Promise<void>((resolve) => {
+        socket.once('close', () => resolve());
+      });
       const client = new Client({
         connectionString: databaseUrl,
+        stream: () => socket,
         application_name: options.applicationName,
+        keepAlive: Boolean(options.keepAliveMs),
+        keepAliveInitialDelayMillis: options.keepAliveMs,
         connectionTimeoutMillis: 5000,
         query_timeout: 5000,
       });
       let ending: Promise<void> | undefined;
-      const end = () => (ending ??= client.end());
+      const end = () =>
+        (ending ??= (async () => {
+          // Give PostgreSQL its normal Terminate, but a half-open peer must
+          // not hold shutdown. This read-only connection owns no transaction.
+          const deadline = setTimeout(() => socket.destroy(), 1000).unref();
+          try {
+            await Promise.all([client.end(), closed]);
+          } finally {
+            clearTimeout(deadline);
+          }
+        })());
       const disconnected = new Promise<void>((resolve) => {
         const lost = () => resolve();
         client.once('end', lost);

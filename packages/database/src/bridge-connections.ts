@@ -21,13 +21,10 @@ export class BridgeConnectionError extends Error {
 
 /** PostgreSQL authority for a transport connection; never authorizes tool execution. */
 export function createBridgeConnectionAuthority(
-  database = getDatabase(),
-  options: {
-    serverId?: string;
-    leaseMs?: number;
-    notificationDatabaseUrl?: string;
-  } = {},
+  injectedDatabase?: ReturnType<typeof getDatabase>,
+  options: { serverId?: string; leaseMs?: number } = {},
 ) {
+  const database = injectedDatabase ?? getDatabase();
   const serverId = UuidSchema.parse(options.serverId ?? randomUUID());
   const leaseMs = options.leaseMs ?? 30_000;
   if (!Number.isInteger(leaseMs) || leaseMs < 1000 || leaseMs > 60_000)
@@ -88,23 +85,44 @@ export function createBridgeConnectionAuthority(
     async subscribe(
       listener: (deviceId: string, kind: 'connection' | 'work') => void,
     ) {
+      const channels = [
+        'allrice_bridge_connection',
+        'allrice_bridge_runtime_operation',
+        'allrice_bridge_commands',
+        'allrice_bridge_workspace_selection',
+      ];
+      const receive = (channel: string, payload: string) => {
+        const id = UuidSchema.safeParse(payload);
+        if (id.success)
+          listener(
+            id.data,
+            channel === 'allrice_bridge_connection' ? 'connection' : 'work',
+          );
+      };
+      if (injectedDatabase) {
+        // Preserve the injected pool's own connection configuration and
+        // lifetime. Its caller owns the pool, including driver reconnect.
+        const subscriptions: { unlisten(): Promise<void> }[] = [];
+        const close = async () => {
+          await Promise.all(subscriptions.map((item) => item.unlisten()));
+        };
+        try {
+          for (const channel of channels)
+            subscriptions.push(
+              await database.listen(channel, (payload) =>
+                receive(channel, payload),
+              ),
+            );
+        } catch (error) {
+          await close();
+          throw error;
+        }
+        return close;
+      }
       const subscription = openDatabaseNotifications(
         database,
-        [
-          'allrice_bridge_connection',
-          'allrice_bridge_runtime_operation',
-          'allrice_bridge_commands',
-          'allrice_bridge_workspace_selection',
-        ],
-        (channel, payload) => {
-          const id = UuidSchema.safeParse(payload);
-          if (id.success)
-            listener(
-              id.data,
-              channel === 'allrice_bridge_connection' ? 'connection' : 'work',
-            );
-        },
-        { databaseUrl: options.notificationDatabaseUrl },
+        channels,
+        receive,
       );
       try {
         await subscription.ready;

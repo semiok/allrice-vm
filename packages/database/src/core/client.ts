@@ -36,13 +36,36 @@ export function openDatabaseNotifications(
   database: ReturnType<typeof postgres>,
   channels: readonly string[],
   receive: (channel: string, payload: string) => void,
-  options: { databaseUrl?: string; onListen?(): void } = {},
+  options: { onListen?(): void } = {},
 ) {
-  const url =
-    options.databaseUrl ?? (database === client ? clientUrl : undefined);
-  if (!url) throw Error('Dedicated notification connection URL required');
-  return openPostgresNotifications(url, channels, receive, {
+  if (database !== client || !clientUrl)
+    throw Error('Notification connection must use the process database');
+  const { host, ssl, target_session_attrs, keep_alive } = database.options;
+  if (host.length !== 1 || ssl || target_session_attrs) {
+    // Keep the original driver's host selection and TLS policy for DSNs
+    // whose connection semantics differ between the two drivers.
+    const listener = createDedicatedDatabase(database);
+    let closing: Promise<void> | undefined;
+    const ready = (async () => {
+      for (const channel of channels) {
+        if (closing) return;
+        await listener.listen(
+          channel,
+          (payload) => {
+            if (!closing) receive(channel, payload);
+          },
+          options.onListen,
+        );
+      }
+    })();
+    return {
+      ready,
+      close: () => (closing ??= listener.end({ timeout: 5 })),
+    };
+  }
+  return openPostgresNotifications(clientUrl, channels, receive, {
     applicationName: database.options.connection.application_name,
+    keepAliveMs: (keep_alive ?? 0) * 1000,
     onListen: options.onListen,
   });
 }

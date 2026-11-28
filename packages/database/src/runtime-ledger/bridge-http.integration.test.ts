@@ -332,9 +332,7 @@ async function fixture(options: { wss?: boolean } = {}) {
     const { createBridgeSocketGateway, createBridgeLoopbackDispatch } =
       await import(modulePath);
     const gateway = await createBridgeSocketGateway({
-      authority: createBridgeConnectionAuthority(database, {
-        notificationDatabaseUrl: process.env.ALLRICE_TEST_DATABASE_URL,
-      }),
+      authority: createBridgeConnectionAuthority(database),
       enabled: () => true,
       dispatch: createBridgeLoopbackDispatch(address.port),
       heartbeatMs: 100,

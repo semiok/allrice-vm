@@ -5,6 +5,8 @@ import {
 } from './bridge-settings.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -20,6 +22,7 @@ import {
 } from './bridge.ts';
 import type * as Client from './core/client.ts';
 import { createBridgeConnectionAuthority } from './bridge-connections.ts';
+import { openPostgresNotifications } from './core/notification-client.ts';
 import {
   resolveWorkbenchTerminalTarget,
   revalidateBridgeTerminalTarget,
@@ -169,10 +172,12 @@ suite(
       'closes the Bridge LISTEN socket %s without closing the Web business pool',
       async (timing) => {
         const applicationName = 'bridge-close-' + randomUUID();
-        const web = postgres(process.env.ALLRICE_TEST_DATABASE_URL!, {
-          max: 1,
-          connection: { application_name: applicationName },
-        });
+        const client = await vi.importActual<typeof Client>('./core/client.ts');
+        const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+        url.searchParams.set('application_name', applicationName);
+        vi.stubEnv('DATABASE_URL', url.toString());
+        const previous = database;
+        const web = (database = client.getDatabase());
         const notify = vi.fn();
         const channel = 'allrice_bridge_workspace_selection';
         const subscriptionPids = () => admin<{ pid: number }[]>`
@@ -185,9 +190,7 @@ suite(
           const [business] = await web<
             { pid: number }[]
           >`select pg_backend_pid() as pid`;
-          close = await createBridgeConnectionAuthority(web, {
-            notificationDatabaseUrl: process.env.ALLRICE_TEST_DATABASE_URL,
-          }).subscribe(notify);
+          close = await createBridgeConnectionAuthority().subscribe(notify);
           const [first] = await subscriptionPids();
           expect(first).toBeDefined();
           const device = randomUUID();
@@ -226,12 +229,55 @@ suite(
           try {
             await close?.();
           } finally {
-            await web.end({ timeout: 5 });
+            database = previous;
+            vi.unstubAllEnvs();
+            await client.closeDatabase();
           }
         }
       },
       10000,
     );
+
+    it('joins the capacity LISTEN socket even when its proxy keeps the TCP peer open', async () => {
+      const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+      const sockets: Socket[] = [];
+      const proxy = createServer({ allowHalfOpen: true }, (incoming) => {
+        const upstream = createConnection({
+          host: url.hostname,
+          port: Number(url.port),
+        });
+        sockets.push(incoming, upstream);
+        incoming.on('error', () => upstream.destroy());
+        upstream.on('error', () => incoming.destroy());
+        incoming.pipe(upstream);
+        // The database may close normally, but the proxy withholds peer FIN.
+        upstream.pipe(incoming, { end: false });
+      });
+      proxy.listen(0, '127.0.0.1');
+      await once(proxy, 'listening');
+      const address = proxy.address();
+      if (!address || typeof address === 'string')
+        throw Error('fixture listener missing');
+      const routed = new URL(url);
+      routed.port = String(address.port);
+      const owner = openPostgresNotifications(
+        routed.toString(),
+        ['allrice_model_gateway_capacity'],
+        () => {},
+      );
+      try {
+        await owner.ready;
+        const joined = await Promise.race([
+          owner.close().then(() => true),
+          delay(3500, false, { ref: false }),
+        ]);
+        expect(joined).toBe(true);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await owner.close();
+        await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      }
+    }, 6000);
 
     it('human terminal authority binds the actual login, private chat and grant generation without mutating presence', async () => {
       const f = await terminalFixture();
