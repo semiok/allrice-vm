@@ -2,7 +2,15 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createServer, type Server } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  truncate,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Browser, Page } from 'playwright-core';
@@ -219,7 +227,7 @@ suite(
       },
     );
 
-    it('reopens an ambiguous publication on its original receipt and never submits a second upload', async () => {
+    it('reopens cleanly and retries the original publication through the normal button without a duplicate upload', async () => {
       const page = await browser.newPage();
       try {
         await page.goto(origin);
@@ -232,45 +240,45 @@ suite(
         const open = () =>
           root(page).getByRole('button', { name: '上传', exact: true }).click();
         const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+        const choose = () =>
+          dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+            name: '上传回归.txt',
+            mimeType: 'text/plain',
+            buffer: Buffer.from('same canonical write'),
+          });
+        const publish = () =>
+          dialog.getByRole('button', { name: '发布', exact: true }).click();
         await open();
-        await dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
-          name: '待核.txt',
-          mimeType: 'text/plain',
-          buffer: Buffer.from('same canonical write'),
-        });
-        await dialog.getByRole('button', { name: '发布', exact: true }).click();
-        await dialog
-          .getByText('发布结果待核，请按原请求核对。', { exact: true })
-          .waitFor();
+        await choose();
+        await publish();
+        await dialog.getByText('上传中断，请重试。', { exact: true }).waitFor();
         await dialog.getByRole('button', { name: '取消', exact: true }).click();
         await open();
-        await dialog
-          .getByRole('button', { name: '核对结果', exact: true })
-          .waitFor();
+        await dialog.getByRole('textbox').waitFor();
+        expect(await dialog.getByRole('alert').count()).toBe(0);
+        expect(await dialog.getByRole('button', { name: /核对/ }).count()).toBe(
+          0,
+        );
         await expect
           .poll(
             async () =>
               (await evidence(page)).calls.filter(
-                (call) => call.method === 'readWriteReceipt',
+                ({ method }) => method === 'readWriteReceipt',
               ).length,
           )
           .toBe(1);
-        await dialog.getByRole('textbox').fill('只改当前表单，不属于原请求');
         await page.evaluate(() => window.__panelDataFixture.finishReceipt());
-        await dialog
-          .getByRole('button', { name: '核对结果', exact: true })
-          .click();
-        await dialog.getByText('原发布已完成。', { exact: true }).waitFor();
-        expect(await dialog.getByRole('textbox').inputValue()).toBe(
-          '只改当前表单，不属于原请求',
-        );
-        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        await choose();
+        await publish();
         await dialog.waitFor({ state: 'hidden' });
         const calls = (await evidence(page)).calls;
         const uploads = calls.filter((call) => call.method === 'publishUpload');
         expect(uploads).toHaveLength(1);
         const requestId = (uploads[0]!.input as { requestId: string })
           .requestId;
+        expect(await page.getByText(requestId, { exact: false }).count()).toBe(
+          0,
+        );
         expect(
           calls
             .filter((call) => call.method === 'readWriteReceipt')
@@ -281,6 +289,78 @@ suite(
         ]);
       } finally {
         await page.close();
+      }
+    });
+
+    it('shows the file limit and disables the publishing button until the upload completes', async () => {
+      const page = await browser.newPage();
+      const folder = await mkdtemp(join(tmpdir(), 'allrice-material-limit-'));
+      const oversized = join(folder, '过大的资料.txt');
+      try {
+        await writeFile(oversized, '');
+        await truncate(oversized, 50 * 1024 ** 2 + 1);
+        await page.goto(origin);
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+        await root(page)
+          .getByRole('button', { name: '上传', exact: true })
+          .click();
+        const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+        const input = dialog.getByLabel('选择文件', { exact: true });
+        const publish = dialog.getByRole('button', {
+          name: '发布',
+          exact: true,
+        });
+        const limit = dialog.getByText('文件超过 50 MB 上限。', {
+          exact: true,
+        });
+        const choose = () =>
+          input.setInputFiles({
+            name: '普通资料.txt',
+            mimeType: 'text/plain',
+            buffer: Buffer.from('可以上传的资料'),
+          });
+        await input.setInputFiles(oversized);
+        await limit.waitFor();
+        expect(await publish.isDisabled()).toBe(true);
+        expect(
+          (await evidence(page)).calls.filter(
+            ({ method }) => method === 'publishUpload',
+          ),
+        ).toHaveLength(0);
+        await choose();
+        expect(await limit.count()).toBe(0);
+        await page.evaluate(() =>
+          window.__panelDataFixture.rejectNextPublication(413),
+        );
+        await publish.click();
+        await limit.waitFor();
+        await page.evaluate(() => window.__panelDataFixture.holdPublication());
+        await publish.click();
+        const publishing = dialog.getByRole('button', {
+          name: '发布中...',
+          exact: true,
+        });
+        await publishing.waitFor();
+        expect(await publishing.isDisabled()).toBe(true);
+        expect(await publishing.getAttribute('aria-busy')).toBe('true');
+        await page.screenshot({
+          path: join(output, 'publication-pending.png'),
+        });
+        await page.evaluate(() =>
+          window.__panelDataFixture.finishPublication(),
+        );
+        await dialog.waitFor({ state: 'hidden' });
+        await root(page).getByText('普通资料.txt', { exact: true }).waitFor();
+        expect(
+          (await evidence(page)).calls.filter(
+            ({ method }) => method === 'publishUpload',
+          ),
+        ).toHaveLength(2);
+      } finally {
+        await page.close();
+        await rm(folder, { recursive: true });
       }
     });
 
@@ -354,13 +434,9 @@ suite(
         });
         expect(b!.requestId).not.toBe(a!.requestId);
         expect(await inquiries()).toEqual([a!.requestId]);
-        expect(
-          await dialog
-            .getByRole('button', {
-              name: '核对结果 ' + a!.requestId.slice(0, 8),
-            })
-            .isDisabled(),
-        ).toBe(true);
+        expect(await dialog.getByRole('button', { name: /核对/ }).count()).toBe(
+          0,
+        );
         await page.reload();
         await chooseMaterials();
         await open();
@@ -445,11 +521,20 @@ suite(
           () => document.body.dataset.publicationHashHeld === 'true',
         );
         await page.evaluate(() => window.__panelDataFixture.finishReceipt());
-        await dialog.getByText('原发布已完成。', { exact: true }).waitFor();
+        await expect
+          .poll(async () =>
+            page.evaluate(
+              () =>
+                Object.keys(sessionStorage).filter((key) =>
+                  key.startsWith('allrice:publication-receipts:v2:'),
+                ).length,
+            ),
+          )
+          .toBe(0);
         await page.evaluate(() =>
           window.dispatchEvent(new Event('release-publication-hash')),
         );
-        await expect.poll(() => publish.isEnabled()).toBe(true);
+        await dialog.waitFor({ state: 'hidden' });
         const calls = (await evidence(page)).calls;
         const writes = calls.filter((call) => call.method === 'publishUpload');
         expect(writes).toHaveLength(1);
@@ -496,9 +581,7 @@ suite(
           buffer: Buffer.from('内容'),
         });
         await dialog.getByRole('button', { name: '发布', exact: true }).click();
-        await dialog
-          .getByText('无法保留原发布请求，请重试。', { exact: true })
-          .waitFor();
+        await dialog.getByText('上传中断，请重试。', { exact: true }).waitFor();
         expect(
           (await evidence(page)).calls.filter(
             (call) => call.method === 'publishUpload',
@@ -539,7 +622,7 @@ suite(
           };
         });
         await publish.click();
-        await dialog.getByText('发布被明确拒绝。', { exact: true }).waitFor();
+        await dialog.getByText('上传中断，请重试。', { exact: true }).waitFor();
         expect(
           await dialog
             .getByRole('button', { name: '核对结果', exact: true })

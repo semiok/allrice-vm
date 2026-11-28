@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { z } from 'zod';
 import {
-  EmployeePanelsHttpError,
+  EmployeePanelsWriteUnknownError,
   EmployeePanelsWriteRejectedError,
 } from '../../lib/chatflow/employee-panel-data-http';
 import {
+  REFERENCE_UPLOAD_MAX_BYTES,
   ReferenceAudienceSchema,
   ReferencePublicationActionSchema,
   ReferencePublishInputSchema,
@@ -71,15 +72,13 @@ const receiptSchema = z.strictObject({
 });
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
-type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
-type ReceiptCheckStage = 'checking' | 'waiting' | 'settled' | 'unavailable';
-type PublicationReceiptAccess = 'issued' | 'verified' | 'denied';
-const settledPublications = new Map<string, ReceiptOutcome>();
-const publicationAccess = new Map<string, PublicationReceiptAccess>();
+type SavedPublication = Parameters<Props['onSaved']>[0];
+type Resolution =
+  { outcome: 'recorded'; saved: SavedPublication } | { outcome: 'rejected' };
+const settledPublications = new Map<string, Resolution>();
 const publicationRecordKey = (key: string, requestId: string) =>
   key + '/' + requestId;
 const receiptPrefix = 'allrice:publication-receipts:v2:';
-const receiptDenialPrefix = 'allrice:publication-receipt-denials:v1:';
 const receiptAddress = z.tuple([
   UuidSchema,
   UuidSchema,
@@ -89,14 +88,6 @@ const receiptAddress = z.tuple([
   z.enum(['file', 'upload', 'audience', 'revoke', 'delete']),
   UuidSchema.nullable(),
 ]);
-const receiptActions = {
-  file: '原添加为企业资料',
-  upload: '原发布',
-  audience: '原资料编辑',
-  revoke: '原撤销',
-  delete: '原删除',
-};
-
 // Keep the original selector, intent digest and known status across reloads.
 // File bytes and display metadata stay in the active form.
 function storedPublications(key: string | undefined) {
@@ -124,56 +115,15 @@ function restorePublications(key: string | undefined) {
     return [];
   }
 }
-function readPublicationReceiptAccess(
-  key: string | undefined,
-  receipt: PublicationReceipt,
-) {
-  if (!key) return;
-  const id = publicationRecordKey(key, receipt.requestId);
-  const current = publicationAccess.get(id);
-  if (current !== undefined) return current;
-  try {
-    if (sessionStorage.getItem(receiptDenialPrefix + id) === '1')
-      return 'denied';
-  } catch {
-    // A restored receipt still needs its own read in this document.
-  }
-}
-function canShowPublicationReceipt(
-  key: string | undefined,
-  receipt: PublicationReceipt,
-) {
-  const access = readPublicationReceiptAccess(key, receipt);
-  return access === 'issued' || access === 'verified';
-}
-function setPublicationReceiptUnavailable(
-  key: string,
-  receipt: PublicationReceipt,
-  unavailable: boolean,
-) {
-  const id = publicationRecordKey(key, receipt.requestId);
-  publicationAccess.set(id, unavailable ? 'denied' : 'verified');
-  try {
-    // Keep the receipt record readable by v2 clients. Reconcile the stored
-    // denial on every definite response so transient storage errors can heal.
-    const marker = receiptDenialPrefix + id;
-    if ((sessionStorage.getItem(marker) === '1') === unavailable) return;
-    if (unavailable) sessionStorage.setItem(marker, '1');
-    else sessionStorage.removeItem(marker);
-  } catch {
-    // Both entries in this tab still use the known access state.
-  }
-}
 function settlePublication(
   key: string,
   receipt: PublicationReceipt,
-  outcome: ReceiptOutcome,
+  resolution: Resolution,
 ) {
   settledPublications.set(
     publicationRecordKey(key, receipt.requestId),
-    outcome,
+    resolution,
   );
-  setPublicationReceiptUnavailable(key, receipt, false);
   try {
     rememberPublications(key, pendingPublications(key));
   } catch {
@@ -184,7 +134,7 @@ function settlePublication(
         JSON.stringify(
           storedPublications(key).map((value) =>
             value.requestId === receipt.requestId
-              ? { ...value, outcome }
+              ? { ...value, outcome: resolution.outcome }
               : value,
           ),
         ),
@@ -207,50 +157,23 @@ async function publicationFingerprint(value: unknown) {
 
 class ReceiptStorageUnavailable extends Error {}
 
-const waitingForReceipt = '发布结果待核，请按原请求核对。';
-const unavailableReceipt = '当前无法核对原发布请求。';
-
-function usePublicationReceiptRetry(
-  available: boolean,
-  recheck: () => Promise<unknown>,
-) {
-  const [checking, setChecking] = useState(false);
-  const [focused, setFocused] = useState(false);
-  const inFlight = useRef(false);
-  // Keep keyboard focus until the next navigation even when the result
-  // settles the last receipt that could be checked here.
-  if (!available && !checking && !focused) return null;
-  const retry = async () => {
-    if (inFlight.current || !available) return;
-    inFlight.current = true;
-    setChecking(true);
-    try {
-      await recheck();
-    } finally {
-      inFlight.current = false;
-      setChecking(false);
-    }
-  };
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      aria-busy={checking || undefined}
-      aria-disabled={checking || !available || undefined}
-      onFocus={() => setFocused(true)}
-      onBlur={() => setFocused(false)}
-      onClick={() => void retry()}
-    >
-      {checking ? '正在核对…' : available ? '重试核对' : '核对结束'}
-    </Button>
-  );
-}
-
-function receiptAccessDenied(error: unknown) {
-  return (
-    error instanceof EmployeePanelsHttpError &&
-    [401, 403, 404].includes(error.status)
-  );
+const fileSizeError = `文件超过 ${REFERENCE_UPLOAD_MAX_BYTES / 1024 ** 2} MB 上限。`;
+const publishError = '发布未完成，请重试。';
+const uploadError = '上传中断，请重试。';
+function saveError(error: unknown, upload: boolean) {
+  const failure =
+    error instanceof EmployeePanelsWriteUnknownError ? error.cause : error;
+  if (
+    upload &&
+    failure instanceof Error &&
+    'status' in failure &&
+    failure.status === 413
+  ) {
+    return 'code' in failure && failure.code === 'QUOTA_EXCEEDED'
+      ? '企业资料存储空间不足。'
+      : fileSizeError;
+  }
+  return upload ? uploadError : publishError;
 }
 
 async function checkPublication(
@@ -259,53 +182,41 @@ async function checkPublication(
   key: string,
   receipt: PublicationReceipt,
   signal: AbortSignal,
-): Promise<ReceiptOutcome | undefined> {
+): Promise<Resolution | undefined> {
+  signal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+  signal.throwIfAborted();
   const known = settledPublications.get(
     publicationRecordKey(key, receipt.requestId),
   );
   if (known) return known;
-  let result: Awaited<ReturnType<EmployeePanelDataClient['readWriteReceipt']>>;
-  try {
-    result = await data.readWriteReceipt(
-      {
-        workspaceId,
-        operation: receipt.operation,
-        requestId: receipt.requestId,
-        sourceId: receipt.sourceId,
-      },
-      signal,
-    );
-  } catch (error) {
-    signal.throwIfAborted();
-    if (receiptAccessDenied(error))
-      setPublicationReceiptUnavailable(key, receipt, true);
-    throw error;
-  }
+  const response = await data.readWriteReceipt(
+    {
+      workspaceId,
+      operation: receipt.operation,
+      requestId: receipt.requestId,
+      sourceId: receipt.sourceId,
+    },
+    signal,
+  );
   signal.throwIfAborted();
+  const saved = response.result;
   if (
-    result.status !== 'recorded' ||
-    result.ready === false ||
-    !result.result
-  ) {
-    setPublicationReceiptUnavailable(key, receipt, false);
+    response.status !== 'recorded' ||
+    response.ready === false ||
+    !saved ||
+    !('sourceId' in saved)
+  )
     return;
-  }
-  settlePublication(key, receipt, 'recorded');
-  return 'recorded';
+  const result = { outcome: 'recorded', saved } as const;
+  settlePublication(key, receipt, result);
+  return result;
 }
 
-type PendingPublication = {
-  id: string;
-  key: string;
-  receipt: PublicationReceipt;
-  action: string;
-  targetId: string;
-};
-type SidebarReceiptNote =
-  | { stage: 'checking'; message: string; reading: AbortSignal }
-  | { stage: 'waiting' | 'settled'; message: string };
+function refreshPublishedFiles() {
+  window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+}
 
-/** Recover the original request even when the completed write removed its row. */
+/** Read earlier writes on panel entry without exposing their internal keys. */
 export function ReferencePublicationPending({
   workspaceId,
   viewerId,
@@ -324,82 +235,16 @@ export function ReferencePublicationPending({
   signal: AbortSignal;
 }) {
   const { organizationId, employeeInstanceId, threadId } = receiptScope;
-  const [records, setRecords] = useState<PendingPublication[]>([]);
-  const [notes, setNotes] = useState<Record<string, SidebarReceiptNote>>({});
-  const checking = useRef(new Map<string, AbortSignal>()).current;
-  const entrySignal = useRef<AbortSignal | null>(null);
-  const reconcile = useCallback(
-    async (record: PendingPublication, requestSignal: AbortSignal) => {
-      const { id, key, receipt, action, targetId } = record;
-      if (requestSignal.aborted || checking.get(id)?.aborted === false) return;
-      checking.set(id, requestSignal);
-      const note = (value: SidebarReceiptNote) =>
-        setNotes((previous) => ({ ...previous, [id]: value }));
-      const waiting: SidebarReceiptNote = {
-        stage: 'waiting',
-        message: waitingForReceipt,
-      };
-      if (readPublicationReceiptAccess(key, receipt) !== 'denied')
-        note({
-          stage: 'checking',
-          message: '正在核对' + action + '…',
-          reading: requestSignal,
-        });
-      try {
-        const outcome = await checkPublication(
-          dataClient,
-          workspaceId,
-          key,
-          receipt,
-          requestSignal,
-        );
-        if (requestSignal.aborted) return;
-        if (!outcome) {
-          note(waiting);
-          return;
-        }
-        setRecords((previous) => previous.filter((value) => value.id !== id));
-        note({
-          stage: 'settled',
-          message:
-            action +
-            (outcome === 'recorded' ? '已完成。' : '已拒绝。') +
-            ' ' +
-            targetId,
-        });
-        if (outcome === 'recorded')
-          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
-      } catch (error) {
-        if (requestSignal.aborted) return;
-        if (receiptAccessDenied(error)) {
-          setNotes((previous) => {
-            const next = { ...previous };
-            delete next[id];
-            return next;
-          });
-        } else if (readPublicationReceiptAccess(key, receipt) !== 'denied') {
-          note(waiting);
-        }
-      } finally {
-        if (checking.get(id) === requestSignal) checking.delete(id);
-      }
-    },
-    [checking, dataClient, workspaceId],
-  );
-
   useEffect(() => {
     if (dialogOpen || signal.aborted) return;
-    const found: PendingPublication[] = [];
+    const records: { key: string; receipt: PublicationReceipt }[] = [];
     try {
       for (let index = 0; index < sessionStorage.length; index++) {
         const key = sessionStorage.key(index);
         if (!key?.startsWith(receiptPrefix)) continue;
         try {
-          const address = receiptAddress.parse(
-            JSON.parse(key.slice(receiptPrefix.length)),
-          );
           const [org, viewer, workspace, employee, thread, action, target] =
-            address;
+            receiptAddress.parse(JSON.parse(key.slice(receiptPrefix.length)));
           if (
             org !== organizationId ||
             viewer !== viewerId ||
@@ -422,102 +267,37 @@ export function ReferencePublicationPending({
                   : target &&
                     receipt.sourceId === target &&
                     receipt.operation === 'change-publication';
-            if (matches)
-              found.push({
-                id: publicationRecordKey(key, receipt.requestId),
-                key,
-                receipt,
-                action: receiptActions[action],
-                targetId: target ?? receipt.requestId,
-              });
+            if (matches) records.push({ key, receipt });
           }
         } catch {
-          // Ignore an unidentified entry while recovering independently scoped requests.
+          // Ignore malformed storage records without touching other requests.
         }
       }
     } catch {
       return;
     }
-    setRecords(found);
     const controller = new AbortController();
-    const currentSignal = AbortSignal.any([signal, controller.signal]);
-    entrySignal.current = currentSignal;
-    // Restore each unknown or denied selector through its own original GET.
-    for (const record of found) {
-      if (!canShowPublicationReceipt(record.key, record.receipt))
-        void reconcile(record, currentSignal);
-    }
-    return () => {
-      controller.abort();
-      entrySignal.current = null;
-    };
+    const active = AbortSignal.any([signal, controller.signal]);
+    for (const { key, receipt } of records)
+      void checkPublication(dataClient, workspaceId, key, receipt, active)
+        .then((result) => {
+          if (!active.aborted && result?.outcome === 'recorded')
+            refreshPublishedFiles();
+        })
+        .catch(() => {});
+    return () => controller.abort();
   }, [
+    dataClient,
     dialogOpen,
     employeeInstanceId,
     organizationId,
     panel,
-    reconcile,
     signal,
     threadId,
     viewerId,
     workspaceId,
   ]);
-
-  const hidden = new Set(
-    records
-      .filter(({ key, receipt }) => !canShowPublicationReceipt(key, receipt))
-      .map(({ id }) => id),
-  );
-  const visibleNotes = Object.entries(notes).filter(
-    ([id, note]) =>
-      !hidden.has(id) &&
-      (note.stage !== 'checking' || !note.reading.aborted) &&
-      (note.stage === 'settled' || !settledPublications.has(id)),
-  );
-  const visibleRecords = records.filter(
-    ({ id }) => !hidden.has(id) && !settledPublications.has(id),
-  );
-  const retries = records.filter(
-    ({ id, key, receipt }) =>
-      notes[id]?.stage === 'waiting' &&
-      !settledPublications.has(id) &&
-      readPublicationReceiptAccess(key, receipt) === undefined,
-  );
-  const retry = usePublicationReceiptRetry(retries.length > 0, async () => {
-    const current = entrySignal.current;
-    if (current)
-      await Promise.allSettled(
-        retries.map((record) => reconcile(record, current)),
-      );
-  });
-  if (!visibleRecords.length && !visibleNotes.length && !retry) return null;
-  return (
-    <div hidden={dialogOpen} className={css.recovery}>
-      {visibleRecords.map((record) => {
-        const { id } = record;
-        return (
-          <Button
-            key={id}
-            type="button"
-            variant="ghost"
-            disabled={checking.get(id)?.aborted === false}
-            onClick={() => {
-              if (entrySignal.current)
-                void reconcile(record, entrySignal.current);
-            }}
-          >
-            核对{record.action} {record.targetId}
-          </Button>
-        );
-      })}
-      {retry}
-      {visibleNotes.map(([id, note]) => (
-        <p key={id} role="status">
-          {note.message}
-        </p>
-      ))}
-    </div>
-  );
+  return null;
 }
 
 // Replacing the account, workspace or precise target discards local form state
@@ -596,101 +376,62 @@ function PublicationForm({
   const [purpose, setPurpose] = useState(reference?.purpose ?? '');
   const [upload, setUpload] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<{
-    message: string;
-    pendingRequestId?: string;
-  }>();
+  const [error, setError] = useState<string>();
   const fileInput = useRef<HTMLInputElement>(null);
   const pending = useRef(false);
   const transport = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
   const edits = useRef(0);
-  const checks = useRef(new Map<string, AbortController>()).current;
+  const checks = useRef(
+    new Map<
+      string,
+      {
+        controller: AbortController;
+        result: Promise<Resolution | undefined>;
+      }
+    >(),
+  ).current;
   const [initialReceipts] = useState(() => restorePublications(receiptKey));
-  const [receipts, setReceipts] = useState(initialReceipts);
-  const [receiptNotes, setReceiptNotes] = useState<
-    Record<string, { stage: ReceiptCheckStage; message: string }>
-  >({});
-  const completion = receiptActions[target.kind] + '已完成。';
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
       transport.current?.abort();
-      for (const check of checks.values()) check.abort();
+      for (const { controller } of checks.values()) controller.abort();
       checks.clear();
     };
   }, [checks]);
 
   const reconcile = useCallback(
-    async (value: PublicationReceipt) => {
-      if (!receiptKey || checks.has(value.requestId)) return;
+    (receipt: PublicationReceipt) => {
+      if (!receiptKey) return;
+      const existing = checks.get(receipt.requestId);
+      if (existing) return existing.result;
       const controller = new AbortController();
-      const note = (
-        stage: ReceiptCheckStage,
-        message: string,
-        keepUnavailable = false,
-      ) =>
-        setReceiptNotes((prior) => ({
-          ...prior,
-          [value.requestId]:
-            keepUnavailable &&
-            readPublicationReceiptAccess(receiptKey, value) === 'denied'
-              ? { stage: 'unavailable', message: unavailableReceipt }
-              : { stage, message },
-        }));
-      const clearWaitingError = () =>
-        setError((current) =>
-          current?.pendingRequestId === value.requestId ? undefined : current,
-        );
-      checks.set(value.requestId, controller);
-      // Rechecking the same intent keeps a denied receipt hidden until an
-      // authorized response establishes its current state.
-      note('checking', '正在核对原发布结果…', true);
-      try {
-        const outcome = await checkPublication(
-          data,
-          workspaceId,
-          receiptKey,
-          value,
-          controller.signal,
-        );
-        if (!alive.current || controller.signal.aborted) return;
-        if (!outcome) {
-          note('waiting', waitingForReceipt);
-          return;
-        }
-        setReceipts((prior) =>
-          prior.filter((pending) => pending.requestId !== value.requestId),
-        );
-        clearWaitingError();
-        note(
-          'settled',
-          outcome === 'recorded'
-            ? completion
-            : receiptActions[target.kind] + '已拒绝。',
-        );
-        if (outcome === 'recorded') {
-          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
-        }
-      } catch (error) {
-        if (!alive.current || controller.signal.aborted) return;
-        if (receiptAccessDenied(error)) {
-          clearWaitingError();
-          // Read denial says nothing about whether the original write ran.
-          // Keep its scoped key for a later authorized lookup.
-          note('unavailable', unavailableReceipt);
-        } else note('waiting', waitingForReceipt, true);
-      } finally {
-        if (checks.get(value.requestId) === controller)
-          checks.delete(value.requestId);
-      }
+      const result = checkPublication(
+        data,
+        workspaceId,
+        receiptKey,
+        receipt,
+        controller.signal,
+      )
+        .catch(() => undefined)
+        .finally(() => {
+          if (checks.get(receipt.requestId)?.controller === controller)
+            checks.delete(receipt.requestId);
+        });
+      checks.set(receipt.requestId, { controller, result });
+      return result;
     },
-    [data, checks, receiptKey, workspaceId, completion, target.kind],
+    [checks, data, receiptKey, workspaceId],
   );
   useEffect(() => {
-    for (const prior of initialReceipts) void reconcile(prior);
+    for (const receipt of initialReceipts)
+      void reconcile(receipt)?.then((result) => {
+        if (alive.current && result?.outcome === 'recorded')
+          refreshPublishedFiles();
+      });
   }, [initialReceipts, reconcile]);
 
   const title = {
@@ -729,13 +470,12 @@ function PublicationForm({
             (target.kind === 'revoke' && publication.origin === 'file') ||
             (target.kind === 'delete' && publication.origin === 'upload')));
 
-  function forget(value: PublicationReceipt, outcome: ReceiptOutcome) {
-    if (!receiptKey) return;
-    settlePublication(receiptKey, value, outcome);
-    if (alive.current)
-      setReceipts((prior) =>
-        prior.filter((pending) => pending.requestId !== value.requestId),
-      );
+  function chooseUpload(file: File | null) {
+    edits.current++;
+    const oversized = file !== null && file.size > REFERENCE_UPLOAD_MAX_BYTES;
+    setUpload(oversized ? null : file);
+    setError(oversized ? fileSizeError : undefined);
+    if (oversized && fileInput.current) fileInput.current.value = '';
   }
 
   async function save() {
@@ -815,10 +555,28 @@ function PublicationForm({
         const held = readPending();
         const sameIntent = (receipt: PublicationReceipt) =>
           receipt.intentDigest === intentDigest;
-        const prior = atClick.find(sameIntent) ?? held.find(sameIntent);
+        const prior =
+          atClick.find(sameIntent) ??
+          held.find(sameIntent) ??
+          initialReceipts.find(
+            (receipt) =>
+              sameIntent(receipt) &&
+              settledPublications.get(
+                publicationRecordKey(receiptKey, receipt.requestId),
+              )?.outcome === 'recorded',
+          );
         if (prior) {
-          setReceipts(held);
-          void reconcile(prior);
+          // An unknown response never authorizes a second write. The normal
+          // publish button checks the exact saved request instead.
+          const resolution = await reconcile(prior);
+          if (
+            !alive.current ||
+            controller.signal.aborted ||
+            edits.current !== formVersion
+          )
+            return;
+          if (resolution?.outcome === 'recorded') onSaved(resolution.saved);
+          else setError(target.kind === 'upload' ? uploadError : publishError);
           return;
         }
         requestId = proposed;
@@ -838,10 +596,6 @@ function PublicationForm({
         } catch {
           throw new ReceiptStorageUnavailable();
         }
-        publicationAccess.set(
-          publicationRecordKey(receiptKey, requestId),
-          'issued',
-        );
         issued = record;
       } else requestIds.current.set(intentDigest, requestId);
       const saved = reference
@@ -864,7 +618,8 @@ function PublicationForm({
               ? data.publishFile(body, controller.signal)
               : data.publishUpload(body, controller.signal);
           })();
-      if (issued) forget(issued, 'recorded');
+      if (issued && receiptKey)
+        settlePublication(receiptKey, issued, { outcome: 'recorded', saved });
       if (
         alive.current &&
         !controller.signal.aborted &&
@@ -875,28 +630,10 @@ function PublicationForm({
       const definite =
         caught instanceof EmployeePanelDataUnavailableError ||
         caught instanceof EmployeePanelsWriteRejectedError;
-      if (issued && !definite) {
-        if (alive.current && !controller.signal.aborted) {
-          setReceipts(restorePublications(receiptKey));
-          setError({
-            message: waitingForReceipt,
-            pendingRequestId: issued.requestId,
-          });
-        }
-        return;
-      }
-      if (issued) forget(issued, 'rejected');
-      if (alive.current && !controller.signal.aborted) {
-        setError({
-          message:
-            definite ||
-            (reference && caught instanceof Error && 'status' in caught)
-              ? caught.message
-              : caught instanceof ReceiptStorageUnavailable
-                ? '无法保留原发布请求，请重试。'
-                : '发布未完成，请重试。',
-        });
-      }
+      if (issued && receiptKey && definite)
+        settlePublication(receiptKey, issued, { outcome: 'rejected' });
+      if (alive.current && !controller.signal.aborted)
+        setError(saveError(caught, target.kind === 'upload'));
     } finally {
       if (alive.current && !controller.signal.aborted) {
         pending.current = false;
@@ -905,18 +642,7 @@ function PublicationForm({
     }
   }
 
-  const shownError = error?.message || download.error || available.error;
-  const visibleReceipts = receipts.filter((receipt) =>
-    canShowPublicationReceipt(receiptKey, receipt),
-  );
-  const retries = receipts.filter(
-    (receipt) =>
-      receiptNotes[receipt.requestId]?.stage === 'waiting' &&
-      readPublicationReceiptAccess(receiptKey, receipt) === undefined,
-  );
-  const retry = usePublicationReceiptRetry(retries.length > 0, () =>
-    Promise.allSettled(retries.map(reconcile)),
-  );
+  const shownError = error || download.error || available.error;
   return (
     <DshDialog
       title={title}
@@ -986,10 +712,7 @@ function PublicationForm({
               onDrop={(event) => {
                 event.preventDefault();
                 const file = event.dataTransfer.files[0];
-                if (!busy && file) {
-                  edits.current++;
-                  setUpload(file);
-                }
+                if (!pending.current && file) chooseUpload(file);
               }}
             >
               <WorkbenchFileIcon kind="upload" />
@@ -1011,10 +734,9 @@ function PublicationForm({
                 aria-label="选择文件"
                 hidden
                 disabled={busy}
-                onChange={(event) => {
-                  edits.current++;
-                  setUpload(event.target.files?.[0] ?? null);
-                }}
+                onChange={(event) =>
+                  chooseUpload(event.target.files?.[0] ?? null)
+                }
               />
             </div>
           )}
@@ -1095,15 +817,6 @@ function PublicationForm({
           {shownError}
         </p>
       )}
-      {Object.entries(receiptNotes).map(([id, note]) => (
-        <p className={css.description} role="status" key={id}>
-          {(note.stage === 'settled' ||
-            visibleReceipts.some((receipt) => receipt.requestId === id)) &&
-            Object.keys(receiptNotes).length > 1 &&
-            id.slice(0, 8) + ' · '}
-          {note.message}
-        </p>
-      ))}
       <footer className={css.actions}>
         <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
           取消
@@ -1137,26 +850,10 @@ function PublicationForm({
               先下载
             </a>
           ))}
-        {visibleReceipts.map((receipt) => (
-          <Button
-            key={receipt.requestId}
-            type="button"
-            variant="ghost"
-            disabled={receiptNotes[receipt.requestId]?.stage === 'checking'}
-            aria-label={
-              visibleReceipts.length === 1 && !retry
-                ? '核对结果'
-                : '核对结果 ' + receipt.requestId.slice(0, 8)
-            }
-            onClick={() => void reconcile(receipt)}
-          >
-            核对结果
-          </Button>
-        ))}
-        {retry}
         <Button
           type="button"
           variant="primary"
+          aria-busy={busy || undefined}
           className={destructive ? css.danger : undefined}
           disabled={
             busy ||
@@ -1168,7 +865,7 @@ function PublicationForm({
           }
           onClick={() => void save()}
         >
-          {confirmation}
+          {busy && target.kind === 'upload' ? '发布中...' : confirmation}
         </Button>
       </footer>
     </DshDialog>

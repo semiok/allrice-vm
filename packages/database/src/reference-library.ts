@@ -10,6 +10,7 @@ import type { readWorkbenchFile } from './workbench-files.ts';
 import type { OrganizationSharedReader } from './organization-shared-reader.ts';
 import {
   ContentOwnershipSchema,
+  REFERENCE_UPLOAD_MAX_BYTES,
   ReferenceActionSchema,
   ReferenceRevisionSchema,
   ReferenceUploadInputSchema,
@@ -1288,7 +1289,7 @@ export async function publishReference(
     )
       throw new ReferenceLibraryError('invalid_content');
     bytes = Buffer.from(v.contentBase64, 'base64');
-    if (!bytes.length || bytes.length > 50 * 1024 * 1024)
+    if (!bytes.length || bytes.length > REFERENCE_UPLOAD_MAX_BYTES)
       throw new ReferenceLibraryError('invalid_content');
   }
   let imageFacts = bytes ? inspectReferenceImage(bytes) : null;

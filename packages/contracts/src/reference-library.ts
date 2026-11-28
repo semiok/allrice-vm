@@ -8,6 +8,8 @@ import { WorkbenchFileSharingSchema } from './file-audience.ts';
 // PostgreSQL UUID identity is case-insensitive; JSON ownership and dedup keys must agree.
 const ReferenceInputUuidSchema = UuidSchema.transform((id) => id.toLowerCase());
 
+export const REFERENCE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+
 export const ReferenceAudienceSchema = WorkbenchFileSharingSchema.transform(
   (value) => ({
     ...value,

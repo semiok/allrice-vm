@@ -26,21 +26,6 @@
   color: var(--dsw-alias-label-secondary);
   line-height: 22px;
 }
-.recovery:not([hidden]) {
-  padding: 0 12px 8px;
-  display: grid;
-  gap: 4px;
-  overflow-wrap: anywhere;
-}
-.recovery button {
-  justify-content: start;
-  min-width: 0;
-  white-space: normal;
-}
-.recovery p {
-  margin: 0;
-  font-size: 12px;
-}
 .file {
   display: flex;
   gap: 12px;
