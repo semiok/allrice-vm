@@ -1421,6 +1421,18 @@ it
       const c = third!.identity.employeeInstanceId;
       const d = fourth!.identity.employeeInstanceId;
       const app = workbench.locator('#app');
+      const borrow = (
+        scopeId: string,
+        identity: typeof f.identity,
+        token = sessionToken,
+      ) =>
+        f.invoke(scopeId, token, {
+          selection: {
+            workspaceId: identity.workspaceId,
+            employeeInstanceId: identity.employeeInstanceId,
+            threadId: identity.threadId,
+          },
+        });
       const scope = async () => (await app.getAttribute('data-scope-id'))!;
       const firstScope = await scope();
       const scroll = workbench.locator('[data-conversation-scroll]');
@@ -1531,7 +1543,7 @@ it
       } finally {
         resumeDocument.resolve();
       }
-      expect((await f.invoke(cancelledScope)).status).toBe(404);
+      expect((await borrow(cancelledScope, second!.identity)).status).toBe(404);
       expect(await scope()).toBe(firstScope);
 
       await open(b);
@@ -1617,7 +1629,7 @@ it
       expect(
         page.frames().some((frame) => frame.url().includes(secondScope)),
       ).toBe(false);
-      expect((await f.invoke(secondScope)).status).toBe(404);
+      expect((await borrow(secondScope, second!.identity)).status).toBe(404);
       expect(f.pageSignals.get(secondScope)?.aborted).toBe(true);
       await expect.poll(() => joinedScopes.has(secondScope)).toBe(true);
       expect(
@@ -1630,7 +1642,7 @@ it
           page.frames().some((frame) => frame.url().includes(thirdScope)),
         )
         .toBe(false);
-      expect((await f.invoke(thirdScope)).status).toBe(404);
+      expect((await borrow(thirdScope, third!.identity)).status).toBe(404);
       expect(await scope()).toBe(fourthScope);
       expect(await editor.isEditable()).toBe(true);
 
@@ -1649,8 +1661,14 @@ it
           () => closedSockets.has(firstScope) && closedSockets.has(fourthScope),
         )
         .toBe(true);
-      expect((await f.invoke(firstScope)).status).toBe(404);
-      expect((await f.invoke(fourthScope)).status).toBe(404);
+      expect((await borrow(firstScope, f.identity)).status).toBe(401);
+      expect((await borrow(fourthScope, fourth!.identity)).status).toBe(401);
+      expect((await borrow(firstScope, f.identity, otherToken)).status).toBe(
+        404,
+      );
+      expect(
+        (await borrow(fourthScope, fourth!.identity, otherToken)).status,
+      ).toBe(404);
       await context.close();
       return;
     }
