@@ -21,13 +21,17 @@ const suite =
     : describe.skip;
 const loopback = '127.0.0.1';
 const firstListen = Buffer.from('LISTEN allrice_d_entry_authority\0');
+const firstQualificationQuery = [
+  Buffer.from('from pg_catalog.pg_type'),
+  Buffer.from('begin isolation level repeatable read read only'),
+];
 const poll = { timeout: 5_000, interval: 25 };
-type Hold = 'startup' | 'listen' | null;
+type Hold = 'startup' | 'listen' | 'qualification' | null;
 type ScannerInput = Parameters<typeof startProductionDiskPreprovision>[0];
 
-// Both endpoints connect to real drivers. The only protocol observation is
-// the fixed LISTEN command, including across TCP reads. The relay never logs
-// packets and never closes the driver-facing socket itself to satisfy a test.
+// Both endpoints connect to real drivers. Observe only fixed query markers,
+// including across TCP reads. The relay never logs packets or destroys the
+// driver-facing socket to satisfy a test.
 async function relay(dbUrl: URL, hold: Hold = null) {
   const sockets = new Set<Socket>();
   const peers: {
@@ -39,7 +43,13 @@ async function relay(dbUrl: URL, hold: Hold = null) {
   }[] = [];
   const server = createServer({ allowHalfOpen: true }, (clientSocket) => {
     let holding = peers.length === 0 && hold === 'startup';
-    let watchingListen = peers.length === 0 && hold === 'listen';
+    let markers =
+      peers.length === 0 && hold === 'listen'
+        ? [firstListen]
+        : peers.length === 1 && hold === 'qualification'
+          ? firstQualificationQuery
+          : [];
+    const tailSize = Math.max(...markers.map((marker) => marker.length), 1) - 1;
     let tail = Buffer.alloc(0);
     const upstream = createConnection({
       host: loopback,
@@ -59,13 +69,13 @@ async function relay(dbUrl: URL, hold: Hold = null) {
       peer.port = upstream.localPort;
     });
     clientSocket.on('data', (chunk: Buffer) => {
-      if (watchingListen) {
+      if (markers.length) {
         const frame = Buffer.concat([tail, chunk]);
-        if (frame.includes(firstListen)) {
+        if (markers.some((marker) => frame.includes(marker))) {
           holding = true;
-          watchingListen = false;
+          markers = [];
           tail = Buffer.alloc(0);
-        } else tail = frame.subarray(-(firstListen.length - 1));
+        } else tail = frame.subarray(-tailSize);
       }
       if (!upstream.destroyed) upstream.write(chunk);
     });
@@ -204,9 +214,13 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       previousFeedClosed: boolean[];
       settledReadsAtFeedOpen: number[];
     }) => Promise<void>,
+    holdQualification = false,
   ) {
     const feed = await relay(databaseUrl, hold);
-    const reads = await relay(databaseUrl);
+    const reads = await relay(
+      databaseUrl,
+      holdQualification ? 'qualification' : null,
+    );
     vi.stubEnv('DATABASE_URL', reads.url.toString());
     const outcomes: string[] = [];
     const previousFeedClosed: boolean[] = [];
@@ -316,8 +330,15 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
         if (action === 'disconnect') {
           const expectedSweeps = phase === 'idle' ? 2 : 1;
           await expect
-            .poll(() => f.readRoster.mock.calls.length, poll)
-            .toBe(expectedSweeps);
+            .poll(
+              () => f.readRoster.mock.results[expectedSweeps - 1]?.value,
+              poll,
+            )
+            .toHaveProperty('page');
+          if (phase !== 'idle')
+            await expect
+              .poll(() => f.prepared.mock.results[0]?.value, poll)
+              .toBe('prepared');
           expect(f.previousFeedClosed).toEqual([true]);
           await f.owner.close();
           await closed(f.feed.peers[1]!);
@@ -327,6 +348,22 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     },
     20_000,
   );
+
+  it('closes a fresh qualification connection during its first SQL response', async () => {
+    await withScanner(
+      null,
+      async (f) => {
+        await expect.poll(() => f.reads.peers[1]?.held, poll).toBe(true);
+        expect(f.outcomes).toEqual([]);
+        expect(f.prepared).not.toHaveBeenCalled();
+        await f.owner.close();
+        expect(f.outcomes).toEqual(['rejected']);
+        expect(f.openFeed).toHaveBeenCalledTimes(1);
+        await Promise.all([...f.feed.peers, ...f.reads.peers].map(closed));
+      },
+      true,
+    );
+  }, 20_000);
 
   it.each(['disconnect', 'close'] as const)(
     'settles the blocked qualification transaction and sockets on %s',
@@ -372,7 +409,9 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
           if (action === 'disconnect') {
             release.resolve();
             await lock;
-            await expect.poll(() => f.prepared.mock.calls.length, poll).toBe(1);
+            await expect
+              .poll(() => f.prepared.mock.results[0]?.value, poll)
+              .toBe('prepared');
             expect(f.settledReadsAtFeedOpen).toEqual([0, 1]);
             expect(f.previousFeedClosed).toEqual([true]);
           } else {
