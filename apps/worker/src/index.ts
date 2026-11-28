@@ -1211,6 +1211,14 @@ const stopWorker = (signal: string) => {
           error instanceof WorkerShutdownError
             ? error.failures.map(({ name }) => name)
             : ['shutdown_setup'],
+        databaseRetained:
+          error instanceof WorkerShutdownError &&
+          error.failures.some(
+            ({ name, error }) =>
+              name === 'database' &&
+              error instanceof Error &&
+              error.message === 'WORKER_SHUTDOWN_MAINTENANCE_RETAINED',
+          ),
       });
       process.exitCode = 1;
       const result = await personVmHost;

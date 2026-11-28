@@ -1632,6 +1632,44 @@ it('joins all scoped transport owners before asking for the combined ledger reco
   expect(host.modelOwnerMaintenancePending()).toBe(false);
 });
 
+it('joins the independent capacity listener during zero-VM shutdown', async () => {
+  const entered = gate(),
+    released = gate();
+  const database = {
+    listen: vi.fn(async (_channel, _notify, onListen: () => void) => {
+      onListen();
+    }),
+    end: vi.fn(async () => {
+      entered.release();
+      await released.promise;
+    }),
+  };
+  const value = await open();
+  io.dedicated.mockReturnValue(database);
+  const store = io.model.mock.calls[0]![0].store;
+  const watch = await store.watchCapacity(randomUUID(), signal());
+  value.model.close.mockImplementation(() => watch.close());
+  const close = value.host.close();
+  try {
+    await entered.promise;
+    expect(database.listen).toHaveBeenCalledWith(
+      'allrice_model_gateway_capacity',
+      expect.any(Function),
+      expect.any(Function),
+    );
+    await expect(watch.wait()).rejects.toMatchObject({
+      code: 'ADMISSION_CLOSED',
+    });
+    expect(io.dedicated).toHaveBeenCalledExactlyOnceWith(trustedDatabase);
+    expect(value.bound.egress.close).not.toHaveBeenCalled();
+  } finally {
+    released.release();
+    await close;
+  }
+  expect(database.end).toHaveBeenCalledExactlyOnceWith({ timeout: 5 });
+  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+});
+
 it('retains the provider owner when the model gateway cannot prove its join', async () => {
   const value = fixture();
   const failure = Error('synthetic unknown model transport join');

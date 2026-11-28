@@ -514,30 +514,37 @@ export function createAssignedNativeWebStartup(input: {
     };
   }
   async function close() {
-    if (closing) return closing;
-    stopped.abort(new PersonVmError('LEASE_LOST'));
-    closing = (async () => {
-      await Promise.allSettled(
-        [...running.values()].map((group) => group.stopArchive?.()),
-      );
-      await Promise.allSettled([...pending]);
-      const results = await Promise.allSettled(
-        [...running.values()].flatMap((group) =>
-          [...group.owners.values(), ...group.unpublished.values()].map(
-            (owner) => owner.close(),
-          ),
-        ),
-      );
-      if (
-        [...running.values()].some(
-          (group) => group.unjoinedOpen || group.unjoinedGuest,
-        ) ||
-        results.some((result) => result.status === 'rejected')
-      )
-        throw new PersonVmError('CLEANUP_INCOMPLETE');
-      running.clear();
-    })();
-    return closing;
+    if (!closing) {
+      closing = Promise.resolve().then(async () => {
+        await Promise.allSettled(
+          [...running.values()].map((group) => group.stopArchive?.()),
+        );
+        await Promise.allSettled([...pending]);
+        await Promise.all(
+          [...running.values()].map(async (group) => {
+            const results = await Promise.allSettled(
+              [...group.owners.values(), ...group.unpublished.values()].map(
+                async (owner) => owner.close(),
+              ),
+            );
+            if (
+              !group.retiring &&
+              !group.unjoinedOpen &&
+              !group.unjoinedGuest &&
+              results.every((result) => result.status === 'fulfilled') &&
+              running.get(group.binding.vmId) === group
+            )
+              running.delete(group.binding.vmId);
+          }),
+        );
+      });
+      stopped.abort(new PersonVmError('LEASE_LOST'));
+    }
+    await closing;
+    // An exact physical stop can resolve a missing remote close receipt after
+    // the initial lifetime drain. Only that group's successful retirement
+    // removes the obligation. Unjoined local work still blocks shutdown.
+    if (running.size) throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
   const abort = () => {
     void close().catch(() => {});

@@ -18,6 +18,7 @@ import {
   completeBridgeWorkspaceSelection,
 } from './bridge.ts';
 import type * as Client from './core/client.ts';
+import { createBridgeConnectionAuthority } from './bridge-connections.ts';
 import {
   resolveWorkbenchTerminalTarget,
   revalidateBridgeTerminalTarget,
@@ -162,6 +163,54 @@ suite(
         await admin.end();
       }
     });
+
+    it('closes the replacement Bridge LISTEN socket without closing the Web business pool', async () => {
+      const applicationName = 'bridge-close-' + randomUUID();
+      const web = postgres(process.env.ALLRICE_TEST_DATABASE_URL!, {
+        max: 1,
+        connection: { application_name: applicationName },
+      });
+      const notify = vi.fn();
+      const channel = 'allrice_bridge_workspace_selection';
+      const subscriptionPids = () => admin<{ pid: number }[]>`
+        select pid from pg_stat_activity
+        where application_name = ${applicationName}
+          and query = ${`listen "${channel}"`}
+      `;
+      let close: (() => Promise<void>) | undefined;
+      try {
+        close = await createBridgeConnectionAuthority(web).subscribe(notify);
+        const [first] = await subscriptionPids();
+        expect(first).toBeDefined();
+        const device = randomUUID();
+        await web.notify(channel, device);
+        await vi.waitFor(() =>
+          expect(notify).toHaveBeenCalledWith(device, 'work'),
+        );
+        await admin`select pg_terminate_backend(${first!.pid})`;
+        await vi.waitFor(
+          async () => {
+            const [replacement] = await subscriptionPids();
+            expect(replacement?.pid).toBeDefined();
+            expect(replacement?.pid).not.toBe(first!.pid);
+          },
+          { timeout: 5000 },
+        );
+        await close();
+        await vi.waitFor(async () =>
+          expect(await subscriptionPids()).toEqual([]),
+        );
+        await expect(web`select 1 as healthy`).resolves.toMatchObject([
+          { healthy: 1 },
+        ]);
+      } finally {
+        try {
+          await close?.();
+        } finally {
+          await web.end({ timeout: 5 });
+        }
+      }
+    }, 10000);
 
     it('human terminal authority binds the actual login, private chat and grant generation without mutating presence', async () => {
       const f = await terminalFixture();

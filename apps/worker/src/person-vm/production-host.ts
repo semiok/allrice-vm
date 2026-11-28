@@ -276,6 +276,8 @@ export function createProductionPersonVmHost(input: {
     bound: BoundSources | undefined,
     gateway: ReturnType<typeof createEgressGateway> | undefined,
     model: ModelGatewayPort | undefined,
+    modelCapacityDatabase:
+      ReturnType<typeof createDedicatedDatabase> | undefined,
     scheduledWake: ReturnType<typeof createProductionScheduledWake> | undefined,
     installed:
       ReturnType<typeof installAssignedDEntryNativeRuntime> | undefined,
@@ -502,7 +504,6 @@ export function createProductionPersonVmHost(input: {
         ),
       );
       let vmFailures = await stopOwnedVms();
-      if (startupOwner) await settle([() => startupOwner.close()]);
       let receiptFailures = await retireReceipts();
       // Guest stop cannot prove upstream HTTP closure. Keep the ledger
       // fence until the exact dedicated dispatcher supplies its own proof.
@@ -510,6 +511,9 @@ export function createProductionPersonVmHost(input: {
       let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
+      const capacityDatabase = modelCapacityDatabase;
+      if (capacityDatabase)
+        await settle([() => capacityDatabase.end({ timeout: 5 })]);
       const closeTransport =
         sourceOwner?.model.closeTransport ??
         sourceOwner?.model.transport?.close;
@@ -532,6 +536,9 @@ export function createProductionPersonVmHost(input: {
           }
         }
       }
+      // The lifetime drain may have started before an exact stop. Verify the
+      // remaining owners after every stop/receipt retry has joined.
+      if (startupOwner) await settle([() => startupOwner.close()]);
       const providerOwner = providers;
       const installationFailures = providerOwner
         ? await collectFailures([
@@ -709,7 +716,11 @@ export function createProductionPersonVmHost(input: {
         if (wakeAt !== null) throw new PersonVmError('ACTIVITY_UNKNOWN');
       };
       const openSql = () => createDedicatedDatabase(trustedDatabase);
-      const storeModel = createPostgresModelGatewayStore(trustedDatabase);
+      const storeModel = createPostgresModelGatewayStore(
+        trustedDatabase,
+        () =>
+          (modelCapacityDatabase ??= createDedicatedDatabase(trustedDatabase)),
+      );
       const budget = providers.configuration.lifecycle.hostVmBudgetMiB;
       if (budget !== undefined && budget * 1024 ** 2 > totalmem())
         throw new PersonVmError('PROVIDER_FAILED');

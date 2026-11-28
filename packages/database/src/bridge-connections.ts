@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { UuidSchema } from '@allrice/contracts';
 
-import { getDatabase } from './core/client.ts';
+import { createDedicatedDatabase, getDatabase } from './core/client.ts';
 
 export interface BridgeSocketConnection {
   deviceId: string;
@@ -84,7 +84,11 @@ export function createBridgeConnectionAuthority(
     async subscribe(
       listener: (deviceId: string, kind: 'connection' | 'work') => void,
     ) {
-      const subscriptions: { unlisten: () => Promise<void> }[] = [];
+      // postgres.js rebuilds listener handles on reconnect. End this
+      // subscription's client so the reconnected listener closes as well.
+      const subscription = createDedicatedDatabase(database);
+      let closing: Promise<void> | undefined;
+      const close = () => (closing ??= subscription.end({ timeout: 5 }));
       try {
         for (const channel of [
           'allrice_bridge_connection',
@@ -92,24 +96,28 @@ export function createBridgeConnectionAuthority(
           'allrice_bridge_commands',
           'allrice_bridge_workspace_selection',
         ]) {
-          subscriptions.push(
-            await database.listen(channel, (payload) => {
-              const id = UuidSchema.safeParse(payload);
-              if (id.success)
-                listener(
-                  id.data,
-                  channel === 'allrice_bridge_connection'
-                    ? 'connection'
-                    : 'work',
-                );
-            }),
-          );
+          await subscription.listen(channel, (payload) => {
+            if (closing) return;
+            const id = UuidSchema.safeParse(payload);
+            if (id.success)
+              listener(
+                id.data,
+                channel === 'allrice_bridge_connection' ? 'connection' : 'work',
+              );
+          });
         }
       } catch (error) {
-        await Promise.all(subscriptions.map((s) => s.unlisten()));
+        try {
+          await close();
+        } catch (cleanup) {
+          throw new AggregateError(
+            [error, cleanup],
+            'Bridge subscription close unconfirmed',
+          );
+        }
         throw error;
       }
-      return () => Promise.all(subscriptions.map((s) => s.unlisten()));
+      return close;
     },
   };
 }

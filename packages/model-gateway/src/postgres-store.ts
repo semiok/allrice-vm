@@ -93,10 +93,11 @@ export function nativeCallKey(binding: ModelCallBinding): string {
     .digest('hex');
 }
 
-/** Caller owns the pool and its lifecycle. All SQL touches only this owner's
+/** Caller owns both clients and their lifecycles. All SQL touches only this owner's
  * three tables; no joins into identity, employee, Run or billing internals. */
 export function createPostgresModelGatewayStore(
   db: postgres.Sql,
+  capacityDatabase: () => postgres.Sql = () => db,
 ): ModelGatewayStore {
   const json = (value: unknown) =>
     db.json(JSON.parse(JSON.stringify(value)) as postgres.JSONValue);
@@ -144,7 +145,7 @@ export function createPostgresModelGatewayStore(
     },
     async watchCapacity(personId, signal) {
       signal.throwIfAborted();
-      const hub = capacityHub(db);
+      const hub = capacityHub(capacityDatabase());
       let notified = false;
       let closed = false;
       let listenFailure: unknown;
