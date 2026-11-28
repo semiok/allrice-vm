@@ -1336,32 +1336,50 @@ it
       await app.evaluate((node) => {
         node.dataset.testOriginalDocument = 'first';
       });
-      const open = async (employeeInstanceId: string, threadId: string) => {
+      const open = async (employeeInstanceId: string) => {
         const row = workbench.locator(
-          '[data-row-key="session:' + threadId + '"]',
+          '[data-row-key="workspace:' + employeeInstanceId + '"]',
         );
-        const start = performance.now();
-        await row.press('Enter');
+        await row.evaluate((node) => {
+          node.addEventListener(
+            'click',
+            () => parent.performance.mark('cross-employee-click'),
+            {
+              capture: true,
+              once: true,
+            },
+          );
+        });
+        await row.click();
         await page.waitForURL(
           (url) =>
             url.searchParams.get('employeeInstanceId') === employeeInstanceId,
+          { timeout: 8_000 },
         );
         await workbench
           .locator(
             '#app[data-employee-instance-id="' + employeeInstanceId + '"]',
           )
-          .waitFor();
+          .waitFor({ timeout: 8_000 });
         expect(await editor.isEditable()).toBe(true);
-        return Math.round(performance.now() - start);
+        return page.evaluate(
+          () =>
+            new Promise<number>((resolve) =>
+              requestAnimationFrame(() => {
+                const start = performance
+                  .getEntriesByName('cross-employee-click')
+                  .at(-1)!.startTime;
+                performance.clearMarks('cross-employee-click');
+                resolve(Math.round(performance.now() - start));
+              }),
+            ),
+        );
       };
-      await open(cross!.identity.employeeInstanceId, cross!.identity.threadId!);
+      await open(cross!.identity.employeeInstanceId);
       await editor.fill('第二位员工的独立草稿');
       const secondScope = await app.getAttribute('data-scope-id');
       expect(secondScope).not.toBe(firstScope);
-      const warm = await open(
-        f.selection.employeeInstanceId,
-        f.selection.threadId,
-      );
+      const warm = await open(f.selection.employeeInstanceId);
       console.info(
         'CROSS_EMPLOYEE_NATIVE_RETURN ' +
           JSON.stringify({
