@@ -8,6 +8,7 @@ import {
 } from '../../../../../lib/d-entry/profile';
 import { dEntryErrorResponse } from '../../../../../lib/d-entry/responses';
 import { renderEmployeeDocument } from '../../../../../lib/d-entry/employee-document';
+import { headlessPresentedHost } from '../../../../../lib/d-entry/presented-host';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -31,6 +32,10 @@ export async function GET(request: Request, { params }: Params) {
       return unavailable();
     }
     if (new URL(request.url).search) throw new DataAccessError('not_found');
+    if (target.path === 'native/api/present.host') {
+      await qualifyDocument(input, target);
+      return headlessPresentedHost();
+    }
     if (target.path !== 'native/index.html')
       return await profileStaticFile(input, target, target.path);
     const address = await qualifyDocument(input, target);
