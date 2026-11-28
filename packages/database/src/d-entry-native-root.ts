@@ -185,6 +185,7 @@ export function isDEntryNativeTitleRetryable(error: unknown) {
     (error instanceof Error &&
       'code' in error &&
       (error.code === '57014' ||
+        error.code === '55P03' ||
         error.code === '40P01' ||
         error.code === 'CONNECTION_CLOSED'))
   );

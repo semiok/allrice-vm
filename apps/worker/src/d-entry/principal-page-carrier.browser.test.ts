@@ -185,8 +185,8 @@ it
           }
           if (failNextTitle) {
             failNextTitle = false;
-            throw Object.assign(Error('fixture title statement timeout'), {
-              code: '57014',
+            throw Object.assign(Error('fixture title lock timeout'), {
+              code: '55P03',
             });
           }
           if (title) {
