@@ -39,7 +39,7 @@ const occurrence = pin
   })
   .strict();
 const unavailable = () => new Error('这条引用已失效，请从工作台重新选择。');
-type Header = PropsRuntime<'conversation.session.header.actions'>;
+type InputDock = PropsRuntime<'conversation.input.dock'>;
 type ReferenceRequest = Parameters<
   NonNullable<EmployeePanelsPort['useReference']>
 >[0];
@@ -75,16 +75,11 @@ export function apply(ctx: Context) {
   if (!lifetime || lifetime.aborted) return;
   const page = document.querySelector<HTMLElement>('#app');
   if (!page || documents.has(document)) return;
-  const { organizationId, viewerId, scopeId, nativeSessionId, selection } =
+  const { organizationId, viewerId, nativeSessionId, selection } =
     readEmployeeDocument(page.dataset);
   const { threadId, workspaceId, employeeInstanceId } = selection;
   if (!threadId || !nativeSessionId) return;
-  const scopeKey = [organizationId, viewerId, workspaceId, scopeId].join('/');
   const documentId = crypto.randomUUID();
-  const data = createEmployeePanelsHttpClient(selection, {
-    expectedViewerId: viewerId,
-    lifetimeSignal: lifetime,
-  });
 
   // Publish the document slot before the panels owner starts. Cordis may
   // activate the input services later than the existing business binder.
@@ -128,10 +123,13 @@ export function apply(ctx: Context) {
       return next.epoch;
     },
   };
+  const notify = () => {
+    for (const listener of listeners) listener();
+  };
   const publish = (bridge: DocumentReferences | undefined) => {
     if (currentReferences === bridge) return;
     currentReferences = bridge;
-    for (const listener of listeners) listener();
+    notify();
   };
   const clear = () => publish(undefined);
   documents.set(page.ownerDocument, referenceSource);
@@ -151,30 +149,23 @@ export function apply(ctx: Context) {
       if (lifetime.aborted) return;
       const owner = new AbortController();
       const active = AbortSignal.any([lifetime, owner.signal]);
-      let actions: Header['inputActions'] | undefined;
-      let mounted: SessionIdOf | undefined;
-      function Capture({ sessionId, inputActions }: Header) {
+      const editors = new Map<SessionIdOf, InputDock['inputActions']>();
+      function Capture({ sessionId, inputActions }: InputDock) {
         useEffect(() => {
-          if (sessionId !== nativeSessionId) return;
-          mounted = sessionId;
-          actions = inputActions;
+          editors.set(sessionId, inputActions);
+          notify();
           return () => {
-            if (actions === inputActions) {
-              actions = undefined;
-              mounted = undefined;
+            if (editors.get(sessionId) === inputActions) {
+              editors.delete(sessionId);
+              notify();
             }
           };
         }, [sessionId, inputActions]);
         return null;
       }
       const current = (id: string) => {
-        if (
-          active.aborted ||
-          id !== nativeSessionId ||
-          mounted !== nativeSessionId ||
-          native.sidebarRight.mounted.getSnapshot() !== mounted
-        )
-          return;
+        const mounted = native.sidebarRight.mounted.getSnapshot();
+        if (active.aborted || mounted === undefined || mounted !== id) return;
         const binding = native.sessions.binding(mounted);
         return binding?.session.getSnapshot().openState === 'open'
           ? binding
@@ -182,7 +173,8 @@ export function apply(ctx: Context) {
       };
       const parse = (raw: string) => {
         const value = occurrence.parse(JSON.parse(raw));
-        if (value.sessionId !== nativeSessionId) throw unavailable();
+        if (value.sessionId !== native.sidebarRight.mounted.getSnapshot())
+          throw unavailable();
         return value;
       };
       const currentPanelOwner = (id: SessionIdOf) => {
@@ -193,7 +185,7 @@ export function apply(ctx: Context) {
           !bound.signal.aborted &&
           snapshot &&
           referenceSource.current?.matches(id, snapshot)
-          ? bound
+          ? { bound, snapshot }
           : undefined;
       };
 
@@ -208,16 +200,30 @@ export function apply(ctx: Context) {
             clipboardText: (raw) => `@${parse(raw).fileName}`,
             async serialize(raw, signal) {
               const selected = parse(raw);
-              const binding = current(nativeSessionId);
-              const bound = currentPanelOwner(nativeSessionId as SessionIdOf);
+              const id = native.sidebarRight.mounted.getSnapshot();
+              if (id === undefined || id !== selected.sessionId)
+                throw unavailable();
+              const binding = current(id);
+              const target = currentPanelOwner(id);
+              const threadId = target?.snapshot.publicationManagement?.threadId;
               // A restored draft belongs to the initial owner of this
               // document. Replacing that owner must also fence restored chips.
               const expectedEpoch =
                 selected.documentId === documentId ? selected.ownerEpoch : 1;
-              if (!binding || !bound || expectedEpoch !== bound.epoch)
+              if (
+                !binding ||
+                !target ||
+                !threadId ||
+                expectedEpoch !== target.bound.epoch
+              )
                 throw unavailable();
+              const { bound, snapshot } = target;
               const attempt = AbortSignal.any([signal, active, bound.signal]);
               attempt.throwIfAborted();
+              const data = createEmployeePanelsHttpClient(
+                { ...selection, threadId },
+                { expectedViewerId: viewerId, lifetimeSignal: lifetime },
+              );
               const result = await data.selectMaterial(
                 {
                   workspaceId,
@@ -227,9 +233,11 @@ export function apply(ctx: Context) {
               );
               attempt.throwIfAborted();
               const actual = result.selection;
+              const rechecked = currentPanelOwner(id);
               if (
                 current(selected.sessionId) !== binding ||
-                currentPanelOwner(nativeSessionId as SessionIdOf) !== bound ||
+                rechecked?.bound !== bound ||
+                rechecked.snapshot !== snapshot ||
                 result.viewerId !== viewerId ||
                 result.workspaceId !== workspaceId ||
                 result.canReference !== true ||
@@ -263,10 +271,10 @@ export function apply(ctx: Context) {
           },
         }),
       );
-      native.slots.inject('conversation.session.header.actions', () =>
+      native.slots.inject('conversation.input.dock', () =>
         native.slots.register(
           {
-            name: 'conversation.session.header.actions',
+            name: 'conversation.input.dock',
             id: 'allrice-employee-panels.reference-input',
           },
           Capture,
@@ -277,11 +285,12 @@ export function apply(ctx: Context) {
           const scope = snapshot.publicationManagement;
           return (
             !active.aborted &&
-            id === nativeSessionId &&
-            snapshot.scopeKey === scopeKey &&
+            native.sidebarRight.mounted.getSnapshot() === id &&
+            editors.has(id) &&
             scope?.organizationId === organizationId &&
             scope.employeeInstanceId === employeeInstanceId &&
-            scope.threadId === threadId &&
+            scope.threadId === snapshot.materials.sessionId &&
+            scope.threadId === snapshot.files.sessionId &&
             snapshot.materials.workspaceId === workspaceId &&
             snapshot.files.workspaceId === workspaceId &&
             snapshot.materials.viewerId === viewerId &&
@@ -290,14 +299,15 @@ export function apply(ctx: Context) {
         },
         insert(request, epoch) {
           const binding = current(request.sessionId);
-          const bound = currentPanelOwner(request.sessionId);
+          const target = currentPanelOwner(request.sessionId);
+          const actions = editors.get(request.sessionId);
           if (
             !binding ||
-            !bound ||
-            bound.epoch !== epoch ||
+            !target ||
+            target.bound.epoch !== epoch ||
             !actions ||
             request.signal.aborted ||
-            request.scopeKey !== scopeKey
+            request.scopeKey !== target.snapshot.scopeKey
           )
             return false;
           const reference = selectionPin.safeParse(request.reference);
@@ -306,10 +316,12 @@ export function apply(ctx: Context) {
           if (manifestDigest && digest && manifestDigest !== digest)
             return false;
           const span = actions.captureInsertion();
+          const rechecked = currentPanelOwner(request.sessionId);
           if (
             request.signal.aborted ||
             current(request.sessionId) !== binding ||
-            currentPanelOwner(request.sessionId) !== bound
+            rechecked?.bound !== target.bound ||
+            rechecked.snapshot !== target.snapshot
           )
             return false;
           return native.conversation.input.for(binding.ctx).insertReference(
@@ -321,7 +333,7 @@ export function apply(ctx: Context) {
                 version: 1,
                 sessionId: request.sessionId,
                 documentId,
-                ownerEpoch: bound.epoch,
+                ownerEpoch: target.bound.epoch,
               }),
               label: reference.data.fileName,
               appearance: 'file',

@@ -82,15 +82,14 @@ ${js}
         return () => style.remove();
       });
       sidebar.apply(ctx);
-      const workbench = settings.bindEmployeeDocumentSettings(ctx);
+      references.apply(ctx);
+      const workbench = product.installEmployeeProductOwner(ctx);
       settings.apply(ctx, {
         workbench,
         notifications: false,
         renderLauncher: sidebar.AllRiceSettingsLauncher,
       });
       panels.apply(ctx);
-      references.apply(ctx);
-      product.installEmployeeProductOwner(ctx);
       topbar.apply(ctx);
       ctx.inject(['sidebarRight', 'sessions'], (scope) => {
         childPane.registerChildPane(scope, require('react'));

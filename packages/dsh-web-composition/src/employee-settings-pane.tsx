@@ -11,34 +11,10 @@ import {
 } from 'react';
 import { AccountPasswordSettings } from '../../../apps/web/app/chatflow/account-password-settings';
 import { SidebarSettingsButton } from '../../../apps/web/app/chatflow/sidebar-settings-trigger';
-import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
-import {
-  bindEmployeeSettings,
-  type EmployeeWorkbenchSettingsPort,
-} from './employee-settings-port';
+import { type EmployeeWorkbenchSettingsPort } from './employee-settings-port';
 import styles from './employee-settings.module.css';
 
 const settingsTab = 'allrice-employee-settings';
-
-/** Only the authenticated employee document owns account commands. */
-export function bindEmployeeDocumentSettings(ctx: Context) {
-  const documentScope = globalThis as typeof globalThis & {
-    __ALLRICE_D_ENTRY_LIFETIME__?: AbortSignal;
-  };
-  const signal = documentScope.__ALLRICE_D_ENTRY_LIFETIME__;
-  if (!signal) return false;
-  const data = document.getElementById('app')?.dataset;
-  if (data?.loginSessionId && !signal.aborted) {
-    const { nativeSessionId, selection } = readEmployeeDocument(data);
-    if (nativeSessionId && selection.threadId)
-      bindEmployeeSettings(ctx, {
-        signal,
-        nativeSessionId,
-        loginSessionId: data.loginSessionId,
-      });
-  }
-  return true;
-}
 
 async function goToLogin(signal: AbortSignal) {
   const response = await fetch('/api/v1/auth/session', {
@@ -152,18 +128,25 @@ export function applyEmployeeSettingsPane(ctx: Context) {
       const lifetime = new AbortController();
       const signal = AbortSignal.any([port.signal, lifetime.signal]);
       const right = scope.sidebarRight;
-      const current = () =>
-        !signal.aborted && right.mounted.getSnapshot() === port.nativeSessionId;
+      const current = () => {
+        const mounted = right.mounted.getSnapshot();
+        return !signal.aborted && mounted && port.isCurrentRoot(mounted)
+          ? mounted
+          : undefined;
+      };
       const globalPanel = () =>
         scope.layout.panelInfo.getSnapshot().activePanelId !== null;
-      const canOpenPane = () => !signal.aborted && (current() || globalPanel());
+      const canOpenPane = () =>
+        !signal.aborted && (current() !== undefined || globalPanel());
       const subscribe = (listener: () => void) => {
         const dispose = right.mounted.subscribe(listener);
         const disposeLayout = scope.layout.panelInfo.subscribe(listener);
+        const disposeOwner = port.subscribe(listener);
         signal.addEventListener('abort', listener, { once: true });
         return () => {
           dispose();
           disposeLayout();
+          disposeOwner();
           signal.removeEventListener('abort', listener);
         };
       };
@@ -198,25 +181,21 @@ export function applyEmployeeSettingsPane(ctx: Context) {
         sessionId,
         useTabInfo,
       }: PropsRuntime<'sidebar.right.pane.tab'>) {
-        const live = useSyncExternalStore(subscribe, current);
+        const selected = useSyncExternalStore(subscribe, current);
         const { tab } = useTabInfo();
         const paneSignal = useMemo(
           () => AbortSignal.any([signal, tab.signal]),
           [tab.signal],
         );
-        if (
-          !live ||
-          sessionId !== port.nativeSessionId ||
-          !tab.visible ||
-          tab.signal.aborted
-        )
+        if (selected !== sessionId || !tab.visible || tab.signal.aborted)
           return null;
         return (
           <SettingsPane
             port={port}
             signal={paneSignal}
             openNative={() => {
-              if (current() && !tab.signal.aborted) launcher?.open();
+              if (current() === sessionId && !tab.signal.aborted)
+                launcher?.open();
             }}
           />
         );

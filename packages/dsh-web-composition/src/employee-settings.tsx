@@ -20,7 +20,6 @@ import type {
 } from './employee-settings-port';
 import styles from './employee-settings.module.css';
 import { applyEmployeeSettingsPane } from './employee-settings-pane';
-export { bindEmployeeDocumentSettings } from './employee-settings-pane';
 
 export { bindEmployeeSettings } from './employee-settings-port';
 export type * from './employee-settings-port';

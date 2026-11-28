@@ -18,6 +18,7 @@ import {
 } from '@allrice/contracts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { skillTestCatalog } from '../../../web/test/employee-skills-host-data.js';
+import { createSyntheticPanelsData } from '../../../../packages/dsh-web-composition/tests/fixtures/employee-panels/data.js';
 import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
@@ -296,6 +297,18 @@ it
     let browserBootstrapReads = 0;
     let scopedBundleReads = 0;
     let documentLoads = 0;
+    const panelPath = `/api/v1/d-entry/panels/${f.identity.employeeInstanceId}/`;
+    const skillsPath = panelPath + 'skills';
+    const legacySkillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
+    const catalog = skillTestCatalog(
+      f.identity.employeeInstanceId,
+      f.identity.workspaceId,
+    );
+    const materials = createSyntheticPanelsData();
+    const reference = materials.references[0]!;
+    const late = deferred();
+    const reads: unknown[] = [];
+    const materialReads: string[] = [];
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -312,6 +325,52 @@ it
       };
       try {
         const scopeId = url.searchParams.get('scopeId');
+        if (url.pathname === skillsPath || url.pathname === legacySkillsPath) {
+          const ordinal = reads.push({
+            method: request.method,
+            path: url.pathname,
+            workspace: url.searchParams.get('workspaceId'),
+            thread: url.searchParams.get('threadId'),
+            expectedViewer: request.headers['x-allrice-expected-viewer-id'],
+            organization: request.headers['x-allrice-organization-id'],
+            workspaceHeader: request.headers['x-allrice-workspace-id'],
+          });
+          if (scenario === 'attached' && ordinal === 1) {
+            await late.promise;
+            return await copy(
+              Response.json({
+                ...catalog,
+                personalSkills: catalog.personalSkills.map((skill) => ({
+                  ...skill,
+                  displayName: '已关闭访次的技能',
+                })),
+              }),
+            );
+          }
+          return await copy(
+            Response.json(
+              scenario === 'attached' && ordinal === 2
+                ? skillTestCatalog(randomUUID(), f.identity.workspaceId)
+                : catalog,
+            ),
+          );
+        }
+        if (url.pathname === panelPath + 'materials') {
+          const thread = url.searchParams.get('threadId');
+          if (thread) materialReads.push(thread);
+          return await copy(Response.json(materials.catalog));
+        }
+        if (url.pathname === panelPath + 'materials/options') {
+          return await copy(
+            Response.json({
+              viewerId: f.identity.personId,
+              options: {
+                ...materials.options,
+                workspaceId: f.identity.workspaceId,
+              },
+            }),
+          );
+        }
         if (realShell) {
           if (url.pathname === '/api/v1/d-entry/identity') {
             return await copy(
@@ -576,6 +635,7 @@ it
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
+            data-login-session-id="${f.context.sessionId}"
             data-native-session-id="${nativeId}" data-binding-ref="${published.bindingRef}" data-graph-rev="${graph.rev}"
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
@@ -596,74 +656,37 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
-    const skillsPath = `/api/v1/d-entry/panels/${f.identity.employeeInstanceId}/skills`;
-    const legacySkillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
-    const catalog = skillTestCatalog(
-      f.identity.employeeInstanceId,
-      f.identity.workspaceId,
-    );
-    const late = deferred();
-    const reads: unknown[] = [];
-    await page.route(
-      (url) =>
-        url.origin === f.origin &&
-        (url.pathname.startsWith(skillsPath) ||
-          url.pathname.startsWith(legacySkillsPath)),
-      async (route) => {
-        const request = route.request();
-        const url = new URL(request.url());
-        const ordinal = reads.push({
-          method: request.method(),
-          path: url.pathname,
-          workspace: url.searchParams.get('workspaceId'),
-          thread: url.searchParams.get('threadId'),
-          expectedViewer: request.headers()['x-allrice-expected-viewer-id'],
-          organization: request.headers()['x-allrice-organization-id'],
-          workspaceHeader: request.headers()['x-allrice-workspace-id'],
-        });
-        if (ordinal === 1) await late.promise;
-        await route.fulfill({
-          json:
-            ordinal === 1
-              ? {
-                  ...catalog,
-                  personalSkills: catalog.personalSkills.map((skill) => ({
-                    ...skill,
-                    displayName: '已关闭访次的技能',
-                  })),
-                }
-              : ordinal === 2
-                ? skillTestCatalog(randomUUID(), f.identity.workspaceId)
-                : catalog,
-        });
-      },
-    );
     // Keep the first test response deliverable after abort so we exercise the
     // Reader's late-result guard, independently of browser fetch cancellation.
-    await page.addInitScript((path) => {
-      const original = window.fetch.bind(window);
-      let held = false;
-      window.fetch = async (input, init) => {
-        if (held || typeof input !== 'string' || !input.startsWith(path + '?'))
-          return original(input, init);
-        held = true;
-        init?.signal?.addEventListener(
-          'abort',
-          () => {
-            document.documentElement.dataset.skillReadAborted = 'true';
-          },
-          { once: true },
-        );
-        const reply = await original(input, { ...init, signal: undefined });
-        const parse = reply.json.bind(reply);
-        reply.json = async () => {
-          const result: unknown = await parse();
-          document.documentElement.dataset.lateSkillRead = 'true';
-          return result;
+    if (scenario === 'attached')
+      await page.addInitScript((path) => {
+        const original = window.fetch.bind(window);
+        let held = false;
+        window.fetch = async (input, init) => {
+          if (
+            held ||
+            typeof input !== 'string' ||
+            !input.startsWith(path + '?')
+          )
+            return original(input, init);
+          held = true;
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              document.documentElement.dataset.skillReadAborted = 'true';
+            },
+            { once: true },
+          );
+          const reply = await original(input, { ...init, signal: undefined });
+          const parse = reply.json.bind(reply);
+          reply.json = async () => {
+            const result: unknown = await parse();
+            document.documentElement.dataset.lateSkillRead = 'true';
+            return result;
+          };
+          return reply;
         };
-        return reply;
-      };
-    }, skillsPath);
+      }, skillsPath);
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
       await page.addInitScript((linuxProfile) => {
@@ -831,6 +854,83 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    const dock = (nativeId: string) =>
+      workbench.locator(
+        '[data-sidebar-right-session="' +
+          nativeId +
+          '"][data-sidebar-right-panel]',
+      );
+    async function openWorkbenchPane(nativeId: string, name: string) {
+      const entries = workbench.getByLabel('工作台入口', { exact: true });
+      const entry = entries.getByRole('button', { name, exact: true });
+      if (await entry.isVisible()) {
+        await entry.click();
+      } else {
+        await workbench
+          .locator('[data-conversation-header-corner]')
+          .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
+          .click();
+        await dock(nativeId)
+          .getByRole('button', {
+            name: new RegExp('^' + name + '\\s*打开这位员工的业务工作台$'),
+          })
+          .click();
+      }
+    }
+    async function closeWorkbenchPane(nativeId: string, name: string) {
+      await dock(nativeId)
+        .getByRole('tab', { name: new RegExp(name) })
+        .getByRole('button', { name: /^(关闭|Close)$/ })
+        .click();
+    }
+    async function useMaterial(nativeId: string, threadId: string) {
+      const file = reference.fileName;
+      const before = materialReads.length;
+      await openWorkbenchPane(nativeId, '企业资料');
+      await dock(nativeId)
+        .getByRole('button', {
+          name: '引用到对话 ' + file,
+          exact: true,
+        })
+        .click();
+      await expect.poll(() => editor.textContent()).toContain(file);
+      expect(materialReads.slice(before)).toEqual([threadId]);
+      await closeWorkbenchPane(nativeId, '企业资料');
+    }
+    async function checkR3SelectedRoot(nativeId: string, threadId: string) {
+      const before = reads.length;
+      await workbench
+        .locator('#chat-sidebar')
+        .getByRole('button', {
+          name: '设置',
+          exact: true,
+        })
+        .click();
+      await dock(nativeId)
+        .getByRole('button', {
+          name: 'AllRice 账号',
+          exact: true,
+        })
+        .waitFor();
+      await closeWorkbenchPane(nativeId, '设置');
+      await openWorkbenchPane(nativeId, '能力');
+      await dock(nativeId)
+        .getByRole('button', {
+          name: '翻译校对',
+          exact: true,
+        })
+        .waitFor();
+      expect(reads.slice(before)).toEqual([
+        expect.objectContaining({
+          method: 'GET',
+          path: skillsPath,
+          thread: threadId,
+          expectedViewer: f.identity.personId,
+        }),
+      ]);
+      await closeWorkbenchPane(nativeId, '能力');
+      await useMaterial(nativeId, threadId);
+    }
     if (switching) {
       const frame = page.locator('iframe');
       const mark = randomUUID();
@@ -892,6 +992,10 @@ it
           expect(socketCount).toBe(1);
         }
         if (attempt === 0) await editor.fill('另一条会话的原生草稿');
+        if (scenario === 'switch' && attempt === 0) {
+          await checkR3SelectedRoot(nativeId, target!);
+          await editor.fill('另一条会话的原生草稿');
+        }
       }
       expect(await editor.innerText()).toBe('未发送的原生草稿');
       expect(await frame.count()).toBe(1);
@@ -1199,6 +1303,7 @@ it
         ).toBe(mark);
       }
       expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      await checkR3SelectedRoot(createdNativeId, createdThread);
       await context.close();
       return;
     }
@@ -1363,6 +1468,7 @@ it
             workspaceHeader: f.identity.workspaceId,
           })),
         );
+        await useMaterial('root', f.selection.threadId!);
       } catch (error) {
         const state = await workbench.locator('html').evaluate(() => ({
           viewportWidth: innerWidth,

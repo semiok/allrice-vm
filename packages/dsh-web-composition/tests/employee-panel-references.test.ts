@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { SessionIdOf } from '@deepseek-ai/dsh-client-ui-slots';
+import type * as React from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   apply,
@@ -17,7 +18,7 @@ import {
 import { unboundEmployeePanelDataClient } from '../../../apps/web/lib/chatflow/employee-panel-data';
 
 vi.mock('react', async (original) => ({
-  ...(await original<typeof import('react')>()),
+  ...(await original<typeof React>()),
   useEffect: (callback: () => void) => callback(),
 }));
 
@@ -115,7 +116,13 @@ const fixture = (deferred = false) => {
     get codec() {
       return registerSource.mock.calls[0]![0].codec;
     },
-    reference: { insert: port?.useReference! },
+    reference: {
+      insert: (
+        request: Parameters<
+          NonNullable<NonNullable<typeof port>['useReference']>
+        >[0],
+      ) => port?.useReference?.(request) ?? false,
+    },
     bindOwner,
     currentBinding,
     binding,

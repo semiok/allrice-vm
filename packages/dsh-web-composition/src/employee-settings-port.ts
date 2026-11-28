@@ -65,8 +65,9 @@ export interface EmployeeSettingsPort {
 /** Production account and native launcher for one authenticated document. */
 export interface EmployeeWorkbenchSettingsPort {
   readonly signal: AbortSignal;
-  readonly nativeSessionId: string;
   readonly loginSessionId: string;
+  isCurrentRoot(id: string): boolean;
+  subscribe(listener: () => void): () => void;
 }
 
 export interface EmployeeSettingsOptions {

@@ -34,6 +34,7 @@ import {
   bindEmployeePanelsHttp,
   type EmployeePanelsSnapshot,
 } from './employee-panels';
+import { bindEmployeeSettings } from './employee-settings-port';
 
 function position<T>() {
   let snapshot: T | null = null;
@@ -56,9 +57,9 @@ export function installEmployeeProductOwner(ctx: Context) {
     __ALLRICE_D_ENTRY_LIFETIME__?: AbortSignal;
   };
   const signal = scope.__ALLRICE_D_ENTRY_LIFETIME__;
-  if (!signal) return;
+  if (!signal) return false;
   const data = document.getElementById('app')?.dataset;
-  if (!data) return;
+  if (!data || signal.aborted) return true;
   const { scopeId, selection, viewerId, organizationId, nativeSessionId } =
     readEmployeeDocument(data);
   if (!nativeSessionId || !selection.threadId)
@@ -79,6 +80,21 @@ export function installEmployeeProductOwner(ctx: Context) {
   let switchingScope = false;
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
+  const panelSelection = (nativeId: string) => {
+    if (signal.aborted || switchingScope || nativeId !== activeNativeSession)
+      return null;
+    const root = registered.get(nativeId);
+    return root?.scopeId === resourceScopeId && root.threadId === activeThreadId
+      ? { selection: { ...selection, threadId: root.threadId }, viewerId }
+      : null;
+  };
+  if (data.loginSessionId)
+    bindEmployeeSettings(ctx, {
+      signal,
+      loginSessionId: data.loginSessionId,
+      isCurrentRoot: (id) => panelSelection(id) !== null,
+      subscribe: panels.subscribe,
+    });
   const ownerKey = [
     organizationId,
     viewerId,
@@ -113,8 +129,8 @@ export function installEmployeeProductOwner(ctx: Context) {
         tree: { ...previous.tree, activeId: thread },
       });
     const panel = panels.getSnapshot();
-    if (!panel || panel.files.sessionId === thread) return;
     const panelKey = resourceScopeId + '/' + thread;
+    if (!panel || panel.scopeKey === panelKey) return;
     panels.update({
       ...panel,
       scopeKey: panelKey,
@@ -501,32 +517,23 @@ export function installEmployeeProductOwner(ctx: Context) {
         sessionId: activeThreadId,
         headers: requestHeaders,
       };
-      const skillScope = {
-        scopeId: ownerKey,
-        workspaceId: selection.workspaceId,
-        instanceId: selection.employeeInstanceId,
-        headers: requestHeaders,
-      };
       const skillWrites: EmployeeSkillWriteStore = new Map();
-      const readSkills = (signal: AbortSignal) =>
-        readDEntryEmployeeSkills(
-          skillScope,
-          { threadId, expectedViewerId: viewerId },
-          signal,
-        );
       const employeeName = employee.currentVersion.manifest.name;
-      const initial: EmployeePanelsSnapshot = {
-        scopeKey: ownerKey,
-        publicationManagement: {
-          organizationId,
-          employeeInstanceId: selection.employeeInstanceId,
-          threadId: activeThreadId,
-        },
-        filesUnread: null,
-        filesUnreadSource: unread,
-        workflow: ({ signal: tabSignal }) => ({
+      const workflow: EmployeePanelsSnapshot['workflow'] = ({
+        signal: tabSignal,
+      }) => {
+        const scopeKey = panels.getSnapshot()?.scopeKey ?? ownerKey;
+        const root = activeNativeSession;
+        const selectedThread = activeThreadId;
+        const skillScope = {
+          scopeId: scopeKey,
+          workspaceId: selection.workspaceId,
+          instanceId: selection.employeeInstanceId,
+          headers: requestHeaders,
+        };
+        return {
           employeeName,
-          scopeKey: ownerKey,
+          scopeKey,
           onRead() {},
           showSkills: true,
           children: null,
@@ -538,11 +545,44 @@ export function installEmployeeProductOwner(ctx: Context) {
             copy: employeeSkillHostCopy,
             backLabel: '返回能力列表',
             // Configuration is available independently of the Guest registry.
-            readOnlyCatalog: readSkills,
+            readOnlyCatalog: async (caller) => {
+              const active = AbortSignal.any([signal, tabSignal, caller]);
+              const assertCurrent = () => {
+                active.throwIfAborted();
+                if (
+                  !root ||
+                  panelSelection(root)?.selection.threadId !== selectedThread ||
+                  panels.getSnapshot()?.scopeKey !== scopeKey
+                )
+                  throw new DOMException(
+                    'Employee panel retired',
+                    'AbortError',
+                  );
+              };
+              assertCurrent();
+              const skills = await readDEntryEmployeeSkills(
+                skillScope,
+                { threadId: selectedThread, expectedViewerId: viewerId },
+                active,
+              );
+              assertCurrent();
+              return skills;
+            },
             scopeSignal: signal,
             lifetimeSignal: tabSignal,
           },
-        }),
+        };
+      };
+      const initial: EmployeePanelsSnapshot = {
+        scopeKey: ownerKey,
+        publicationManagement: {
+          organizationId,
+          employeeInstanceId: selection.employeeInstanceId,
+          threadId: activeThreadId,
+        },
+        filesUnread: null,
+        filesUnreadSource: unread,
+        workflow,
         materials: { ...common, readOnly: true },
         files: {
           ...common,
@@ -596,19 +636,6 @@ export function installEmployeeProductOwner(ctx: Context) {
             : undefined,
       };
       panels.update(initial);
-      const panelSelection = (nativeId: string) => {
-        if (
-          signal.aborted ||
-          switchingScope ||
-          nativeId !== activeNativeSession
-        )
-          return null;
-        const root = registered.get(nativeId);
-        return root?.scopeId === resourceScopeId &&
-          root.threadId === activeThreadId
-          ? { selection: { ...selection, threadId: root.threadId }, viewerId }
-          : null;
-      };
       await bindEmployeePanelsHttp(
         ctx,
         {
@@ -621,4 +648,5 @@ export function installEmployeeProductOwner(ctx: Context) {
       refreshUnread();
     })
     .catch(() => {});
+  return true;
 }
