@@ -165,6 +165,7 @@ export async function setupNativeWebFixture(
     nativeToolEvidenceProbe?: string;
     identity?: Omit<DEntryIdentity, 'threadId'>;
     loginSessionId?: string;
+    employeeInstructions?: string;
   },
   managedModel?: NativeWebModelAdapter,
   beforePrompt?: Parameters<typeof openNativeWebOwner>[0]['beforePrompt'],
@@ -245,6 +246,7 @@ export async function setupNativeWebFixture(
     cliPath,
     startupTimeoutMs: 10000,
     principalProfile,
+    employeeInstructions: isolated?.employeeInstructions,
   };
   const launch = launchOnTestHost(
     await prepareNativeWebLaunch(
@@ -663,12 +665,24 @@ export async function setupNativeWebFixture(
     lifetime,
     child,
     observeNativeStartup,
-    async restartRetained(nextModel?: NativeWebModelAdapter) {
+    async restartRetained(
+      nextModel?: NativeWebModelAdapter,
+      updated?: { employeeRevision: number; employeeInstructions: string },
+    ) {
       if (child.exitCode === null && child.signalCode === null)
         throw Error('The original isolated Host must stop before restart');
       const next = launchOnTestHost(
         await prepareNativeWebLaunch(
-          configuration,
+          updated
+            ? {
+                ...configuration,
+                employeeInstructions: updated.employeeInstructions,
+                principalProfile: {
+                  ...principalProfile,
+                  employeeRevision: updated.employeeRevision,
+                },
+              }
+            : configuration,
           binding,
           profile,
           undefined,

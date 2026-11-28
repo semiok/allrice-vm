@@ -30,6 +30,7 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
+import { readNativeScheduleObservations } from '../native-schedule-observation.js';
 import {
   nativeWebLaunchOnGuest,
   prepareNativeWebLaunch,
@@ -124,6 +125,13 @@ export function createAssignedNativeWebStartup(input: {
     readonlyDshDirectory: string;
   }>;
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
+  employeeInstructions?: Readonly<{
+    read(
+      binding: PersonVmBinding,
+      employee: PersonVmWebRoster['entries'][number],
+      signal: AbortSignal,
+    ): Promise<string>;
+  }>;
   configuration: Pick<
     NativeWebConfiguration,
     'cliPath' | 'startupTimeoutMs' | 'terminalEnabled'
@@ -337,7 +345,7 @@ export function createAssignedNativeWebStartup(input: {
       personId: group.binding.personId,
     });
   }
-  async function joinArchivedOwner(group: RunningGroup, owner: NativeWebOwner) {
+  async function joinEmployeeOwner(group: RunningGroup, owner: NativeWebOwner) {
     const exited = owner.retireAfterJobExit(group.binding);
     if (exited) return exited;
     try {
@@ -367,7 +375,7 @@ export function createAssignedNativeWebStartup(input: {
             if (await confirmArchive(group, endpoint)) {
               if (!group.ready || signal.aborted) return;
               await retireEmployee(group, endpoint, owner, () =>
-                joinArchivedOwner(group, owner),
+                joinEmployeeOwner(group, owner),
               );
               group.census = group.census.filter(
                 ({ employeeInstanceId }) => employeeInstanceId !== employeeId,
@@ -384,9 +392,16 @@ export function createAssignedNativeWebStartup(input: {
     endpoint: Endpoint,
     profile: NativeWebGuestProfile,
     memory: Awaited<ReturnType<PersonVmRuntimePort['memoryGuestPlan']>>,
+    signal: AbortSignal,
     model?: NativeWebModelAdapter,
   ) {
     const home = `/work/.allrice/employees/${endpoint.employeeInstanceId}`;
+    const employeeInstructions = await input.employeeInstructions?.read(
+      binding,
+      endpoint,
+      signal,
+    );
+    signal.throwIfAborted();
     return prepareNativeWebLaunch(
       {
         ...input.configuration,
@@ -402,6 +417,7 @@ export function createAssignedNativeWebStartup(input: {
         dshHome: `${home}/dsh`,
         agentsHome: `${home}/agents`,
         workdir: '/work',
+        employeeInstructions,
       },
       binding,
       profile,
@@ -592,18 +608,21 @@ export function createAssignedNativeWebStartup(input: {
         const model = await modelAdapter?.(binding, signal);
         current(binding, web);
         signal.throwIfAborted();
-        const launches = await Promise.all(
-          cold.endpoints.map(async (endpoint) => ({
+        const preparing = cold.endpoints.map(async (endpoint) => ({
+          endpoint,
+          launch: await prepareEmployee(
+            binding,
             endpoint,
-            launch: await prepareEmployee(
-              binding,
-              endpoint,
-              profile,
-              memory,
-              model,
-            ),
-          })),
-        );
+            profile,
+            memory,
+            signal,
+            model,
+          ),
+        }));
+        const launches = await Promise.all(preparing).catch(async (error) => {
+          await Promise.allSettled(preparing);
+          throw error;
+        });
         current(binding, web);
         signal.throwIfAborted();
         const selectedThreadId = model?.scoped ? web.editorThreadId : undefined;
@@ -1113,11 +1132,53 @@ export function createAssignedNativeWebStartup(input: {
           slot = physicalSlot(prior);
           if (!slot) throw new PersonVmError('CLEANUP_INCOMPLETE');
           const joined = existing.retireAfterJobExit(binding);
-          if (!joined)
-            throw new PersonVmError(
-              sameRevision ? 'RUNTIME_NOT_READY' : 'WEB_ENDPOINTS_PREPARING',
+          if (joined) {
+            await retireEmployee(group, prior, existing, () => joined);
+          } else {
+            const instructions = input.employeeInstructions;
+            if (
+              !instructions ||
+              prior.workspaceId !== selected.workspaceId ||
+              prior.employeeRevision >= selected.employeeRevision ||
+              prior.employeeVersionId !== selected.employeeVersionId
+            )
+              throw new PersonVmError(
+                sameRevision ? 'RUNTIME_NOT_READY' : 'WEB_ENDPOINTS_PREPARING',
+              );
+            const assertIdle = async () => {
+              const revision = existing.nativeActivityRevision();
+              const schedule = await readNativeScheduleObservations(
+                {
+                  catalog: () =>
+                    existing.readScheduleCatalog(scope.assertCurrent, signal),
+                },
+                signal,
+              );
+              const activity = await existing.readNativeActivity(
+                scope.assertCurrent,
+                signal,
+              );
+              await scope.assertCurrent();
+              if (
+                !activity.complete ||
+                activity.work.size ||
+                revision !== existing.nativeActivityRevision() ||
+                // A running VM with no employee owner has no wake handoff.
+                // Keep this scheduler live even if its next reminder is far away.
+                schedule.items.some(({ status }) => status === 'active')
+              )
+                throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+            };
+            // Close the old scopes only once the owner appears idle. A
+            // previously admitted RPC can still commit during scope close,
+            // so take the decisive activity and schedule sample after join.
+            await assertIdle();
+            await existing.joinStaleProfilePrincipals();
+            await assertIdle();
+            await retireEmployee(group, prior, existing, () =>
+              joinEmployeeOwner(group, existing),
             );
-          await retireEmployee(group, prior, existing, () => joined);
+          }
           await scope.assertCurrent();
         }
         if (
@@ -1144,7 +1205,7 @@ export function createAssignedNativeWebStartup(input: {
             await scope.assertCurrent();
             try {
               await retireEmployee(group, prior, owner, () =>
-                joinArchivedOwner(group, owner),
+                joinEmployeeOwner(group, owner),
               );
             } catch {
               // The archived owner's quarantine retains this slot. B has not
@@ -1176,6 +1237,7 @@ export function createAssignedNativeWebStartup(input: {
           endpoint,
           profile,
           memory,
+          signal,
           model,
         );
         await scope.assertCurrent();

@@ -23,6 +23,7 @@ import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 import { nativeScopedModelPatches } from './model-task-presets.js';
+import { nativeEmployeePersonaPatches } from './employee-instructions.js';
 import {
   nativeSearchToolPatches,
   nativeWebBundlePatches,
@@ -42,6 +43,47 @@ const binding = {
   organizationId: randomUUID(),
   leaseEpoch: 1,
 };
+it('keeps scoped native tools and enables employee instructions in every stock Web preset', () => {
+  const model = nativeScopedModelPatches({
+    compaction: { provider: 'openai', model: 'gpt-4.1-mini' },
+  });
+  const original = composeEntries([...nativeWebBundlePatches(), model]);
+  const entries = composeEntries([
+    ...nativeWebBundlePatches(),
+    model,
+    nativeEmployeePersonaPatches(model),
+  ]);
+  const presets = entries.filter(
+    ({ name }) => name === '@deepseek-ai/dsh-agent-preset',
+  );
+  expect(presets.map(({ id }) => id).sort()).toEqual([
+    'preset-cordis',
+    'preset-minimal',
+    'preset-ptc',
+    'preset-standard',
+  ]);
+  for (const { id, config } of presets) {
+    const plugins = config?.plugins as { name: string }[];
+    const isInstructionOrPersona = ({ name }: { name: string }) =>
+      name === '@deepseek-ai/dsh-persona' ||
+      name === '@deepseek-ai/dsh-agent-instructions';
+    expect(plugins.filter(isInstructionOrPersona)).toEqual([
+      expect.objectContaining({
+        name: '@deepseek-ai/dsh-persona',
+        config: expect.objectContaining({ prefix: '', complete: false }),
+      }),
+      expect.objectContaining({
+        name: '@deepseek-ai/dsh-agent-instructions',
+        config: expect.objectContaining({ maxBytes: 65536 }),
+      }),
+    ]);
+    const previous = original.find((entry) => entry.id === id)?.config
+      ?.plugins as typeof plugins;
+    expect(plugins.filter((entry) => !isInstructionOrPersona(entry))).toEqual(
+      previous.filter((entry) => !isInstructionOrPersona(entry)),
+    );
+  }
+});
 it('生产compiler收集全部native Web产品而不emit测试；typecheck仍收集完整测试', () => {
   const worker = fileURLToPath(new URL('../../', import.meta.url));
   function configuration(name: string) {
