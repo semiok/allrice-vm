@@ -1989,10 +1989,11 @@ it
       }
       if (cross) {
         const before = { documentLoads, socketCount };
-        const original = [...f.pageSignals].find(
-          ([, signal]) => !signal.aborted,
-        )?.[0];
-        expect(original).toBeDefined();
+        // The carrier's initial scope is distinct from the resource scope
+        // selected by the most recent acknowledged in-document handoff.
+        const original = lastScopeId!;
+        expect(original).toBeTruthy();
+        expect((await f.invokeThread(original, otherThread)).status).toBe(200);
         const next = {
           workspaceId: cross.identity.workspaceId,
           employeeInstanceId: cross.identity.employeeInstanceId,
@@ -2025,7 +2026,26 @@ it
         expect(await editor.innerText()).not.toContain('未发送的原生草稿');
         expect(documentLoads).toBe(before.documentLoads + 1);
         expect(socketCount).toBe(before.socketCount + 1);
-        expect((await f.invokeThread(original!, otherThread)).status).toBe(200);
+        expect((await f.invokeThread(original, otherThread)).status).toBe(200);
+        await workbench
+          .locator(
+            '[data-row-key="workspace:' + f.selection.employeeInstanceId + '"]',
+          )
+          .click();
+        await page.waitForURL(
+          (url) =>
+            url.searchParams.get('employeeInstanceId') ===
+              f.selection.employeeInstanceId &&
+            url.searchParams.get('threadId') === otherThread,
+          { waitUntil: 'commit' },
+        );
+        expect(
+          await workbench.locator('#app').getAttribute('data-fixture-document'),
+        ).toBe(mark);
+        expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+        expect((await f.invokeThread(original, otherThread)).status).toBe(200);
+        expect(documentLoads).toBe(before.documentLoads + 1);
+        expect(socketCount).toBe(before.socketCount + 1);
         await page.goto(
           f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
         );
