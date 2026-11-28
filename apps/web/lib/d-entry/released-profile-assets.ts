@@ -42,7 +42,8 @@ export async function readReleasedProfileAssets(
 ) {
   if (!sha.safeParse(manifestSha256).success) return undefined;
   const release = await readLocalProfileAssets(entrypoint);
-  return release?.stamp === manifestSha256 ? release : undefined;
+  if (release?.stamp !== manifestSha256) return undefined;
+  return { root: release.root, paths: release.paths, bundles: release.bundles };
 }
 
 /** Warming only gets a list of code already staged in the public release. */

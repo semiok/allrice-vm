@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { gzipSync } from 'node:zlib';
+import { stageDshProfileAssets } from '../../../../scripts/dev-release/stage-dsh-profile-assets.mjs';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
@@ -63,6 +65,7 @@ it
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
+      source: { head: string };
       files: { path: string }[];
       profile: { files: { reference: string; sha256: string }[] };
     } = JSON.parse(sealed.toString());
@@ -192,6 +195,7 @@ it
           write: false,
           outdir: '/fixture-dsh-switch',
           jsx: 'automatic',
+          minify: coldAssets,
           loader: {
             '.woff': 'dataurl',
             '.woff2': 'dataurl',
@@ -282,7 +286,29 @@ it
     );
     const publicEntry = publicRoot + 'managed/employee-web-entry.js';
     const publicStyle = publicRoot + 'managed/employee-web-entry.css';
-    const coldPaths = [...publicBundles.keys(), publicEntry, publicStyle];
+    let coldPaths: string[] = [];
+    let stagedPaths: Set<string> | undefined;
+    if (coldAssets && bench !== 'baseline') {
+      const root = await realpath(
+        await mkdtemp(join(tmpdir(), 'd-entry-warm-')),
+      );
+      closes.push(() => rm(root, { recursive: true, force: true }));
+      await mkdir(join(root, 'apps/worker/dist'), { recursive: true });
+      await mkdir(join(root, 'apps/web/.next/server'), { recursive: true });
+      await mkdir(join(root, 'apps/web/.next/static'), { recursive: true });
+      await cp(release.directory, join(root, 'apps/worker/dist/d-entry-web'), {
+        recursive: true,
+      });
+      await stageDshProfileAssets(root, manifest.source.head);
+      const index: { paths: string[]; startup: string[] } = JSON.parse(
+        await readFile(
+          join(root, 'apps/web/.next/server/dsh-profile.json'),
+          'utf8',
+        ),
+      );
+      coldPaths = index.startup.map((path) => publicRoot + path);
+      stagedPaths = new Set(index.paths);
+    }
     const coldRequests = new Map<string, number>();
     const coldFinished = new Map<string, number>();
     let readyAt: number | undefined;
@@ -537,7 +563,9 @@ it
         }
         if (coldAssets && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
-          if (!staticFiles.has('/' + file))
+          if (
+            !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
+          )
             return response.writeHead(404).end();
           if (coldPaths.includes(url.pathname)) {
             coldRequests.set(
@@ -812,6 +840,7 @@ it
       realShell
         ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
         : f.origin,
+      coldAssets ? { waitUntil: 'commit' } : undefined,
     );
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
