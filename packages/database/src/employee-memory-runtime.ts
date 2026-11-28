@@ -289,6 +289,7 @@ async function caller<T>(
   work: (bound: BoundMemory) => Promise<T>,
   scopeLock: true | 'read' = true,
   ownerAssembly?: MemoryRuntimeAssembly,
+  operation?: 'dispatch',
 ) {
   signal.throwIfAborted();
   const assembly = ownerAssembly ?? requireMemoryRuntimeAssembly();
@@ -303,6 +304,12 @@ async function caller<T>(
   return withDedicatedCallerTransaction(
     getDatabase(),
     async (tx) => {
+      if (operation === 'dispatch') {
+        // An occupied pin must not hold a socket or the foreground memory
+        // order indefinitely after its caller has left.
+        await tx`set local lock_timeout = '2000ms'`;
+        await tx`set local statement_timeout = '3000ms'`;
+      }
       const scope = await employeeMemoryScope(
         context,
         target.workspaceId,
@@ -589,6 +596,7 @@ async function restoreNativeEmployeeMemoryContext(
     },
     'read',
     assembly,
+    dispatch ? 'dispatch' : undefined,
   );
   signal.throwIfAborted();
   return document;

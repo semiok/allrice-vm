@@ -78,20 +78,26 @@ export function installNativeCloseObserver(): () => void {
 }
 
 export function observeNativeClose() {
-  const ready = Promise.withResolvers<void>();
-  const written = Promise.withResolvers<void>();
+  let markReady!: () => void;
+  let markWritten!: () => void;
+  const headersReady = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  const bodyWritten = new Promise<void>((resolve) => {
+    markWritten = resolve;
+  });
   let wroteBody = false;
   const observation: Observation = {
     requests: new Map(),
-    onHeaders: ready.resolve,
+    onHeaders: markReady,
     onBody() {
       wroteBody = true;
-      written.resolve();
+      markWritten();
     },
   };
   return {
-    headersReady: ready.promise,
-    bodyWritten: written.promise,
+    headersReady,
+    bodyWritten,
     get wroteBody() {
       return wroteBody;
     },

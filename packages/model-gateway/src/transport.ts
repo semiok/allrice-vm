@@ -33,12 +33,15 @@ async function waitForWire(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const stopped = Promise.withResolvers<never>();
-  const abort = addAbortListener(signal, () => stopped.reject(signal.reason));
+  let rejectStopped!: (reason: unknown) => void;
+  const stopped = new Promise<never>((_, reject) => {
+    rejectStopped = reject;
+  });
+  const abort = addAbortListener(signal, () => rejectStopped(signal.reason));
   try {
     await Promise.race([
       observed,
-      stopped.promise,
+      stopped,
       sending.then(() => {
         throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
       }),
@@ -400,12 +403,15 @@ export function createMeteredTransport(options: {
           if (!request.body)
             throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
           const source = request.body.getReader();
-          const releaseBody = Promise.withResolvers<void>();
+          let releaseBody!: () => void;
+          const readyBody = new Promise<void>((resolve) => {
+            releaseBody = resolve;
+          });
           let receivedBody = false;
           const body = new ReadableStream(
             {
               async pull(controller) {
-                await releaseBody.promise;
+                await readyBody;
                 requestSignal.throwIfAborted();
                 const chunk = await source.read();
                 requestSignal.throwIfAborted();
@@ -439,7 +445,7 @@ export function createMeteredTransport(options: {
                 if (authorized)
                   throw new ModelGatewayError('AUTHORIZATION_DENIED');
                 authorized = true;
-                releaseBody.resolve();
+                releaseBody();
                 try {
                   await waitForWire(
                     nativeClose.bodyWritten,
@@ -458,7 +464,7 @@ export function createMeteredTransport(options: {
             dispatched = true;
           } catch (error) {
             contextStop.abort(error);
-            releaseBody.resolve();
+            releaseBody();
             dispatched = nativeClose.wroteBody;
             await sending
               .then((value) => value.body?.cancel(error))
