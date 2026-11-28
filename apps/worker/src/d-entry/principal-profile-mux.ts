@@ -27,6 +27,7 @@ import {
   type DEntryPageInput,
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
+import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import {
   DEntryNativeRootRejected,
@@ -233,6 +234,7 @@ async function runOwner(
       page,
       send,
       AbortSignal.any([connected, generation.stop.signal, page.signal]),
+      Boolean(shared),
     );
     current = generation;
   }
@@ -499,7 +501,12 @@ async function runOwner(
   }
 }
 
-function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
+function pageStreams(
+  page: DEntryPageHandle,
+  send: Send,
+  signal: AbortSignal,
+  exactRoot = false,
+) {
   const streams = new Map<
     string,
     {
@@ -537,8 +544,24 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
       void inputError.catch((error: unknown) => stop.abort(error));
     }
     const source = page.use(child, async (child) => {
-      if (frame.endpoint === 'session/follow')
+      if (frame.endpoint === 'session/follow') {
+        if (exactRoot) {
+          const { request } = TYPERT_REMOTE.methods['session/follow']
+            .input({ strict: true })
+            .create()
+            .parse(
+              DEntryPageRpcRequestSchema.shape.payload.parse(frame.payload)
+                .args,
+            );
+          const { address } = request;
+          const id =
+            address.kind === 'session'
+              ? address.sessionId
+              : address.childSessionId;
+          await page.authorize(id, 'read', child);
+        }
         follow = await page.watchFollow(child);
+      }
       if (follow) {
         if (!page.scope.opened.followWithdrawals)
           throw new RemoteError(
@@ -763,6 +786,7 @@ export function createDEntryPageMux(
           const {
             organizationId,
             scopeId,
+            warm,
             workspaceId,
             employeeInstanceId,
             threadId,
@@ -782,6 +806,7 @@ export function createDEntryPageMux(
             peer.on('error', stop);
             return peer;
           };
+          if (warm && (scopeId || !threadId)) throw denied();
           if (scopeId) {
             await pages.borrow(
               token,
@@ -799,7 +824,7 @@ export function createDEntryPageMux(
               },
             );
           } else {
-            await pages.authorizeUpgrade(token, input, connected);
+            await pages.authorizeUpgrade(token, input, connected, warm === '1');
             await runOwner(pages, token, input, await accept(), connected);
           }
         })

@@ -296,6 +296,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     dispatchSwitch?: (requestId: string, threadId: string) => void,
     borrowable = true,
   ) {
+    if (!borrowable && (previous || input.selection.threadId)) throw denied();
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
     const timing = dEntryStartupTiming('page-open');
@@ -412,7 +413,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           owner: current.owner,
           operationId,
           signal: current.signal,
-          access: 'page',
+          access: borrowable ? 'page' : 'employee-streams',
         }),
       );
       if (
@@ -831,6 +832,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       token: string,
       input: Selection,
       signal: AbortSignal,
+      warm = false,
     ) {
       const auth = await history(token, input, signal);
       const data = deps.data();
@@ -838,7 +840,24 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       const root =
         input.selection.threadId &&
         (await deps.historyRoot(auth.context, input.selection));
-      if (!root) {
+      if (warm) {
+        if (!root || !data.confirmVerifiedEditor)
+          throw new DEntryNativeUnavailable();
+        const current = await currentDEntryRequest(deps, token, input, signal);
+        if (
+          current.context.sessionId !== auth.context.sessionId ||
+          !sameDEntryIdentity(current.identity, root.identity)
+        )
+          throw denied();
+        const ready = await data.confirmVerifiedEditor(
+          current.context,
+          current.identity,
+          signal,
+        );
+        if (!ready || ready.binding.vmId !== root.vmId)
+          throw new DEntryNativeUnavailable();
+        ready.proof.throwIfAborted();
+      } else if (!root) {
         // Qualification only. Opening the socket alone never creates a root.
         await currentDEntryRequest(deps, token, input, signal);
       }

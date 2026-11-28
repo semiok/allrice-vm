@@ -440,6 +440,43 @@ it('requires rollout authority, a routable exact model and a current employee af
   );
 });
 
+it('only requires authenticated VM authority for employee-wide read streams', async () => {
+  const f = fixture();
+  f.beforeProof.mockRejectedValue(new Error('model route unavailable'));
+  const input = {
+    context: f.context,
+    identity: { ...f.identity, threadId: null },
+    owner: f.owner,
+    operationId: randomUUID(),
+    signal: f.signal,
+  };
+  const streams = await f.port.resolveAdmissionOwner({
+    ...input,
+    access: 'employee-streams',
+  });
+  expect(f.beforeProof).not.toHaveBeenCalled();
+  expect(f.confirmPhysical).toHaveBeenCalledWith(
+    f.context,
+    input.identity,
+    f.binding,
+    expect.any(AbortSignal),
+  );
+  await expect(
+    f.port.resolveAdmissionOwner({ ...input, access: 'page' }),
+  ).rejects.toThrow('model route unavailable');
+  await expect(
+    f.port.resolveAdmissionOwner({
+      ...input,
+      access: 'employee-streams',
+      identity: { ...input.identity, threadId: randomUUID() },
+    }),
+  ).rejects.toBeInstanceOf(DataAccessError);
+  f.group.abort(Error('employee transport retired'));
+  await expect(streams.assertCurrent(f.signal)).rejects.toThrow(
+    'employee transport retired',
+  );
+});
+
 it('binds the same entry participant and keeps native root creation inert until run, then joins it on close', async () => {
   const f = fixture();
   await f.prove();

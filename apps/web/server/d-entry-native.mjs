@@ -82,14 +82,16 @@ export function createDEntryNativeGateway({
           const { organizationId, ...selection } = selectors;
           const input = page
             ? (() => {
-                const { carrier, organizationId, scopeId, ...selection } =
+                const { carrier, organizationId, scopeId, warm, ...selection } =
                   DEntryPageMuxQuerySchema.parse(selectors);
-                return { carrier, organizationId, selection, scopeId };
+                return { carrier, organizationId, selection, scopeId, warm };
               })()
             : DEntryNativeOwnerRequestSchema.parse({
                 organizationId,
                 selection,
               });
+          if (input.warm && (input.scopeId || !input.selection.threadId))
+            throw Error('D_ENTRY_WARM_SELECTION');
           if (!page && !input.selection.threadId)
             throw Error('D_ENTRY_THREAD_REQUIRED');
           // This name is the existing Web session cookie (identity/session.ts),
@@ -165,6 +167,7 @@ export function createDEntryNativeGateway({
             ...input.selection,
             ...(page && { carrier: 'page' }),
             ...(input.scopeId && { scopeId: input.scopeId }),
+            ...(input.warm && { warm: input.warm }),
           }).toString();
           abort.signal.throwIfAborted();
           worker = connect(target, {

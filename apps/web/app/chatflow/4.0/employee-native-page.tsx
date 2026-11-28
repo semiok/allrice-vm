@@ -74,6 +74,7 @@ type ThreadHandoff = {
   requestId: string;
   submitted?: boolean;
   scopeId?: string;
+  restored?: boolean;
 };
 
 type EntryWarmup = {
@@ -603,6 +604,49 @@ export function EmployeeNativePage({
           finish('failed');
         });
     }
+    function beginLiveSwitch(
+      selection: DEntrySelectionInput,
+      restored = false,
+    ) {
+      if (
+        !prepare ||
+        !carrier ||
+        !scopeId ||
+        !switchReady ||
+        switching ||
+        navigating ||
+        detached ||
+        navigationClosed ||
+        remoteRevoked ||
+        superseded ||
+        !selection.threadId ||
+        document.hidden ||
+        location.pathname !== '/chatflow/4.0' ||
+        selectedEmployee?.workspaceId !== selection.workspaceId ||
+        selectedEmployee.employeeInstanceId !== selection.employeeInstanceId ||
+        selectedEmployee.threadId === selection.threadId
+      )
+        return false;
+      const target: ThreadHandoff = {
+        selection: { ...selection, threadId: selection.threadId },
+        requestId: crypto.randomUUID(),
+        restored,
+      };
+      switching = target;
+      switchTimer = window.setTimeout(() => {
+        if (switching !== target) return;
+        cancelSwitch(target);
+        if (restored) {
+          nextQuery.current = location.search.slice(1);
+          applyQuery();
+        }
+      }, liveSwitchWaitMs);
+      frame.current?.contentWindow?.postMessage(
+        { type: pageThreadSwitchPrepare, scopeId, requestId: target.requestId },
+        location.origin,
+      );
+      return true;
+    }
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -635,7 +679,7 @@ export function EmployeeNativePage({
         !detached &&
         !remoteRevoked
       ) {
-        const selection = switching.selection;
+        const { selection, restored } = switching;
         resourceScopeId = switching.scopeId;
         const query = new URLSearchParams({
           workspaceId: selection.workspaceId,
@@ -649,7 +693,8 @@ export function EmployeeNativePage({
         frameSelection.current = selection;
         selectedQuery = query;
         nextQuery.current = displayedQuery.current = query;
-        history.pushState(history.state, '', '/chatflow/4.0?' + query);
+        if (!restored)
+          history.pushState(history.state, '', '/chatflow/4.0?' + query);
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
@@ -753,37 +798,8 @@ export function EmployeeNativePage({
           selectedEmployee.employeeInstanceId === selection.employeeInstanceId
         )
           return;
-        if (
-          prepare &&
-          !navigating &&
-          switchReady &&
-          selection.threadId &&
-          !document.hidden &&
-          !remoteRevoked &&
-          !detached &&
-          location.pathname === '/chatflow/4.0' &&
-          selectedEmployee?.workspaceId === selection.workspaceId &&
-          selectedEmployee.employeeInstanceId ===
-            selection.employeeInstanceId &&
-          selectedEmployee.threadId !== selection.threadId
-        ) {
-          const target: ThreadHandoff = {
-            selection: { ...selection, threadId: selection.threadId },
-            requestId: crypto.randomUUID(),
-          };
-          switching = target;
-          switchTimer = window.setTimeout(() => {
-            if (switching === target) cancelSwitch(target);
-          }, liveSwitchWaitMs);
-          frame.current?.contentWindow?.postMessage(
-            {
-              type: pageThreadSwitchPrepare,
-              scopeId,
-              requestId: target.requestId,
-            },
-            location.origin,
-          );
-        } else navigate(selection, event.data.reopen === true);
+        if (!beginLiveSwitch(selection))
+          navigate(selection, event.data.reopen === true);
       }
     };
     window.addEventListener('message', receive);
@@ -801,8 +817,20 @@ export function EmployeeNativePage({
     window.addEventListener('pagehide', leaving);
     const restoreQuery = () => {
       if (location.pathname !== '/chatflow/4.0') return;
-      nextQuery.current = location.search.slice(1);
-      if (nextQuery.current !== displayedQuery.current) applyQuery();
+      const query = location.search.slice(1);
+      if (query === displayedQuery.current && !switching) return;
+      const params = new URLSearchParams(query);
+      const selection = DEntrySelectionInputSchema.safeParse(
+        Object.fromEntries(params),
+      );
+      if (
+        selection.success &&
+        params.size === Object.keys(selection.data).length &&
+        beginLiveSwitch(selection.data, true)
+      )
+        return;
+      nextQuery.current = query;
+      if (switching || query !== displayedQuery.current) applyQuery();
     };
     window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
@@ -850,36 +878,42 @@ export function EmployeeNativePage({
     const connect = (
       identity: DEntryIdentity,
       selection: DEntrySelectionInput,
+      warm?: boolean,
     ) =>
-      openNativePageCarrier(identity, selection, () => {
-        remoteRevoked = true;
-        unbindMemoryWrites?.();
-        send(pageRevoked);
-        if (!prepare && !lifetime.signal.aborted) setFailed(true);
-        // Before issuance, ready's rejection is handled by setting below.
-        if (prepare && mounted) finish('failed');
-        // Password changes and logout can revoke this carrier before their
-        // responses reach the iframe. Only the current cookie decides where
-        // the outer page goes.
-        if (mounted)
-          void retire()
-            .then(async () => {
-              if (detached || replace.current !== applyQuery) return;
-              const response = await fetch('/api/v1/auth/session', {
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: lifetime.signal,
-              });
-              // The unqualified entry checks the cookie again on navigation.
-              if (
-                response.status === 401 &&
-                !detached &&
-                replace.current === applyQuery
-              )
-                location.replace('/chatflow/4.0');
-            })
-            .catch(() => {});
-      });
+      openNativePageCarrier(
+        identity,
+        selection,
+        () => {
+          remoteRevoked = true;
+          unbindMemoryWrites?.();
+          send(pageRevoked);
+          if (!prepare && !lifetime.signal.aborted) setFailed(true);
+          // Before issuance, ready's rejection is handled by setting below.
+          if (prepare && mounted) finish('failed');
+          // Password changes and logout can revoke this carrier before their
+          // responses reach the iframe. Only the current cookie decides where
+          // the outer page goes.
+          if (mounted)
+            void retire()
+              .then(async () => {
+                if (detached || replace.current !== applyQuery) return;
+                const response = await fetch('/api/v1/auth/session', {
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: lifetime.signal,
+                });
+                // The unqualified entry checks the cookie again on navigation.
+                if (
+                  response.status === 401 &&
+                  !detached &&
+                  replace.current === applyQuery
+                )
+                  location.replace('/chatflow/4.0');
+              })
+              .catch(() => {});
+        },
+        warm,
+      );
     const setup = async () => {
       const entry = await parsedEntry;
       const { params } = entry;
@@ -899,7 +933,7 @@ export function EmployeeNativePage({
         await waitForVisibleEntry(lifetime.signal);
         selectedQuery = params.toString();
         opening();
-        const attempt = (carrier = connect(warm, selection));
+        const attempt = (carrier = connect(warm, selection, true));
         try {
           opened = await attempt.ready;
           identity = warm;

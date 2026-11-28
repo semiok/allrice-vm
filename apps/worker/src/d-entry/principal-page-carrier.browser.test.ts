@@ -1552,6 +1552,14 @@ it
           (url) => url.searchParams.get('threadId') === otherThread,
         );
         expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+        await page.goBack({ waitUntil: 'commit' });
+        await expect.poll(() => editor.innerText()).toBe('未发送的原生草稿');
+        await page.goForward({ waitUntil: 'commit' });
+        await expect
+          .poll(() => editor.innerText())
+          .toBe('另一条会话的原生草稿');
+        expect(documentLoads).toBe(1);
+        expect(socketCount).toBe(1);
       }
       console.info(
         'NATIVE_THREAD_SWITCH_BENCHMARK ' +

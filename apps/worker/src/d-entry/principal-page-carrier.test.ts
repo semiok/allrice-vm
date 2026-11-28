@@ -216,12 +216,38 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   await next.receive();
 });
 
+it('requires an exact current editor proof before accepting a warm socket', async () => {
+  const f = await fixture();
+  f.confirmVerifiedEditor
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce({
+      binding: { ...f.binding, vmId: randomUUID() },
+      proof: f.owner.revoked,
+    });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const denied = f.connect(undefined, sessionToken, '&warm=1');
+    const [, reply] = await once(denied, 'unexpected-response');
+    expect(reply.statusCode).toBe(503);
+    reply.resume();
+    denied.terminate();
+    expect(f.owner.acquirePrincipal).not.toHaveBeenCalled();
+  }
+  const peer = f.connect(undefined, sessionToken, '&warm=1');
+  await once(peer, 'open');
+  expect(f.confirmVerifiedEditor).toHaveBeenCalledTimes(3);
+});
+
 it('replaces the borrowed root while keeping native employee events on the same channel', async () => {
   const f = await fixture();
   const previousRevocation = f.registerThread(f.selection.threadId);
   const target = randomUUID();
   const revoked = f.registerThread(target);
   const { peer, scopeId, receive } = await open(f, true);
+  expect(
+    f.data.resolveAdmissionOwner.mock.calls
+      .map(([input]) => input.access)
+      .sort(),
+  ).toEqual(['employee-streams', 'page']);
   const requestId = randomUUID();
   send(peer, {
     type: 'open',
@@ -265,6 +291,25 @@ it('replaces the borrowed root while keeping native employee events on the same 
     type: 'error',
     error: { code: 'gateway/cancelled' },
   });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'retired-root-follow',
+      pageScopeId: nextScope,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('retired-root-follow')).toMatchObject({ type: 'error' });
   expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
     404,
   );

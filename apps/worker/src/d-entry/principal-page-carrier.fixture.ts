@@ -333,6 +333,13 @@ export async function fixture(
     await args[4].verifyRoster(args[3]);
     return f.deps.watch();
   });
+  const confirmVerifiedEditor = vi.fn(
+    async () =>
+      ({
+        binding: f.binding,
+        proof: f.owner.revoked,
+      }) as { binding: typeof f.binding; proof: AbortSignal } | undefined,
+  );
   const pages = createDEntryPageRequests({
     ...f.deps,
     owners: {
@@ -350,7 +357,11 @@ export async function fixture(
           : f.deps.owners.resolve();
       },
     },
-    ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
+    data: () => ({
+      ...f.data,
+      confirmVerifiedEditor,
+      ...(newRoot && { prepareEditorRoot }),
+    }),
     authenticate,
     async watch(_context, selection) {
       const authority = await f.deps.watch();
@@ -620,6 +631,7 @@ export async function fixture(
   return {
     ...f,
     proveSwitch,
+    confirmVerifiedEditor,
     prepareEditorRoot,
     registerRoot,
     rememberRoot,

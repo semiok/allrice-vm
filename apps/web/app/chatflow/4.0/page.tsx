@@ -1,11 +1,6 @@
-import { cookies, headers } from 'next/headers';
-import { z } from 'zod';
+import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import {
-  DEntryNativeDiscoverySchema,
-  DEntrySelectionInputSchema,
-  sameDEntryIdentity,
-} from '@allrice/contracts';
+import { DEntrySelectionInputSchema } from '@allrice/contracts';
 import {
   getDEntryNativeRootPin,
   IdentityError,
@@ -16,22 +11,11 @@ import {
   findDEntryEmployee,
 } from '../../../lib/d-entry/entry-threads';
 import { readStartupProfileAssetUrls } from '../../../lib/d-entry/released-profile-assets';
-import {
-  readDEntryWorkerJson,
-  requestDEntryWorker,
-} from '../../../lib/d-entry/native-worker';
-import {
-  getRequestContext,
-  sessionCookieName,
-} from '../../../lib/identity/session';
+import { getRequestContext } from '../../../lib/identity/session';
 import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
-
-const warmEntryDiscoverySchema = DEntryNativeDiscoverySchema.extend({
-  receipt: z.object({ binding: z.object({ vmId: z.string().min(1) }) }),
-}).strip();
 
 async function readWarmEntry(query: URLSearchParams) {
   const selection = DEntrySelectionInputSchema.safeParse(
@@ -54,28 +38,20 @@ async function readWarmEntry(query: URLSearchParams) {
       }, 1_500);
     });
     const discover = async () => {
+      const requestHeaders = await headers();
+      if (requestHeaders.get('sec-fetch-dest') !== 'document') return;
       const request = new Request('http://localhost/chatflow/4.0', {
-        headers: await headers(),
+        headers: requestHeaders,
         signal,
       });
       const context = await getRequestContext(request);
-      const token = (await cookies()).get(sessionCookieName)?.value;
       signal.throwIfAborted();
-      if (!context || !token) return;
-      const input = { context, token, selection: selection.data, signal };
-      const [root, discovery] = await Promise.all([
-        getDEntryNativeRootPin(context, selection.data),
-        requestDEntryWorker(input, 'native-owner').then((response) =>
-          readDEntryWorkerJson(response, warmEntryDiscoverySchema.parse),
-        ),
-      ]);
-      // The probe cannot start an employee VM. The socket still owns admission.
-      if (
-        discovery.controlReady &&
-        discovery.receipt.binding.vmId === root.vmId &&
-        sameDEntryIdentity(discovery.identity, root.identity)
-      )
-        return root.identity;
+      if (!context) return;
+      const root = await getDEntryNativeRootPin(context, selection.data);
+      signal.throwIfAborted();
+      // This only identifies a known thread. The existing socket checks the
+      // current editor proof before admitting the warm attempt.
+      return root.identity;
     };
     return await Promise.race([discover(), deadline]);
   } catch {

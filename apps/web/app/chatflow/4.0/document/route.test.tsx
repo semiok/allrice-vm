@@ -24,19 +24,20 @@ import { deferred } from '../../../../../../packages/d-entry-principal/test/host
 const authenticated = vi.hoisted(() => vi.fn());
 const entryContext = vi.hoisted(() => vi.fn());
 const entryRoot = vi.hoisted(() => vi.fn());
-const entryDiscovery = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
 const directory = vi.hoisted(() => vi.fn());
 const releasedAssets = vi.hoisted(() => vi.fn());
 const cookie = vi.hoisted(() => ({ value: '' }));
+const requestDestination = vi.hoisted(() => ({ value: 'document' }));
 vi.mock('@allrice/database', async (load) => ({
   ...(await load<typeof Database>()),
   readDEntryEmployeeDirectory: directory,
   getDEntryNativeRootPin: entryRoot,
 }));
 vi.mock('next/headers', () => ({
-  headers: async () => new Headers(),
+  headers: async () =>
+    new Headers({ 'sec-fetch-dest': requestDestination.value }),
   cookies: async () => ({
     get: () => cookie,
   }),
@@ -44,7 +45,6 @@ vi.mock('next/headers', () => ({
 vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
   ...(await importOriginal<typeof NativeWorker>()),
   requestDEntryProfile: profileRequest,
-  requestDEntryWorker: entryDiscovery,
 }));
 vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
   ...(await importOriginal<typeof SessionIdentity>()),
@@ -81,42 +81,29 @@ beforeEach(() => {
   authenticated.mockReset();
   entryContext.mockReset();
   entryRoot.mockReset();
-  entryDiscovery.mockReset();
   historyIdentity.mockReset();
   profileRequest.mockReset();
   directory.mockReset();
   releasedAssets.mockReset();
+  requestDestination.value = 'document';
   cookie.value = 'unit-test-original-session-cookie';
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
-it('issues a read-only warm startup hint for the exact current rooted selection', async () => {
+it('offers the warm path only on a document load with an exact owned root', async () => {
   const f = await fixture();
   entryContext.mockResolvedValue(f.context);
-  historyIdentity.mockResolvedValue(f.identity);
   entryRoot.mockImplementation(() => f.root());
-  const discovery = {
-    identity: f.identity,
-    controlReady: true,
-    bindingRef: f.owner.bindingRef,
-    receipt: f.owner.receipt,
-  };
-  entryDiscovery.mockImplementation(() => Response.json(discovery));
   const render = () =>
     EntryPage({ searchParams: Promise.resolve(f.selection) });
   expect((await render()).props.warmIdentity).toEqual(f.identity);
-  expect(entryDiscovery).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ context: f.context, selection: f.selection }),
-    'native-owner',
-  );
-  entryDiscovery.mockImplementationOnce(() =>
-    Response.json({ ...discovery, controlReady: false }),
-  );
+  expect(entryRoot).toHaveBeenCalledExactlyOnceWith(f.context, f.selection);
+  entryRoot.mockRejectedValueOnce(new DataAccessError('not_found'));
   expect((await render()).props.warmIdentity).toBeUndefined();
-  entryDiscovery.mockImplementationOnce(() =>
-    Response.json({ ...discovery, receipt: { binding: { vmId: 'old-vm' } } }),
-  );
+  entryRoot.mockClear();
+  requestDestination.value = 'empty';
   expect((await render()).props.warmIdentity).toBeUndefined();
+  expect(entryRoot).not.toHaveBeenCalled();
 });
 
 it('the Next product page preserves selection before the client opens its long-lived owner', async () => {

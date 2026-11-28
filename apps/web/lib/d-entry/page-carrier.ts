@@ -38,6 +38,7 @@ export function nativeMuxUrl(
   organizationId: string,
   selection: DEntrySelectionInput,
   scopeId?: string,
+  warm?: boolean,
 ) {
   const url = new URL('/api/v1/d-entry/native-mux', origin);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -48,6 +49,7 @@ export function nativeMuxUrl(
     employeeInstanceId: selection.employeeInstanceId,
     ...(selection.threadId && { threadId: selection.threadId }),
     ...(scopeId && { scopeId }),
+    ...(warm && { warm: '1' }),
   }).toString();
   return url;
 }
@@ -56,6 +58,7 @@ export function openNativePageCarrier(
   identity: DEntryIdentity,
   selection: DEntrySelectionInput,
   onRevoked: () => void,
+  warm?: boolean,
 ) {
   const ready =
     pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
@@ -65,7 +68,13 @@ export function openNativePageCarrier(
   void joined.promise.catch(() => {});
   const id = crypto.randomUUID();
   const socket = new WebSocket(
-    nativeMuxUrl(location.origin, identity.organizationId, selection),
+    nativeMuxUrl(
+      location.origin,
+      identity.organizationId,
+      selection,
+      undefined,
+      warm,
+    ),
   );
   let scopeId: string | undefined;
   let carrierSelection = selection;
