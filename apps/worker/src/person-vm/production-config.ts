@@ -294,12 +294,14 @@ const configuration = z
         ...roots,
         value.native.readonlyDshDirectory.hostDirectory,
         value.native.readonlyCommandMemoryDirectory.hostDirectory,
-      ].some(
-        (root) =>
+      ].some((path) => {
+        const root = path.endsWith(sep) ? path.slice(0, -1) : path;
+        return (
           root === snapshot.templateDirectory ||
           root.startsWith(snapshot.templateDirectory + sep) ||
-          snapshot.templateDirectory.startsWith(root + sep),
-      )
+          snapshot.templateDirectory.startsWith(root + sep)
+        );
+      })
     )
       return false;
     return roots.every((root, i) =>

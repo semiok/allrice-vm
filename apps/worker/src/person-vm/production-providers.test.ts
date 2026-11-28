@@ -43,6 +43,25 @@ it('constructs actual providers without launching or creating a disk', async () 
   });
 });
 
+it('keeps a Linux snapshot probe seal out of the production provider dispatch', async () => {
+  const configuration = f.loaded.configuration;
+  const manifestSha256 = 'a'.repeat(64);
+  configuration.linuxSnapshot = {
+    enabled: true,
+    mode: 'probe',
+    platform: 'linux/arm64',
+    engine: 'microsandbox',
+    templateDirectory: join(f.root, 'templates', manifestSha256),
+    manifestSha256,
+  };
+  const providers = await createProductionPersonVmProviders(signal());
+  expect(providers.configuration).toBe(configuration);
+  expect(providers.native).toBeInstanceOf(MicrosandboxPersonVm);
+  expect(providers.disk).toBeInstanceOf(ApfsPersonVmDisk);
+  expect(providers.diskPool).toBeUndefined();
+  expect(source.run).not.toHaveBeenCalled();
+});
+
 it('rejects the sealed macOS pool on a different host before constructing active providers', async () => {
   const cfg = f.loaded.configuration;
   const hash = '2'.repeat(64);

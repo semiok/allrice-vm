@@ -388,17 +388,21 @@ describe('private production Host configuration', () => {
     },
   );
 
-  it('refuses a template inside the retained personal disk root', async () => {
-    source.host = { platform: 'linux', arch: 'arm64' };
-    const config = value();
-    await seal({
-      ...config,
-      linuxSnapshot: snapshot(join(config.disk.root, hash)),
-    });
-    await expect(
-      readProductionHostConfiguration(signal()),
-    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
-  });
+  it.each(['', '/'])(
+    'refuses a template inside disk root (suffix %j)',
+    async (suffix) => {
+      source.host = { platform: 'linux', arch: 'arm64' };
+      const config = value();
+      await seal({
+        ...config,
+        disk: { ...config.disk, root: config.disk.root + suffix },
+        linuxSnapshot: snapshot(join(config.disk.root, hash)),
+      });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
 
   it('requires a positive floor and reserve before accepting an enabled disk configuration', async () => {
     const config = value();

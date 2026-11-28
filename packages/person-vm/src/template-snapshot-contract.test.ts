@@ -80,6 +80,18 @@ const manifest = {
     { role: 'state', path: 'state.bin', sha256, sizeBytes: 16 },
     { role: 'memory', path: 'memory.bin', sha256, sizeBytes: 2048 * 1024 ** 2 },
     { role: 'root-disk', path: 'disk/rootfs.raw', sha256, sizeBytes: 42 },
+    {
+      role: 'dsh-runtime-disk',
+      path: 'disk/runtime.ext4',
+      sha256,
+      sizeBytes: 8192,
+    },
+    {
+      role: 'device-topology',
+      path: 'devices.json',
+      sha256,
+      sizeBytes: 128,
+    },
     { role: 'metadata', path: 'snapshot.json', sha256, sizeBytes: 128 },
   ],
 };
@@ -99,7 +111,10 @@ describe('Linux snapshot template manifest', () => {
     { guest: { ...manifest.guest, workPath: '/home' } },
     { inputs: { ...manifest.inputs, isolationPolicySha256: '' } },
     { inputs: { ...manifest.inputs, commandMemorySha256: undefined } },
+    { inputs: { ...manifest.inputs, dshRuntimeDiskSha256: 'b'.repeat(64) } },
     { files: manifest.files.filter(({ role }) => role !== 'memory') },
+    { files: manifest.files.filter(({ role }) => role !== 'device-topology') },
+    { files: manifest.files.filter(({ role }) => role !== 'dsh-runtime-disk') },
   ])('rejects missing or incompatible metadata (%j)', (overrides) => {
     expect(
       PersonVmTemplateManifestSchema.safeParse({ ...manifest, ...overrides })
@@ -111,6 +126,7 @@ describe('Linux snapshot template manifest', () => {
     { path: 'state.bin' },
     { path: 'disk' },
     { path: 'manifest.json' },
+    { path: 'manifest.sig' },
     { path: '../memory.bin' },
     { path: 'disk//data' },
     { path: 'disk/../data' },

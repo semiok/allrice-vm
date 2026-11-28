@@ -22,8 +22,9 @@ const relativeFile = z
   .refine(
     (path) =>
       !path.endsWith('/') &&
-      path !== 'manifest.json' &&
-      !path.startsWith('manifest.json/') &&
+      !['manifest.json', 'manifest.sig'].some(
+        (name) => path === name || path.startsWith(name + '/'),
+      ) &&
       path.split('/').every((part) => part && part !== '.' && part !== '..'),
   );
 
@@ -57,68 +58,84 @@ const machineLabel = z
   .max(128)
   .refine((label) => label.trim() === label);
 const pageSize = z.literal([4096, 16384, 65536]);
-const requiredFileRoles = ['state', 'memory', 'root-disk'] as const;
+const requiredFileRoles = [
+  'state',
+  'memory',
+  'root-disk',
+  'dsh-runtime-disk',
+  'device-topology',
+] as const;
 
 /** This checks manifest structure. Qualification must check all actual bytes
  * and the signed release identity before a manifest can authorize a restore. */
-export const PersonVmTemplateManifestSchema = z.strictObject({
-  version: z.literal(1),
-  engine: z.literal('microsandbox'),
-  engineVersion: z.literal('0.7.16'),
-  restoreProtocol: z.literal(1),
-  platform: z.literal('linux/arm64'),
-  host: z.strictObject({
-    kernel: machineLabel,
-    cpuModel: machineLabel,
-    cpuFeaturesSha256: sha256,
-    kvmApiVersion: z.literal(12),
-    gic: z.literal('v3'),
-    pageSize,
-  }),
-  guest: z.strictObject({
-    vcpus: z.literal(2),
-    memoryMiB: z.literal(2048),
-    pageSize,
-    kernelSha256: sha256,
-    workMount: z.literal('strict-external-directory'),
-    workPath: z.literal('/work'),
-  }),
-  inputs: z.strictObject({
-    vmmSha256: sha256,
-    firmwareSha256: sha256,
-    agentdSha256: sha256,
-    imageSha256: sha256,
-    dshRuntimeDiskSha256: sha256,
-    dshProfileSha256: sha256,
-    commandMemorySha256: sha256,
-    isolationPolicySha256: sha256,
-  }),
-  files: z
-    .array(
-      z.strictObject({
-        role: z.enum([...requiredFileRoles, 'metadata']),
-        path: relativeFile,
-        sizeBytes: z.number().int().positive().safe(),
-        sha256,
-      }),
-    )
-    .min(3)
-    .max(32)
-    .refine(
-      (files) =>
-        requiredFileRoles.every(
-          (role) => files.filter((file) => file.role === role).length === 1,
-        ) &&
-        files.every(({ path }, index) =>
-          files.every(
-            (file, other) =>
-              index === other ||
-              (file.path !== path && !file.path.startsWith(path + '/')),
+export const PersonVmTemplateManifestSchema = z
+  .strictObject({
+    version: z.literal(1),
+    engine: z.literal('microsandbox'),
+    engineVersion: z.literal('0.7.16'),
+    restoreProtocol: z.literal(1),
+    platform: z.literal('linux/arm64'),
+    host: z.strictObject({
+      kernel: machineLabel,
+      cpuModel: machineLabel,
+      cpuFeaturesSha256: sha256,
+      kvmApiVersion: z.literal(12),
+      gic: z.literal('v3'),
+      pageSize,
+    }),
+    guest: z.strictObject({
+      vcpus: z.literal(2),
+      memoryMiB: z.literal(2048),
+      pageSize,
+      kernelSha256: sha256,
+      workMount: z.literal('strict-external-directory'),
+      workPath: z.literal('/work'),
+    }),
+    inputs: z.strictObject({
+      vmmSha256: sha256,
+      firmwareSha256: sha256,
+      agentdSha256: sha256,
+      imageSha256: sha256,
+      dshRuntimeDiskSha256: sha256,
+      dshProfileSha256: sha256,
+      commandMemorySha256: sha256,
+      isolationPolicySha256: sha256,
+    }),
+    files: z
+      .array(
+        z.strictObject({
+          role: z.enum([...requiredFileRoles, 'metadata']),
+          path: relativeFile,
+          sizeBytes: z.number().int().positive().safe(),
+          sha256,
+        }),
+      )
+      .min(requiredFileRoles.length)
+      .max(32)
+      .refine(
+        (files) =>
+          requiredFileRoles.every(
+            (role) => files.filter((file) => file.role === role).length === 1,
+          ) &&
+          files.every(({ path }, index) =>
+            files.every(
+              (file, other) =>
+                index === other ||
+                (file.path !== path && !file.path.startsWith(path + '/')),
+            ),
           ),
-        ),
-      'Expected distinct files with exactly one state, memory and root disk',
-    ),
-});
+        'Expected distinct files with exactly one entry for each required role',
+      ),
+  })
+  .refine(
+    ({ files, inputs }) =>
+      files.some(
+        (file) =>
+          file.role === 'dsh-runtime-disk' &&
+          file.sha256 === inputs.dshRuntimeDiskSha256,
+      ),
+    'Expected the DSH runtime disk to match the locked digest',
+  );
 
 export type PersonVmTemplateManifest = z.output<
   typeof PersonVmTemplateManifestSchema
@@ -142,26 +159,35 @@ export type TemplateRestoreRequest = Readonly<{
   binding: PersonVmBinding;
   disk: OwnedWorkDiskReceipt;
   egress: PersonVmEgressReceipt;
+  /** Recheck authorization and both receipts before dispatch and before return. */
   assertCurrent(signal: AbortSignal): Promise<void>;
   /** Before any dispatch that might create native compute, even if it times out. */
   onNativeDispatch(): void;
   signal: AbortSignal;
 }>;
 
-/** A successful provider result certifies this binding, not business readiness.
- * No session, credential or ingress may be exposed before these proofs. */
+/** The provider verifies /work inside the guest against the owned host mount.
+ * It authenticates the restored compute and consumes a fresh challenge on a
+ * new private endpoint for this binding. User ingress waits for these proofs. */
 export type RestoredCompute = Readonly<{
   binding: PersonVmBinding;
   templateDigest: string;
   computeIdentity: Readonly<{ pid: number; startedAt: string }>;
   controlEndpoint: string;
   mountIdentity: OwnedWorkDiskReceipt;
+  guestWorkMount: Readonly<{
+    path: '/work';
+    sourceMountId: string;
+    verifiedAgainstOwnedDisk: true;
+  }>;
   networkIdentity: Readonly<{ isolationId: string; egressBindingId: string }>;
   freshness: Readonly<{
     kernelEntropyReseeded: true;
     userRuntimeReinitialized: true;
     networkIdentityRefreshed: true;
     cgroupVerified: true;
+    controlEndpointFresh: true;
+    controlPeerVerified: true;
     controlChallengeConsumed: true;
   }>;
 }>;
