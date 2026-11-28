@@ -1,12 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import { selectDEntryGeneration } from '@allrice/contracts';
-import type { PersonVmBinding, PersonVmWebRoster } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmBinding,
+  type PersonVmWakeStartup,
+  type PersonVmWebRoster,
+} from '@allrice/person-vm';
 import type { ISql, Sql, TransactionSql } from 'postgres';
 import { joinCallerSave } from '../business-runtime/caller-transaction.ts';
 import { createDedicatedDatabase } from '../core/client.ts';
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
-import type { NativeScheduleLedgerOrigin } from './native-schedule-observation-ledger.ts';
+import { readNativeWebEmployeeIds } from '../employees/native-web-roster.ts';
+import {
+  readNativeScheduleSnapshotReceipts,
+  type NativeScheduleLedgerOrigin,
+} from './native-schedule-observation-ledger.ts';
 
 type Identity = PersonVmBinding & { planId: string };
 type WakePlan = Identity & {
@@ -71,8 +80,7 @@ function hasInvalidation(sql: ISql, receiptIds: readonly string[]) {
         where lower(invalidated.id)=original.receipt_id::text))`;
 }
 
-/** Read the current facts for every profile that will restart on this disk.
- * This is an internal boot check, not a replacement for user authorization. */
+/** Read the current authority for every employee covered by the observations. */
 export async function readPersonVmWakeRoster(
   tx: TransactionSql,
   binding: PersonVmBinding,
@@ -166,11 +174,80 @@ export async function readPersonVmWakeRoster(
   };
 }
 
-async function readClaimRoster(
+/** Stop needs a current census, including employees with no local owner. */
+export async function readCompletePersonVmWakeRoster(
+  tx: TransactionSql,
+  binding: PersonVmBinding,
+  expected: PersonVmWebRoster['entries'],
+  lock = false,
+) {
+  const roster = await readPersonVmWakeRoster(tx, binding, expected, lock);
+  if (!roster) return null;
+  const census = await readNativeWebEmployeeIds(tx, binding);
+  return census.size === roster.entries.length &&
+    roster.entries.every(({ employeeInstanceId }) =>
+      census.has(employeeInstanceId),
+    )
+    ? roster
+    : null;
+}
+
+async function readWakeStartup(
+  tx: TransactionSql,
+  binding: PersonVmBinding,
+  planId: string,
+  receiptIds: readonly string[],
+  targetAt: Date,
+): Promise<PersonVmWakeStartup | null> {
+  const [row] = await tx<{ invalidated: boolean }[]>`
+    select ${hasInvalidation(tx, receiptIds)} as invalidated`;
+  if (row?.invalidated !== false) return null;
+  const snapshots = await readNativeScheduleSnapshotReceipts(
+    tx,
+    binding,
+    receiptIds,
+  );
+  if (!snapshots) return null;
+  const roster = await readPersonVmWakeRoster(
+    tx,
+    binding,
+    snapshots.map(({ origin }) => origin),
+  );
+  if (!roster) return null;
+  // The original plan is claimed once at its earliest occurrence. Keep the
+  // other active schedulers alive for later occurrences after that claim settles.
+  const employeeInstanceIds: string[] = [];
+  let earliest = Infinity;
+  for (const { origin, batch } of snapshots) {
+    const active = batch.items.filter((item) => item.status === 'active');
+    if (!active.length) continue;
+    employeeInstanceIds.push(origin.employeeInstanceId);
+    for (const item of active)
+      earliest = Math.min(earliest, Date.parse(item.scheduledAt));
+  }
+  if (earliest !== targetAt.getTime()) return null;
+  employeeInstanceIds.sort();
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify([planId, receiptIds, roster.digest, employeeInstanceIds]),
+    )
+    .digest('hex');
+  return { roster, employeeInstanceIds, digest };
+}
+
+function committedStop(tx: TransactionSql, binding: PersonVmBinding) {
+  return tx`select a.request_id from person_vm_audit a
+    where a.person_id=${binding.personId} and a.organization_id=${binding.organizationId}
+      and a.vm_id=${binding.vmId} and a.lease_epoch=${binding.leaseEpoch}
+      and a.action='stop' and a.result='succeeded'
+    order by a.id desc limit 1`;
+}
+
+async function readClaimStartup(
   tx: TransactionSql,
   claim: ScheduledWakeClaim,
   lock = false,
-): Promise<PersonVmWebRoster | null> {
+): Promise<PersonVmWakeStartup | null> {
   // The physical owner can already have advanced the current epoch.
   // Recheck the immutable stopped source and its original receipt here.
   const [plan] = await tx<{ receipt_ids: string[] }[]>`
@@ -180,13 +257,8 @@ async function readClaimRoster(
     and p.vm_id=${claim.vmId} and p.instance_id=${claim.instanceId}
     and p.lease_epoch=${claim.leaseEpoch} and p.state='claimed'
     and p.claim_until>clock_timestamp() and p.revoked_at is null
-    and not ${hasInvalidation(tx, claim.receiptIds)}
-    and p.plan_id=(
-      select a.request_id from person_vm_audit a
-      where a.person_id=p.person_id and a.organization_id=p.organization_id
-        and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
-        and a.action='stop' and a.result='succeeded'
-      order by a.id desc limit 1)
+    and p.target_at=${claim.targetAt}
+    and p.plan_id=(${committedStop(tx, claim)})
     ${lock ? tx`for share of p` : tx``}`;
   if (
     !plan ||
@@ -194,16 +266,52 @@ async function readClaimRoster(
     plan.receipt_ids.some((id, index) => id !== claim.receiptIds[index])
   )
     return null;
-  const receipts = await tx<{ origin: NativeScheduleLedgerOrigin }[]>`
-  select input_payload->'origin' as origin
-  from allrice_native_schedule_observation_receipts
-  where receipt_id=any(${plan.receipt_ids}::uuid[])`;
-  if (receipts.length !== plan.receipt_ids.length) return null;
-  return readPersonVmWakeRoster(
+  return readWakeStartup(
     tx,
     claim,
-    receipts.map(({ origin }) => origin),
+    claim.planId,
+    plan.receipt_ids,
+    claim.targetAt,
   );
+}
+
+async function readRetainedWake(
+  tx: TransactionSql,
+  binding: PersonVmBinding,
+  lock = false,
+): Promise<PersonVmWakeStartup | null> {
+  // The caller owns the physical lease and pins the predecessor before it
+  // changes epoch. A confirmed withdrawal cannot authorize an old launch.
+  const [plan] = await tx<
+    (Pick<PlanRow, 'plan_id' | 'receipt_ids' | 'target_at' | 'state'> & {
+      reason: string | null;
+    })[]
+  >`
+    select p.plan_id,p.receipt_ids,p.target_at,p.state,p.reason from person_vm_scheduled_wakes p
+    where p.person_id=${binding.personId} and p.organization_id=${binding.organizationId}
+      and p.vm_id=${binding.vmId} and p.instance_id=${binding.instanceId}
+      and p.lease_epoch=${binding.leaseEpoch} and p.revoked_at is null
+      and p.plan_id=(${committedStop(tx, binding)})
+    ${lock ? tx`for share of p` : tx``}`;
+  if (!plan?.target_at) return null;
+  // A claim issued before the physical lease still owns the scheduler's
+  // attempt. Let it settle or expire without racing the foreground resume.
+  if (plan.state === 'claimed') throw new PersonVmError('LEASE_CONFLICT');
+  if (
+    plan.state === 'blocked' &&
+    ['CURRENT_AUTHORITY_DENIED', 'STALE_PLAN'].includes(plan.reason ?? '')
+  )
+    return null;
+  if (plan.state !== 'waiting') throw new PersonVmError('RUNTIME_NOT_READY');
+  const startup = await readWakeStartup(
+    tx,
+    binding,
+    plan.plan_id,
+    plan.receipt_ids,
+    plan.target_at,
+  );
+  if (!startup) throw new PersonVmError('AUTHORIZATION_DENIED');
+  return startup;
 }
 
 async function audit(
@@ -392,6 +500,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             order by coalesce(p.retry_at,p.wake_at),p.person_id
             limit 1 for update of p skip locked
           ) as due where w.plan_id=due.plan_id
+            and pg_try_advisory_xact_lock(hashtextextended('person-vm:' || w.person_id::text,0))
           returning w.*`;
         if (!row?.target_at) return null;
         await audit(tx, row, claimId, 'claim', 'started');
@@ -468,11 +577,43 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       return !!row;
     },
 
-    readClaimRoster(
-      claim: ScheduledWakeClaim,
-    ): Promise<PersonVmWebRoster | null> {
+    readClaimStartup(claim: ScheduledWakeClaim) {
       return sql.begin('isolation level repeatable read read only', (tx) =>
-        readClaimRoster(tx, claim),
+        readClaimStartup(tx, claim),
+      );
+    },
+
+    async readClaimRoster(claim: ScheduledWakeClaim) {
+      return (await this.readClaimStartup(claim))?.roster ?? null;
+    },
+
+    async readRetainedWake(binding: PersonVmBinding, signal: AbortSignal) {
+      signal.throwIfAborted();
+      const startup = await sql.begin(
+        'isolation level repeatable read read only',
+        (tx) => readRetainedWake(tx, binding),
+      );
+      signal.throwIfAborted();
+      return startup;
+    },
+
+    withRetainedWakeAuthority<T>(
+      binding: PersonVmBinding,
+      digest: string,
+      signal: AbortSignal,
+      work: (active: AbortSignal) => Promise<T>,
+    ) {
+      return withOwnedPersonVmAuthorityTransaction(
+        sql,
+        'isolation level repeatable read',
+        signal,
+        async (tx, active) => {
+          const startup = await readRetainedWake(tx, binding, true);
+          active.throwIfAborted();
+          if (startup?.digest !== digest)
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          return work(active);
+        },
       );
     },
 
@@ -481,16 +622,16 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     async withClaimAuthority<T>(
       claim: ScheduledWakeClaim,
       signal: AbortSignal,
-      work: (roster: PersonVmWebRoster, active: AbortSignal) => Promise<T>,
+      work: (startup: PersonVmWakeStartup, active: AbortSignal) => Promise<T>,
     ): Promise<T | null> {
       return withOwnedPersonVmAuthorityTransaction(
         sql,
         'isolation level repeatable read',
         signal,
         async (tx, active) => {
-          const roster = await readClaimRoster(tx, claim, true);
+          const startup = await readClaimStartup(tx, claim, true);
           active.throwIfAborted();
-          return roster ? work(roster, active) : null;
+          return startup ? work(startup, active) : null;
         },
       );
     },
@@ -515,7 +656,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         'isolation level read committed',
         signal,
         async (tx, active) => {
-          const roster = await readPersonVmWakeRoster(
+          const roster = await readCompletePersonVmWakeRoster(
             tx,
             binding,
             expected.entries,

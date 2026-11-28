@@ -765,6 +765,11 @@ export function createProductionPersonVmHost(input: {
         disk: providers.disk,
         diskPool,
         nativeWeb: personNativeWebRoster,
+        employeeMaxRunning: employeeRuntime?.maxRunning,
+        retainedWake: {
+          read: wakeStore.readRetainedWake,
+          withCurrentAuthority: wakeStore.withRetainedWakeAuthority,
+        },
         runtime,
         egress,
         observeOwnedStart(binding, context) {

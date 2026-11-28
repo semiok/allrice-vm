@@ -24,7 +24,10 @@ import {
 } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
-import { createProductionScheduledWake } from './production-scheduled-wake.js';
+import {
+  createProductionScheduledWake,
+  createProductionScheduledWakeSource,
+} from './production-scheduled-wake.js';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -92,6 +95,11 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ];
     const receiptIds = new Map<string, string>();
     const catalog = vi.fn(async () => rows);
+    const additional: {
+      origin: typeof origin;
+      receiptId: string;
+      schedule: { catalog(): Promise<ScheduleCatalogEntry[]> };
+    }[] = [];
     const start = vi.fn<
       Parameters<typeof createPersonVmScheduledWake>[0]['start']
     >(async () => 'ready');
@@ -111,6 +119,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
                 receiptId: receiptIds.get(planId)!,
                 schedule: { catalog },
               },
+              ...additional,
             ],
             assertCurrent,
             ...checks,
@@ -127,6 +136,20 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       start,
       store,
       module,
+      addProfile(entries: ScheduleCatalogEntry[]) {
+        const sibling = {
+          ...origin,
+          employeeInstanceId: randomUUID(),
+          employeeVersionId: randomUUID(),
+          bindingRef: randomUUID(),
+        };
+        additional.push({
+          origin: sibling,
+          receiptId: randomUUID(),
+          schedule: { catalog: async () => entries },
+        });
+        return sibling;
+      },
       async invalidate(planId: string) {
         await createPostgresNativeScheduleObservationLedger(
           db,
@@ -159,14 +182,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
 
   async function publishFixtureAuthority(
     f: Awaited<ReturnType<typeof fixture>>,
+    siblings: (typeof f.origin)[] = [],
   ) {
-    const {
-      personId,
-      organizationId,
-      workspaceId,
-      employeeInstanceId,
-      employeeVersionId,
-    } = f.origin;
+    const { personId, organizationId, workspaceId } = f.origin;
     return db.begin(async (tx) => {
       await tx`insert into allrice_users(id,email,display_name,password_hash)
         values(${personId},${personId + '@example.test'},'Fixture','not-a-real-password')`;
@@ -176,22 +194,29 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         values(${workspaceId},${organizationId},'fixture','Fixture')`;
       await tx`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
         values(${organizationId},${workspaceId},${personId},'member')`;
-      const [employee] = await tx<
-        { id: string }[]
-      >`insert into allrice_employees
+      const employees: string[] = [];
+      for (const { employeeInstanceId, employeeVersionId } of [
+        f.origin,
+        ...siblings,
+      ]) {
+        const [employee] = await tx<
+          { id: string }[]
+        >`insert into allrice_employees
         (organization_id,workspace_id,employee_key,name)
-        values(${organizationId},${workspaceId},'fixture','Fixture') returning id`;
-      await tx`insert into allrice_employee_versions
+        values(${organizationId},${workspaceId},${employeeInstanceId},'Fixture') returning id`;
+        await tx`insert into allrice_employee_versions
         (id,organization_id,workspace_id,employee_id,version,name,model,system_prompt,capabilities,config_checksum)
         values(${employeeVersionId},${organizationId},${workspaceId},${employee!.id},
           1,'Fixture','fixture-model','', '{}'::jsonb,${'sha256:' + 'a'.repeat(64)})`;
-      await tx`insert into allrice_employee_assignments
+        await tx`insert into allrice_employee_assignments
         (id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
         values(${employeeInstanceId},${organizationId},${workspaceId},${employee!.id},${employeeVersionId},${personId})`;
-      await tx`insert into allrice_employee_instances
+        await tx`insert into allrice_employee_instances
         (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id)
         values(${employeeInstanceId},${organizationId},${workspaceId},${personId},
           ${employeeInstanceId},'general',${employeeVersionId})`;
+        employees.push(employee!.id);
+      }
       await tx`insert into allrice_settings(scope_type,key,value)
         values('system','d_entry_rollout_policy',${tx.json({
           revision: randomUUID(),
@@ -199,9 +224,185 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
           selections: [{ personId, organizationId }],
         })})
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
-      return employee!.id;
+      return employees[0]!;
     });
   }
+
+  it('wakes active scoped native occurrences once and retains the full census for authority', async () => {
+    const f = await fixture();
+    const [first] = await f.catalog();
+    const later = f.addProfile([
+      { ...first!, scheduledAt: '2035-11-03T07:00:00.000Z' },
+    ]);
+    const inactive = f.addProfile([{ ...first!, status: 'inactive' }]);
+    const empty = f.addProfile([]);
+    const owners = [f.origin, later, inactive, empty];
+    await publishFixtureAuthority(f, [later, inactive, empty]);
+    const planId = randomUUID();
+    expect(
+      await f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).toEqual({
+      ok: true,
+      nextWakeAt: wakeAt,
+    });
+    await f.stop(planId);
+    const beforeDue = await f.store().readRetainedWake(f.binding, signal);
+    expect(
+      beforeDue?.roster.entries.map(
+        ({ employeeInstanceId }) => employeeInstanceId,
+      ),
+    ).toEqual(
+      owners.map(({ employeeInstanceId }) => employeeInstanceId).sort(),
+    );
+    expect(beforeDue?.employeeInstanceIds).toEqual(
+      [f.origin.employeeInstanceId, later.employeeInstanceId].sort(),
+    );
+    await db.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${'person-vm:' + f.binding.personId},0))`;
+      await expect(f.store().claim(300_000)).resolves.toBeNull();
+    });
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+    await expect(
+      f.store().readRetainedWake(f.binding, signal),
+    ).rejects.toMatchObject({
+      code: 'LEASE_CONFLICT',
+    });
+    expect(await f.store().readClaimStartup(claim!)).toEqual(beforeDue);
+    expect(
+      await f.store().readClaimStartup({ ...claim!, targetAt: new Date(0) }),
+    ).toBeNull();
+    expect(
+      await f.store().readRetainedWake({ ...f.binding, leaseEpoch: 2 }, signal),
+    ).toBeNull();
+
+    const dispatch = vi.fn(async () => {});
+    const startup = vi.fn<
+      Parameters<
+        typeof createProductionScheduledWakeSource
+      >[0]['startRetainedForSchedule']
+    >(async (binding, requestId, authority) => {
+      expect(binding).toEqual(claim);
+      expect(requestId).toBe(claim?.claimId);
+      const current = await authority.readStartup(signal);
+      expect(current).toEqual(beforeDue);
+      await authority.withCurrentAuthority(current.digest, signal, dispatch);
+      return {
+        ...f.binding,
+        phase: 'running',
+        ready: false,
+        diskRetained: true,
+        lastActivityAt: target,
+      };
+    });
+    const source = createProductionScheduledWakeSource(
+      { startRetainedForSchedule: startup },
+      4,
+      db,
+    );
+    await expect(
+      source.start(claim!, () => f.store().isCurrent(claim!), signal),
+    ).resolves.toBe('ready');
+    expect(dispatch).toHaveBeenCalledOnce();
+
+    await db`update allrice_employee_instances set revision=2
+      where id=${later.employeeInstanceId}`;
+    await expect(
+      f.store().readRetainedWake(f.binding, signal),
+    ).resolves.toBeNull();
+    await expect(
+      f
+        .store()
+        .withRetainedWakeAuthority(
+          f.binding,
+          beforeDue!.digest,
+          signal,
+          dispatch,
+        ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    await expect(
+      source.start(claim!, () => f.store().isCurrent(claim!), signal),
+    ).resolves.toBe('denied');
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each(['missing owner', 'running limit', 'physical width'] as const)(
+    'does not prepare a stop without complete and deliverable native coverage: %s',
+    async (reason) => {
+      const f = await fixture();
+      const [task] = await f.catalog();
+      const count = reason === 'running limit' ? 5 : 2;
+      const siblings = Array.from({ length: count - 1 }, () =>
+        f.addProfile([task!]),
+      );
+      const entries = [f.origin, ...siblings];
+      await publishFixtureAuthority(f, siblings);
+      await db`update person_virtual_machines
+        set verified_web_slot_capacity=${reason === 'physical width' ? 1 : count}
+        where vm_id=${f.binding.vmId}`;
+      const roster = await db.begin((tx) =>
+        readPersonVmWakeRoster(tx, f.binding, entries),
+      );
+      expect(roster).not.toBeNull();
+      const wake = createProductionScheduledWake({
+        startup: {
+          activityCatalogs: vi.fn().mockReturnValue(
+            (reason === 'missing owner' ? entries.slice(0, 1) : entries).map(
+              (entry) => ({
+                endpoint: entry,
+                receipt: { binding: f.binding },
+                revoked: signal,
+                bindingRef: entry.bindingRef,
+                owner: {
+                  readScheduleCatalog: async () => [
+                    {
+                      ...task!,
+                      scheduledAt: '2035-11-03T07:00:00.000Z',
+                    },
+                  ],
+                },
+              }),
+            ),
+          ),
+        },
+        database: db,
+        source: createProductionScheduledWakeSource(
+          { startRetainedForSchedule: vi.fn() },
+          4,
+          db,
+        ),
+        lifetime: signal,
+      });
+      try {
+        const planId = randomUUID();
+        expect(
+          await wake.prepareStopWithWake(
+            {
+              binding: f.binding,
+              requestId: planId,
+              scheduledRoster: roster!,
+              assertStopCurrent: async () => {},
+            },
+            signal,
+          ),
+        ).toEqual({
+          blocked: true,
+          reason:
+            reason === 'missing owner'
+              ? 'SCHEDULE_OBSERVATION_UNAVAILABLE'
+              : 'SCHEDULE_WAKE_UNAVAILABLE',
+        });
+        expect(
+          await db`select state from person_vm_scheduled_wakes where plan_id=${planId}`,
+        ).toEqual([]);
+        expect(
+          await db`select phase from person_virtual_machines where vm_id=${f.binding.vmId}`,
+        ).toEqual([{ phase: 'running' }]);
+      } finally {
+        await wake.close();
+      }
+    },
+  );
 
   it('checks the scheduled-idle enrolled roster from current PG authority without a login', async () => {
     const f = await fixture();

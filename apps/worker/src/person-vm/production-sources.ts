@@ -151,7 +151,10 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
-          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          scheduledWake: createProductionScheduledWakeSource(
+            host.vm,
+            host.providers.employeeRuntimeSettings.employeeMaxRunning,
+          ),
           nativeActivity: createProductionNativeActivity(startup, lifetime, {
             sampleIntervalMs:
               host.providers.configuration.lifecycle.idleSampleIntervalMs ??

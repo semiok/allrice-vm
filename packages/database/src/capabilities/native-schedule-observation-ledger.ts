@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { UuidSchema } from '@allrice/contracts';
-import type { Sql } from 'postgres';
+import type { Sql, TransactionSql } from 'postgres';
 import { z } from 'zod';
 import { withDedicatedCallerTransaction } from '../business-runtime/caller-transaction.ts';
 
@@ -182,6 +182,29 @@ function receipt(row: Row): NativeScheduleObservationReceipt {
     operation: expected.operation,
     receivedAt: row.received_at.toISOString(),
   };
+}
+
+export async function readNativeScheduleSnapshotReceipts(
+  tx: TransactionSql,
+  binding: Pick<
+    NativeScheduleLedgerOrigin,
+    'personId' | 'organizationId' | 'vmId' | 'instanceId' | 'leaseEpoch'
+  >,
+  receiptIds: readonly string[],
+): Promise<NativeScheduleSnapshotReceiptInput[] | null> {
+  const rows = await tx<
+    Row[]
+  >`select receipt_id,input_digest,input_payload,received_at
+    from allrice_native_schedule_observation_receipts
+    where receipt_id=any(${[...receiptIds]}::uuid[])
+      and person_id=${binding.personId} and organization_id=${binding.organizationId}
+      and vm_id=${binding.vmId} and lower(input_payload #>> '{origin,instanceId}')=${binding.instanceId}
+      and input_payload #>> '{origin,leaseEpoch}'=${String(binding.leaseEpoch)}`;
+  if (rows.length !== receiptIds.length) return null;
+  const snapshots = rows.map((row) => receipt(row).operation);
+  return snapshots.every((snapshot) => snapshot.kind === 'snapshot')
+    ? snapshots
+    : null;
 }
 
 type Pending<T> = PromiseLike<T> & { cancel(): void };

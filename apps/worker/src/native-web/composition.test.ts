@@ -1617,7 +1617,7 @@ it('holds the bootstrap scope through editor proof and exposes only proved emplo
 });
 
 it('scheduled bootstrap starts the native scheduler and obtains editor proof only from a later real caller', async () => {
-  const f = fixture();
+  const f = capacityFixture(createProductionEmployeeRuntime({}, 20)!);
   const route = new AbortController();
   const readScheduleCatalog = vi.fn<NativeWebOwner['readScheduleCatalog']>(
     async (guard, signal) => {
@@ -1650,6 +1650,9 @@ it('scheduled bootstrap starts the native scheduler and obtains editor proof onl
   const scheduled = {
     purpose: 'scheduled-wake' as const,
     receipt: f.web.receipt,
+    scheduledEmployeeIds: f.web.receipt.endpoints.map(
+      ({ employeeInstanceId }) => employeeInstanceId,
+    ),
   };
   try {
     await f.service.memoryGuestPlan(f.binding, f.scope.signal, scheduled);
@@ -1671,6 +1674,62 @@ it('scheduled bootstrap starts the native scheduler and obtains editor proof onl
     await f.service.close();
   }
 });
+it.each(['scheduled', 'foreground'] as const)(
+  'opens only exact scheduled demand from a retained five-profile census: %s',
+  async (source) => {
+    const f = capacityFixture(createProductionEmployeeRuntime({}, 20)!);
+    const endpoints = Array.from({ length: 5 }, (_, index) => ({
+      ...f.web.receipt.endpoints[0]!,
+      employeeInstanceId: randomUUID(),
+      hostPort: 32171 + index,
+      guestPort: 32171 + index,
+    }));
+    const [selected, due] = endpoints;
+    const receipt = { ...f.web.receipt, endpoints, slots: endpoints };
+    const scheduledEmployeeIds = [due!.employeeInstanceId];
+    const readScheduleCatalog = vi.fn(async () => []);
+    const owner = { ...catalogOwner(), readScheduleCatalog };
+    open.mockResolvedValue(owner);
+    const web =
+      source === 'scheduled'
+        ? { purpose: 'scheduled-wake' as const, receipt, scheduledEmployeeIds }
+        : {
+            ...f.web,
+            selectedEmployee: { ...selected!, ...f.binding },
+            receipt,
+            scheduledEmployeeIds,
+          };
+    try {
+      const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
+      const launched = source === 'scheduled' ? [due!] : [selected!, due!];
+      expect(
+        plan.files
+          .filter(({ path }) => path.endsWith('/owner.patch.json'))
+          .map(({ path }) => path),
+      ).toEqual(
+        launched.map(({ employeeInstanceId }) =>
+          expect.stringContaining('/employees/' + employeeInstanceId + '/'),
+        ),
+      );
+      await f.service.start(f.binding, signal(), f.scope, web);
+      expect(open.mock.calls.map(([input]) => input.context)).toEqual(
+        source === 'scheduled' ? [undefined] : [f.web.context, undefined],
+      );
+      expect(readScheduleCatalog).toHaveBeenCalledOnce();
+      expect(f.service.catalog(f.binding, due!.employeeInstanceId).owner).toBe(
+        owner,
+      );
+      expect(
+        f.service.owner(f.binding, endpoints[4]!.employeeInstanceId),
+      ).toBeUndefined();
+      expect(() => f.service.activityCatalogs(f.binding, signal())).toThrow(
+        'RUNTIME_NOT_READY',
+      );
+    } finally {
+      await f.service.close();
+    }
+  },
+);
 it('launches each employee with an authenticated Web entry locator on the sealed origin', async () => {
   const origin = 'https://employees.example.test';
   const f = fixture(undefined, origin);

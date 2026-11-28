@@ -26,6 +26,12 @@ export type PersonVmWebRoster = Readonly<{
   }>[];
   digest: string;
 }>;
+/** Current authority for the full census and the active native work it covers. */
+export type PersonVmWakeStartup = Readonly<{
+  roster: PersonVmWebRoster;
+  employeeInstanceIds: readonly string[];
+  digest: string;
+}>;
 type WebPort = Readonly<{ hostPort: number; guestPort: number }>;
 type WebUpgrade = 'pending' | 'complete';
 
@@ -56,8 +62,16 @@ export type PersonVmWebStartup = Readonly<
       signal: AbortSignal,
     ): Promise<void>;
   } & (
-    | { context: RequestContext; purpose?: never }
-    | { context?: never; purpose: 'scheduled-wake' }
+    | {
+        context: RequestContext;
+        purpose?: never;
+        scheduledEmployeeIds?: readonly string[];
+      }
+    | {
+        context?: never;
+        purpose: 'scheduled-wake';
+        scheduledEmployeeIds: readonly string[];
+      }
   )
 >;
 export interface PersonVmWebRosterPort {

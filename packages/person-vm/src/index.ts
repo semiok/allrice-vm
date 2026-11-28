@@ -1,6 +1,7 @@
 export * from './contract.ts';
 export type {
   PersonVmWebRoster,
+  PersonVmWakeStartup,
   PersonVmWebEndpointReceipt,
   PersonVmWebStartup,
   NativeWebSetupFailure,

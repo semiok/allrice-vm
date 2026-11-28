@@ -54,6 +54,10 @@ async function exerciseMultiEmployeeNavigation(
   const opens: string[] = [];
   const warmups: string[] = [];
   const creates: string[] = [];
+  const capacityTicket = randomUUID();
+  const capacityDeletes: string[] = [];
+  const capacityCancellation = deferred<void>();
+  const allowCapacityCancellation = deferred<void>();
   const firstClose = deferred<void>();
   const releaseClose = deferred<void>();
   const context = await browser.newContext({
@@ -112,11 +116,44 @@ async function exerciseMultiEmployeeNavigation(
     await page.route('**/api/v1/d-entry/native-prewarm', async (route) => {
       const { selection } = route.request().postDataJSON();
       warmups.push(selection.employeeInstanceId);
-      const fail =
-        selection.employeeInstanceId === c &&
-        warmups.filter((id) => id === c).length === 1;
-      await route.fulfill({ status: fail ? 503 : 204 });
+      if (selection.employeeInstanceId === c) {
+        const attempt = warmups.filter((id) => id === c).length;
+        if (attempt === 1) return route.fulfill({ status: 503 });
+        if (attempt === 2)
+          return route.fulfill({
+            status: 202,
+            json: {
+              operationId: capacityTicket,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              pollAfterMs: 1000,
+            },
+          });
+      }
+      await route.fulfill({ status: 204 });
     });
+    await page.route(
+      '**/api/v1/d-entry/native-prewarm/status?**',
+      async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        expect(url.origin).toBe(origin);
+        expect(Object.fromEntries(url.searchParams)).toEqual({
+          workspaceId: identity.workspaceId,
+          employeeInstanceId: c,
+          operationId: capacityTicket,
+        });
+        if (request.method() === 'DELETE') {
+          capacityDeletes.push(request.method());
+          capacityCancellation.resolve();
+          await allowCapacityCancellation.promise;
+          return route.fulfill({ status: 410, json: { state: 'expired' } });
+        }
+        expect(request.method()).toBe('GET');
+        await route.fulfill({
+          json: { state: 'waiting_for_capacity', activeLimit: 3 },
+        });
+      },
+    );
     await page.route('**/api/v1/sessions?entry=4.0', async (route) => {
       const { selection, operationId } = route.request().postDataJSON();
       expect(selection).toEqual({
@@ -245,7 +282,32 @@ async function exerciseMultiEmployeeNavigation(
     expect(warmups).toEqual([a, c]);
     expect(creates).toEqual([]);
     await page.getByRole('button', { name: '重试', exact: true }).click();
+    const waiting = page.getByRole('status');
+    await waiting
+      .getByRole('heading', { name: '正在等待工作台名额' })
+      .waitFor();
+    expect(
+      await waiting
+        .getByText('已有 3 个员工在运行。有空位会自动继续，也可以取消等待。', {
+          exact: true,
+        })
+        .isVisible(),
+    ).toBe(true);
+    expect(creates).toEqual([]);
+    await page.getByRole('button', { name: '取消等待', exact: true }).click();
+    await capacityCancellation.promise;
+    const continueButton = page.getByRole('button', {
+      name: '继续',
+      exact: true,
+    });
+    expect(await continueButton.isDisabled()).toBe(true);
+    expect(capacityDeletes).toEqual(['DELETE']);
+    expect(creates).toEqual([]);
+    allowCapacityCancellation.resolve();
+    await expect.poll(() => continueButton.isEnabled()).toBe(true);
+    await continueButton.click();
     await editor.waitFor();
+    expect(warmups).toEqual([a, c, c, c]);
     expect(await editor.inputValue()).toBe('');
     expect(creates).toEqual([c]);
     await editor.fill('丙的草稿');
@@ -303,6 +365,7 @@ async function exerciseMultiEmployeeNavigation(
     expect(await editor.inputValue()).toBe('丙的草稿');
   } finally {
     releaseClose.resolve();
+    allowCapacityCancellation.resolve();
     await context.close();
   }
 }

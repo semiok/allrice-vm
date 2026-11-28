@@ -7,6 +7,7 @@ import type {
   PersonVmPort,
   PersonVmRuntimePort,
   PersonVmWebEndpointReceipt,
+  PersonVmWebRoster,
   PersonVmWebStartup,
   PersonVmWebRosterPort,
   ReadonlyCommandMemoryDirectory,
@@ -155,6 +156,7 @@ export function createAssignedNativeWebStartup(input: {
     {
       binding: PersonVmBinding;
       receipt: PersonVmWebEndpointReceipt;
+      census: PersonVmWebRoster['entries'];
       slots?: PersonVmWebEndpointReceipt['slots'];
       runtimeLimit?: number;
       bindingRef: string;
@@ -358,6 +360,9 @@ export function createAssignedNativeWebStartup(input: {
               await retireEmployee(group, endpoint, owner, () =>
                 joinArchivedOwner(group, owner),
               );
+              group.census = group.census.filter(
+                ({ employeeInstanceId }) => employeeInstanceId !== employeeId,
+              );
             }
           }
         });
@@ -452,16 +457,31 @@ export function createAssignedNativeWebStartup(input: {
     runtimeLimit?: number;
   } {
     const { binding, endpoints, slots } = web.receipt;
-    if (!input.employeeRuntime) return { endpoints };
+    const scheduledIds = web.scheduledEmployeeIds;
+    if (!input.employeeRuntime && !scheduledIds) return { endpoints };
     if (!slots?.length) throw new PersonVmError('RUNTIME_NOT_READY');
     const maxRunning = Math.min(runtimeLimit, slots.length);
-    const select = input.employeeRuntime.readColdSelection;
-    if (!select) {
+    const scheduled = new Set(scheduledIds);
+    const scheduledEndpoints = endpoints.filter(({ employeeInstanceId }) =>
+      scheduled.has(employeeInstanceId),
+    );
+    if (
+      scheduledIds &&
+      (!scheduled.size || scheduledEndpoints.length !== scheduledIds.length)
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    if (web.purpose === 'scheduled-wake') {
+      if (scheduledEndpoints.length > maxRunning)
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      return { endpoints: scheduledEndpoints, runtimeLimit: maxRunning };
+    }
+    const select = input.employeeRuntime?.readColdSelection;
+    if (!select && !scheduledIds) {
       if (endpoints.length > maxRunning)
         throw new PersonVmError('RUNTIME_NOT_READY');
       return { endpoints, runtimeLimit: maxRunning };
     }
-    const employee = select(web, signal);
+    const employee = select ? select(web, signal) : web.selectedEmployee;
     if (!employee) throw new PersonVmError('RUNTIME_NOT_READY');
     const selected = endpoints.find((endpoint) =>
       sameEmployee(endpoint, employee),
@@ -472,8 +492,14 @@ export function createAssignedNativeWebStartup(input: {
       employee.organizationId !== binding.organizationId
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    const launches = [
+      selected,
+      ...scheduledEndpoints.filter((endpoint) => endpoint !== selected),
+    ];
+    if (launches.length > maxRunning)
+      throw new PersonVmError('RUNTIME_NOT_READY');
     return {
-      endpoints: [selected],
+      endpoints: launches,
       selectedId: selected.employeeInstanceId,
       runtimeLimit: maxRunning,
     };
@@ -607,6 +633,7 @@ export function createAssignedNativeWebStartup(input: {
         const group: RunningGroup = {
           binding,
           receipt,
+          census: receipt.endpoints,
           slots: web.receipt.slots,
           runtimeLimit: plan.runtimeLimit,
           bindingRef: randomUUID(),
@@ -658,13 +685,17 @@ export function createAssignedNativeWebStartup(input: {
             const employeeId = endpoint.employeeInstanceId;
             group.startingEmployees.add(employeeId);
             attemptedOwnerOpen = true;
-            const owner = await openEmployee(scope, boundLaunch, web.context, {
+            const scheduled = web.scheduledEmployeeIds?.includes(employeeId);
+            const context =
+              !scheduled || plan.selectedId === employeeId
+                ? web.context
+                : undefined;
+            const owner = await openEmployee(scope, boundLaunch, context, {
               recordStartupFailure: web.recordNativeFailure,
               startupPending: () => awaitingGroupSetup,
             });
             group.owners.set(employeeId, owner);
             group.startingEmployees.delete(employeeId);
-            const context = web.context;
             if (context && prove) {
               const proof = await owner.verifyStartingEditor(
                 scope,
@@ -686,7 +717,8 @@ export function createAssignedNativeWebStartup(input: {
                 proof.throwIfAborted();
                 group.verifiedEmployees.set(employeeId, proof);
               }
-            } else if (group.scheduledWake) {
+            }
+            if (scheduled) {
               await owner.readScheduleCatalog(
                 () => scope.assertCurrent(),
                 signal,
@@ -1005,7 +1037,10 @@ export function createAssignedNativeWebStartup(input: {
           const prior = ownerEndpoint(group, employeeId);
           if (!prior) throw new PersonVmError('CLEANUP_INCOMPLETE');
           const sameRevision = sameEmployee(selected, prior);
-          if (sameRevision && existing.controlReady()) return;
+          if (sameRevision && existing.controlReady()) {
+            group.census = roster.entries;
+            return;
+          }
           slot = physicalSlot(prior);
           if (!slot) throw new PersonVmError('CLEANUP_INCOMPLETE');
           const joined = existing.retireAfterJobExit(binding);
@@ -1115,6 +1150,7 @@ export function createAssignedNativeWebStartup(input: {
             }),
           );
           group.owners.set(endpoint.employeeInstanceId, owner);
+          group.census = current.entries;
         } catch (error) {
           try {
             await owner?.close();
@@ -1246,7 +1282,13 @@ export function createAssignedNativeWebStartup(input: {
       if (
         group.updating ||
         group.startingEmployees.size ||
-        group.blockedEmployees.size
+        group.blockedEmployees.size ||
+        group.owners.size !== group.census.length ||
+        group.census.some((entry) => {
+          if (!group.owners.has(entry.employeeInstanceId)) return true;
+          const endpoint = ownerEndpoint(group, entry.employeeInstanceId);
+          return !endpoint || !sameEmployee(endpoint, entry);
+        })
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
       return [...group.owners.keys()]

@@ -170,7 +170,10 @@ function fixture() {
     current: Object.freeze({ withCurrentSelection }),
     startup: Object.freeze({ slottedEntryReceipt: vi.fn() }),
     admission: Object.freeze({}),
-    providers: { configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } } },
+    providers: {
+      configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } },
+      employeeRuntimeSettings: { employeeMaxRunning: 4 },
+    },
     lifetime: lifetime.signal,
   }) as unknown as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {

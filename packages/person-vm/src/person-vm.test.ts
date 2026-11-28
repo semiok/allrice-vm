@@ -421,7 +421,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     });
   });
 
-  async function scheduledFixture() {
+  async function scheduledFixture(count = 1, physicalWidth = count) {
     const store = new MemoryStore();
     const h = harness(store);
     const { rc, binding } = await running(h);
@@ -429,21 +429,35 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     // outcome and let the real service persist and clean up the retained VM.
     h.states.set(binding.vmId, 'stopped');
     await h.service.stop(rc, signal());
-    const endpoint = {
+    const entries = Array.from({ length: count }, () => ({
       workspaceId: randomUUID(),
       employeeInstanceId: randomUUID(),
       employeeRevision: 1,
       employeeVersionId: randomUUID(),
-    };
+    })).sort((a, b) =>
+      a.employeeInstanceId.localeCompare(b.employeeInstanceId),
+    );
     const facts = {
       personId: binding.personId,
       organizationId: binding.organizationId,
-      entries: [endpoint],
+      entries,
     };
     const roster = {
       ...facts,
       digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
     };
+    const wake = {
+      roster,
+      employeeInstanceIds: entries.map(
+        ({ employeeInstanceId }) => employeeInstanceId,
+      ),
+      digest: roster.digest,
+    };
+    const slots = Array.from({ length: physicalWidth }, (_, index) => ({
+      hostPort: 24444 + index,
+      guestPort: 24544 + index,
+    }));
+    store.rows.get(binding.personId)!.verifiedWebSlotCapacity = physicalWidth;
     const interactiveRoster = vi.fn(async () => roster);
     const verified = vi.fn(async () => {});
     h.runtime.assertScheduledReady = verified;
@@ -451,7 +465,11 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     h.native.prepareWebEndpoints = vi.fn(async (current, expected) => ({
       binding: current,
       rosterDigest: expected.digest,
-      endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
+      endpoints: entries.map((entry, index) => ({
+        ...entry,
+        ...slots[index]!,
+      })),
+      slots,
     }));
     h.native.assertWebEndpoints = vi.fn(async () => {});
     const idleOwner = vi.fn();
@@ -464,8 +482,10 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     return {
       h,
       store,
+      rc,
       binding,
       roster,
+      wake,
       service,
       interactiveRoster,
       verified,
@@ -480,7 +500,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     const browserProof = vi.spyOn(f.h.runtime, 'readiness');
     const roster = vi.fn(async () => {
       expect((await f.store.read(f.binding.personId))?.leaseOwner).toBeTruthy();
-      return f.roster;
+      return f.wake;
     });
     const fenced: string[] = [];
     const nativeStart = f.h.native.start;
@@ -501,7 +521,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     const authority: Parameters<
       PersonVmService['startRetainedForSchedule']
     >[2] = {
-      readRoster: roster,
+      readStartup: roster,
       async withCurrentAuthority(digest, active, start) {
         fenced.push(digest);
         expect(digest).toBe(f.roster.digest);
@@ -530,6 +550,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
     expect(startup.mock.lastCall?.[3]).toMatchObject({
       purpose: 'scheduled-wake',
+      scheduledEmployeeIds: f.wake.employeeInstanceIds,
     });
     expect(startup.mock.lastCall?.[3]).not.toHaveProperty('context');
     expect(f.verified).toHaveBeenCalledOnce();
@@ -565,7 +586,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         f.binding,
         randomUUID(),
         {
-          readRoster: async () => f.roster,
+          readStartup: async () => f.wake,
           withCurrentAuthority: async () => {
             throw new PersonVmError('AUTHORIZATION_DENIED');
           },
@@ -590,7 +611,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         f.binding,
         requestId,
         {
-          readRoster: async () => f.roster,
+          readStartup: async () => f.wake,
           async withCurrentAuthority(_digest, active, work) {
             if (++fenced === 2) throw new PersonVmError('AUTHORIZATION_DENIED');
             return work(active);
@@ -610,6 +631,104 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         .map((event) => event.result),
     ).toEqual(['started', 'failed']);
   });
+
+  it.each([
+    [5, 5],
+    [3, 2],
+  ])(
+    'rejects %i scheduled employees given %i verified ports before advancing the stopped generation',
+    async (count, width) => {
+      const f = await scheduledFixture(count, width);
+      const before = f.h.log.slice();
+      const dispatch = vi.fn();
+      await expect(
+        f.service.startRetainedForSchedule(
+          f.binding,
+          randomUUID(),
+          { readStartup: async () => f.wake, withCurrentAuthority: dispatch },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(f.h.native.prepareWebEndpoints).not.toHaveBeenCalled();
+      expect(f.h.log).toEqual(before);
+      expect(await f.store.read(f.binding.personId)).toMatchObject({
+        phase: 'stopped',
+        instanceId: f.binding.instanceId,
+        leaseEpoch: f.binding.leaseEpoch,
+      });
+    },
+  );
+
+  it.each(['mixed', 'deduplicated', 'over-capacity'] as const)(
+    'uses the exact committed plan when foreground wins the retained lease: %s',
+    async (scenario) => {
+      const f = await scheduledFixture(5);
+      const selected = f.roster.entries[0]!;
+      const active = f.wake.employeeInstanceIds.slice(
+        scenario === 'deduplicated' ? 0 : 1,
+        scenario === 'over-capacity' ? undefined : 2,
+      );
+      const wake = { ...f.wake, employeeInstanceIds: active };
+      const read = vi.fn(async (binding: typeof f.binding) => {
+        expect(binding).toEqual(f.binding);
+        expect(
+          (await f.store.read(f.binding.personId))?.leaseOwner,
+        ).toBeTruthy();
+        return wake;
+      });
+      let fences = 0;
+      const native = f.h.native.start;
+      f.h.native.start = async (...args) => {
+        expect(fences).toBe(2);
+        await native(...args);
+      };
+      const startup = vi.spyOn(f.h.runtime, 'start');
+      f.h.authorize(true);
+      const service = new PersonVmService({
+        ...f.h.options,
+        nativeWeb: { prepare: f.interactiveRoster },
+        retainedWake: {
+          read,
+          async withCurrentAuthority(binding, digest, active, work) {
+            expect(binding).toEqual(f.binding);
+            expect(digest).toBe(wake.digest);
+            fences++;
+            return work(active);
+          },
+        },
+      });
+      const opening = service.prewarm(
+        f.rc,
+        { trigger: 'page', selectedEmployee: { ...selected, ...f.binding } },
+        signal(),
+      );
+      if (scenario === 'over-capacity') {
+        await expect(opening).rejects.toMatchObject({
+          code: 'RUNTIME_NOT_READY',
+        });
+        expect(fences).toBe(0);
+        expect(startup).not.toHaveBeenCalled();
+        expect(await f.store.read(f.binding.personId)).toMatchObject({
+          phase: 'stopped',
+          instanceId: f.binding.instanceId,
+          leaseEpoch: f.binding.leaseEpoch,
+        });
+        return;
+      }
+      await expect(opening).resolves.toMatchObject({
+        phase: 'running',
+        ready: true,
+      });
+      expect(fences).toBe(3);
+      expect(startup.mock.lastCall?.[3]).toMatchObject({
+        selectedEmployee: selected,
+        scheduledEmployeeIds: active,
+        context: f.rc,
+      });
+      expect(read.mock.calls.length).toBeGreaterThan(1);
+    },
+  );
 
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
