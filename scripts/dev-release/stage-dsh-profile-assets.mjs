@@ -38,7 +38,7 @@ async function listFiles(root, prefix = '') {
 }
 
 const managedEntry = 'managed/employee-web-entry.js';
-const nativeStartup = /^native\/assets\/(?:index|vendor)-[\w-]+\.(?:js|css)$/;
+const nativeStartup = /^native\/assets\/(?:index|vendor)-[\w-]+\.css$/;
 
 function managedStartupImports(outputs) {
   const entry = Object.keys(outputs).find((path) =>

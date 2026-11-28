@@ -5,7 +5,7 @@ import {
 } from './profile-download';
 
 export const publicProfileStartupPath =
-  /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/(?:bundles\/[a-f0-9]{64}\.js|managed\/(?:employee-web-entry\.(?:css|js)|[\w-]+\.js)|native\/assets\/(?:index|vendor)-[\w-]+\.(?:js|css))(?![\s\S])/;
+  /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/(?:bundles\/[a-f0-9]{64}\.js|managed\/(?:employee-web-entry\.(?:css|js)|[\w-]+\.js)|native\/assets\/(?:index|vendor)-[\w-]+\.css)(?![\s\S])/;
 
 /** Populate the ordinary HTTP cache, without evaluating code or keeping bytes. */
 export async function warmPublicProfileAssets(
