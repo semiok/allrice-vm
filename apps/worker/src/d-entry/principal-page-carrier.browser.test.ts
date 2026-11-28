@@ -78,9 +78,11 @@ it
     const live = independentlyInstalled ? await buildProfileFixture() : release;
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
-      source: { head: string };
+      source: {
+        head: string;
+        contributionInputs: { path: string; sha256: string }[];
+      };
       files: { path: string }[];
-      source: { contributionInputs: { path: string; sha256: string }[] };
       profile: { files: { reference: string; sha256: string }[] };
     } = JSON.parse(sealed.toString());
     const ownerPath =
