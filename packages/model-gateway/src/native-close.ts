@@ -7,12 +7,19 @@ type RequestClose = {
   socket?: Socket;
   settled: Promise<void>;
   onSettled(): void;
+  onHeaders(): void;
+  onBody(): void;
 };
-type Observation = { requests: Map<object, RequestClose> };
+type Observation = {
+  requests: Map<object, RequestClose>;
+  onHeaders(): void;
+  onBody(): void;
+};
 const dispatches = new AsyncLocalStorage<Observation>();
 const requests = new WeakMap<object, RequestClose>();
 const create = channel('undici:request:create');
 const headers = channel('undici:client:sendHeaders');
+const bodyChunk = channel('undici:request:bodyChunkSent');
 const trailers = channel('undici:request:trailers');
 
 /** Public Undici diagnostics, pinned by Node 22.23.2. Read only request object
@@ -27,7 +34,15 @@ export function installNativeCloseObserver(): () => void {
     const settled = new Promise<void>((resolve) => {
       onSettled = resolve;
     });
-    const entry = { complete: false, settled, onSettled };
+    // Wire admission attaches only to the first native request in this
+    // exact fetch. Native close still follows every observed request.
+    const entry = {
+      complete: false,
+      settled,
+      onSettled,
+      onHeaders: observation.requests.size ? () => {} : observation.onHeaders,
+      onBody: observation.requests.size ? () => {} : observation.onBody,
+    };
     observation.requests.set(request, entry);
     requests.set(request, entry);
   };
@@ -36,8 +51,12 @@ export function installNativeCloseObserver(): () => void {
     const entry = requests.get(request);
     if (!entry) return;
     entry.socket = socket;
+    entry.onHeaders();
     if (socket.closed) entry.onSettled();
     else socket.once('close', entry.onSettled);
+  };
+  const onBody = (message: unknown) => {
+    requests.get((message as { request: object }).request)?.onBody();
   };
   const onTrailers = (message: unknown) => {
     const entry = requests.get((message as { request: object }).request);
@@ -48,17 +67,40 @@ export function installNativeCloseObserver(): () => void {
   };
   create.subscribe(onCreate);
   headers.subscribe(onHeaders);
+  bodyChunk.subscribe(onBody);
   trailers.subscribe(onTrailers);
   return () => {
     create.unsubscribe(onCreate);
     headers.unsubscribe(onHeaders);
+    bodyChunk.unsubscribe(onBody);
     trailers.unsubscribe(onTrailers);
   };
 }
 
 export function observeNativeClose() {
-  const observation: Observation = { requests: new Map() };
+  let markReady!: () => void;
+  let markWritten!: () => void;
+  const headersReady = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  const bodyWritten = new Promise<void>((resolve) => {
+    markWritten = resolve;
+  });
+  let wroteBody = false;
+  const observation: Observation = {
+    requests: new Map(),
+    onHeaders: markReady,
+    onBody() {
+      wroteBody = true;
+      markWritten();
+    },
+  };
   return {
+    headersReady,
+    bodyWritten,
+    get wroteBody() {
+      return wroteBody;
+    },
     run<T>(operation: () => T): T {
       return dispatches.run(observation, operation);
     },

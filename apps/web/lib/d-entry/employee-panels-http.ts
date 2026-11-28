@@ -1,3 +1,4 @@
+import { referenceArchivePolicy } from '@allrice/file-archives';
 import { z } from 'zod';
 import {
   MaterialsActionCommandProjectionSchema,
@@ -6,6 +7,7 @@ import {
   ReferencePublicationQuerySchema,
   ReferencePublishInputSchema,
   UuidSchema,
+  supportsEmployeeFileMentionText,
   WorkbenchDeliverablesFilterSchema,
   WorkbenchFileFavoriteSchema,
   WorkbenchFileUploadSchema,
@@ -276,6 +278,12 @@ export function createEmployeePanelsHandlers(
         ...catalog,
         quotableFileIds: catalog.files
           .filter((file) => {
+            if (params.get('mention') === '1')
+              return (
+                supportsEmployeeFileMentionText(file) ||
+                (file.mediaType === 'application/zip' &&
+                  file.sizeBytes <= referenceArchivePolicy.maximumBytes)
+              );
             if (file.reference?.companyTemplate) return true;
             const current =
               file.reference?.checksum === file.checksum

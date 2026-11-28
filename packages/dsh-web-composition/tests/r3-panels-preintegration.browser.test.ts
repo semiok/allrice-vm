@@ -1,5 +1,6 @@
+import { decodeEmployeeFileMention } from '@allrice/contracts';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -107,7 +108,17 @@ async function fixtureApis(page: Page, requests: string[]) {
     expect(url.searchParams.get('threadId')).toBe(threadId);
     const key = url.pathname.slice(prefix.length);
     if (key === 'skills') return route.fulfill({ json: sample.skills });
-    if (key === 'materials') return route.fulfill({ json: sample.catalog });
+    if (key === 'materials') {
+      const search = url.searchParams.get('query') ?? '';
+      return route.fulfill({
+        json: {
+          ...sample.catalog,
+          references: sample.catalog.references
+            .filter((row) => row.fileName.includes(search))
+            .map((row) => ({ ...row, fullTextReady: true })),
+        },
+      });
+    }
     if (key === 'materials/options')
       return route.fulfill({
         json: { viewerId: panelsViewer, options: sample.options },
@@ -116,6 +127,13 @@ async function fixtureApis(page: Page, requests: string[]) {
       return route.fulfill({
         json: {
           ...sample.files,
+          files: sample.files.files.filter(
+            (file) =>
+              (!url.searchParams.get('objectId') ||
+                file.objectId === url.searchParams.get('objectId')) &&
+              (!url.searchParams.get('query') ||
+                file.fileName.includes(url.searchParams.get('query')!)),
+          ),
           employees: [{ id: panelsEmployee, name: employeeName }],
         },
       });
@@ -143,6 +161,12 @@ suite('R3 preintegration through the installed workbench', () => {
     console.info(`R3 panel preintegration evidence: ${artifacts}`);
     host = await startInstalledProfile(
       new URL('./fixtures/settings-workbench-client.js', import.meta.url),
+    );
+    const internal = join(host.root, 'workspace', 'allrice-memory');
+    await mkdir(internal);
+    await writeFile(
+      join(internal, 'private-fixture.md'),
+      'Private filesystem fixture',
     );
     browser = await chromium.launch({
       headless: true,
@@ -177,6 +201,146 @@ suite('R3 preintegration through the installed workbench', () => {
       await host?.close();
     }
   });
+
+  it.each([1440, 390])(
+    'uses the native @ picker for authorized materials and deliverables at %ipx',
+    async (width) => {
+      const context = await browser.newContext({
+        viewport: { width, height: width === 390 ? 844 : 1000 },
+        reducedMotion: 'reduce',
+      });
+      const page = await context.newPage();
+      page.setDefaultTimeout(12_000);
+      const requests: string[] = [];
+      const errors: string[] = [];
+      page.on('console', (message) => {
+        if (message.type() === 'error') errors.push(message.text());
+      });
+      page.on('pageerror', (error) => errors.push(error.message));
+      const shot = (name: string) =>
+        page.screenshot({
+          path: join(artifacts, `r3-mention-${width}-${name}.png`),
+          animations: 'disabled',
+        });
+      try {
+        const data = await fixtureApis(page, requests);
+        await page.goto(host.authUrl);
+        const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
+        await proceed.waitFor({ timeout: 5_000 }).catch(() => {});
+        if (await proceed.isVisible()) await proceed.click();
+        await page.goto(host.origin);
+        await page.waitForFunction(() =>
+          Boolean(window.__allriceSettingsWorkbench),
+        );
+        await page.evaluate(
+          (markup) => window.__allriceSettingsWorkbench!.mount(markup),
+          employeeDocument(),
+        );
+        const editor = page.locator('[contenteditable="true"]');
+        const menu = page.locator('[data-trigger-menu]');
+        const options = menu.getByRole('option');
+        const folder = menu.getByRole('option', {
+          name: '企业资料',
+          exact: false,
+        });
+        const file = data.files.files[2]!;
+        const material = data.references[0]!;
+        const output = menu.getByRole('option', {
+          name: file.fileName,
+          exact: true,
+        });
+        await editor.click();
+        await page.keyboard.insertText('@');
+        await output.waitFor();
+        expect(await options.first().getAttribute('id')).toBe(
+          await folder.getAttribute('id'),
+        );
+        expect(await menu.innerText()).not.toContain('allrice-memory');
+        expect(await menu.innerText()).not.toContain('private-fixture.md');
+        expect(await menu.innerText()).not.toContain(
+          data.files.files[0]!.fileName,
+        );
+        await menu
+          .getByRole('option', { name: '新建对话', exact: true })
+          .first()
+          .waitFor();
+        expect(await menu.innerText()).not.toMatch(/session-[\da-f]{8}-/iu);
+        await shot('root');
+        await page.keyboard.press('Tab');
+        const reference = menu.getByRole('option', {
+          name: material.fileName,
+          exact: true,
+        });
+        await reference.waitFor();
+        await shot('tab');
+        await page.keyboard.insertText(material.fileName.slice(0, 4));
+        await expect.poll(() => options.count()).toBe(1);
+        await page.keyboard.press('Enter');
+        await editor.getByText(material.fileName, { exact: true }).waitFor();
+        await page.keyboard.press('End');
+        await page.keyboard.insertText(' @"');
+        await folder.click();
+        await reference.waitFor();
+        expect(await editor.innerText()).toContain('@"企业资料/');
+        await menu
+          .getByRole('button', { name: '文件与文件夹', exact: true })
+          .click();
+        expect((await editor.innerText()).trimEnd().endsWith('@"')).toBe(true);
+        await output.click();
+        await editor.getByText(file.fileName, { exact: true }).waitFor();
+        const references = await page.evaluate(() =>
+          window.__allriceSettingsWorkbench!.references(),
+        );
+        expect(references.map(({ label }) => label)).toEqual([
+          material.fileName,
+          file.fileName,
+        ]);
+        expect(
+          references.map(({ text }) => decodeEmployeeFileMention(text.trim())),
+        ).toEqual([
+          {
+            threadId,
+            label: material.fileName,
+            pin: {
+              kind: 'material',
+              sourceId: material.sourceId,
+              revisionId: material.revisionId,
+              revision: material.revision,
+              checksum: material.checksum,
+            },
+          },
+          {
+            threadId,
+            label: file.fileName,
+            pin: {
+              kind: 'deliverable',
+              objectId: file.objectId,
+              checksum: file.checksum,
+            },
+          },
+        ]);
+        expect(
+          requests.every(
+            (entry) =>
+              entry.startsWith('GET ') &&
+              !entry.endsWith('/preview') &&
+              !entry.endsWith('/selection'),
+          ),
+        ).toBe(true);
+        await shot('references');
+      } catch (error) {
+        await shot('first-failure');
+        throw error;
+      } finally {
+        await writeFile(
+          join(artifacts, `r3-mention-${width}-requests.json`),
+          JSON.stringify({ requests, errors }, null, 2),
+        );
+        await context.close();
+      }
+    },
+    45_000,
+  );
 
   it.each([1440, 390])(
     'opens five real panes and keeps both native references at %ipx',

@@ -18,6 +18,10 @@
 # native settings-general continues to own the actual settings shell.
 - id: ui-sidebar
   disabled: true
+# Employee @ discovery uses authorized business catalogs. Session references
+# still use the native resolver. This UI plugin has a no-op Host entry.
+- id: ui-reference
+  disabled: true
 # Employee settings retain native General and all execution/Host services.
 # The inserted Host-only entries reuse native Config defaults and behavior;
 # native client-modules skips package subpaths. Retain the probe's Typert face.

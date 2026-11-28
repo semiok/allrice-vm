@@ -79,6 +79,7 @@ export async function productionInputsFixture() {
     },
     web: {
       terminalEnabled: true,
+      nativeMemoryEnabled: false,
       cliPath: `/opt/allrice/dsh/${hash}/cli.mjs`,
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',

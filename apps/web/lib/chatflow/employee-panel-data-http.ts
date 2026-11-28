@@ -340,13 +340,21 @@ export function createEmployeePanelsHttpClient(
       );
     },
     async listDeliverables(
-      input: z.input<typeof WorkbenchDeliverablesFilterSchema>,
+      {
+        mention,
+        ...input
+      }: z.input<typeof WorkbenchDeliverablesFilterSchema> & { mention?: true },
       signal: AbortSignal,
     ) {
       const value = WorkbenchDeliverablesFilterSchema.parse(input);
       const { workspaceId, ...query } = value;
       return WorkbenchDeliverablesActionsCatalogSchema.parse(
-        await call('/deliverables', signal, { workspaceId }, { query }),
+        await call(
+          '/deliverables',
+          signal,
+          { workspaceId },
+          { query: { ...query, mention: mention ? 1 : undefined } },
+        ),
       );
     },
     async captureReference(

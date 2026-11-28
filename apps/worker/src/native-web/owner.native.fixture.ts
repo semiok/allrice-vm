@@ -163,6 +163,7 @@ export async function setupNativeWebFixture(
     resetProbe?: boolean;
     onPublicationDiagnostic?: (text: string) => void;
     nativeToolEvidenceProbe?: string;
+    nativeMemoryEnabled?: boolean;
     identity?: Omit<DEntryIdentity, 'threadId'>;
     loginSessionId?: string;
   },
@@ -244,6 +245,7 @@ export async function setupNativeWebFixture(
     workdir: root,
     cliPath,
     startupTimeoutMs: 10000,
+    nativeMemoryEnabled: isolated?.nativeMemoryEnabled,
     principalProfile,
   };
   const launch = launchOnTestHost(

@@ -57,7 +57,7 @@ export async function readReferenceSelection(
   sql: Sql,
   lock: boolean,
   sharedReader?: OrganizationSharedReader,
-  readKind?: 'image' | 'archive',
+  readKind?: 'image' | 'archive' | 'quote-original',
 ) {
   let publicationSource = false;
   try {

@@ -190,6 +190,7 @@ const configuration = z
         cliPath: guestPath,
         startupTimeoutMs: positive,
         terminalEnabled: z.boolean().default(true),
+        nativeMemoryEnabled: z.boolean().default(false),
         publicOrigin: z.string().refine((value) => {
           try {
             const url = new URL(value);

@@ -4,12 +4,14 @@ import {
   prepareDeepSeekChatRequest,
 } from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { addAbortListener } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
 import type {
   ModelCallBinding,
   ModelGatewayStore,
   GatewayProvider,
+  ModelDispatchAuthority,
   ModelAttemptReceipt,
 } from './contract.ts';
 import { unknownUsage, WireUsageObserver } from './usage.ts';
@@ -25,6 +27,30 @@ import {
 import { createOwnedModelTransport } from './owned-transport.ts';
 
 type Fetch = typeof globalThis.fetch;
+async function waitForWire(
+  observed: Promise<void>,
+  sending: Promise<Response>,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  let rejectStopped!: (reason: unknown) => void;
+  const stopped = new Promise<never>((_, reject) => {
+    rejectStopped = reject;
+  });
+  const abort = addAbortListener(signal, () => rejectStopped(signal.reason));
+  try {
+    await Promise.race([
+      observed,
+      stopped,
+      sending.then(() => {
+        throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+      }),
+    ]);
+    signal.throwIfAborted();
+  } finally {
+    abort[Symbol.dispose]();
+  }
+}
 type FetchScope = {
   authTransaction<T>(operation: () => Promise<T>): Promise<T>;
   fetch(
@@ -161,7 +187,11 @@ export function createMeteredTransport(options: {
   provider: GatewayProvider;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
-  assertContextCurrent?(signal: AbortSignal): Promise<void>;
+  withContextCurrent?(
+    signal: AbortSignal,
+    authority: ModelDispatchAuthority | void,
+    dispatch: () => Promise<void>,
+  ): Promise<void>;
   activate(): Promise<void>;
 }) {
   const controller = new AbortController();
@@ -211,12 +241,19 @@ export function createMeteredTransport(options: {
         init?.signal ?? (input instanceof Request ? input.signal : undefined);
       // pi-ai supplies its own independent 15s timeout after refresh starts.
       // Never merge model/client/revocation/close cancellation into it.
-      const requestSignal = refreshing
+      const callerSignal = refreshing
         ? (incoming ??
           AbortSignal.abort(new ModelGatewayError('AUTH_TRANSACTION_REQUIRED')))
         : incoming
           ? AbortSignal.any([signal, incoming])
           : signal;
+      const contextStop =
+        !refreshing && options.withContextCurrent
+          ? new AbortController()
+          : undefined;
+      const requestSignal = contextStop
+        ? AbortSignal.any([callerSignal, contextStop.signal])
+        : callerSignal;
       const method = (
         init?.method ?? (input instanceof Request ? input.method : 'GET')
       ).toUpperCase();
@@ -351,20 +388,105 @@ export function createMeteredTransport(options: {
             }),
           duplex: 'half',
         };
-        // The memory check, when installed, runs after the selected-generation
-        // read and all other async gates. Refresh has no memory input.
-        await options.provider.assertDispatchCurrent?.(requestSignal);
-        if (classification.kind === 'model' && options.assertContextCurrent)
-          await options.assertContextCurrent(requestSignal);
-        requestSignal.throwIfAborted();
-        dispatched = true;
-        // Redirects are disabled in request; hidden 421 replay is disabled by
-        // the one-shot body. Each later SDK fetch gets its own durable attempt.
-        const response = await nativeClose.run(() =>
-          options.provider.fetchOwned
-            ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
-            : nativeFetch(request, dispatchInit),
-        );
+        const authority =
+          await options.provider.assertDispatchCurrent?.(requestSignal);
+        const send = (init: RequestInit) =>
+          // Disable redirects and hidden 421 replay. Each later SDK fetch
+          // gets its own durable attempt.
+          nativeClose.run(() =>
+            options.provider.fetchOwned
+              ? options.provider.fetchOwned(nativeFetch, request, init)
+              : nativeFetch(request, init),
+          );
+        let response: Response;
+        if (contextStop && options.withContextCurrent) {
+          // Memory dispatch requires the dedicated HTTP/1 Undici dispatcher.
+          // Node's implicit dispatcher does not provide first-chunk proof.
+          if (!options.provider.fetchOwned || !request.body)
+            throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+          const source = request.body.getReader();
+          let releaseBody!: () => void;
+          const readyBody = new Promise<void>((resolve) => {
+            releaseBody = resolve;
+          });
+          let receivedBody = false;
+          const body = new ReadableStream(
+            {
+              async pull(controller) {
+                await readyBody;
+                requestSignal.throwIfAborted();
+                const chunk = await source.read();
+                requestSignal.throwIfAborted();
+                if (chunk.done) {
+                  source.releaseLock();
+                  if (!receivedBody)
+                    throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+                  controller.close();
+                } else {
+                  receivedBody ||= chunk.value.byteLength > 0;
+                  controller.enqueue(chunk.value);
+                }
+              },
+              async cancel(reason) {
+                try {
+                  await source.cancel(reason);
+                } finally {
+                  source.releaseLock();
+                }
+              },
+            },
+            { highWaterMark: 0 },
+          );
+          const sending = send({ ...dispatchInit, body });
+          void sending.catch(() => {});
+          let authorized = false;
+          try {
+            // The pinned HTTP/1 driver transitions into its body iterator
+            // after obtaining the socket. It writes neither headers nor body
+            // while the first nonempty chunk is withheld.
+            await waitForWire(nativeClose.headersReady, sending, requestSignal);
+            await options.withContextCurrent(
+              requestSignal,
+              authority,
+              async () => {
+                requestSignal.throwIfAborted();
+                authority?.assertCurrent();
+                if (authorized)
+                  throw new ModelGatewayError('AUTHORIZATION_DENIED');
+                authorized = true;
+                releaseBody();
+                try {
+                  await waitForWire(
+                    nativeClose.bodyWritten,
+                    sending,
+                    AbortSignal.any([requestSignal, AbortSignal.timeout(3000)]),
+                  );
+                } catch (error) {
+                  // Stop the wire before unwinding the SQL locks.
+                  contextStop.abort(error);
+                  throw error;
+                }
+              },
+            );
+            if (!nativeClose.wroteBody)
+              throw new ModelGatewayError('AUTHORIZATION_DENIED');
+            dispatched = true;
+          } catch (error) {
+            contextStop.abort(error);
+            releaseBody();
+            dispatched = nativeClose.wroteBody;
+            await sending
+              .then((value) => value.body?.cancel(error))
+              .catch(() => {});
+            throw error;
+          }
+          response = await sending;
+        } else {
+          requestSignal.throwIfAborted();
+          authority?.assertCurrent();
+          dispatched = true;
+          response = await send(dispatchInit);
+        }
         status = response.status;
         if (!response.body) {
           if (
@@ -521,7 +643,7 @@ export function createMeteredTransport(options: {
         await finish(
           dispatched && !transportJoined
             ? 'unknown'
-            : requestSignal.aborted
+            : callerSignal.aborted
               ? 'canceled'
               : 'failed',
         );

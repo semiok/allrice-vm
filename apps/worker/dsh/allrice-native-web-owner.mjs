@@ -416,6 +416,11 @@ async function observePromptOrigins(
 const nativeToolBodyClaims = new Map();
 const witnessedNativeTools = new WeakSet();
 const publishedMemoryTools = new WeakMap();
+const hostMemoryTools = new WeakSet();
+const unknownMemoryCandidate = Object.freeze({
+  outcome: 'unknown',
+  text: 'Memory candidate outcome is unconfirmed. Do not retry. Check Pending memories before taking further action.',
+});
 
 // Only the exact, sealed registration may opt in. A successful around-dispatch
 // result, on its own, cannot mark entry into the registered implementation.
@@ -437,7 +442,11 @@ export function withNativeToolEvidence(tool, version) {
 
 // The future sealed memory registration must use this wrapper around the
 // actual implementation. Merely returning from a waterfall cannot authorize it.
-export function withNativeMemoryToolPublication(tool, version) {
+export function withNativeMemoryToolPublication(
+  tool,
+  version,
+  executeInHost = false,
+) {
   if (
     !['mcp__allrice__memory_read', 'mcp__allrice__memory_remember'].includes(
       tool.name,
@@ -455,16 +464,63 @@ export function withNativeMemoryToolPublication(tool, version) {
       const ref = await nativeToolBodyClaims.get(exec.token)?.(
         wrapped,
         version,
+        args,
       );
       exec.signal.throwIfAborted();
-      if (typeof ref !== 'string')
+      if (
+        executeInHost ? typeof ref?.text !== 'string' : typeof ref !== 'string'
+      )
         throw Error('Native memory call unavailable');
       return execute(args, exec, ref);
     },
   };
   witnessedNativeTools.add(wrapped);
   publishedMemoryTools.set(wrapped, version);
+  if (executeInHost) hostMemoryTools.add(wrapped);
   return wrapped;
+}
+
+export function installNativeMemoryTools(scope, definitions) {
+  if (
+    !Array.isArray(definitions) ||
+    definitions.length !== 2 ||
+    definitions[0]?.id !== 'memory_read' ||
+    definitions[1]?.id !== 'memory_remember'
+  )
+    throw Error('Invalid native memory tool configuration');
+  const names = new Set(definitions.map(({ id }) => 'mcp__allrice__' + id));
+  for (const { id, version, description, parameters } of definitions)
+    scope.tools.register(
+      withNativeMemoryToolPublication(
+        {
+          name: 'mcp__allrice__' + id,
+          description,
+          parameters,
+          output: {
+            schema: { type: 'string' },
+            render: (_ctx, text) => [{ type: 'text', text }],
+          },
+          execute(_args, _exec, result) {
+            return result.text;
+          },
+        },
+        version,
+        true,
+      ),
+    );
+  scope.on(
+    'system-prompt/assemble',
+    async (_assembly, context, next) => {
+      const prompt = await next();
+      if (context.agent && isNativeOrdinaryRoot(context.agent.session.header))
+        return prompt;
+      return {
+        ...prompt,
+        tools: prompt.tools.filter(({ name }) => !names.has(name)),
+      };
+    },
+    { global: true, prepend: true },
+  );
 }
 
 function readMemoryToolVersions(scope, session, toolSchemas, selected) {
@@ -941,7 +997,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
       attempt.dispatched.add(exec.callId);
       let sealedVersion;
       if (nativeToolBodyClaims.has(exec.token)) return next();
-      nativeToolBodyClaims.set(exec.token, (wrapped, version) => {
+      nativeToolBodyClaims.set(exec.token, (wrapped, version, args) => {
         if (
           wrapped !== definition ||
           sealedVersion ||
@@ -954,6 +1010,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
         sealedVersion = version;
         if (publishedMemoryTools.has(wrapped)) {
           const toolId = wrapped.name.slice('mcp__allrice__'.length);
+          const inHost = hostMemoryTools.has(wrapped);
           if (
             !currentMemoryTools(attempt.memoryToolWitness) ||
             attempt.memoryTools?.[toolId] !== wrapped
@@ -965,6 +1022,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
             claimed.messageId !== attempt.human.occurrence.messageId
           )
             return false;
+          const remember = inHost && toolId === 'memory_remember';
+          if (remember && observer.rememberOutcomeUnknown)
+            return unknownMemoryCandidate;
           return observer
             .publishMemoryCall(
               {
@@ -980,7 +1040,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 dispatch: { kind: 'sealed-handler', version },
               },
               exec.signal,
+              inHost ? { value: args } : undefined,
             )
+            .catch(() => null)
             .then((ref) => {
               if (
                 capture() &&
@@ -988,8 +1050,13 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 attempts.get(session) === attempt &&
                 inboxClaims.get(session) === claimed &&
                 currentMemoryTools(attempt.memoryToolWitness)
-              )
+              ) {
+                if (remember && ref?.outcome !== 'result') {
+                  observer.rememberOutcomeUnknown = true;
+                  return unknownMemoryCandidate;
+                }
                 return ref;
+              }
               return null;
             });
         }
@@ -1094,11 +1161,18 @@ export function observeNativePrompts(scope, lifetime, capture) {
     if (value.action === 'memory-call-result') {
       const observer = observers.get(id);
       const ref = value.nativeRequestRef;
+      const result = value.result;
       if (
         observer?.key !== key ||
         (ref !== null &&
           (typeof ref !== 'string' || !ref || ref.length > 256)) ||
-        !observer.memoryReplies.get(value.ticket)?.(ref)
+        (result !== undefined &&
+          (ref !== null ||
+            !result ||
+            typeof result.text !== 'string' ||
+            (result.outcome !== 'result' && result.outcome !== 'unknown') ||
+            Buffer.byteLength(result.text) > 10_000)) ||
+        !observer.memoryReplies.get(value.ticket)?.(result ?? ref)
       )
         return notFound();
       return globalThis.Response.json({ accepted: true });
@@ -1151,11 +1225,15 @@ export function observeNativePrompts(scope, lifetime, capture) {
           handlerRecords: 0,
           registryResult: false,
           memoryReplies: new Map(),
-          async publishMemoryCall(fact, nativeSignal) {
+          rememberOutcomeUnknown: false,
+          async publishMemoryCall(fact, nativeSignal, argumentsFromTool) {
             if (value.memoryCalls !== true) return null;
             const ticket = randomUUID();
-            const frame = JSON.stringify({ ticket, fact });
-            if (Buffer.byteLength(frame) > 2500) return null;
+            const frame = JSON.stringify({ ticket, fact, argumentsFromTool });
+            if (
+              Buffer.byteLength(frame) > (argumentsFromTool ? 24 * 1024 : 2500)
+            )
+              return null;
             const active = globalThis.AbortSignal.any([
               nativeSignal,
               signal,
@@ -1784,6 +1862,8 @@ export function applyNativeWebOwner(
           if (scoped && typeof select !== 'function')
             throw Error('Native managed model policy is unavailable');
           const promptFacts = observeNativePrompts(scope, signal, current);
+          if (modelAdapter.memoryTools !== undefined)
+            installNativeMemoryTools(scope, modelAdapter.memoryTools);
           const delegations = observeDelegatedInputs(
             scope,
             modelAdapter.webSearchEnabled ? promptFacts.claimed : undefined,

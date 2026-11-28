@@ -1,3 +1,9 @@
+import { createFileArchive } from '@allrice/file-archives';
+import type {
+  ModelCallBinding,
+  GatewayModelInput,
+} from '../../../../packages/model-gateway/src/contract.ts';
+import { createProductionFileMentionContext } from '../../../worker/src/person-vm/production-file-mentions.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -12,11 +18,17 @@ import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
-import { brandMediaModule, brandMediaRelease } from '@allrice/contracts';
+import {
+  brandMediaModule,
+  brandMediaRelease,
+  encodeEmployeeFileMention,
+  type EmployeeFileMentionPin,
+} from '@allrice/contracts';
 import {
   DataAccessError,
   addEmployeeInstanceModule,
   createChatSession,
+  createEmployeeInstance,
   ensureDEntryNativeRoot,
   readDEntryEmployeeDirectory,
   requireDEntryNativeIdentity,
@@ -1872,6 +1884,340 @@ suite(
           signal(),
         ),
       ).toMatchObject({ status: 'unknown', result: null });
+    });
+    function modelCall(
+      p: Awaited<ReturnType<typeof person>>,
+      threadId: string,
+    ) {
+      return {
+        provider: 'deepseek',
+        context: p.context,
+        employeeInstanceId: p.selection.employeeInstanceId,
+        employeeRelease: p.versionId,
+        allriceThreadRef: threadId,
+      } as ModelCallBinding;
+    }
+    function referenceMessage(threadId: string, pin: EmployeeFileMentionPin) {
+      const id = randomUUID() as NonNullable<
+        GatewayModelInput['messages'][number]['id']
+      >;
+      return [
+        {
+          id,
+          role: 'user',
+          source: { kind: 'user' },
+          content: [
+            {
+              type: 'text',
+              text:
+                'Read this file.\n' +
+                encodeEmployeeFileMention({
+                  threadId,
+                  label: 'Fixture file',
+                  pin,
+                }),
+            },
+          ],
+        },
+      ] satisfies GatewayModelInput['messages'];
+    }
+    function fileMentions(
+      storage: Parameters<typeof createProductionFileMentionContext>[0],
+    ) {
+      const read = createProductionFileMentionContext(storage);
+      return (
+        call: ModelCallBinding,
+        messages: GatewayModelInput['messages'],
+        active: AbortSignal,
+        adopted = new Set(messages.flatMap(({ id }) => (id ? [id] : []))),
+      ) => read(call, messages, adopted, active);
+    }
+    it('rechecks a sealed file quote after queued publication withdrawal and denies other employees and organizations before reading bytes', async () => {
+      const p = await person();
+      const other = await person();
+      const peer = await createEmployeeInstance(p.context, {
+        workspaceId: p.selection.workspaceId,
+        assignmentId: p.selection.employeeInstanceId,
+        requestId: randomUUID(),
+        profile: { name: 'Another employee under the same person' },
+      });
+      await release(p, other);
+      const thread = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const foreignThread = await createChatSession(
+        other.context,
+        other.selection,
+        { executionGeneration: '4.0' },
+      );
+      const text = 'original-model-excerpt-' + randomUUID();
+      const source = await p.client.uploadDeliverable(
+        uploadInput(p, 'record.txt', text),
+        signal(),
+      );
+      const published = await p.client.publishFile(
+        {
+          workspaceId: p.selection.workspaceId,
+          origin: 'file',
+          objectId: source.objectId,
+          requestId: randomUUID(),
+          purpose: 'Fixed private document',
+          audience: { scope: 'personal', departmentIds: [] },
+        },
+        signal(),
+      );
+      await processed(published.revisionId, text);
+      const { selection } = await p.client.selectMaterial(
+        {
+          workspaceId: p.selection.workspaceId,
+          revisionId: published.revisionId,
+        },
+        signal(),
+      );
+      const pin = {
+        kind: 'material' as const,
+        sourceId: selection.sourceId,
+        revisionId: selection.revisionId,
+        revision: selection.revision,
+        digest: selection.digest,
+        checksum: selection.checksum,
+      };
+      const storage = runtimeFixtureStorage(f.db);
+      const get = vi.fn(storage.get.bind(storage));
+      const read = fileMentions({ get });
+      const call = modelCall(p, thread.id);
+      const messages = referenceMessage(thread.id, pin);
+      await expect(
+        read({ ...call, employeeInstanceId: peer.id }, messages, signal()),
+      ).rejects.toThrow();
+      await expect(
+        read(
+          modelCall(other, foreignThread.id),
+          referenceMessage(foreignThread.id, pin),
+          signal(),
+        ),
+      ).rejects.toThrow();
+      expect(get).not.toHaveBeenCalled();
+      const [quoted] = messages;
+      const later = {
+        ...quoted!,
+        id: randomUUID() as NonNullable<
+          GatewayModelInput['messages'][number]['id']
+        >,
+        content: [
+          {
+            type: 'text' as const,
+            text: 'A later input in the same native turn.',
+          },
+        ],
+      };
+      const coalesced = [quoted!, later];
+      const prepared = await read(call, coalesced, signal());
+      expect(prepared?.messages[1]).toEqual(later);
+      expect(
+        await read(call, coalesced, signal(), new Set([later.id])),
+      ).toBeUndefined();
+
+      expect(JSON.stringify(messages)).not.toContain(text);
+      expect(JSON.stringify(prepared?.messages)).toContain(text);
+      const dispatch = vi.fn(async () => {});
+      await prepared!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      dispatch.mockClear();
+      const catalog = await p.client.queryMaterials(
+        { workspaceId: p.selection.workspaceId, query: {} },
+        signal(),
+      );
+      const row = catalog.references.find(
+        ({ revisionId }) => revisionId === published.revisionId,
+      )!;
+      await p.client.changePublication(
+        {
+          sourceId: published.sourceId,
+          body: {
+            workspaceId: p.selection.workspaceId,
+            requestId: randomUUID(),
+            expectedRevision: row.publication!.audienceRevision,
+            action: 'revoke',
+          },
+        },
+        signal(),
+      );
+      await expect(
+        prepared!.withCurrent(signal(), undefined, dispatch),
+      ).rejects.toThrow();
+      expect(dispatch).not.toHaveBeenCalled();
+      await expect(read(call, messages, signal())).rejects.toThrow();
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+    it('reads an unprocessed original PDF delivery on its first call without a reference-library copy', async () => {
+      const p = await person();
+      await release(p);
+      const thread = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const marker = 'FIRST_NATIVE_PDF';
+      const stream = 'BT /F1 12 Tf 40 100 Td (' + marker + ') Tj ET';
+      const objects = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>',
+        `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream.replace('FIRST', 'LATER')}\nendstream`,
+      ];
+      let pdf = '%PDF-1.4\n';
+      const offsets = objects.map((object, i) => {
+        const offset = Buffer.byteLength(pdf);
+        pdf += `${i + 1} 0 obj\n${object}\nendobj\n`;
+        return offset;
+      });
+      const xref = Buffer.byteLength(pdf);
+      pdf +=
+        'xref\n0 8\n0000000000 65535 f \n' +
+        offsets
+          .map((offset) => String(offset).padStart(10, '0') + ' 00000 n \n')
+          .join('') +
+        `trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+      const bytes = Buffer.from(pdf);
+      const { objectId } = await p.client.uploadDeliverable(
+        {
+          ...uploadInput(p, 'first.pdf'),
+          mediaType: 'application/pdf',
+          contentBase64: bytes.toString('base64'),
+        },
+        signal(),
+      );
+      await f.db`insert into allrice_deliverable_versions
+        (id,organization_id,workspace_id,owner_id,object_id,series_id,version,session_id,file_name,format)
+        values (${randomUUID()},${p.context.organizationId},${p.selection.workspaceId},${p.context.actor.id},
+        ${objectId},${randomUUID()},1,${thread.id},'first.pdf','pdf')`;
+      const read = fileMentions(runtimeFixtureStorage(f.db));
+      const pin = {
+        kind: 'deliverable' as const,
+        objectId,
+        checksum: 'sha256:' + createHash('sha256').update(bytes).digest('hex'),
+      };
+      const prepared = await read(
+        modelCall(p, thread.id),
+        referenceMessage(thread.id, pin),
+        signal(),
+      );
+      expect(JSON.stringify(prepared?.messages)).toContain(marker);
+      expect(JSON.stringify(prepared?.messages)).not.toContain(
+        'LATER_NATIVE_PDF',
+      );
+      const added = prepared!.messages[0]!.content.at(-1);
+      if (added?.type !== 'text') throw Error('Missing file reference content');
+      const next = JSON.parse(added.text.slice(added.text.indexOf('{'))).next;
+      expect(typeof next).toBe('string');
+      const nextPage = await read(
+        modelCall(p, thread.id),
+        [
+          {
+            ...prepared!.messages[0]!,
+            content: [{ type: 'text', text: next }],
+          },
+        ],
+        signal(),
+      );
+      expect(JSON.stringify(nextPage?.messages)).toContain('LATER_NATIVE_PDF');
+      expect(JSON.stringify(nextPage?.messages)).not.toContain(marker);
+
+      const dispatch = vi.fn(async () => {});
+      await prepared!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      const [copies] =
+        await f.db`select count(*)::int as count from allrice_knowledge_revisions where organization_id=${p.context.organizationId}`;
+      expect(copies?.count).toBe(0);
+      const published = await p.client.publishUpload(
+        {
+          ...uploadInput(p, 'unprocessed-material.pdf'),
+          mediaType: 'application/pdf',
+          contentBase64: bytes.toString('base64'),
+          origin: 'upload',
+          purpose: '',
+          audience: { scope: 'personal', departmentIds: [] },
+        },
+        signal(),
+      );
+      const materials = await p.client.queryMaterials(
+        { workspaceId: p.selection.workspaceId, query: {} },
+        signal(),
+      );
+      const fixed = materials.references.find(
+        (row) => row.revisionId === published.revisionId,
+      )!;
+      expect(fixed.processing).toBe('saved');
+      expect(fixed.fullTextReady).toBe(false);
+      const quotedMaterial = await read(
+        modelCall(p, thread.id),
+        referenceMessage(thread.id, {
+          kind: 'material',
+          sourceId: fixed.sourceId,
+          revisionId: fixed.revisionId,
+          revision: fixed.revision,
+          digest: fixed.manifestDigest,
+          checksum: fixed.checksum,
+        }),
+        signal(),
+      );
+      expect(JSON.stringify(quotedMaterial?.messages)).toContain(marker);
+      await quotedMaterial!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(2);
+    });
+    it('lists the validated directory of an owned ZIP delivery without exposing member text', async () => {
+      const p = await person();
+      await release(p);
+      const thread = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const bytes = await createFileArchive([
+        {
+          path: 'quarter/notes.txt',
+          bytes: Buffer.from('unexpanded member body'),
+        },
+      ]);
+      const { objectId } = await p.client.uploadDeliverable(
+        {
+          ...uploadInput(p, 'evidence.zip'),
+          mediaType: 'application/zip',
+          contentBase64: Buffer.from(bytes).toString('base64'),
+        },
+        signal(),
+      );
+      await f.db`insert into allrice_deliverable_versions
+        (id,organization_id,workspace_id,owner_id,object_id,series_id,version,session_id,file_name,format)
+        values (${randomUUID()},${p.context.organizationId},${p.selection.workspaceId},${p.context.actor.id},
+        ${objectId},${randomUUID()},1,${thread.id},'evidence.zip','zip')`;
+      const catalog = await p.client.listDeliverables(
+        {
+          workspaceId: p.selection.workspaceId,
+          category: 'artifact',
+          mention: true,
+        },
+        signal(),
+      );
+      expect(catalog.quotableFileIds).toContain(objectId);
+      const read = fileMentions(runtimeFixtureStorage(f.db));
+      const pin = {
+        kind: 'deliverable' as const,
+        objectId,
+        checksum: 'sha256:' + createHash('sha256').update(bytes).digest('hex'),
+      };
+      const prepared = await read(
+        modelCall(p, thread.id),
+        referenceMessage(thread.id, pin),
+        signal(),
+      );
+      expect(JSON.stringify(prepared?.messages)).toContain('quarter/notes.txt');
+      expect(JSON.stringify(prepared?.messages)).not.toContain(
+        'unexpanded member body',
+      );
+      const dispatch = vi.fn(async () => {});
+      await prepared!.withCurrent(signal(), undefined, dispatch);
+      expect(dispatch).toHaveBeenCalledTimes(1);
     });
     it('uploads independent same-name files, favorites all employees, publishes a fixed copy and rejects its exact selection after revoke without B/MCP/VM', async () => {
       const p = await person();
