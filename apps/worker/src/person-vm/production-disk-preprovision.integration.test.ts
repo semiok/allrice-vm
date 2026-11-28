@@ -230,6 +230,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       prepared: ReturnType<typeof vi.fn<ScannerInput['port']['prepare']>>;
       outcomes: string[];
       previousFeedClosed: boolean[];
+      rosterReturnedAfterEof: boolean[];
       settledReadsAtFeedOpen: number[];
     }) => Promise<void>,
     holdQualification = false,
@@ -269,7 +270,15 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
         },
       };
     });
-    const readRoster = vi.fn(readPersonVmDiskPreparationRoster);
+    const rosterReturnedAfterEof: boolean[] = [];
+    const readRoster = vi.fn<ScannerInput['readRoster']>(async (signal) => {
+      const roster = await readPersonVmDiskPreparationRoster(signal);
+      const peer = reads.peers.at(-1);
+      rosterReturnedAfterEof.push(
+        Boolean(peer?.upstreamEnded || peer?.upstreamClosed),
+      );
+      return roster;
+    });
     const prepared = vi.fn<ScannerInput['port']['prepare']>(
       async (target, guard) => {
         expect(target).toMatchObject({
@@ -312,6 +321,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
         prepared,
         outcomes,
         previousFeedClosed,
+        rosterReturnedAfterEof,
         settledReadsAtFeedOpen,
       });
     } catch (error) {
@@ -345,6 +355,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     ['idle', 'disconnect'],
     ['startup', 'close'],
     ['listen', 'close'],
+    ['idle', 'close'],
   ] as const)(
     'joins the %s notification socket on %s',
     async (phase, action) => {
@@ -396,11 +407,41 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
           await f.owner.close();
           await closed(f.feed.peers[1]!);
         }
+        expect(f.rosterReturnedAfterEof).toEqual(
+          Array.from({ length: f.rosterReturnedAfterEof.length }, () => true),
+        );
         expect(await fixture.db`select 1 as ok`).toEqual([{ ok: 1 }]);
       });
     },
     20_000,
   );
+
+  it('handles qualification cancellation in the same turn as opening the connection', async () => {
+    const reads = await relay(databaseUrl);
+    vi.stubEnv('DATABASE_URL', reads.url.toString());
+    try {
+      const cancellation = new AbortController();
+      const reading = readPersonVmDiskPreparationTarget(
+        personId,
+        cancellation.signal,
+      );
+      cancellation.abort(Error('qualification cancelled'));
+      await expect(reading).rejects.toBeInstanceOf(Error);
+      await expect(reading).rejects.not.toHaveProperty(
+        'code',
+        'CLEANUP_INCOMPLETE',
+      );
+      expect(reads.peers.length).toBeLessThanOrEqual(1);
+      await Promise.all(reads.peers.map(closed));
+    } finally {
+      try {
+        await reads.close();
+        await client.closeDatabase();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    }
+  }, 20_000);
 
   it('closes a fresh qualification connection during its first SQL response', async () => {
     await withScanner(

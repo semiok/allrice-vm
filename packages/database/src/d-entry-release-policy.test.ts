@@ -66,46 +66,48 @@ function fixture(
   instances = [instance()],
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
-  const sql = vi.fn(
-    async (strings: TemplateStringsArray, ...params: unknown[]) => {
-      const query = strings.join('?');
-      seen.push({ query, params });
-      if (
-        query.startsWith('begin ') ||
-        query.includes('set local transaction_timeout') ||
-        query === 'commit'
-      )
-        return [];
-      if (query.includes('from allrice_settings')) {
-        return [
-          {
-            value: JSON.stringify({
-              revision: 'revision-1',
-              defaultGeneration,
-              selections,
-            }),
-          },
-        ];
-      }
-      if (query.includes('from person_virtual_machines')) return vm;
-      if (query.includes('join allrice_audit_events audit'))
-        return [{ verified: tenantVersionVerified }];
-      if (query.includes('from allrice_employee_instances')) {
-        const [organizations, ownerId] = params as [string, string];
-        return instances
-          .filter(
-            (row) =>
-              organizations.split(',').includes(row.organization_id) &&
-              row.owner_id === ownerId,
-          )
-          .map((row) => ({
-            ...row,
-            platform_version: platformVersion,
-          }));
-      }
-      throw Error('Unexpected fixture query');
-    },
-  );
+  const query = async (strings: TemplateStringsArray, ...params: unknown[]) => {
+    const query = strings.join('?');
+    seen.push({ query, params });
+    if (
+      query.startsWith('begin ') ||
+      query.includes('set local transaction_timeout') ||
+      query === 'commit'
+    )
+      return [];
+    if (query.includes('from allrice_settings')) {
+      return [
+        {
+          value: JSON.stringify({
+            revision: 'revision-1',
+            defaultGeneration,
+            selections,
+          }),
+        },
+      ];
+    }
+    if (query.includes('from person_virtual_machines')) return vm;
+    if (query.includes('join allrice_audit_events audit'))
+      return [{ verified: tenantVersionVerified }];
+    if (query.includes('from allrice_employee_instances')) {
+      const [organizations, ownerId] = params as [string, string];
+      return instances
+        .filter(
+          (row) =>
+            organizations.split(',').includes(row.organization_id) &&
+            row.owner_id === ownerId,
+        )
+        .map((row) => ({
+          ...row,
+          platform_version: platformVersion,
+        }));
+    }
+    throw Error('Unexpected fixture query');
+  };
+  const sql = vi.fn((...args: Parameters<typeof query>) => {
+    const result = query(...args);
+    return Object.assign(result, { execute: () => result });
+  });
   let socketClosed!: () => void;
   const end = vi.fn(async () => socketClosed());
   data.getDatabase.mockReturnValue({ options: { fetch_types: true } });
@@ -204,8 +206,10 @@ it('resolves the released person’s employee from the same snapshot as policy, 
     organizationId: org,
     workspaceId: workspace,
   };
-  expect(data.principal).toHaveBeenCalledExactlyOnceWith(subject, sql);
-  expect(data.employee).toHaveBeenCalledExactlyOnceWith(subject, first, sql);
+  const scope = data.principal.mock.calls[0]?.[1] as typeof sql;
+  expect(scope.mock).toBe(sql.mock);
+  expect(data.principal).toHaveBeenCalledExactlyOnceWith(subject, scope);
+  expect(data.employee).toHaveBeenCalledExactlyOnceWith(subject, first, scope);
 });
 
 it('requires a writable current membership and a live assignment', async () => {
@@ -342,8 +346,10 @@ it('requires an exact, still published platform source without rejecting tenant-
       employeeId: assignedEmployee,
       versionId: version,
     },
-    sql,
+    data.principal.mock.calls[0]?.[1],
   );
+  const scope = data.publication.mock.calls[0]?.[1] as typeof sql;
+  expect(scope.mock).toBe(sql.mock);
 
   data.publication.mockClear();
   data.employee.mockResolvedValueOnce({

@@ -301,9 +301,13 @@ async function readDiskPreparation<T>(
   try {
     // Start on the only connection before reserving it. postgres.js 3.4.9
     // does not finish a cold reserve when type discovery is disabled.
-    await (mode === 'read only'
-      ? client`begin read only`
-      : client`begin isolation level repeatable read read only`);
+    const begin =
+      mode === 'read only'
+        ? client`begin read only`
+        : client`begin isolation level repeatable read read only`;
+    // Enqueue the initial operation before an abort in this same turn can
+    // end the otherwise unused pool and leave no socket event to join.
+    await begin.execute();
     active.throwIfAborted();
     // A lost session may never continue this transaction on a new socket.
     const sql = new Proxy(await client.reserve(), {
