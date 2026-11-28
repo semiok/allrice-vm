@@ -277,7 +277,7 @@ async function readDiskPreparation<T>(
     },
   });
   const close = () =>
-    (closing ??= (async () => {
+    (closing ??= Promise.resolve().then(async () => {
       await client.end({ timeout: 0 });
       // The end timeout can initiate a half-close. Join the driver's actual
       // socket-close event before the scanner may finish or replace its feed.
@@ -294,7 +294,7 @@ async function readDiskPreparation<T>(
       } finally {
         deadline.abort();
       }
-    })());
+    }));
   const abort = () => void close().catch(() => {});
   active.addEventListener('abort', abort, { once: true });
   let result: T;

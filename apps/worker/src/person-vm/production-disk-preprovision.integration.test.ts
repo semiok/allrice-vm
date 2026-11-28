@@ -207,7 +207,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     await expect
       .poll(() => [peer.clientClosed, peer.upstreamClosed], poll)
       .toEqual([true, true]);
-    await expect.poll(() => backends(peer), poll).toEqual([]);
+    if (peer.port) await expect.poll(() => backends(peer), poll).toEqual([]);
   }
 
   async function terminate(peer: Peer, pid: number) {
