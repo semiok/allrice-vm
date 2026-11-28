@@ -95,13 +95,13 @@ it('issues a read-only warm startup hint for the exact current rooted selection'
   entryContext.mockResolvedValue(f.context);
   historyIdentity.mockResolvedValue(f.identity);
   entryRoot.mockImplementation(() => f.root());
-  entryDiscovery.mockImplementation(() =>
-    Response.json({
-      identity: f.identity,
-      controlReady: true,
-      bindingRef: f.owner.bindingRef,
-    }),
-  );
+  const discovery = {
+    identity: f.identity,
+    controlReady: true,
+    bindingRef: f.owner.bindingRef,
+    receipt: f.owner.receipt,
+  };
+  entryDiscovery.mockImplementation(() => Response.json(discovery));
   const render = () =>
     EntryPage({ searchParams: Promise.resolve(f.selection) });
   expect((await render()).props.warmIdentity).toEqual(f.identity);
@@ -110,11 +110,11 @@ it('issues a read-only warm startup hint for the exact current rooted selection'
     'native-owner',
   );
   entryDiscovery.mockImplementationOnce(() =>
-    Response.json({
-      identity: f.identity,
-      controlReady: false,
-      bindingRef: f.owner.bindingRef,
-    }),
+    Response.json({ ...discovery, controlReady: false }),
+  );
+  expect((await render()).props.warmIdentity).toBeUndefined();
+  entryDiscovery.mockImplementationOnce(() =>
+    Response.json({ ...discovery, receipt: { binding: { vmId: 'old-vm' } } }),
   );
   expect((await render()).props.warmIdentity).toBeUndefined();
 });

@@ -1,4 +1,5 @@
-import { headers } from 'next/headers';
+import { cookies, headers } from 'next/headers';
+import { z } from 'zod';
 import { redirect } from 'next/navigation';
 import {
   DEntryNativeDiscoverySchema,
@@ -15,16 +16,22 @@ import {
   findDEntryEmployee,
 } from '../../../lib/d-entry/entry-threads';
 import { readStartupProfileAssetUrls } from '../../../lib/d-entry/released-profile-assets';
-import { currentNativeRequest } from '../../../lib/d-entry/native-request';
 import {
   readDEntryWorkerJson,
   requestDEntryWorker,
 } from '../../../lib/d-entry/native-worker';
-import { getRequestContext } from '../../../lib/identity/session';
+import {
+  getRequestContext,
+  sessionCookieName,
+} from '../../../lib/identity/session';
 import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
+
+const warmEntryDiscoverySchema = DEntryNativeDiscoverySchema.extend({
+  receipt: z.object({ binding: z.object({ vmId: z.string().min(1) }) }),
+}).strip();
 
 async function readWarmEntry(query: URLSearchParams) {
   const selection = DEntrySelectionInputSchema.safeParse(
@@ -36,31 +43,46 @@ async function readWarmEntry(query: URLSearchParams) {
     [...query.keys()].some((key) => query.getAll(key).length !== 1)
   )
     return;
+  const cancellation = new AbortController();
+  const { signal } = cancellation;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const request = new Request('http://localhost/chatflow/4.0', {
-      headers: await headers(),
-      signal: AbortSignal.timeout(1_500),
+    const deadline = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        cancellation.abort();
+        resolve(undefined);
+      }, 1_500);
     });
-    const context = await getRequestContext(request);
-    if (!context) return;
-    const input = await currentNativeRequest(request, selection.data, context);
-    const [root, discovery] = await Promise.all([
-      getDEntryNativeRootPin(context, selection.data),
-      requestDEntryWorker(input, 'native-owner').then((response) =>
-        readDEntryWorkerJson(response, (value) =>
-          DEntryNativeDiscoverySchema.strip().parse(value),
+    const discover = async () => {
+      const request = new Request('http://localhost/chatflow/4.0', {
+        headers: await headers(),
+        signal,
+      });
+      const context = await getRequestContext(request);
+      const token = (await cookies()).get(sessionCookieName)?.value;
+      signal.throwIfAborted();
+      if (!context || !token) return;
+      const input = { context, token, selection: selection.data, signal };
+      const [root, discovery] = await Promise.all([
+        getDEntryNativeRootPin(context, selection.data),
+        requestDEntryWorker(input, 'native-owner').then((response) =>
+          readDEntryWorkerJson(response, warmEntryDiscoverySchema.parse),
         ),
-      ),
-    ]);
-    // Discovery is read-only. The socket must still own and admit the page.
-    if (
-      discovery.controlReady &&
-      sameDEntryIdentity(discovery.identity, input.identity) &&
-      sameDEntryIdentity(root.identity, input.identity)
-    )
-      return input.identity;
+      ]);
+      // The probe cannot start an employee VM. The socket still owns admission.
+      if (
+        discovery.controlReady &&
+        discovery.receipt.binding.vmId === root.vmId &&
+        sameDEntryIdentity(discovery.identity, root.identity)
+      )
+        return root.identity;
+    };
+    return await Promise.race([discover(), deadline]);
   } catch {
     // Cold or unavailable: start through the regular browser prewarm path.
+  } finally {
+    clearTimeout(timer);
+    cancellation.abort();
   }
 }
 
