@@ -165,8 +165,14 @@ describe('P26 History selection async control flow (synthetic fetch, explicit ho
       const workspaceId = '10000000-0000-4000-8000-000000000001';
       const sourceId = '10000000-0000-4000-8000-000000000002';
       const revisionId = '10000000-0000-4000-8000-000000000003';
+      const organizationId = '10000000-0000-4000-8000-000000000004';
       const link = new URL(
-        referencePublicationLink(workspaceId, sourceId, revisionId),
+        referencePublicationLink(
+          workspaceId,
+          sourceId,
+          revisionId,
+          organizationId,
+        ),
       );
       expect(link.pathname).toBe('/chatflow');
       if (ambiguous) link.searchParams.append('workspaceId', sourceId);
@@ -176,6 +182,9 @@ describe('P26 History selection async control flow (synthetic fetch, explicit ho
         ambiguous
           ? '/api/v1/workspace'
           : `/api/v1/workspace?workspaceId=${workspaceId}`,
+      );
+      expect(requests[0]?.init?.headers).toEqual(
+        ambiguous ? undefined : { 'x-allrice-organization-id': organizationId },
       );
       requests[0]?.result.resolve(Response.json({ workspace }));
       requests[1]?.result.resolve(Response.json({ capabilities: {} }));

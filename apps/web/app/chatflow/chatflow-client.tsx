@@ -763,6 +763,8 @@ export function ChatFlowClient({
     currentModuleRequest?.kind === 'workflow'
       ? currentModuleRequest
       : undefined;
+  const currentPublicationRequest =
+    currentModuleRequest?.kind === 'materials' && !!currentModuleRequest.id;
   const currentReferenceSourceRequest =
     currentModuleRequest?.kind === 'reference' &&
     !!currentModuleRequest.id?.startsWith('citation:');
@@ -772,7 +774,8 @@ export function ChatFlowClient({
       !!currentMemoryRequest ||
       !!currentSubagentRequest ||
       !!currentCapabilityRequest ||
-      currentReferenceSourceRequest) &&
+      currentReferenceSourceRequest ||
+      currentPublicationRequest) &&
     layout.open;
   const openAutomationTask = (
     task: { id: string; name?: string },
@@ -925,14 +928,15 @@ export function ChatFlowClient({
   };
   const referenceLinkHandled = useRef('');
   useEffect(() => {
+    if (!workspace || referenceLinkHandled.current === settingsScope) return;
+    const location = readReferencePublicationLocation();
     if (
-      !workbenchEnabled ||
-      !workspace ||
-      referenceLinkHandled.current === settingsScope
+      !location ||
+      location.workspaceId !== workspace.workspaceId ||
+      (location.organizationId &&
+        location.organizationId !== workspace.organizationId)
     )
       return;
-    const location = readReferencePublicationLocation();
-    if (!location || location.workspaceId !== workspace.workspaceId) return;
     referenceLinkHandled.current = settingsScope;
     setModuleRequest((previous) => ({
       scope: fileScope,
@@ -941,7 +945,7 @@ export function ChatFlowClient({
       id: `${location.sourceId}/${location.revisionId}`,
     }));
     workbench.show(undefined, true);
-  }, [workbenchEnabled, workspace, settingsScope, fileScope, workbench.show]);
+  }, [workspace, settingsScope, fileScope, workbench.show]);
   useEffect(() => {
     if (
       !workbenchEnabled ||
@@ -3439,7 +3443,8 @@ export function ChatFlowClient({
         currentMemoryRequest ||
         currentSubagentRequest ||
         currentCapabilityRequest ||
-        currentReferenceSourceRequest) &&
+        currentReferenceSourceRequest ||
+        currentPublicationRequest) &&
       hasWorkbenchContent ? (
         <ArtifactWorkbench
           personalDeliverables
@@ -3562,7 +3567,7 @@ export function ChatFlowClient({
                   sessionId={activeId}
                   headers={tenantHeaders}
                   active={active}
-                  readOnly={conversationReadOnly || busy}
+                  readOnly={!workbenchEnabled || conversationReadOnly || busy}
                   initialReference={
                     currentModuleRequest?.kind === 'materials' &&
                     currentModuleRequest.id

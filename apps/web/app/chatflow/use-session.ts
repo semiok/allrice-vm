@@ -194,7 +194,15 @@ export function useSession({ setError }: UseSessionOptions) {
           new URLSearchParams({ workspaceId: publication.workspaceId })
         : '/api/v1/workspace';
       const [workspaceResult, capabilityResult] = await Promise.all([
-        fetch(workspaceUrl, { cache: 'no-store', signal }).then((response) => {
+        fetch(workspaceUrl, {
+          cache: 'no-store',
+          signal,
+          ...(publication?.organizationId && {
+            headers: {
+              'x-allrice-organization-id': publication.organizationId,
+            },
+          }),
+        }).then((response) => {
           signal?.throwIfAborted();
           return readJson<{ workspace: Workspace }>(response);
         }),

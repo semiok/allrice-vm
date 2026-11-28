@@ -345,7 +345,12 @@ export function EnterpriseMaterialsPanel(props: {
   async function copy(r: ReferenceRevision) {
     try {
       await navigator.clipboard.writeText(
-        referencePublicationLink(props.workspaceId, r.sourceId, r.revisionId),
+        referencePublicationLink(
+          props.workspaceId,
+          r.sourceId,
+          r.revisionId,
+          props.headers['x-allrice-organization-id'],
+        ),
       );
       if (current.current === identity && active.current) {
         const notice = '链接已复制，查看仍需资料访问权限';

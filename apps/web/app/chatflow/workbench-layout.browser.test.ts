@@ -15623,11 +15623,14 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       );
       expect(link.searchParams.has('file')).toBe(false);
       expect(link.pathname).toBe('/chatflow');
+      expect(link.searchParams.get('organizationId')).toBe(org);
+      link.searchParams.set('disabled', '1');
       const linkedWorkspace = f.page.waitForRequest((request) => {
         const url = new URL(request.url());
         return (
           url.pathname === '/api/v1/workspace' &&
-          url.searchParams.get('workspaceId') === workspace
+          url.searchParams.get('workspaceId') === workspace &&
+          request.headers()['x-allrice-organization-id'] === org
         );
       });
       await f.page.goto(link.href);

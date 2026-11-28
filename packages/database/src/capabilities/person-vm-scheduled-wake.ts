@@ -235,6 +235,8 @@ export async function readPersonVmEmployeeInstructions(
   sql = getDatabase(),
 ) {
   return sql.begin('isolation level repeatable read read only', async (tx) => {
+    // Like the wake scan, keep a blocked read from holding the Worker drain.
+    await tx`set local statement_timeout = '2s'`;
     if (!(await readPersonVmWakeRoster(tx, binding, [employee])))
       throw new PersonVmError('AUTHORIZATION_DENIED');
     const [row] = await tx<
