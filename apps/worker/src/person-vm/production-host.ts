@@ -966,9 +966,6 @@ export function createProductionPersonVmHost(input: {
             active.throwIfAborted();
             return renderEmployeeInstructions(profile);
           },
-          scheduleGuardMs: getIdleScheduleGuardMs(
-            providers.configuration.lifecycle,
-          ),
         },
         configuration: {
           ...providers.configuration.web,

@@ -1,4 +1,57 @@
 import type { readPersonVmEmployeeInstructions } from '@allrice/database';
+import { composeEntries } from '@deepseek-ai/dsh-app-boot';
+import { PersonVmError } from '@allrice/person-vm';
+import { nativeWebBundlePatches } from './search-tools.js';
+
+/** The Web bundle applies both global and per-Agent persona defaults. Apply
+ * its public preset configuration after the existing route and tool patches. */
+export function nativeEmployeePersonaPatches(
+  overlays: Parameters<typeof composeEntries>[0][number],
+) {
+  const entries = composeEntries([...nativeWebBundlePatches(), overlays]);
+  const instructions = entries.find(
+    ({ id, name }) =>
+      id === 'agent-instructions' &&
+      name === '@deepseek-ai/dsh-agent-instructions',
+  );
+  if (!instructions) throw new PersonVmError('PROVIDER_FAILED');
+  return entries.flatMap((preset) => {
+    if (preset.name !== '@deepseek-ai/dsh-agent-preset' || !preset.id)
+      return [];
+    const plugins = preset.config?.plugins as
+      | { id?: string; name: string; config?: Record<string, unknown> }[]
+      | undefined;
+    if (!plugins?.some((plugin) => plugin.name === '@deepseek-ai/dsh-persona'))
+      return [];
+    return [
+      {
+        id: preset.id,
+        config: {
+          ...preset.config,
+          plugins: [
+            ...plugins.map((plugin) =>
+              plugin.name === '@deepseek-ai/dsh-persona'
+                ? {
+                    ...plugin,
+                    config: { ...plugin.config, prefix: '', complete: false },
+                  }
+                : plugin,
+            ),
+            ...(plugins.some((plugin) => plugin.name === instructions.name)
+              ? []
+              : [
+                  {
+                    id: instructions.id,
+                    name: instructions.name,
+                    config: instructions.config,
+                  },
+                ]),
+          ],
+        },
+      },
+    ];
+  });
+}
 
 const styles = {
   concise: '结论优先，简洁表达，保留必要的依据。',

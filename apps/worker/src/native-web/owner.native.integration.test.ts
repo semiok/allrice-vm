@@ -1129,9 +1129,13 @@ it.skipIf(!cli)(
       '先核实交付标准 {{保留字面}}',
     );
     expect(JSON.stringify(assistantInputs[1]!.messages)).toContain('整理交付');
-    for (const { system, tools } of assistantInputs) {
-      expect(system).not.toContain('AI agent powered by DeepSeek Harness');
-      expect(system).not.toContain('You are a coding agent');
+    for (const { system, messages, tools } of assistantInputs) {
+      const modelContext = JSON.stringify({ system, messages });
+      expect(modelContext).not.toContain(
+        'AI agent powered by DeepSeek Harness',
+      );
+      expect(modelContext).not.toContain('You are a coding agent');
+      expect(modelContext).not.toContain('You are ChatGPT');
       expect(tools?.length).toBeGreaterThan(0);
     }
     expect(assistantInputs[1]!.messages).toEqual(

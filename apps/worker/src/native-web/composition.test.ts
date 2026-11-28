@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
+import { ScheduleId } from '@deepseek-ai/dsh-schedule';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import type {
   PersonVmBootstrapScope,
   PersonVmGuestLaunchDispatch,
@@ -209,13 +211,50 @@ function capacityFixture(
     },
   };
 }
+it('joins each employee profile read before reporting a failed cold plan', async () => {
+  const queried = latch(),
+    release = latch();
+  const refusal = new PersonVmError('AUTHORIZATION_DENIED');
+  const f = fixture(undefined, undefined, {
+    employeeInstructions: {
+      read: vi
+        .fn()
+        .mockRejectedValueOnce(refusal)
+        .mockImplementationOnce(async () => {
+          queried.resolve();
+          await release.promise;
+          return 'fixture instructions';
+        }),
+    },
+  });
+  let settled = false;
+  const plan = f.service.memoryGuestPlan(f.binding, signal(), f.web);
+  void plan.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  try {
+    await queried.promise;
+    await new Promise<void>((done) => setImmediate(done));
+    expect(settled).toBe(false);
+  } finally {
+    release.resolve();
+    await expect(plan).rejects.toBe(refusal);
+    await f.service.close();
+  }
+  expect(f.scope.launch).not.toHaveBeenCalled();
+});
+
 it('replaces only the idle employee owner after a committed profile revision', async () => {
   const f = capacityFixture(createProductionEmployeeRuntime({}, 20)!, {
     read: vi.fn(
       async (_binding, endpoint) =>
         `employee ${endpoint.employeeInstanceId} revision ${endpoint.employeeRevision}`,
     ),
-    scheduleGuardMs: 30_000,
   });
   const [first, sibling] = f.web.receipt.endpoints;
   const revised = { ...first!, employeeRevision: first!.employeeRevision + 1 };
@@ -224,7 +263,20 @@ it('replaces only the idle employee owner after a committed profile revision', a
   const previous = {
     ...catalogOwner(),
     nativeActivityRevision: vi.fn(() => 0),
-    readScheduleCatalog: vi.fn(async () => []),
+    readScheduleCatalog: vi.fn<NativeWebOwner['readScheduleCatalog']>(
+      async () => [
+        {
+          id: ScheduleId('persona-schedule'),
+          sessionId: SessionId('original'),
+          title: 'Fixture schedule',
+          prompt: 'Fixture reminder',
+          kind: 'every',
+          everySeconds: 60,
+          status: 'active',
+          scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      ],
+    ),
     readNativeActivity: vi.fn(async () => ({
       complete: true,
       work: new Set<string>(),
@@ -266,6 +318,17 @@ it('replaces only the idle employee owner after a committed profile revision', a
   );
   await f.service.start(f.binding, signal(), f.scope, web);
   try {
+    const [schedule] = await previous.readScheduleCatalog(
+      async () => {},
+      signal(),
+    );
+    previous.readScheduleCatalog.mockResolvedValueOnce([
+      { ...schedule!, scheduledAt: new Date(Date.now() + 1000).toISOString() },
+    ]);
+    await expect(f.enroll(revised)).rejects.toMatchObject({
+      code: 'WEB_ENDPOINTS_PREPARING',
+    });
+    expect(previous.close).not.toHaveBeenCalled();
     previous.readNativeActivity.mockResolvedValueOnce({
       complete: false,
       work: new Set(['turn']),
@@ -276,7 +339,7 @@ it('replaces only the idle employee owner after a committed profile revision', a
     expect(previous.close).not.toHaveBeenCalled();
     const change = f.enroll(revised);
     try {
-      await draining.promise;
+      await Promise.race([draining.promise, change]);
       expect(f.bootstrap).not.toHaveBeenCalled();
       expect(() =>
         f.service.catalog(f.binding, first!.employeeInstanceId),

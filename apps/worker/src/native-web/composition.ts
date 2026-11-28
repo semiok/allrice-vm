@@ -132,7 +132,6 @@ export function createAssignedNativeWebStartup(input: {
       employee: PersonVmWebRoster['entries'][number],
       signal: AbortSignal,
     ): Promise<string>;
-    scheduleGuardMs: number;
   }>;
   configuration: Pick<
     NativeWebConfiguration,
@@ -603,19 +602,21 @@ export function createAssignedNativeWebStartup(input: {
         const model = await modelAdapter?.(binding, signal);
         current(binding, web);
         signal.throwIfAborted();
-        const launches = await Promise.all(
-          cold.endpoints.map(async (endpoint) => ({
+        const preparing = cold.endpoints.map(async (endpoint) => ({
+          endpoint,
+          launch: await prepareEmployee(
+            binding,
             endpoint,
-            launch: await prepareEmployee(
-              binding,
-              endpoint,
-              profile,
-              memory,
-              signal,
-              model,
-            ),
-          })),
-        );
+            profile,
+            memory,
+            signal,
+            model,
+          ),
+        }));
+        const launches = await Promise.all(preparing).catch(async (error) => {
+          await Promise.allSettled(preparing);
+          throw error;
+        });
         current(binding, web);
         signal.throwIfAborted();
         const selectedThreadId = model?.scoped ? web.editorThreadId : undefined;
@@ -1158,8 +1159,9 @@ export function createAssignedNativeWebStartup(input: {
               !activity.complete ||
               activity.work.size ||
               revision !== existing.nativeActivityRevision() ||
-              (next !== null &&
-                next <= Date.now() + instructions.scheduleGuardMs)
+              // Principal close and exact native job cancellation each use
+              // the owner cleanup budget. The VM remains mounted throughout.
+              (next !== null && next <= Date.now() + 2 * input.cleanupTimeoutMs)
             )
               throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
             await retireEmployee(group, prior, existing, () =>
