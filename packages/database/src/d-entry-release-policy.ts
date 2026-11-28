@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type postgres from 'postgres';
 import { z } from 'zod';
 import {
@@ -33,6 +33,31 @@ const disabledPolicy = {
   selections: [],
 };
 
+async function readStoredReleasePolicy(
+  sql: ReturnType<typeof getDatabase> | postgres.TransactionSql,
+  lock = false,
+) {
+  // A missing settings row cannot serialize with the first publication.
+  if (lock)
+    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
+  const [row] = await sql<
+    { value: string }[]
+  >`select value::text as value from allrice_settings
+    where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
+    ${lock ? sql`for share` : sql``}`;
+  return row?.value ?? JSON.stringify(disabledPolicy);
+}
+
+function parsePublishedPolicy(value: string) {
+  const parsed = DEntryRolloutPolicySchema.safeParse(JSON.parse(value));
+  if (parsed.success && parsed.data.defaultGeneration === '3.x')
+    return parsed.data;
+}
+
+function recoveryRevision(value: string) {
+  return `repair:${createHash('sha256').update(value).digest('hex')}`;
+}
+
 /** Internal host read; callers establish current session/employee authority.
  * Missing configuration is the explicitly approved default-off policy. Invalid
  * stored configuration fails closed rather than silently changing a thread. */
@@ -40,26 +65,19 @@ export async function readDEntryReleasePolicy(
   sql: ReturnType<typeof getDatabase> | postgres.TransactionSql = getDatabase(),
   lock = false,
 ) {
-  // A missing settings row cannot serialize with the first publication.
-  if (lock)
-    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
-  const [row] = await sql`select value from allrice_settings
-    where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
-    ${lock ? sql`for share` : sql``}`;
-  const parsed = DEntryRolloutPolicySchema.safeParse(
-    row?.value ?? disabledPolicy,
-  );
-  if (!parsed.success || parsed.data.defaultGeneration !== '3.x')
-    throw new Error('D entry published policy is unavailable');
-  return parsed.data;
+  const policy = parsePublishedPolicy(await readStoredReleasePolicy(sql, lock));
+  if (!policy) throw new Error('D entry published policy is unavailable');
+  return policy;
 }
 
 export async function getDEntryReleasePolicy(context: RequestContext) {
   const db = getDatabase();
   await requireCurrentPlatformAdmin(context, db, false);
-  const policy = await readDEntryReleasePolicy(db);
+  const stored = await readStoredReleasePolicy(db);
+  const policy = parsePublishedPolicy(stored);
   await requireCurrentPlatformAdmin(context, db, false);
-  return policy;
+  // The repair revision is only accepted by the full platform replacement.
+  return policy ?? { ...disabledPolicy, revision: recoveryRevision(stored) };
 }
 
 /** Published by the same platform-admin authority as native_question_mode.
@@ -77,22 +95,13 @@ export async function updateDEntryReleasePolicy(
     const actor = await requireCurrentPlatformAdmin(context, tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
     await requireCurrentPlatformAdmin(context, tx, false);
-    const [stored] = await tx`select value from allrice_settings
-      where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}`;
-    const previous = DEntryRolloutPolicySchema.safeParse(
-      stored?.value ?? disabledPolicy,
-    );
-    const current =
-      previous.success && previous.data.defaultGeneration === '3.x'
-        ? previous.data
-        : undefined;
+    const stored = await readStoredReleasePolicy(tx);
+    const current = parsePublishedPolicy(stored);
     if (options.compareRevision) {
-      if (!current) throw new Error('D entry published policy is unavailable');
-      if (current.revision !== parsed.revision)
+      if ((current?.revision ?? recoveryRevision(stored)) !== parsed.revision)
         throw new DEntryPersonRolloutConflict();
     }
-    // A valid replacement submitted without CAS can repair an unreadable
-    // policy. Check every candidate selection as a new release in that case.
+    // An unreadable policy has no trusted selections to carry forward.
     const settingId = await writeReleasePolicy(
       tx,
       actor,

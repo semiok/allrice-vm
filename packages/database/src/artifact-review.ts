@@ -1006,38 +1006,50 @@ export async function inspectTenantRunArtifacts(
       join allrice_chat_sessions s on s.id=e.session_id and s.organization_id=e.organization_id and s.workspace_id=e.workspace_id and s.owner_id=e.owner_id
       where e.run_id=${runId} and e.organization_id=${target.organizationId} and e.workspace_id=${target.workspaceId} and e.owner_id=${target.subjectId}`;
     if (!run) fail('artifact_not_found');
-    const rows = await artifactRows(
-      tx,
-      {
-        organizationId: target.organizationId,
-        workspaceId: target.workspaceId,
-        ownerId: target.subjectId,
-      },
-      run.session_id,
-      artifactId,
-      51,
-      undefined,
-      runId,
-      false,
-      { businessOnly: true, lockObjects: false },
-    );
+    const scope = {
+      organizationId: target.organizationId,
+      workspaceId: target.workspaceId,
+      ownerId: target.subjectId,
+    };
     const visible = [];
-    for (const row of rows) {
-      const artifact = mapArtifact(row);
-      if (!isBusinessDeliverable(artifact.kind, artifact.provenance.kind))
-        continue;
-      const access = await workbenchFileAccess(issuer, artifact.object.id, tx);
-      if (!access || access.canRead)
-        visible.push({
-          ...artifact,
-          version: { ...artifact.version, changeSummary: null },
-          provenance: {
-            kind: artifact.provenance.kind,
-            runId: artifact.provenance.runId,
-            operationId: artifact.provenance.operationId,
-            stepId: artifact.provenance.stepId,
-          },
-        });
+    let before: { createdAt: string; id: string } | undefined;
+    while (visible.length < 51) {
+      const rows = await artifactRows(
+        tx,
+        scope,
+        run.session_id,
+        artifactId,
+        artifactId ? 1 : 51,
+        before,
+        runId,
+        false,
+        { businessOnly: true, lockObjects: false },
+      );
+      for (const row of rows) {
+        const artifact = mapArtifact(row);
+        if (!isBusinessDeliverable(artifact.kind, artifact.provenance.kind))
+          continue;
+        const access = await workbenchFileAccess(
+          issuer,
+          artifact.object.id,
+          tx,
+        );
+        if (!access || access.canRead)
+          visible.push({
+            ...artifact,
+            version: { ...artifact.version, changeSummary: null },
+            provenance: {
+              kind: artifact.provenance.kind,
+              runId: artifact.provenance.runId,
+              operationId: artifact.provenance.operationId,
+              stepId: artifact.provenance.stepId,
+            },
+          });
+        if (visible.length === 51) break;
+      }
+      const last = rows.at(-1);
+      if (artifactId || rows.length < 51 || !last) break;
+      before = { createdAt: last.cursor_created_at, id: last.id };
     }
     if (artifactId && !visible.length) fail('artifact_not_found');
     await requireTenantInspectionScope(issuer, target, tx);

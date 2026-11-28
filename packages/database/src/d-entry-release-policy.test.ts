@@ -74,11 +74,11 @@ function fixture(
       if (query.includes('from allrice_settings')) {
         return [
           {
-            value: {
+            value: JSON.stringify({
               revision: 'revision-1',
               defaultGeneration,
               selections,
-            },
+            }),
           },
         ];
       }

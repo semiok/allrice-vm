@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   UuidSchema,
   type RuntimeRunUsage,
@@ -154,9 +155,21 @@ function mapAdministrativeRuntimeEvent(row: DshRuntimeEventRow) {
           ? String(payload.status)
           : 'info';
   const id = `${row.run_id}:${row.sequence}`;
+  const callId =
+    kind === 'tool' || kind === 'search'
+      ? row.event_type === 'harness.native'
+        ? safeRecord(payload.nativePayload).callId
+        : payload.toolCallId
+      : null;
+  const key =
+    typeof callId === 'string' && callId.trim() && callId.length <= 160
+      ? `${row.run_id}:tool:${createHash('sha256')
+          .update(JSON.stringify([payload.source, callId]))
+          .digest('hex')}`
+      : id;
   return {
     id,
-    key: id,
+    key,
     runId: row.run_id,
     sequence: row.sequence,
     kind,

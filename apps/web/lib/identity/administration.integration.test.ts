@@ -22,7 +22,11 @@ import {
   GET as rollout,
   PUT as change,
 } from '../../app/api/v1/admin/d-entry-release-policy/person/route';
-import { PUT as replaceRollout } from '../../app/api/v1/admin/d-entry-release-policy/route';
+import {
+  GET as bulkRollout,
+  PUT as replaceRollout,
+} from '../../app/api/v1/admin/d-entry-release-policy/route';
+import { projectRuntimeTimelineEvents } from '../../app/runtime-console/runtime-timeline';
 
 const cookie = vi.hoisted(() => ({ token: '' }));
 vi.mock('next/headers', () => ({
@@ -429,6 +433,16 @@ integration('MET-288 live administration HTTP contract', () => {
     };
     await fixture.db`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
       values(${organizationId},${workspaceId},${runId},${seq!.next},'harness.native',${fixture.db.json(event)})`;
+    const toolRecord = {
+      source: 'tool_broker',
+      name: 'PRIVATE_TOOL_NAME',
+      toolCallId: 'PRIVATE_TOOL_CALL',
+      summary: 'PRIVATE_TOOL_OUTPUT',
+    };
+    const next = Number(seq!.next) + 1;
+    await fixture.db`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
+      values(${organizationId},${workspaceId},${runId},${next},'tool.started',${fixture.db.json(toolRecord)}),
+      (${organizationId},${workspaceId},${runId},${next + 1},'tool.completed',${fixture.db.json(toolRecord)})`;
     await fixture.db`update allrice_chat_sessions set title='PRIVATE_SESSION_TITLE' where id=${sessionId}`;
     const dashboard = await activity(
       request(
@@ -497,6 +511,12 @@ integration('MET-288 live administration HTTP contract', () => {
     expect(JSON.stringify(body)).not.toMatch(
       /PRIVATE_TOOL|Synthetic research goal|Synthetic finished report/,
     );
+    const projected = projectRuntimeTimelineEvents(turn.events).filter(
+      ({ sequence }) => sequence >= next,
+    );
+    expect(projected).toMatchObject([
+      { sequence: next, status: 'completed', kind: 'tool', detail: null },
+    ]);
     expect(
       (await eventsRead(member.token, sessionId, organizationId)).status,
     ).toBe(403);
@@ -577,15 +597,20 @@ integration('MET-288 live administration HTTP contract', () => {
         provenanceKind: 'project_snapshot',
       },
     );
-    const restricted = await tenant.createArtifact(
-      runId,
-      'PRIVATE_FILE',
-      undefined,
-    );
+    const restrictedFiles = [];
+    for (let i = 0; i < 51; i++) {
+      restrictedFiles.push(
+        (await tenant.createArtifact(runId, `PRIVATE_FILE_${i}`, undefined))
+          .artifactId,
+      );
+    }
+    const restricted = { artifactId: restrictedFiles[0]! };
+    await fixture.db`update allrice_deliverable_versions set created_at='2001-01-01'
+      where id=${tenant.artifact.artifactId}`;
     await fixture.db`insert into allrice_workbench_file_policies
       (object_id,organization_id,workspace_id,owner_id,file_name,scope)
       select object_id,organization_id,workspace_id,owner_id,file_name,'personal'
-      from allrice_deliverable_versions where id=${restricted.artifactId}`;
+      from allrice_deliverable_versions where id=any(${restrictedFiles}::uuid[])`;
     const read = (artifactId?: string) =>
       validation(
         request(
@@ -609,6 +634,7 @@ integration('MET-288 live administration HTTP contract', () => {
       tenant.artifact.artifactId,
     ]);
     expect(body.artifacts[0].version.changeSummary).toBeNull();
+    expect(body.artifactsTruncated).toBe(false);
     expect(JSON.stringify(body)).not.toContain('PRIVATE_IMAGE_EDIT_PROMPT');
     const company = (query: Record<string, string> = {}) =>
       deliverables(
@@ -638,5 +664,52 @@ integration('MET-288 live administration HTTP contract', () => {
       ).toBe(404);
       expect((await company({ before: artifact.artifactId })).status).toBe(404);
     }
+  });
+
+  it('allows only a revision-matched platform replacement of unreadable rollout data', async () => {
+    const path = '/d-entry-release-policy';
+    const corrupt = (value: string) =>
+      fixture.db`insert into allrice_settings(scope_type,key,value)
+        values('system','d_entry_rollout_policy',${value}::text::jsonb)
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    const replace = (revision: string) =>
+      replaceRollout(
+        new Request(api + path, {
+          method: 'PUT',
+          headers: { origin, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            revision,
+            defaultGeneration: '3.x',
+            selections: [],
+          }),
+        }),
+      );
+    await corrupt('{"private":"PRIVATE_ROLLOUT","integer":9007199254740992}');
+    await expect(readDEntryReleasePolicy()).rejects.toThrow(
+      'D entry published policy is unavailable',
+    );
+    expect((await bulkRollout(request(path, manager.token))).status).toBe(403);
+    const read = await bulkRollout(request(path, operator.token));
+    expect(read.status).toBe(200);
+    const first = await read.json();
+    expect(first).toEqual({
+      revision: expect.stringMatching(/^repair:[a-f0-9]{64}$/),
+      defaultGeneration: '3.x',
+      selections: [],
+    });
+    await corrupt('{"private":"PRIVATE_ROLLOUT","integer":9007199254740993}');
+    expect((await replace(first.revision)).status).toBe(409);
+    const latest = await (
+      await bulkRollout(request(path, operator.token))
+    ).json();
+    expect(latest.revision).not.toBe(first.revision);
+    const repaired = await replace(latest.revision);
+    expect(repaired.status).toBe(200);
+    const updated = await repaired.json();
+    expect(await readDEntryReleasePolicy()).toEqual(updated);
+    expect(updated.revision).not.toMatch(/^repair:/);
+    const [audit] = await fixture.db`select actor_id from allrice_audit_events
+      where action='d_entry_release.update' and metadata->>'revision'=${updated.revision}`;
+    expect(audit?.actor_id).toBe(operator.id);
   });
 });
