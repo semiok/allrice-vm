@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { arch, platform } from 'node:os';
 import {
   basename,
   dirname,
@@ -16,7 +17,10 @@ import {
   PlatformPersonVmPolicySchema,
   readPlatformPersonVmConfiguration,
 } from '@allrice/contracts';
-import { checkedReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
+import {
+  checkedReadonlyCommandMemoryDirectory,
+  LinuxSnapshotConfigurationSchema,
+} from '@allrice/person-vm';
 import { z } from 'zod';
 import { resolveProductionEmployeeRuntimeSettings } from './production-employee-runtime.js';
 
@@ -70,6 +74,7 @@ const destinationIp = z.string().refine((value) => {
 const configuration = z
   .object({
     version: z.literal(1),
+    linuxSnapshot: LinuxSnapshotConfigurationSchema,
     native: z
       .object({
         binary: absolute,
@@ -282,6 +287,21 @@ const configuration = z
           '/node_modules/@deepseek-ai/dsh/lib/bin.js'
     )
       return false;
+    const snapshot = value.linuxSnapshot;
+    if (
+      snapshot.enabled &&
+      [
+        ...roots,
+        value.native.readonlyDshDirectory.hostDirectory,
+        value.native.readonlyCommandMemoryDirectory.hostDirectory,
+      ].some(
+        (root) =>
+          root === snapshot.templateDirectory ||
+          root.startsWith(snapshot.templateDirectory + sep) ||
+          snapshot.templateDirectory.startsWith(root + sep),
+      )
+    )
+      return false;
     return roots.every((root, i) =>
       roots.every(
         (other, j) =>
@@ -313,6 +333,11 @@ export async function readProductionHostConfiguration(signal: AbortSignal) {
     const sealed = await readSealedPersonVmHostConfiguration(build, signal);
     if (!sealed) unavailable();
     const value = configuration.parse(sealed.configuration);
+    if (
+      value.linuxSnapshot.enabled &&
+      (platform() !== 'linux' || arch() !== 'arm64')
+    )
+      unavailable();
     const defaults = readPlatformPersonVmConfiguration();
     signal.throwIfAborted();
     const memoryMiB = value.memory.policy.physicalBytes / bytesPerMiB;

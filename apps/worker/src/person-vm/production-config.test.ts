@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
+import type * as os from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as turn } from 'node:timers/promises';
@@ -23,7 +24,16 @@ import { createProductionEmployeeRuntime } from './production-employee-runtime.j
 const source = vi.hoisted<{
   build: ReturnType<typeof vi.fn>;
   opened?: (file: FileHandle) => void;
+  host?: { platform: NodeJS.Platform; arch: NodeJS.Architecture };
 }>(() => ({ build: vi.fn() }));
+vi.mock('node:os', async (original) => {
+  const actual = await original<typeof os>();
+  return {
+    ...actual,
+    platform: () => source.host?.platform ?? actual.platform(),
+    arch: () => source.host?.arch ?? actual.arch(),
+  };
+});
 vi.mock('node:fs/promises', async (original) => {
   const actual = await original<typeof fs>();
   return {
@@ -50,6 +60,16 @@ const hash = '1'.repeat(64);
 let root: string, originalArgv: string[];
 let build: ServiceBuildIdentity;
 const signal = () => new AbortController().signal;
+function snapshot(templateDirectory = join(root, 'templates', hash)) {
+  return {
+    enabled: true,
+    mode: 'probe',
+    platform: 'linux/arm64',
+    engine: 'microsandbox',
+    templateDirectory,
+    manifestSha256: hash,
+  };
+}
 function value() {
   return {
     version: 1,
@@ -218,6 +238,7 @@ beforeEach(async () => {
   await seal();
 });
 afterEach(async () => {
+  source.host = undefined;
   process.argv = originalArgv;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -230,7 +251,10 @@ describe('private production Host configuration', () => {
     await seal({ ...original, employeePortSlots: width });
     const result = await readProductionHostConfiguration(signal());
     expect(result.platform.employeePortSlots).toBe(width);
-    expect(result.configuration).toEqual(original);
+    expect(result.configuration).toEqual({
+      ...original,
+      linuxSnapshot: { enabled: false },
+    });
     expect(result.employeeRuntimeSettings).toEqual({
       employeeMaxRunning: Math.min(4, width),
       employeeIdleMs: 1_200_000,
@@ -298,7 +322,10 @@ describe('private production Host configuration', () => {
       await seal({ ...original, employeePortSlots: width });
       const result = await readProductionHostConfiguration(signal());
       expect(result.platform.employeePortSlots).toBe(20);
-      expect(result.configuration).toEqual(original);
+      expect(result.configuration).toEqual({
+        ...original,
+        linuxSnapshot: { enabled: false },
+      });
       expect(warn.mock.calls).toEqual([
         [
           '[person-vm.host-configuration]',
@@ -323,6 +350,54 @@ describe('private production Host configuration', () => {
     expect((await read()).configuration.disk.preprovision).toEqual({
       enabled: false,
     });
+  });
+
+  it('keeps the optional snapshot probe off for legacy and explicitly disabled macOS seals', async () => {
+    source.host = { platform: 'darwin', arch: 'arm64' };
+    const read = () => readProductionHostConfiguration(signal());
+    expect((await read()).configuration.linuxSnapshot).toEqual({
+      enabled: false,
+    });
+    await seal({ ...value(), linuxSnapshot: { enabled: false } });
+    expect((await read()).configuration.linuxSnapshot).toEqual({
+      enabled: false,
+    });
+  });
+
+  it('accepts the private sealed Linux ARM64 probe configuration', async () => {
+    source.host = { platform: 'linux', arch: 'arm64' };
+    const linuxSnapshot = snapshot();
+    await seal({ ...value(), linuxSnapshot });
+    expect(
+      (await readProductionHostConfiguration(signal())).configuration
+        .linuxSnapshot,
+    ).toEqual(linuxSnapshot);
+  });
+
+  it.each([
+    { platform: 'darwin', arch: 'arm64' },
+    { platform: 'linux', arch: 'x64' },
+  ] satisfies (typeof source.host)[])(
+    'rejects a Linux probe on a mismatched host (%j)',
+    async (host) => {
+      source.host = host;
+      await seal({ ...value(), linuxSnapshot: snapshot() });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
+
+  it('refuses a template inside the retained personal disk root', async () => {
+    source.host = { platform: 'linux', arch: 'arm64' };
+    const config = value();
+    await seal({
+      ...config,
+      linuxSnapshot: snapshot(join(config.disk.root, hash)),
+    });
+    await expect(
+      readProductionHostConfiguration(signal()),
+    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
   });
 
   it('requires a positive floor and reserve before accepting an enabled disk configuration', async () => {
@@ -497,7 +572,10 @@ describe('private production Host configuration', () => {
 
   it('reads only exact measured bytes after the original build verifier succeeds', async () => {
     const result = await readProductionHostConfiguration(signal());
-    expect(result.configuration).toEqual(value());
+    expect(result.configuration).toEqual({
+      ...value(),
+      linuxSnapshot: { enabled: false },
+    });
     expect(result.platform).toBe(readPlatformPersonVmConfiguration());
     expect(result.configuration.memory.policy.physicalBytes).toBe(
       result.platform.memoryMiB * 1024 ** 2,

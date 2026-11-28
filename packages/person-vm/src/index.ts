@@ -67,6 +67,18 @@ export type {
   PersonVmResourcePort,
 } from './resource-contract.ts';
 export { createPersonVmResourcePort } from './resource-watch.ts';
+export {
+  LinuxSnapshotConfigurationSchema,
+  PersonVmTemplateManifestSchema,
+  type OwnedWorkDiskReceipt,
+  type PersonVmTemplateManifest,
+  type PersonVmTemplatePort,
+  type RestoredCompute,
+  type TemplateRestoreRequest,
+  type TemplateSeal,
+  type TemplateStopReceipt,
+  type VerifiedTemplate,
+} from './template-snapshot-contract.ts';
 
 export {
   createPersonVmCommandMemoryObserver,

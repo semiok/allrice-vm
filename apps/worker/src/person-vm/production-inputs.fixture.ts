@@ -38,6 +38,7 @@ export async function productionInputsFixture() {
   const platform = readPlatformPersonVmConfiguration();
   const configuration: ProductionHostConfiguration = {
     version: 1,
+    linuxSnapshot: { enabled: false },
     native: {
       ...native,
       artifactChecksums,
