@@ -1,0 +1,470 @@
+import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { sealTemplate } from './build.mjs';
+import { captureCreateArgs, cpuAbi, readNativeCheckpoint } from './capture.mjs';
+import { payloads, sha256 } from './capture-contract.mjs';
+import { assertEmptyGuest } from './guest-audit.mjs';
+import { verifyTemplate } from './verify.mjs';
+import { source as oci } from '../../person-vm-image/verify.mjs';
+
+const digest = 'a'.repeat(64);
+const dsh = '/opt/allrice/dsh/' + digest;
+const controls = '/opt/allrice/command-memory/' + digest;
+const cleanGuest = {
+  work: [],
+  privateEntries: [],
+  seeds: [],
+  inet: [],
+  unix: [],
+  swap: [],
+  pageSize: 4096,
+  mounts: [
+    { path: '/', type: 'ext4', flags: ['rw'] },
+    { path: '/work', type: 'virtiofs', flags: ['rw'] },
+    { path: dsh, type: 'ext4', flags: ['ro'] },
+    { path: controls, type: 'virtiofs', flags: ['ro'] },
+  ],
+  processes: [
+    { task: 'agent', cwd: '/', env: ['PATH'], fds: ['socket:[1]'] },
+    { task: 'audit', cwd: '/', env: ['PATH'], fds: ['pipe:[2]'] },
+  ],
+};
+const profile = { dsh, controls, pageSize: 4096 };
+const signal = () => globalThis.AbortSignal.timeout(5000);
+const host = {
+  kernel: '6.12.0',
+  cpuModel: 'arm64 pinned ABI',
+  cpuFeaturesSha256: digest,
+  kvmApiVersion: 12,
+  gic: 'v3',
+  pageSize: 4096,
+};
+const guest = {
+  vcpus: 2,
+  memoryMiB: 2048,
+  pageSize: 4096,
+  kernelSha256: digest,
+  workMount: 'strict-external-directory',
+  workPath: '/work',
+};
+const inputs = {
+  vmmSha256: digest,
+  firmwareSha256: digest,
+  agentdSha256: digest,
+  imageSha256: digest,
+  dshRuntimeDiskSha256: sha256('runtime.ext4'),
+  dshProfileSha256: digest,
+  commandMemorySha256: digest,
+  isolationPolicySha256: digest,
+};
+
+async function fixtures(t) {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'snapshot-build-'));
+  t.after(async () => {
+    for (const name of await readdir(join(root, 'sealed'))) {
+      await chmod(join(root, 'sealed', name), 0o700);
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+  const source = join(root, 'capture');
+  const output = join(root, 'sealed');
+  await mkdir(source, { mode: 0o700 });
+  await mkdir(output, { mode: 0o700 });
+  for (const path of Object.keys(payloads)) {
+    await writeFile(join(source, path), path, { mode: 0o444 });
+  }
+  const expected = {
+    host,
+    guest,
+    inputs,
+    deviceTopologySha256: sha256('device-topology.json'),
+  };
+  const receipt = {
+    version: 1,
+    mode: 'fixture',
+    boot: 'new-offline-public-oci',
+    cleanup: 'stopped-and-removed',
+    full: true,
+    integrityVerified: true,
+    engineVersion: '0.7.16',
+    host,
+    guest,
+    inputs,
+    deviceTopologySha256: expected.deviceTopologySha256,
+    preflight: {
+      kvmApi: 12,
+      reflink: true,
+      msbVersion: '0.7.16',
+      kernel: '6.12.0',
+      pageBytes: 4096,
+      dataUuid: 'a'.repeat(8) + '-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      scratchUuid: 'b'.repeat(8) + '-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      scratchLuksUuid: 'c'.repeat(8) + '-cccc-cccc-cccc-cccccccccccc',
+      dataDevice: '1:0',
+      scratchDevice: '2:0',
+    },
+    audit: assertEmptyGuest(cleanGuest, profile),
+    files: Object.entries(payloads).map(([path, role]) => ({
+      path,
+      role,
+      sha256: sha256(path),
+      sizeBytes: Buffer.byteLength(path),
+    })),
+  };
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const options = {
+    source,
+    output,
+    expected,
+    privateKey,
+    signal: signal(),
+    mode: 'fixture',
+    run: {
+      mode: 'fixture',
+      target: 'local-fixture',
+      id: 'synthetic-1',
+      commit: 'b'.repeat(40),
+      tree: 'c'.repeat(40),
+      seal: 'sha256:' + digest,
+    },
+    captureSha256: null,
+  };
+  async function save() {
+    const bytes = Buffer.from(JSON.stringify(receipt));
+    const path = join(source, 'capture.json');
+    await rm(path, { force: true });
+    await writeFile(path, bytes, { mode: 0o444 });
+    options.captureSha256 = sha256(bytes);
+  }
+  await save();
+  return { root, source, output, options, publicKey, receipt, save };
+}
+
+test('seals identical input deterministically and archives it as an offline fixture', async (t) => {
+  const f = await fixtures(t);
+  const first = await sealTemplate(f.options);
+  const other = join(f.root, 'other-seal');
+  await mkdir(other, { mode: 0o700 });
+  t.after(async () => {
+    try {
+      await chmod(join(other, first.seal.manifestSha256), 0o700);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  });
+  const second = await sealTemplate({ ...f.options, output: other });
+  assert.equal(second.seal.manifestSha256, first.seal.manifestSha256);
+  for (const name of ['manifest.json', 'manifest.sig']) {
+    assert.deepEqual(
+      await readFile(join(second.seal.templateDirectory, name)),
+      await readFile(join(first.seal.templateDirectory, name)),
+    );
+  }
+  await chmod(second.seal.templateDirectory, 0o700);
+  const verify = {
+    seal: first.seal,
+    expected: f.options.expected,
+    publicKey: f.publicKey,
+    publisherUid: process.getuid(),
+    signal: signal(),
+  };
+  await assert.rejects(
+    verifyTemplate(verify),
+    /missing build, integrity or cleanup proof/,
+  );
+  assert.deepEqual(
+    await verifyTemplate({ ...verify, captureMode: 'fixture' }),
+    first,
+  );
+  const index = JSON.parse(
+    await readFile(join(first.seal.templateDirectory, 'first-day-index.json')),
+  );
+  assert.equal(index.run.mode, 'fixture');
+  assert.deepEqual(
+    index.records.map(({ step, result }) => [step, result]),
+    [
+      ['preflight', 'pass'],
+      ['host', 'skip'],
+      ['single-vm', 'skip'],
+      ['workbench', 'skip'],
+      ['timing', 'skip'],
+      ['concurrency', 'skip'],
+      ['recovery', 'skip'],
+    ],
+  );
+  const receipt = await readFile(
+    join(first.seal.templateDirectory, index.records[0].artifact.file),
+  );
+  assert.equal(sha256(receipt), index.records[0].artifact.sha256);
+  await assert.rejects(sealTemplate(f.options), /already published/);
+  assert.deepEqual(await readdir(f.output), [first.seal.manifestSha256]);
+});
+
+test('competing publishers leave exactly one verified generation', async (t) => {
+  const f = await fixtures(t);
+  const results = await Promise.allSettled([
+    sealTemplate(f.options),
+    sealTemplate(f.options),
+  ]);
+  assert.equal(
+    results.filter(({ status }) => status === 'fulfilled').length,
+    1,
+  );
+  assert.equal((await readdir(f.output)).length, 1);
+});
+
+test('rejects receipt bytes different from the reviewer pin', async (t) => {
+  const f = await fixtures(t);
+  f.options.captureSha256 = digest;
+  await assert.rejects(sealTemplate(f.options), /receipt digest mismatch/);
+});
+
+test('refuses unconfirmed cleanup or a missing empty guest audit', async (t) => {
+  const f = await fixtures(t);
+  f.receipt.cleanup = 'unknown';
+  await f.save();
+  await assert.rejects(sealTemplate(f.options), /cleanup proof/);
+  f.receipt.cleanup = 'stopped-and-removed';
+  f.receipt.audit.noSeedFiles = false;
+  await f.save();
+  await assert.rejects(sealTemplate(f.options), /empty-guest audit/);
+  assert.deepEqual(await readdir(f.output), []);
+});
+
+test('refuses mismatched MSB, KVM, kernel, pages and data/scratch overlap', async (t) => {
+  const f = await fixtures(t);
+  const valid = { ...f.receipt.preflight };
+  for (const change of [
+    { msbVersion: '0.7.17' },
+    { kvmApi: 11 },
+    { kernel: '5.15.0' },
+    { pageBytes: 65536 },
+    { scratchDevice: valid.dataDevice },
+  ]) {
+    f.receipt.preflight = { ...valid, ...change };
+    await f.save();
+    await assert.rejects(
+      sealTemplate(f.options),
+      /ABI or scratch identity mismatch/,
+    );
+  }
+});
+
+test('refuses changed bytes, permissions, symlink, and trailing files before publication', async (t) => {
+  const f = await fixtures(t);
+  const file = join(f.source, 'execution.bin');
+  await chmod(file, 0o644);
+  await assert.rejects(sealTemplate(f.options), /link count or permissions/);
+  await writeFile(file, 'x'.repeat('execution.bin'.length));
+  await chmod(file, 0o444);
+  await assert.rejects(sealTemplate(f.options), /payload changed/);
+  await rm(file);
+  const outside = join(f.root, 'outside.bin');
+  await writeFile(outside, 'execution.bin', { mode: 0o444 });
+  await symlink(outside, file);
+  await assert.rejects(sealTemplate(f.options), { code: 'ELOOP' });
+  await writeFile(join(f.source, 'tail.json'), '{}');
+  await assert.rejects(
+    sealTemplate(f.options),
+    /trailing or missing capture file/,
+  );
+  assert.deepEqual(await readdir(f.output), []);
+});
+
+test('permits only empty writable work and public read-only mounts', () => {
+  assert.equal(assertEmptyGuest(cleanGuest, profile).workEmpty, true);
+  for (const [change, error] of [
+    [{ work: ['tenant'] }, /tenant directory/],
+    [{ privateEntries: ['/home/node/employee'] }, /tenant directory/],
+    [{ seeds: ['/var/lib/systemd/random-seed'] }, /seed or host key/],
+    [{ inet: ['0.0.0.0:8080'] }, /network listener/],
+    [{ unix: ['@private-app'] }, /network listener/],
+    [{ swap: ['/swap'] }, /active swap/],
+    [{ pageSize: 65536 }, /ABI page size/],
+    [
+      {
+        mounts: [
+          ...cleanGuest.mounts,
+          { path: '/home', type: 'virtiofs', flags: ['ro'] },
+        ],
+      },
+      /unexpected template mount/,
+    ],
+    [
+      {
+        processes: [
+          { ...cleanGuest.processes[0], fds: ['/work/file'] },
+          cleanGuest.processes[1],
+        ],
+      },
+      /open descriptor/,
+    ],
+    [
+      {
+        processes: [
+          { ...cleanGuest.processes[0], env: ['TENANT_SECRET'] },
+          cleanGuest.processes[1],
+        ],
+      },
+      /environment/,
+    ],
+  ]) {
+    assert.throws(
+      () => assertEmptyGuest({ ...cleanGuest, ...change }, profile),
+      error,
+    );
+  }
+});
+
+test('pins the local offline command arguments and all CPU cores', () => {
+  const args = captureCreateArgs({
+    runtimeDisk: '/input/runtime.ext4',
+    dsh,
+    controlsHost: '/input/controls',
+    controls,
+    work: '/scratch/empty',
+  });
+  assert.equal(args[args.indexOf('--pull') + 1], 'never');
+  assert.equal(args[args.indexOf('--net-default') + 1], 'deny');
+  assert.equal(args[args.indexOf('--mount-dir') + 1], '/scratch/empty:/work');
+  assert.equal(
+    args[args.indexOf('--mount-disk') + 1],
+    '/input/runtime.ext4:' + dsh + ':format=raw,fstype=ext4,ro',
+  );
+  assert.deepEqual(
+    args.filter((arg) => arg === '--port' || arg === '--net-rule'),
+    [],
+  );
+  const info = (id, features = 'fp asimd') =>
+    'processor: ' +
+    id +
+    '\nFeatures: ' +
+    features +
+    '\nCPU implementer: 0x41\nCPU architecture: 8\nCPU variant: 0x0\nCPU part: 0xd0c\nCPU revision: 1';
+  assert.deepEqual(cpuAbi(info(0) + '\n\n' + info(1, 'asimd fp')), {
+    cpuModel: '0x41/8/0x0/0xd0c/1',
+    cpuFeaturesSha256: sha256('asimd fp'),
+  });
+  assert.throws(
+    () => cpuAbi(info(0) + '\n\n' + info(1, 'asimd')),
+    /heterogeneous CPU ABI/,
+  );
+});
+
+test('reads the pinned checkpoint generations and rejects native capture ABI and object drift', async (t) => {
+  const root = await mkdtemp(
+    join(await realpath(tmpdir()), 'native-snapshot-fixture-'),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const checkpointRoot = join(root, 'checkpoint');
+  async function object(bytes) {
+    const hash = sha256(bytes);
+    const dir = join(checkpointRoot, 'objects/sha256', hash.slice(0, 2));
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, hash);
+    await writeFile(path, bytes);
+    return { id: 'sha256:' + hash, path };
+  }
+  const state = await object('VMM execution bytes');
+  const ram = await object(
+    JSON.stringify({
+      schema: 'microsandbox.memory/1',
+      architecture: 'aarch64',
+      guest_page_size: 4096,
+      pause_generation: 7,
+    }),
+  );
+  const disk = await object(
+    JSON.stringify({ layers: [{}], pause_generation: 7 }),
+  );
+  const geometry = {
+    vcpus: 2,
+    max_vcpus: 2,
+    memory_mib: 2048,
+    max_memory_mib: 2048,
+  };
+  const devices = [{ device_id: 'root', device_type: 2 }];
+  const topology = {
+    devices,
+    geometry: {
+      max_memory_mib: 2048,
+      max_vcpus: 2,
+      memory_mib: 2048,
+      vcpus: 2,
+    },
+    resources: [],
+  };
+  const expected = {
+    host,
+    guest,
+    inputs,
+    deviceTopologySha256: sha256(JSON.stringify(topology)),
+  };
+  const checkpoint = {
+    schema: 'microsandbox.checkpoint/1',
+    architecture: 'aarch64',
+    checkpoint_id: 'fixture',
+    pause_generation: 7,
+    execution_state: state.id,
+    memory: ram.id,
+    disks: [disk.id],
+    geometry,
+    resources: [],
+    devices,
+  };
+  const descriptor = {
+    schema: 'microsandbox.snapshot/1',
+    scope: 'checkpoint',
+    root_disk: { layout: 'flat' },
+    parent: null,
+    capture: {
+      source_lineage: 'allrice-public-template',
+      consistency: 'application-consistent',
+      source_checkpoint: 'fixture',
+    },
+    image: { reference: oci.baseImage, manifest_digest: 'sha256:' + digest },
+    state: { kind: 'checkpoint', checkpoint_id: 'fixture' },
+  };
+  async function save(options = {}) {
+    const bytes = Buffer.from(JSON.stringify({ ...checkpoint, ...options }));
+    descriptor.state.checkpoint_root = 'sha256:' + sha256(bytes);
+    await writeFile(join(checkpointRoot, 'checkpoint.json'), bytes);
+    await writeFile(join(root, 'snapshot.json'), JSON.stringify(descriptor));
+  }
+  await save();
+  const verified = await readNativeCheckpoint(root, expected, signal());
+  assert.equal(verified.execution, state.path);
+  assert.equal(verified.memoryPath, ram.path);
+  assert.equal(verified.rootDisk, disk.path);
+  for (const change of [
+    { architecture: 'x86_64' },
+    { owned_volumes: [{}] },
+    { disks: [disk.id, disk.id] },
+  ]) {
+    await save(change);
+    await assert.rejects(
+      readNativeCheckpoint(root, expected, signal()),
+      /ABI or resource closure/,
+    );
+  }
+  await save();
+  await writeFile(state.path, 'changed VMM bytes');
+  await assert.rejects(
+    readNativeCheckpoint(root, expected, signal()),
+    /object digest mismatch/,
+  );
+});

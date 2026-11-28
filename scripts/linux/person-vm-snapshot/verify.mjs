@@ -1,12 +1,13 @@
 import { createHash, verify } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { isDeepStrictEqual, TextDecoder } from 'node:util';
 import {
   LinuxSnapshotConfigurationSchema,
   PersonVmTemplateManifestSchema,
 } from '../../../packages/person-vm/src/template-snapshot-contract.ts';
+import { checkCaptureReceipt, firstDayIndex } from './capture-contract.mjs';
 
 const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const maxManifestBytes = 256 * 1024;
@@ -60,13 +61,25 @@ async function readSealedFile(path, publisherUid, signal, consume) {
 /** Offline readback of a publisher-owned template. The compatibility values
  * come from trusted build inputs and host preflight, independently of the manifest.
  * A later restore needs its own live ownership and mount proof. */
-export async function verifyTemplate({
-  seal: rawSeal,
-  publicKey,
-  expected,
-  publisherUid,
-  signal,
-}) {
+export async function verifyTemplate(options) {
+  return verifySealedDirectory(options);
+}
+
+/** A publisher stages the protected directory next to the final digest path,
+ * so rename changes only the name, even on filesystems with strict .. ACLs. */
+export async function verifyStagedTemplate(staged, options) {
+  requireEvidence(
+    dirname(staged) === dirname(options.seal.templateDirectory) &&
+      basename(staged).startsWith('.pending-'),
+    'unexpected staging path',
+  );
+  return verifySealedDirectory(options, staged);
+}
+
+async function verifySealedDirectory(
+  { seal: rawSeal, publicKey, expected, publisherUid, signal, captureMode },
+  staged,
+) {
   const seal = LinuxSnapshotConfigurationSchema.parse(rawSeal);
   requireEvidence(seal.enabled, 'probe seal required');
   requireEvidence(
@@ -78,7 +91,7 @@ export async function verifyTemplate({
     'publisher UID required',
   );
 
-  const root = seal.templateDirectory;
+  const root = staged ?? seal.templateDirectory;
   signal.throwIfAborted();
   requireEvidence((await realpath(root)) === root, 'unexpected real path');
   const rootStat = await lstat(root, { bigint: true });
@@ -127,6 +140,50 @@ export async function verifyTemplate({
   );
 
   const files = new Map(manifest.files.map((file) => [file.path, file]));
+  if (
+    captureMode ||
+    files.has('capture.json') ||
+    files.has('first-day-index.json')
+  ) {
+    async function readEvidence(path) {
+      const entry = files.get(path);
+      requireEvidence(
+        entry?.role === 'metadata',
+        'missing signed capture evidence',
+      );
+      return readSealedFile(
+        join(root, path),
+        publisherUid,
+        signal,
+        async (file, size) => {
+          requireEvidence(
+            size === BigInt(entry.sizeBytes) &&
+              size <= BigInt(maxManifestBytes),
+            'invalid capture evidence size',
+          );
+          const bytes = await file.readFile({ signal });
+          requireEvidence(
+            createHash('sha256').update(bytes).digest('hex') === entry.sha256,
+            'capture evidence digest mismatch',
+          );
+          return bytes;
+        },
+      );
+    }
+    const receiptBytes = await readEvidence('capture.json');
+    const receipt = JSON.parse(receiptBytes);
+    const index = JSON.parse(await readEvidence('first-day-index.json'));
+    const mode = captureMode ?? 'linux';
+    checkCaptureReceipt(receipt, { expected, mode });
+    requireEvidence(
+      isDeepStrictEqual(index, firstDayIndex(index.run, receiptBytes, mode)) &&
+        files.size === receipt.files.length + 2 &&
+        receipt.files.every((entry) =>
+          isDeepStrictEqual(entry, files.get(entry.path)),
+        ),
+      'signed capture evidence does not match the template',
+    );
+  }
   const directories = new Set();
   for (const path of files.keys()) {
     const parts = path.split('/');
