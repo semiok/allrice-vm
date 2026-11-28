@@ -54,6 +54,8 @@ it
     'unattached',
     'native-create',
     'outer-create',
+    'wallet-storage',
+    'wallet-messages',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -70,7 +72,8 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const wallet = scenario === 'wallet-storage' || scenario === 'wallet-messages';
+    const realShell = switching || nativeCreate || coldAssets || wallet;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -1028,6 +1031,46 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (wallet) {
+      await page.addInitScript((denyStorage) => {
+        const child = window !== parent;
+        if (child && !location.pathname.includes('/document')) return;
+        const denied = () => {
+          throw new DOMException(
+            'Access to storage is not allowed from this context',
+            'SecurityError',
+          );
+        };
+        if (denyStorage) {
+          Object.defineProperty(window, 'localStorage', { get: denied });
+          Object.defineProperty(Storage.prototype, 'getItem', { value: denied });
+          for (const name of ['caches', 'indexedDB'])
+            Object.defineProperty(window, name, { get: denied });
+          return;
+        }
+        const noise = { target: 'metamask-inpage', data: { name: 'ObjectMultiplex' } };
+        let bursts = 0;
+        const broadcast = setInterval(() => {
+          const peer = child ? parent : document.querySelector('iframe')?.contentWindow;
+          if (!peer) return;
+          for (let i = 0; i < 24; i++) peer.postMessage(noise, location.origin);
+          document.documentElement.dataset.walletBursts = String(++bursts);
+          if (bursts === 40) clearInterval(broadcast);
+        }, 10);
+        if (!child) return;
+        const append = HTMLHeadElement.prototype.append;
+        HTMLHeadElement.prototype.append = function (...nodes) {
+          if (nodes.some((node) => node instanceof HTMLScriptElement && node.textContent)) {
+            document.documentElement.dataset.walletRegistrationNoise = '1';
+            const injected = document.createElement('script');
+            injected.textContent = "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
+            append.call(this, injected);
+            injected.remove();
+          }
+          append.apply(this, nodes);
+        };
+      }, scenario === 'wallet-storage');
+    }
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
       page.on('request', (request) => {
@@ -1320,6 +1363,19 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (wallet) {
+      expect(await editor.innerText()).toContain('未发送的原生草稿');
+      await expect.poll(() => page.locator('iframe').isVisible()).toBe(true);
+      if (scenario === 'wallet-messages') {
+        await page.locator('html[data-wallet-bursts]').waitFor();
+        await workbench.locator('html[data-wallet-registration-noise="1"]').waitFor();
+        expect(errors).toContain('Wallet content script noise');
+      } else {
+        expect(errors).not.toContain('Access to storage is not allowed from this context');
+      }
+      await context.close();
+      return;
+    }
     const dock = (nativeId: string) =>
       workbench.locator(
         '[data-sidebar-right-session="' +
