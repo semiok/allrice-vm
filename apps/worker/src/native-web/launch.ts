@@ -37,6 +37,7 @@ export type NativeWebConfiguration = Readonly<{
   cliPath: string;
   startupTimeoutMs: number;
   terminalEnabled?: boolean;
+  employeeInstructions?: string;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -218,6 +219,15 @@ export async function prepareNativeWebLaunch(
     auth,
     files: Object.freeze([
       { path: plugin, contents: ownerSource, mode: 0o600 },
+      ...(config.employeeInstructions !== undefined
+        ? [
+            {
+              path: `${config.dshHome}/AGENTS.md`,
+              contents: config.employeeInstructions,
+              mode: 0o600,
+            },
+          ]
+        : []),
       {
         path: `${directory}/allrice-native-run-journal.mjs`,
         contents: journalSource,
@@ -258,6 +268,14 @@ export function apply(ctx, config) {
       {
         path: patch,
         contents: JSON.stringify([
+          ...(config.employeeInstructions !== undefined
+            ? [
+                {
+                  id: 'system-prompt',
+                  config: { includeHarnessIdentity: false, personaPrefix: '' },
+                },
+              ]
+            : []),
           {
             id: 'web-runtime',
             // rc.2 replaces config as a whole; CLI webStartup values are not merged.

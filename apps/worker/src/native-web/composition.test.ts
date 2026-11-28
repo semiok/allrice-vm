@@ -57,7 +57,11 @@ function fixture(
   publicOrigin?: string,
   hot?: Pick<
     Parameters<typeof createAssignedNativeWebStartup>[0],
-    'hotGuest' | 'readRoster' | 'archive' | 'employeeRuntime'
+    | 'hotGuest'
+    | 'readRoster'
+    | 'archive'
+    | 'employeeRuntime'
+    | 'employeeInstructions'
   >,
 ) {
   const binding = {
@@ -155,6 +159,9 @@ function capacityFixture(
   employeeRuntime: NonNullable<
     Parameters<typeof createAssignedNativeWebStartup>[0]['employeeRuntime']
   >,
+  employeeInstructions?: Parameters<
+    typeof createAssignedNativeWebStartup
+  >[0]['employeeInstructions'],
 ) {
   const bootstrap = vi.fn();
   const assertWebEndpoints = vi.fn(async () => {});
@@ -163,6 +170,7 @@ function capacityFixture(
   let notifyArchive: (id: string | null) => Promise<void> = async () => {};
   const f = fixture(undefined, undefined, {
     employeeRuntime,
+    employeeInstructions,
     hotGuest: { bootstrap, assertWebEndpoints },
     readRoster,
     archive: {
@@ -201,6 +209,106 @@ function capacityFixture(
     },
   };
 }
+it('replaces only the idle employee owner after a committed profile revision', async () => {
+  const f = capacityFixture(createProductionEmployeeRuntime({}, 20)!, {
+    read: vi.fn(
+      async (_binding, endpoint) =>
+        `employee ${endpoint.employeeInstanceId} revision ${endpoint.employeeRevision}`,
+    ),
+    scheduleGuardMs: 30_000,
+  });
+  const [first, sibling] = f.web.receipt.endpoints;
+  const revised = { ...first!, employeeRevision: first!.employeeRevision + 1 };
+  const draining = latch(),
+    joined = latch();
+  const previous = {
+    ...catalogOwner(),
+    nativeActivityRevision: vi.fn(() => 0),
+    readScheduleCatalog: vi.fn(async () => []),
+    readNativeActivity: vi.fn(async () => ({
+      complete: true,
+      work: new Set<string>(),
+    })),
+    close: vi.fn(async () => {
+      draining.resolve();
+      await joined.promise;
+    }),
+  };
+  const other = {
+    ...catalogOwner(),
+    readScheduleCatalog: vi.fn(async () => []),
+  };
+  const replacement = catalogOwner();
+  open
+    .mockResolvedValueOnce(previous)
+    .mockResolvedValueOnce(other)
+    .mockResolvedValueOnce(replacement);
+  const roster = {
+    ...f.binding,
+    digest: 'updated',
+    entries: [revised, sibling!],
+  };
+  f.readRoster.mockResolvedValue(roster);
+  const web = {
+    ...f.web,
+    selectedEmployee: { ...first!, ...f.binding, threadId: null },
+    scheduledEmployeeIds: [sibling!.employeeInstanceId],
+  };
+  const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
+  expect(plan.files).toEqual(
+    expect.arrayContaining(
+      [first!, sibling!].map((endpoint) => ({
+        path: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh/AGENTS.md`,
+        contents: `employee ${endpoint.employeeInstanceId} revision ${endpoint.employeeRevision}`,
+        mode: 0o600,
+      })),
+    ),
+  );
+  await f.service.start(f.binding, signal(), f.scope, web);
+  try {
+    previous.readNativeActivity.mockResolvedValueOnce({
+      complete: false,
+      work: new Set(['turn']),
+    });
+    await expect(f.enroll(revised)).rejects.toMatchObject({
+      code: 'WEB_ENDPOINTS_PREPARING',
+    });
+    expect(previous.close).not.toHaveBeenCalled();
+    const change = f.enroll(revised);
+    try {
+      await draining.promise;
+      expect(f.bootstrap).not.toHaveBeenCalled();
+      expect(() =>
+        f.service.catalog(f.binding, first!.employeeInstanceId),
+      ).toThrow('WEB_ENDPOINTS_PREPARING');
+      expect(
+        f.service.catalog(f.binding, sibling!.employeeInstanceId).owner,
+      ).toBe(other);
+    } finally {
+      joined.resolve();
+    }
+    await change;
+    expect(f.bootstrap.mock.calls[0]?.[2]).toMatchObject({
+      files: expect.arrayContaining([
+        {
+          path: `/work/.allrice/employees/${first!.employeeInstanceId}/dsh/AGENTS.md`,
+          contents: `employee ${first!.employeeInstanceId} revision ${revised.employeeRevision}`,
+          mode: 0o600,
+        },
+      ]),
+    });
+    expect(
+      f.service.catalog(f.binding, first!.employeeInstanceId),
+    ).toMatchObject({
+      endpoint: revised,
+      owner: replacement,
+    });
+    expect(other.close).not.toHaveBeenCalled();
+  } finally {
+    joined.resolve();
+    await f.service.close();
+  }
+});
 it.each(['proved', 'unproved'] as const)(
   'cold plan starts the current employee and requires its editor proof: %s',
   async (scenario) => {

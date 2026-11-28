@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { addAbortListener } from 'node:events';
-import { selectDEntryGeneration } from '@allrice/contracts';
+import {
+  EmployeeInstanceProfileSchema,
+  selectDEntryGeneration,
+} from '@allrice/contracts';
 import {
   PersonVmError,
   PERSON_VM_WAKE_RESUME_AUDIT,
@@ -10,7 +13,7 @@ import {
 } from '@allrice/person-vm';
 import type { ISql, Sql, TransactionSql } from 'postgres';
 import { joinCallerSave } from '../business-runtime/caller-transaction.ts';
-import { createDedicatedDatabase } from '../core/client.ts';
+import { createDedicatedDatabase, getDatabase } from '../core/client.ts';
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import { readNativeWebEmployeeIds } from '../employees/native-web-roster.ts';
 import {
@@ -220,6 +223,37 @@ export async function readCompletePersonVmWakeRoster(
     )
     ? roster
     : null;
+}
+
+/** Host launch material for one exact roster entry, including sessionless
+ * retained wake. Keep personal fields out of the public endpoint receipt. */
+export async function readPersonVmEmployeeInstructions(
+  binding: PersonVmBinding,
+  employee: PersonVmWebRoster['entries'][number],
+  sql = getDatabase(),
+) {
+  return sql.begin('isolation level repeatable read read only', async (tx) => {
+    if (!(await readPersonVmWakeRoster(tx, binding, [employee])))
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const [row] = await tx<
+      { profile: unknown; name: string; description: string }[]
+    >`select i.profile,v.name,v.description
+      from allrice_employee_instances i
+      join allrice_employee_versions v on v.id=${employee.employeeVersionId}
+        and v.organization_id=i.organization_id and v.workspace_id=i.workspace_id
+      where i.id=${employee.employeeInstanceId}`;
+    if (!row) throw new PersonVmError('AUTHORIZATION_DENIED');
+    const { name, description, role, mission, workStyle, expressionStyle } =
+      EmployeeInstanceProfileSchema.parse(row.profile);
+    return {
+      name: name ?? row.name,
+      description: description ?? row.description,
+      role,
+      mission,
+      workStyle,
+      expressionStyle,
+    };
+  });
 }
 
 async function readWakeStartup(

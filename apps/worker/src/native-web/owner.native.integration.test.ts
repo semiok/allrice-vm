@@ -31,6 +31,7 @@ import {
   type PersonVmManagedJob,
 } from '@allrice/person-vm';
 import * as NativeTransport from './transport.js';
+import { renderEmployeeInstructions } from './employee-instructions.js';
 import { setupNativeWebFixture } from './owner.native.fixture.js';
 import {
   waitForPromptFact,
@@ -961,13 +962,25 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'continues a retained native conversation using the new Host model and effort',
+  'continues a retained native conversation using revised employee instructions and Host model',
   { tags: [tag], timeout: 30000 },
   async () => {
     const capability = 'a'.repeat(43);
     const assistantModels: string[] = [];
-    const assistantInputs: { reasoningEffort: string; messages: unknown[] }[] =
-      [];
+    const assistantInputs: {
+      reasoningEffort: string;
+      messages: unknown[];
+      system?: string;
+      tools?: { name: string }[];
+    }[] = [];
+    const profile = {
+      name: '测试员工甲',
+      description: '',
+      role: '资料整理',
+      mission: '核对资料',
+      workStyle: '先确认目标',
+      expressionStyle: 'structured' as const,
+    };
     const server = createServer((request, response) => {
       void (async () => {
         const bytes: Buffer[] = [];
@@ -1033,7 +1046,7 @@ it.skipIf(!cli)(
       roots,
       cleanup,
       undefined,
-      undefined,
+      { employeeInstructions: renderEmployeeInstructions(profile) },
       route('gpt-5.6-sol', 'low'),
     );
     const signal = AbortSignal.timeout(20_000);
@@ -1086,11 +1099,41 @@ it.skipIf(!cli)(
     }
     await prompt(f.owner, 1);
     await f.owner.close();
-    const next = await f.restartRetained({
-      ...route('gpt-6.2-sol', 'high'),
-      historicalModels: [route('gpt-5.6-sol', 'low').modelInfo],
-    });
+    const next = await f.restartRetained(
+      {
+        ...route('gpt-6.2-sol', 'high'),
+        historicalModels: [route('gpt-5.6-sol', 'low').modelInfo],
+      },
+      {
+        employeeRevision: f.principalProfile.employeeRevision + 1,
+        employeeInstructions: renderEmployeeInstructions({
+          ...profile,
+          name: '更名后的测试员工甲',
+          mission: '整理交付',
+          workStyle: '先核实交付标准 {{保留字面}}',
+          expressionStyle: 'concise',
+        }),
+      },
+    );
     await prompt(next.owner, 2);
+    expect(JSON.stringify(assistantInputs[0]!.messages)).toContain(
+      '测试员工甲',
+    );
+    expect(JSON.stringify(assistantInputs[0]!.messages)).toContain(
+      '先确认目标',
+    );
+    expect(JSON.stringify(assistantInputs[1]!.messages)).toContain(
+      '更名后的测试员工甲',
+    );
+    expect(JSON.stringify(assistantInputs[1]!.messages)).toContain(
+      '先核实交付标准 {{保留字面}}',
+    );
+    expect(JSON.stringify(assistantInputs[1]!.messages)).toContain('整理交付');
+    for (const { system, tools } of assistantInputs) {
+      expect(system).not.toContain('AI agent powered by DeepSeek Harness');
+      expect(system).not.toContain('You are a coding agent');
+      expect(tools?.length).toBeGreaterThan(0);
+    }
     expect(assistantInputs[1]!.messages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

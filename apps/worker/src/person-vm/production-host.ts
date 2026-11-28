@@ -21,6 +21,7 @@ import {
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
+  readPersonVmEmployeeInstructions,
   readPersonVmWakeRoster,
   requireCurrentPlatformAdmin,
   subscribeDEntryEmployeeArchive,
@@ -73,6 +74,7 @@ import {
   personNativeWebRoster,
 } from '../native-web/composition.js';
 import { dEntryNativePublicUrl } from '../native-web/launch.js';
+import { renderEmployeeInstructions } from '../native-web/employee-instructions.js';
 import {
   authorizeProductionPersonVmDeletion,
   createProductionPersonVmAuthority,
@@ -952,6 +954,21 @@ export function createProductionPersonVmHost(input: {
             await readWorkerEmployeeWebSeal(active),
             active,
           );
+        },
+        employeeInstructions: {
+          async read(binding, employee, active) {
+            active.throwIfAborted();
+            const profile = await readPersonVmEmployeeInstructions(
+              binding,
+              employee,
+              trustedDatabase,
+            );
+            active.throwIfAborted();
+            return renderEmployeeInstructions(profile);
+          },
+          scheduleGuardMs: getIdleScheduleGuardMs(
+            providers.configuration.lifecycle,
+          ),
         },
         configuration: {
           ...providers.configuration.web,

@@ -52,6 +52,8 @@ import { updateEmployeeRelease } from './employee-quality.ts';
 import * as folderTriggers from '../folder-triggers.ts';
 import { lockSchedulePrincipal } from '../native-schedule-authority.ts';
 import { createRuntimeFixtureDatabase } from '../runtime.fixture.ts';
+import { readPersonVmEmployeeInstructions } from '../capabilities/person-vm-scheduled-wake.ts';
+import { dEntryReleasePolicyKey } from '../d-entry-release-policy.ts';
 import { createEmployeeAdministrationFixture } from '../employee-administration.fixture.ts';
 import { assertWorkbenchSession } from '../artifact-review.ts';
 import { createRunAuthorityFixture } from '../run-authority.fixture.ts';
@@ -257,6 +259,64 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
       (select count(*)::int from allrice_jobs) jobs`;
     return counts;
   }
+  it('reads only the currently authorized employee instruction revision', async () => {
+    const f = await setup();
+    const employee = await f.custom('Original employee');
+    const binding = {
+      vmId: randomUUID(),
+      instanceId: randomUUID(),
+      leaseEpoch: 1,
+      organizationId: f.a.organizationId,
+      personId: f.a.user.id,
+    };
+    await fixture.db`insert into allrice_settings(scope_type,key,value)
+      values('system',${dEntryReleasePolicyKey},${fixture.db.json({
+        revision: 'employee-instructions-test',
+        defaultGeneration: '3.x',
+        selections: [
+          {
+            organizationId: binding.organizationId,
+            personId: binding.personId,
+          },
+        ],
+      })})`;
+    try {
+      const entry = {
+        workspaceId: employee.workspaceId,
+        employeeInstanceId: employee.id,
+        employeeRevision: employee.revision,
+        employeeVersionId: employee.source.employeeVersionId,
+      };
+      const read = (target = entry, owner = binding) =>
+        readPersonVmEmployeeInstructions(owner, target, fixture.db);
+      await expect(read()).resolves.toMatchObject({
+        name: 'Original employee',
+      });
+      await expect(
+        read(entry, { ...binding, personId: f.b.user.id }),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const revised = await updateEmployeeInstance(f.a.context, employee.id, {
+        workspaceId: employee.workspaceId,
+        requestId: randomUUID(),
+        expectedRevision: employee.revision,
+        profile: {
+          name: 'Renamed employee',
+          mission: 'Review all sources',
+          workStyle: 'Verify first',
+          expressionStyle: 'structured',
+        },
+      });
+      await expect(read()).rejects.toMatchObject({
+        code: 'AUTHORIZATION_DENIED',
+      });
+      await expect(
+        read({ ...entry, employeeRevision: revised.revision }),
+      ).resolves.toMatchObject(revised.profile);
+    } finally {
+      await fixture.db`delete from allrice_settings where key=${dEntryReleasePolicyKey}
+        and scope_type='system' and scope_id is null`;
+    }
+  });
   it('publishes the committed roster change when the application creates a custom employee', async () => {
     const f = await setup();
     const existing = await preparePersonNativeWebRoster(f.a.context);
