@@ -679,9 +679,19 @@ export async function openNativeWebOwner(input: {
     stage('launch');
     starting = setup(async () => {
       try {
-        job = input.dispatchLaunch
-          ? await input.scope.launch(input.launch.command, input.dispatchLaunch)
-          : await input.scope.launch(input.launch.command);
+        const dispatch = input.dispatchLaunch;
+        job = await input.scope.launch(
+          input.launch.command,
+          dispatch
+            ? (active, issue) =>
+                dispatch(AbortSignal.any([active, signal]), issue)
+            : undefined,
+          (launched) => {
+            if (!sameVmBinding(launched.binding, binding))
+              throw new PersonVmError('LEASE_LOST');
+            job = launched;
+          },
+        );
         return job;
       } catch (error) {
         if (

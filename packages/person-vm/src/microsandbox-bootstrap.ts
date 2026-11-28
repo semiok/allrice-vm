@@ -195,6 +195,7 @@ async function spawnMicrosandboxJob(
   for (const [key, value] of Object.entries(commandSpec.env ?? {}))
     args.push('--env', `${key}=${value}`);
   if (commandSpec.workdir) args.push('--workdir', commandSpec.workdir);
+  let acknowledgedJobId: string | undefined;
   const issue = async (active: AbortSignal) => {
     active.throwIfAborted();
     let id: string;
@@ -216,15 +217,16 @@ async function spawnMicrosandboxJob(
           ? 'PROVIDER_FAILED'
           : 'CLEANUP_INCOMPLETE',
       );
+    // A successful CLI close with a valid ID is independent of the SQL
+    // connection's later outcome. Retain it before leaving that transaction.
+    acknowledgedJobId = id;
     return id;
   };
-  // Only dispatch and its exact job receipt are pinned to schedule authority.
-  // General startup assertions and the long-lived job remain outside that lock.
-  const jobId = dispatch
-    ? await dispatch(scope.signal, issue)
-    : await issue(scope.signal);
   // Cleanup uses only its independent owner budget, even after scope loss.
-  async function nativeWait(signal: AbortSignal): Promise<PersonVmJobExit> {
+  async function nativeWait(
+    jobId: string,
+    signal: AbortSignal,
+  ): Promise<PersonVmJobExit> {
     signal.throwIfAborted();
     const result: unknown = JSON.parse(
       await command(
@@ -251,10 +253,49 @@ async function spawnMicrosandboxJob(
       timedOut: result.timed_out,
     });
   }
+  async function cancelAndWait(jobId: string, signal: AbortSignal) {
+    signal.throwIfAborted();
+    try {
+      await command(['kill', name, '--job', jobId], signal);
+    } catch {
+      /* A completed job can refuse kill; only wait can certify it. */
+    }
+    return nativeWait(jobId, signal);
+  }
+  let jobId: string;
+  try {
+    // Only dispatch and the exact receipt are pinned to schedule authority.
+    jobId = dispatch
+      ? await dispatch(scope.signal, issue)
+      : await issue(scope.signal);
+    if (acknowledgedJobId === undefined || jobId !== acknowledgedJobId)
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    scope.signal.throwIfAborted();
+    await scope.assertCurrent();
+    scope.signal.throwIfAborted();
+  } catch (error) {
+    if (acknowledgedJobId !== undefined) {
+      try {
+        await cancelAndWait(
+          acknowledgedJobId,
+          AbortSignal.timeout(input.cleanupTimeoutMs),
+        );
+      } catch (cleanup) {
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError(
+            [error, cleanup],
+            'Native launch cleanup failed',
+            { cause: error },
+          ),
+        });
+      }
+    }
+    throw error;
+  }
   const job: PersonVmManagedProbeJob = Object.freeze({
     binding: scope.binding,
     jobId,
-    wait: nativeWait,
+    wait: (signal: AbortSignal) => nativeWait(jobId, signal),
     stdout: async (signal: AbortSignal) => {
       signal.throwIfAborted();
       const records = await command(
@@ -284,31 +325,8 @@ async function spawnMicrosandboxJob(
         })
         .join('');
     },
-    cancelAndWait: async (signal: AbortSignal) => {
-      signal.throwIfAborted();
-      try {
-        await command(['kill', name, '--job', jobId], signal);
-      } catch {
-        /* A completed job can refuse kill; only wait can certify it. */
-      }
-      return nativeWait(signal);
-    },
+    cancelAndWait: (signal: AbortSignal) => cancelAndWait(jobId, signal),
   });
-  try {
-    scope.signal.throwIfAborted();
-    await scope.assertCurrent();
-    scope.signal.throwIfAborted();
-  } catch (error) {
-    try {
-      await job.cancelAndWait(AbortSignal.timeout(input.cleanupTimeoutMs));
-    } catch (cleanup) {
-      if (lifetime === 'bootstrap-retained') throw cleanup;
-      throw new PersonVmError('CLEANUP_INCOMPLETE', {
-        cause: new AggregateError([error, cleanup]),
-      });
-    }
-    throw error;
-  }
   return lifetime === 'probe-operation'
     ? operationScopedProbe(scope, job)
     : job;

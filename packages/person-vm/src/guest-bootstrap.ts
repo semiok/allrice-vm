@@ -50,6 +50,8 @@ export interface PersonVmBootstrapScope extends PersonVmStartingScope {
   launch(
     command: PersonVmGuestCommand,
     dispatch?: PersonVmGuestLaunchDispatch,
+    /** Accept the exact job before the closing startup authority check. */
+    ownJob?: (job: PersonVmManagedJob) => void,
   ): Promise<PersonVmManagedJob>;
   /** Fixed native probe of the current sandbox's assigned Web interface. */
   readNativeWebGuestAddress?(
@@ -137,12 +139,15 @@ export async function bootstrapPersonVm(input: {
       launch: (
         command: PersonVmGuestCommand,
         dispatch?: PersonVmGuestLaunchDispatch,
+        ownJob?: (job: PersonVmManagedJob) => void,
       ) =>
-        track(() =>
-          dispatch
+        track(async () => {
+          const job = await (dispatch
             ? launcher.launch(command, dispatch)
-            : launcher.launch(command),
-        ),
+            : launcher.launch(command));
+          ownJob?.(job);
+          return job;
+        }),
       ...(launcher.readNativeWebGuestAddress
         ? {
             readNativeWebGuestAddress: (signal?: AbortSignal) =>

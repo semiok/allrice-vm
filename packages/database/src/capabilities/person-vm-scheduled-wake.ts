@@ -46,6 +46,7 @@ export type ScheduledWakeClaim = Identity & {
   receiptIds: readonly string[];
   targetAt: Date;
   attempts: number;
+  retryAtBeforeClaim?: Date | null;
 };
 export type ScheduledWakeOutcome =
   | { state: 'ready' }
@@ -447,17 +448,20 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       const dedicated = createDedicatedDatabase(sql);
       let closing: Promise<void> | undefined;
       const close = () => (closing ??= dedicated.end({ timeout: 0 }));
+      let scan: { cancel(): void } | undefined;
+      let cancellation: Promise<void> | undefined;
       // This transaction is strictly read-only. It can safely be terminated
-      // without waiting for an unresponsive database or a network read.
-      const abort = addAbortListener(
-        active,
-        () => void close().catch(() => {}),
-      );
+      // after sending a CancelRequest for the exact query. Closing the socket
+      // alone may leave its backend waiting for a lock until statement_timeout.
+      const abort = addAbortListener(active, () => {
+        if (scan) cancellation = Promise.resolve(scan.cancel()).catch(() => {});
+        void close().catch(() => {});
+      });
       try {
         return await dedicated.begin('read only', async (tx) => {
           await tx`set local statement_timeout = '2s'`;
           active.throwIfAborted();
-          const [row] = await tx<{ earliest: Date | null }[]>`
+          const pending = tx<{ earliest: Date | null }[]>`
         select min(at) as earliest from (
         select greatest(p.wake_at,p.retry_at) as at
         from person_virtual_machines vm
@@ -473,6 +477,9 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         select greatest(wake_at,claim_until) as at
           from person_vm_scheduled_wakes where state='claimed'
         ) committed`;
+          scan = pending;
+          const [row] = await pending;
+          scan = undefined;
           active.throwIfAborted();
           return row?.earliest ?? null;
         });
@@ -481,7 +488,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         throw error;
       } finally {
         abort[Symbol.dispose]();
-        await close();
+        await Promise.all([cancellation, close()]);
       }
     },
     stage(plan: WakePlan): Promise<boolean> {
@@ -664,23 +671,29 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           if (startup?.digest !== digest)
             throw new PersonVmError('AUTHORIZATION_DENIED');
           const claimId = randomUUID();
-          const [row] = await tx<PlanRow[]>`
+          const [row] = await tx<
+            (PlanRow & { previous_retry_at: Date | null })[]
+          >`
             update person_vm_scheduled_wakes p
             set state='claimed',claim_id=${claimId},
               claim_until=clock_timestamp()+${PERSON_VM_WAKE_CLAIM_MS}::double precision * interval '1 millisecond',
-              retry_at=null,attempts=attempts+1,reason=null,updated_at=now()
-            from person_virtual_machines vm
+              retry_at=null,attempts=p.attempts+1,reason=null,updated_at=now()
+            from person_virtual_machines vm, person_vm_scheduled_wakes previous
             where p.plan_id=${startup.planId} and p.state='waiting' and p.revoked_at is null
+              and previous.plan_id=p.plan_id
               and vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
               and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
               and vm.lease_epoch=${binding.leaseEpoch} and vm.phase in ('stopped','cold')
               and vm.lease_owner=${ownerToken} and vm.lease_expires_at>clock_timestamp()
               and vm.disk_retained and vm.native_created and vm.egress_receipt is null
               and jsonb_array_length(vm.holds)=0
-            returning p.*`;
+            returning p.*, previous.retry_at as previous_retry_at`;
           if (!row?.target_at) throw new PersonVmError('LEASE_LOST');
           await audit(tx, row, claimId, 'claim', 'started');
-          return claimForBinding(row, binding, claimId);
+          return {
+            ...claimForBinding(row, binding, claimId),
+            retryAtBeforeClaim: row.previous_retry_at,
+          };
         },
       );
     },
@@ -770,6 +783,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           set state=case when revoked_at is not null then 'blocked'
               when ${stopped} then 'waiting' else 'unknown' end,
             claim_id=null,claim_until=null,attempts=case when ${stopped} then attempts-1 else attempts end,
+            retry_at=case when revoked_at is null and ${stopped}
+              then ${claim.retryAtBeforeClaim ?? null}::timestamptz end,
             reason=case when revoked_at is not null then 'STALE_PLAN'
               when ${stopped} then 'DISPATCH_CANCELLED' else 'START_UNCONFIRMED' end,
             updated_at=now()

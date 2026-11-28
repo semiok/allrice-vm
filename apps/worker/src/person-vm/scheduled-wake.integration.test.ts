@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -22,6 +22,7 @@ import {
   PersonVmService,
   PostgresPersonVmStore,
   PERSON_VM_WAKE_RESUME_AUDIT,
+  type PersonVmBootstrapScope,
 } from '@allrice/person-vm';
 import {
   afterAll,
@@ -40,6 +41,8 @@ import {
   harness,
 } from '../../../../packages/person-vm/src/test-support.ts';
 import { bootstrapMicrosandbox } from '../../../../packages/person-vm/src/microsandbox-bootstrap.ts';
+import { runCommand } from '../../../../packages/person-vm/src/process.ts';
+import { openNativeWebOwner } from '../native-web/owner.js';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
 import {
   createProductionScheduledWake,
@@ -251,7 +254,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     });
   }
 
-  async function retainedFixture() {
+  async function retainedFixture(maxResidentVms?: number) {
     const f = await fixture();
     const selected = f.addProfile([]);
     const unrelated = f.addProfile([]);
@@ -263,12 +266,18 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ).toMatchObject({ ok: true });
     await f.stop(planId);
     const store = f.store();
-    const vmStore = new PostgresPersonVmStore(() =>
-      createDedicatedDatabase(db),
+    const vmStore = new PostgresPersonVmStore(
+      () => createDedicatedDatabase(db),
+      undefined,
+      maxResidentVms,
     );
     const h = harness(vmStore);
     await h.disk.create({ vmId: f.binding.vmId, tier: 'warm' }, signal);
     h.states.set(f.binding.vmId, 'stopped');
+    const gatewayPorts = [38990];
+    h.setPorts(gatewayPorts);
+    await db`update person_virtual_machines set gateway_ports=${db.json(gatewayPorts)},stopped_at=now()
+      where vm_id=${f.binding.vmId}`;
     const roster = (await db.begin((tx) =>
       readPersonVmWakeRoster(tx, f.binding, [f.origin, selected, unrelated]),
     ))!;
@@ -320,15 +329,22 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     return { f, h, vmStore, planId, store, user, makeDue, runDue, planStatus };
   }
 
-  it.each(['not dispatched', 'native started'] as const)(
+  it.each(['egress preflight', 'native preflight', 'native started'] as const)(
     'keeps foreground startup failure grounded in its stopped native evidence: %s',
     async (scenario) => {
       const x = await retainedFixture();
       const failure = new PersonVmError('EGRESS_UNAVAILABLE');
-      if (scenario === 'not dispatched')
+      const notDispatched = scenario !== 'native started';
+      if (scenario === 'egress preflight')
         vi.spyOn(x.h.egress, 'prepare').mockRejectedValueOnce(failure);
-      else vi.spyOn(x.h.native, 'bootstrap').mockRejectedValueOnce(failure);
+      else if (scenario === 'native preflight') {
+        Object.defineProperty(x.h.native, 'observesStartDispatch', {
+          value: true,
+        });
+        vi.spyOn(x.h.native, 'start').mockRejectedValueOnce(failure);
+      } else vi.spyOn(x.h.native, 'bootstrap').mockRejectedValueOnce(failure);
       const runtime = vi.spyOn(x.h.runtime, 'start');
+      const nativeStop = vi.spyOn(x.h.native, 'stop');
       await expect(x.store.claim(300_000)).resolves.toBeNull();
       await expect(x.user()).rejects.toMatchObject({ code: failure.code });
       const row = await x.vmStore.read(x.f.binding.personId);
@@ -343,14 +359,26 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         where request_id=${x.planId} and lease_epoch=${row!.leaseEpoch}
           and action=${PERSON_VM_WAKE_RESUME_AUDIT} order by id`;
       expect(receipts).toEqual(
-        (scenario === 'not dispatched'
-          ? ['started', 'succeeded']
-          : ['started']
-        ).map((result) => ({ result, error_code: row!.instanceId })),
+        (notDispatched ? ['started', 'succeeded'] : ['started']).map(
+          (result) => ({ result, error_code: row!.instanceId }),
+        ),
       );
       await x.makeDue();
-      if (scenario === 'not dispatched') {
+      if (notDispatched) {
         expect(x.h.log).not.toContain('native:start');
+        expect(nativeStop).toHaveBeenCalledExactlyOnceWith(
+          {
+            ...x.f.binding,
+            instanceId: row!.instanceId,
+            leaseEpoch: row!.leaseEpoch,
+          },
+          expect.any(AbortSignal),
+          { requireStopped: true },
+        );
+        expect(x.h.log).toContain('native:assert-stopped');
+        expect(x.h.log.indexOf('native:assert-stopped')).toBeLessThan(
+          x.h.log.indexOf('disk:detach'),
+        );
         expect(await x.planStatus()).toMatchObject({ state: 'waiting' });
         await expect(
           x.store.nextCommittedWakeAt(signal),
@@ -380,6 +408,138 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(x.h.log.filter((entry) => entry === 'native:start')).toHaveLength(
         1,
       );
+    },
+  );
+
+  it('does not carry a known undispatched plan without exact native stop readback', async () => {
+    const x = await retainedFixture();
+    const startup = new PersonVmError('EGRESS_UNAVAILABLE');
+    const stopReadback = new PersonVmError('ACTIVITY_UNKNOWN');
+    vi.spyOn(x.h.egress, 'prepare').mockRejectedValueOnce(startup);
+    vi.spyOn(x.h.native, 'assertStopped').mockRejectedValueOnce(stopReadback);
+    await expect(x.user()).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+      cause: {
+        errors: [
+          startup,
+          expect.objectContaining({
+            code: 'CLEANUP_INCOMPLETE',
+            cause: stopReadback,
+          }),
+        ],
+      },
+    });
+    expect(x.h.log).toContain('native:stop');
+    expect(x.h.log).not.toContain('disk:detach');
+    expect(await x.vmStore.read(x.f.binding.personId)).toMatchObject({
+      phase: 'failed',
+    });
+    expect(await x.planStatus()).toEqual({
+      state: 'unknown',
+      reason: 'START_UNCONFIRMED',
+    });
+    await x.makeDue();
+    expect(await x.runDue()).toBe(false);
+  });
+
+  it('joins a foreground abort before native start without reviving the revoked schedule', async () => {
+    const x = await retainedFixture();
+    const prepareEgress = x.h.egress.prepare;
+    vi.spyOn(x.h.egress, 'prepare').mockImplementationOnce(async (...args) => {
+      const receipt = await prepareEgress(...args);
+      await x.f.invalidate(x.planId);
+      return receipt;
+    });
+    const runtime = vi.spyOn(x.h.runtime, 'start');
+    await expect(x.user()).rejects.toMatchObject({
+      code: 'AUTHORIZATION_DENIED',
+    });
+    expect(x.h.log).not.toContain('native:start');
+    expect(x.h.log).toContain('native:assert-stopped');
+    expect(await x.planStatus()).toEqual({
+      state: 'blocked',
+      reason: 'STALE_PLAN',
+    });
+    await expect(x.user()).resolves.toMatchObject({
+      phase: 'running',
+      ready: true,
+    });
+    expect(runtime).toHaveBeenCalledOnce();
+    expect(runtime.mock.lastCall?.[3]?.scheduledEmployeeIds).toBeUndefined();
+    expect(await x.runDue()).toBe(false);
+  });
+
+  it('restores the background retry deadline when a foreground capacity check refuses the new epoch', async () => {
+    const x = await retainedFixture(1);
+    await fixture(); // A separate VM still owns the one physical slot.
+    await x.makeDue();
+    const claim = await x.store.claim(300_000);
+    expect(claim?.planId).toBe(x.planId);
+    await expect(
+      x.store.settle(claim!, {
+        state: 'waiting',
+        reason: 'START_UNAVAILABLE',
+        retryDelayMs: 60_000,
+      }),
+    ).resolves.toBe(true);
+    const [prior] =
+      await db`select retry_at,attempts from person_vm_scheduled_wakes
+      where plan_id=${x.planId}`;
+    expect(prior!.retry_at).toBeInstanceOf(Date);
+    expect(prior!.attempts).toBe(1);
+    await expect(x.user()).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });
+    expect(await x.vmStore.read(x.f.binding.personId)).toMatchObject({
+      phase: 'stopped',
+      leaseEpoch: x.f.binding.leaseEpoch,
+      instanceId: x.f.binding.instanceId,
+    });
+    expect(await x.planStatus()).toMatchObject({ state: 'waiting' });
+    await expect(x.store.nextCommittedWakeAt(signal)).resolves.toEqual(
+      prior!.retry_at,
+    );
+    expect(
+      (
+        await db`select retry_at,attempts from person_vm_scheduled_wakes
+        where plan_id=${x.planId}`
+      )[0],
+    ).toEqual(prior);
+    expect(await x.runDue()).toBe(false);
+  });
+
+  it.each(['unused claim release', 'unknown settlement'] as const)(
+    'preserves the original startup error alongside a failed %s',
+    async (stage) => {
+      const beforeReserve = stage === 'unused claim release';
+      const x = await retainedFixture(beforeReserve ? 1 : undefined);
+      const settlement = new Error('fixture cannot write the wake outcome');
+      const startup = new PersonVmError('EGRESS_UNAVAILABLE');
+      if (beforeReserve) {
+        await fixture();
+        vi.spyOn(x.store, 'releaseUnusedClaim').mockRejectedValueOnce(
+          settlement,
+        );
+      } else {
+        vi.spyOn(x.h.egress, 'prepare').mockRejectedValueOnce(startup);
+        vi.spyOn(x.h.native, 'assertStopped').mockRejectedValueOnce(
+          new PersonVmError('ACTIVITY_UNKNOWN'),
+        );
+        vi.spyOn(x.store, 'settle').mockRejectedValueOnce(settlement);
+      }
+      await expect(x.user()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+        cause: {
+          errors: beforeReserve
+            ? [
+                expect.objectContaining({ code: 'RUNTIME_NOT_READY' }),
+                settlement,
+              ]
+            : [
+                startup,
+                expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' }),
+                settlement,
+              ],
+        },
+      });
     },
   );
 
@@ -424,6 +584,109 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(await x.runDue()).toBe(false);
   });
 
+  const scheduledCommand = {
+    executable: 'node',
+    args: ['scheduled-sentinel'],
+  };
+  async function useManagedExecFixture(
+    x: Awaited<ReturnType<typeof retainedFixture>>,
+    exec: (active: AbortSignal, stagingRoot: string) => Promise<string>,
+    options: {
+      wait?: (active: AbortSignal) => Promise<void>;
+      afterLaunch?: () => Promise<unknown>;
+    } = {},
+  ) {
+    const stagingRoot = await realpath(
+      await mkdtemp(join(tmpdir(), 'wake-exec-proof-')),
+    );
+    const cleanupCalls: string[] = [];
+    x.h.native.bootstrap = async (scope) => {
+      const launcher = await bootstrapMicrosandbox({
+        scope,
+        stagingRoot,
+        name: 'retained-test',
+        cleanupTimeoutMs: 1000,
+        plan: {
+          files: [
+            { path: '/work/init.cjs', contents: '//fixture', mode: 0o600 },
+            { path: '/work/launcher', contents: '#!/bin/sh', mode: 0o700 },
+          ],
+          initialize: { executable: 'node', args: ['/work/init.cjs'] },
+          launcher: '/work/launcher',
+          env: {},
+        },
+        async command(args, active) {
+          if (args[0] === 'exec')
+            return args.includes('scheduled-sentinel')
+              ? exec(active, stagingRoot)
+              : 'setup-job';
+          if (
+            args[1] === 'retained-test' &&
+            args[2] === '--job' &&
+            args[3] !== 'setup-job'
+          ) {
+            cleanupCalls.push(`${args[0]}:${args[3]}`);
+            active.throwIfAborted();
+            if (args[0] === 'wait') await options.wait?.(active);
+          }
+          if (args[0] === 'wait')
+            return JSON.stringify({ code: 0, success: true, timed_out: false });
+          return '';
+        },
+      });
+      if (!options.afterLaunch) return launcher;
+      return {
+        ...launcher,
+        async launch(...args: Parameters<typeof launcher.launch>) {
+          const job = await launcher.launch(...args);
+          await options.afterLaunch!();
+          return job;
+        },
+      };
+    };
+    return {
+      stagingRoot,
+      cleanupCalls,
+      close: () => rm(stagingRoot, { recursive: true, force: true }),
+    };
+  }
+
+  const openFixtureOwner = (
+    scope: PersonVmBootstrapScope,
+    dispatch: NonNullable<Parameters<PersonVmBootstrapScope['launch']>[1]>,
+    timeoutMs: number,
+  ) =>
+    openNativeWebOwner({
+      scope,
+      dispatchLaunch: dispatch,
+      launch: {
+        binding: scope.binding,
+        auth: {
+          dshHome: '/work/a',
+          origin: 'http://127.0.0.1:32179/',
+          nonce: randomUUID(),
+          timeoutMs,
+        },
+        files: [],
+        command: scheduledCommand,
+      },
+      lifetime: signal,
+      vm: { assertCurrentBinding: vi.fn() },
+      cleanupTimeoutMs: 1000,
+    });
+
+  async function disconnectWakeAuthority() {
+    const killed = await db`with owner as (
+      select distinct l.pid from pg_locks l join pg_stat_activity a using(pid)
+      where l.relation='person_vm_scheduled_wakes'::regclass
+        and l.mode='RowShareLock' and l.granted and a.datname=current_database()
+        and a.application_name=current_setting('application_name')
+        and l.pid<>pg_backend_pid())
+      select pg_terminate_backend(pid, 1000) as stopped from owner
+      where (select count(*) from owner)=1`;
+    expect(killed).toEqual([{ stopped: true }]);
+  }
+
   it.each([
     ['foreground', 'revocation first'],
     ['foreground', 'dispatch first'],
@@ -433,9 +696,6 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     'serializes actual native scheduler exec on PG authority: %s / %s',
     async (route, order) => {
       const x = await retainedFixture();
-      const stagingRoot = await realpath(
-        await mkdtemp(join(tmpdir(), 'wake-exec-proof-')),
-      );
       const issued = deferred<void>(),
         allowReceipt = deferred<void>();
       const dispatched = vi.fn(async () => {
@@ -443,47 +703,19 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         await allowReceipt.promise;
         return 'scheduled-job';
       });
+      const native = await useManagedExecFixture(x, dispatched);
       const archive = (locking: boolean) =>
         db.begin(async (tx) => {
           if (locking) await tx`set local lock_timeout='100ms'`;
           await tx`update allrice_employee_instances set archived_at=now()
         where id=${x.f.origin.employeeInstanceId}`;
         });
-      x.h.native.bootstrap = (scope) =>
-        bootstrapMicrosandbox({
-          scope,
-          stagingRoot,
-          name: 'retained-test',
-          cleanupTimeoutMs: 1000,
-          plan: {
-            files: [
-              { path: '/work/init.cjs', contents: '//fixture', mode: 0o600 },
-              { path: '/work/launcher', contents: '#!/bin/sh', mode: 0o700 },
-            ],
-            initialize: { executable: 'node', args: ['/work/init.cjs'] },
-            launcher: '/work/launcher',
-            env: {},
-          },
-          async command(args) {
-            if (args[0] === 'exec')
-              return args.includes('scheduled-sentinel')
-                ? dispatched()
-                : 'setup-job';
-            if (args[0] === 'wait')
-              return JSON.stringify({
-                code: 0,
-                success: true,
-                timed_out: false,
-              });
-            return '';
-          },
-        });
       x.h.runtime.start = async (_binding, _active, scope, web) => {
         expect(web?.scheduledEmployeeIds).toEqual([
           x.f.origin.employeeInstanceId,
         ]);
         const job = await scope.launch(
-          { executable: 'node', args: ['scheduled-sentinel'] },
+          scheduledCommand,
           async (active, work) => {
             if (order === 'revocation first') await x.f.invalidate(x.planId);
             return web!.dispatchScheduledLaunch!(active, work);
@@ -521,7 +753,151 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       } finally {
         allowReceipt.resolve();
         await opening.catch(() => {});
-        await rm(stagingRoot, { recursive: true, force: true });
+        await native.close();
+      }
+    },
+  );
+
+  it('joins a timed-out owned native CLI before releasing the plan lock and does not use partial stdout', async () => {
+    const x = await retainedFixture();
+    const issued = deferred<void>();
+    const rescue = new AbortController();
+    let launchSignal: AbortSignal | undefined;
+    let joined = false;
+    const exec = vi.fn(async (active: AbortSignal, root: string) => {
+      launchSignal = active;
+      issued.resolve();
+      try {
+        return await runCommand({
+          executable: process.execPath,
+          args: [
+            '-e',
+            "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); process.stdout.write('partial-job-id'); setInterval(() => {}, 1000)",
+            join(root, 'child-pid'),
+          ],
+          env: {},
+          signal: AbortSignal.any([
+            active,
+            rescue.signal,
+            AbortSignal.timeout(4500),
+          ]),
+        });
+      } finally {
+        joined = true;
+      }
+    });
+    const native = await useManagedExecFixture(x, exec);
+    x.h.runtime.start = async (_binding, _active, scope, web) => {
+      await openFixtureOwner(scope, web!.dispatchScheduledLaunch!, 1000);
+    };
+    await x.makeDue();
+    const opening = x.runDue();
+    void opening.catch(() => {});
+    try {
+      await Promise.race([
+        issued.promise,
+        opening.then(() => {
+          throw Error('Native dispatch never issued');
+        }),
+      ]);
+      await expect(
+        db.begin(async (tx) => {
+          await tx`set local lock_timeout='100ms'`;
+          await tx`update allrice_employee_instances set archived_at=now()
+            where id=${x.f.origin.employeeInstanceId}`;
+        }),
+      ).rejects.toMatchObject({ code: '55P03' });
+      await expect(opening).resolves.toBe(true);
+      expect(launchSignal?.aborted).toBe(true);
+      expect(launchSignal?.reason).toMatchObject({ code: 'PROVIDER_FAILED' });
+      expect(joined).toBe(true);
+      const pid = Number(
+        await readFile(join(native.stagingRoot, 'child-pid'), 'utf8'),
+      );
+      expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      expect(() => process.kill(pid, 0)).toThrow(/ESRCH/);
+      expect(native.cleanupCalls).toEqual([]);
+      expect(exec).toHaveBeenCalledOnce();
+      expect(await x.planStatus()).toEqual({
+        state: 'unknown',
+        reason: 'START_UNCONFIRMED',
+      });
+      await expect(
+        db`update allrice_employee_instances set archived_at=now()
+          where id=${x.f.origin.employeeInstanceId} returning id`,
+      ).resolves.toEqual([{ id: x.f.origin.employeeInstanceId }]);
+      expect(await x.runDue()).toBe(false);
+    } finally {
+      rescue.abort();
+      await opening.catch(() => {});
+      await native.close();
+    }
+  });
+
+  it.each(['PG connection loss', 'closing authority check'] as const)(
+    'joins only the detached job already acknowledged before %s',
+    async (failure) => {
+      const x = await retainedFixture();
+      const waiting = deferred<void>(),
+        allowWait = deferred<void>();
+      const exec = vi.fn((active: AbortSignal) =>
+        runCommand({
+          executable: process.execPath,
+          args: ['-e', "process.stdout.write('acknowledged-scheduled-job')"],
+          env: {},
+          signal: active,
+        }),
+      );
+      const native = await useManagedExecFixture(x, exec, {
+        async wait() {
+          waiting.resolve();
+          await allowWait.promise;
+        },
+        ...(failure === 'closing authority check' && {
+          afterLaunch: () => x.f.invalidate(x.planId),
+        }),
+      });
+      x.h.runtime.start = async (_binding, _active, scope, web) => {
+        await openFixtureOwner(
+          scope,
+          (active, issue) =>
+            web!.dispatchScheduledLaunch!(active, async (locked) => {
+              const id = await issue(locked);
+              if (failure === 'PG connection loss')
+                await disconnectWakeAuthority();
+              return id;
+            }),
+          5000,
+        );
+      };
+      await x.makeDue();
+      const opening = x.runDue();
+      void opening.catch(() => {});
+      try {
+        await Promise.race([
+          waiting.promise,
+          opening.then(() => {
+            throw Error('Acknowledged native job was lost');
+          }),
+        ]);
+        expect(native.cleanupCalls).toEqual([
+          'kill:acknowledged-scheduled-job',
+          'wait:acknowledged-scheduled-job',
+        ]);
+        expect(await x.planStatus()).toMatchObject({ state: 'claimed' });
+        allowWait.resolve();
+        await expect(opening).resolves.toBe(true);
+        expect(exec).toHaveBeenCalledOnce();
+        expect(await x.planStatus()).toEqual(
+          failure === 'PG connection loss'
+            ? { state: 'unknown', reason: 'START_UNCONFIRMED' }
+            : { state: 'blocked', reason: 'STALE_PLAN' },
+        );
+        expect(await x.runDue()).toBe(false);
+      } finally {
+        allowWait.resolve();
+        await opening.catch(() => {});
+        await native.close();
       }
     },
   );
@@ -1230,15 +1606,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     const work = f
       .store()
       .withClaimAuthority(claim!, signal, async (_, active) => {
-        const killed = await db`with owner as (
-        select distinct l.pid from pg_locks l join pg_stat_activity a using(pid)
-        where l.relation='person_vm_scheduled_wakes'::regclass
-          and l.mode='RowShareLock' and l.granted and a.datname=current_database()
-          and a.application_name=current_setting('application_name')
-          and l.pid<>pg_backend_pid())
-        select pg_terminate_backend(pid, 1000) as stopped from owner
-        where (select count(*) from owner)=1`;
-        expect(killed).toEqual([{ stopped: true }]);
+        await disconnectWakeAuthority();
         await expect.poll(() => active.aborted).toBe(true);
         expect(finished).toBe(false);
         joined = true;

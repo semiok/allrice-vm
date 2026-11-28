@@ -1424,6 +1424,9 @@ export class PersonVmService
     let reserved = false;
     let previousCapacityReleased = false;
     let nativeStartAttempted = false;
+    const observeNativeStart = () => {
+      nativeStartAttempted = true;
+    };
     try {
       const reserve = async (active: AbortSignal) => {
         active.throwIfAborted();
@@ -1596,17 +1599,21 @@ export class PersonVmService
         const start = async (active: AbortSignal) => {
           await lease.guard();
           active.throwIfAborted();
-          nativeStartAttempted = true;
+          if (!native.observesStartDispatch) observeNativeStart();
           if (web && native.startWithWebEndpoints) {
             const fence = await native.startWithWebEndpoints(
               web.receipt,
               active,
               receipt,
+              observeNativeStart,
             );
+            observeNativeStart();
             checkedWebAfterStart = true;
             return fence;
           }
-          return native.start(binding, active);
+          const fence = await native.start(binding, active, observeNativeStart);
+          observeNativeStart();
+          return fence;
         };
         capacity = await withWakeAuthority(signal, start);
       } else throw new PersonVmError('PROVIDER_FAILED');
@@ -1742,8 +1749,26 @@ export class PersonVmService
       await retainedClaim?.finish('ready');
       return view(row, !scheduled);
     } catch (error) {
+      const settleFailure = async (
+        result: 'not-started' | 'unknown',
+        cleanupErrors: unknown[] = [],
+      ) => {
+        try {
+          await retainedClaim?.finish(result);
+        } catch (settlementError) {
+          cleanupErrors.push(settlementError);
+        }
+        if (cleanupErrors.length)
+          throw new PersonVmError('CLEANUP_INCOMPLETE', {
+            cause: new AggregateError(
+              [error, ...cleanupErrors],
+              'VM startup and cleanup failed',
+              { cause: error },
+            ),
+          });
+      };
       if (!reserved) {
-        await retainedClaim?.finish('not-started');
+        await settleFailure('not-started');
         throw error;
       }
       const failure = safeError(error);
@@ -1758,9 +1783,13 @@ export class PersonVmService
         /* Failure audit cannot prevent physical cleanup after a lost DB connection. */
       }
       const carryWake =
-        wake && !nativeStartAttempted
+        wake &&
+        !nativeStartAttempted &&
+        failure.code !== 'LEASE_LOST' &&
+        (retainedClaim || failure.code !== 'AUTHORIZATION_DENIED')
           ? { planId: wake.planId, recorded: false }
           : undefined;
+      const cleanupErrors: unknown[] = [];
       try {
         await this.cleanup(
           row,
@@ -1773,19 +1802,16 @@ export class PersonVmService
             carryWake,
           },
         );
-      } catch {
-        await retainedClaim?.finish('unknown');
-        throw new PersonVmError('CLEANUP_INCOMPLETE', { cause: failure });
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
       }
-      await retainedClaim?.finish(
-        carryWake?.recorded ? 'not-started' : 'unknown',
+      await settleFailure(
+        carryWake?.recorded && !cleanupErrors.length
+          ? 'not-started'
+          : 'unknown',
+        cleanupErrors,
       );
-      if (
-        scheduled &&
-        carryWake?.recorded &&
-        failure.code !== 'AUTHORIZATION_DENIED' &&
-        failure.code !== 'LEASE_LOST'
-      )
+      if (scheduled && carryWake?.recorded)
         throw new PersonVmError('RUNTIME_NOT_READY', { cause: failure });
       throw failure;
     }
@@ -2121,6 +2147,7 @@ export class PersonVmService
     let egressJoined = true;
     let stopped: 'stopped' | 'absent' | undefined;
     let canCarryWake = false;
+    let failedCarryStop: ErrorOptions | undefined;
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
       if (stopNative && !completion?.nativeAlreadyJoined) {
@@ -2225,31 +2252,32 @@ export class PersonVmService
       try {
         if (row.instanceId) {
           const mount = await this.mounted(row, signal, lease);
-          stopped = await stopAndConfirm(signal);
-          if (
-            completion?.carryWake &&
-            stopped === 'stopped' &&
-            row.diskRetained
-          ) {
+          if (completion?.carryWake) {
+            const native = this.options.native;
+            if (!row.diskRetained || !native.assertStopped)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            await lease.guard();
+            const binding = bindingOf(row);
+            await native.stop(binding, signal, { requireStopped: true });
+            await native.assertStopped(binding, signal);
+            await lease.guard();
+            stopped = 'stopped';
             try {
-              await this.options.native.assertRetainedStartup?.(
-                bindingOf(row),
-                mount,
-                signal,
-              );
+              await native.assertRetainedStartup?.(binding, mount, signal);
               signal.throwIfAborted();
               canCarryWake = true;
             } catch {
               // Physical cleanup can still finish without a reusable wake proof.
             }
-          }
+          } else stopped = await stopAndConfirm(signal);
         } else {
           const inspected = await this.reconcileDisk(row, signal, lease);
           if (!row.nativeCreated && inspected.state === 'ready')
             stopped = 'absent';
         }
-      } catch {
+      } catch (error) {
         failed = true;
+        if (completion?.carryWake) failedCarryStop = { cause: error };
       }
     }
     if (stopped) {
@@ -2299,7 +2327,7 @@ export class PersonVmService
         Boolean(row.instanceId),
     });
     if (carry) carry.recorded = true;
-    if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE', failedCarryStop);
     if (row.instanceId) {
       const binding = bindingOf(row);
       this.admissionHost?.forgetStoppedEntryRecovery(binding);
