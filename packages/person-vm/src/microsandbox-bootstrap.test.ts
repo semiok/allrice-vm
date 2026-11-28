@@ -1,5 +1,6 @@
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -143,6 +144,131 @@ it('labels a failed auth artifact read without retaining guest command output', 
     cause: 'AUTH_ARTIFACT_READ_FAILED',
   });
 });
+
+it.each([
+  { initialize: 75, verify: 0, exit: 75, revoke: false },
+  { initialize: 0, verify: 24, exit: 24, revoke: false },
+  { initialize: 0, verify: 0, exit: 0, revoke: false },
+  { initialize: 0, verify: 0, exit: 0, revoke: true },
+])(
+  'requires the actual shell sequence and an independent mkdir fence ($initialize, $verify, revoked=$revoke)',
+  async ({ initialize, verify, exit, revoke }) => {
+    const { scope, binding } = fixture();
+    const controls = '/opt/allrice/command-memory/' + 'a'.repeat(64);
+    const state = '/run/allrice-command-memory';
+    const config = state + '/config.json';
+    const initializer = join(root, 'test initializer.cjs');
+    await writeFile(
+      initializer,
+      `process.exit(process.argv[2] === 'config file.json' ? ${initialize} : 99);`,
+    );
+    let status: number | null = null;
+    const command = vi.fn(async (args: string[]) => {
+      if (args[0] === 'exec') {
+        const initializerJob = args.indexOf('allrice-initialize-dsh-disk');
+        if (initializerJob === -1) return 'prepare';
+        const result = spawnSync(
+          '/bin/sh',
+          [
+            '-c',
+            args[initializerJob - 1]!,
+            args[initializerJob]!,
+            process.execPath,
+            initializer,
+            'config file.json',
+            `console.log('verifier ran'); process.exit(${verify});`,
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(result.error).toBeUndefined();
+        expect(result.stdout).toBe(initialize === 0 ? 'verifier ran\n' : '');
+        expect(result.status).toBe(exit);
+        status = result.status;
+        return 'initialize-and-verify';
+      }
+      if (args[0] === 'wait' && args[3] === 'initialize-and-verify')
+        return JSON.stringify({
+          code: status,
+          success: status === 0,
+          timed_out: false,
+        });
+      if (args[0] === 'wait') {
+        if (revoke)
+          scope.assertCurrent.mockRejectedValueOnce(
+            new PersonVmError('LEASE_LOST'),
+          );
+        return finished;
+      }
+      if (args[0] === 'cp') return '';
+      throw Error('unexpected native verb');
+    });
+
+    const bootstrap = bootstrapMicrosandbox({
+      scope,
+      name: 'allrice-' + binding.vmId,
+      plan: {
+        files: [
+          { path: config, contents: '{}', mode: 0o600 },
+          { path: '/work/owner/profile.json', contents: '{}', mode: 0o600 },
+        ],
+        initialize: {
+          executable: 'node',
+          args: [controls + '/initialize.cjs', config],
+        },
+        launcher: controls + '/launch-dsh.sh',
+        env: {
+          BASH_ENV: controls + '/bash-env.sh',
+          ALLRICE_MEMORY_RECEIPT_WRITER: controls + '/command-observer.cjs',
+          ALLRICE_MEMORY_RECEIPT_DIRECTORY: state + '/receipts',
+          ALLRICE_MEMORY_RECEIPT_NODE: '/usr/local/bin/node',
+        },
+      },
+      readonlyCommandMemoryDirectory: controls,
+      dshSandbox: {
+        guestDirectory: '/opt/allrice/dsh/' + 'b'.repeat(64),
+        sha256: 'c'.repeat(64),
+        cliSha256: 'd'.repeat(64),
+      },
+      stagingRoot: root,
+      cleanupTimeoutMs: 2000,
+      command,
+    });
+    if (revoke) {
+      await expect(bootstrap).rejects.toMatchObject({ code: 'LEASE_LOST' });
+      expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+        'exec',
+        'wait',
+      ]);
+      return;
+    }
+    if (exit === 0)
+      await expect(bootstrap).resolves.toHaveProperty(
+        'launch',
+        expect.any(Function),
+      );
+    else
+      await expect(bootstrap).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+    expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+      'exec',
+      'wait',
+      'exec',
+      'wait',
+      'cp',
+      'cp',
+      'exec',
+      'wait',
+    ]);
+    expect(command.mock.calls[2]?.[0].slice(-4)).toEqual([
+      '/bin/mkdir',
+      '-p',
+      '--',
+      '/work/owner',
+    ]);
+    expect(command.mock.calls.at(-1)?.[0][3]).toBe('initialize-and-verify');
+  },
+);
 
 it.each(['10.4.1.10', '172.16.0.6', '192.168.4.2'])(
   'returns exactly one current private assigned guest IPv4 %s after native wait and logs',

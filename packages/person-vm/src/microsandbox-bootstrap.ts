@@ -33,6 +33,15 @@ const BASE_IMAGE_PATH =
   '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
 
+// Keep the sealed initializer's public CLI and its native exit code. The
+// following disk proof only reads; neither result escapes a single exact wait.
+const initializeAndVerifyDisk = String.raw`
+node="$1"
+"$node" "$2" "$3" || exit "$?"
+shift 3
+exec "$node" -e "$@"
+`;
+
 const readEthernetAddresses = String.raw`
 const interfaces = require('node:os').networkInterfaces();
 const ipv4 = (interfaces.eth0 ?? []).filter(({ family }) => family === 'IPv4');
@@ -483,16 +492,25 @@ export async function bootstrapMicrosandbox(input: {
     // Each step has a live fence before its side effects. That fence also
     // closes the preceding joined step. The final step has its own closing
     // fence before it can hand the launcher back to the runtime.
+    const diskProof =
+      !employee && sandbox?.cliSha256 !== undefined
+        ? [sandbox.guestDirectory, sandbox.sha256, sandbox.cliSha256]
+        : undefined;
     if (controls && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
       });
     // cp preserves Unix permissions but doesn't create missing file parents.
-    await run({
-      executable: '/bin/mkdir',
-      args: ['-p', '--', ...new Set(files.map((file) => dirname(file.path)))],
-    });
+    const parents = new Set(files.map((file) => dirname(file.path)));
+    // The state job has already created and verified its own directory.
+    // Other parents still require a separate current check before mkdir.
+    if (diskProof) parents.delete(COMMAND_MEMORY_STATE_ROOT);
+    if (!diskProof || parents.size)
+      await run({
+        executable: '/bin/mkdir',
+        args: ['-p', '--', ...parents],
+      });
     for (const [index, file] of files.entries()) {
       await scope.assertCurrent();
       const hostFile = join(stage, String(index));
@@ -502,24 +520,29 @@ export async function bootstrapMicrosandbox(input: {
         scope.signal,
       );
     }
-    if (!employee)
+    if (diskProof)
+      await run({
+        executable: '/bin/sh',
+        args: [
+          '-c',
+          initializeAndVerifyDisk,
+          'allrice-initialize-dsh-disk',
+          '/usr/local/bin/node',
+          ...plan.initialize.args,
+          verifyDshRuntimeDisk,
+          ...diskProof,
+        ],
+      });
+    else if (!employee)
       await run(
         controls
           ? { ...plan.initialize, executable: '/usr/local/bin/node' }
           : plan.initialize,
       );
-    if (sandbox && !employee)
+    if (sandbox && !employee && !diskProof)
       await run({
         executable: '/usr/local/bin/node',
-        args: sandbox.cliSha256
-          ? [
-              '-e',
-              verifyDshRuntimeDisk,
-              sandbox.guestDirectory,
-              sandbox.sha256,
-              sandbox.cliSha256,
-            ]
-          : ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
+        args: ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
       });
     await scope.assertCurrent();
   } catch (error) {
