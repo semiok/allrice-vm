@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { access, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { DEntryProfileGraphSchema } from '@allrice/contracts';
 import { nativeWebAuthArtifact } from '@allrice/person-vm';
 import {
@@ -245,6 +245,117 @@ it(
     await expect(prepareAgain()).rejects.toThrow(
       'Missing Employee Web artifact file: guest/cordis.patch.yml',
     );
+  },
+);
+
+it(
+  'runs native bash without prompting after loading a persisted ask policy',
+  { timeout: 45_000 },
+  async () => {
+    const f = await setupNativeWebFixture(
+      releasedCli(),
+      roots,
+      cleanup,
+      undefined,
+      {
+        nativeToolEvidenceProbe: `
+          import { randomUUID } from 'node:crypto';
+          import { mkdir, writeFile } from 'node:fs/promises';
+          import { resolve } from 'node:path';
+          import { fileURLToPath } from 'node:url';
+
+          export const inject = ['agents', 'sessions', 'permissionPresets',
+            'sandboxPolicy', 'approval', 'appReady'];
+          export function apply(ctx) {
+            const root = fileURLToPath(new URL('../../', import.meta.url));
+            const workspace = resolve(root, 'workspace');
+            const outside = resolve(root, 'outside');
+            const receipt = resolve(root, 'permissions.json');
+            let prompts = 0;
+            ctx.on('approval/request', () => { prompts++; return 'rejected'; });
+            const effective = session => ({
+              mode: ctx.sandboxPolicy.resolve({ session }).mode,
+              approval: ctx.approval.effectivePolicy(session),
+            });
+            const take = (session, kind) =>
+              Array.from({ length: session.seq }, (_, seq) => session.eventAt(seq))
+                .filter(event => event?.type === kind)
+                .map(event => event.data);
+            async function prove() {
+              await mkdir(workspace);
+              await writeFile(outside, 'unchanged');
+              const id = randomUUID();
+              const fresh = await ctx.agents.create({
+                sessionId: id, meta: { cwd: workspace, agentPreset: 'standard' },
+              });
+              const initial = effective(fresh.agent.session);
+              fresh.agent.session.append('approval/policy', { policy: 'ask' });
+              if (!await ctx.sessions.flush(fresh.agent.session))
+                throw Error('Missing native session persistence');
+              await fresh.dispose();
+              const resumed = await ctx.agents.resume({ resumeSessionId: id });
+              try {
+                const agent = resumed.agent;
+                const session = agent.session;
+                const restored = effective(session);
+                const invoke = args => agent.ctx.tools.execute({
+                  name: 'bash', arguments: args, agent,
+                  callId: randomUUID(), signal: AbortSignal.timeout(10_000),
+                });
+                session.append('turn/start', { turn: 1 });
+                const normal = await invoke({ command: "printf '%s' ok > inside" });
+                const normalAsks = take(session, 'approval/asked').length;
+                const outsideWrite = await invoke({
+                  command: "printf '%s' forbidden > '" + outside + "'",
+                });
+                const escalated = await invoke({
+                  command: "printf '%s' forbidden > '" + outside + "'",
+                  sandbox_permissions: 'danger-full-access',
+                  justification: 'Exercise the isolated rejection path.',
+                });
+                session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+                return {
+                  initial, restored, normalAsks, prompts,
+                  options: ctx.permissionPresets.catalog().options.map(o => o.value),
+                  history: take(session, 'approval/policy').map(event => event.policy),
+                  decisions: take(session, 'approval/decided').map(event => event.outcome),
+                  normal: normal.ok, outsideWrite: outsideWrite.ok,
+                  escalated: escalated.ok,
+                };
+              } finally {
+                await resumed.dispose();
+              }
+            }
+            ctx.appReady.onReady(() => {
+              void prove().then(
+                result => writeFile(receipt, JSON.stringify(result)),
+                error => writeFile(receipt, JSON.stringify({ error: String(error) })),
+              );
+            });
+          }
+        `,
+      },
+    );
+    const root = f.launch.command.workdir;
+    const read = (path: string) => readFile(join(root, path), 'utf8');
+    const receipt = await vi.waitFor(
+      async () => JSON.parse(await read('permissions.json')),
+      { timeout: 15_000 },
+    );
+    expect(receipt).toEqual({
+      initial: { mode: 'workspace-write', approval: 'never' },
+      restored: { mode: 'workspace-write', approval: 'never' },
+      options: ['read-only', 'workspace-write'],
+      history: ['never', 'ask', 'never'],
+      normalAsks: 0,
+      prompts: 0,
+      decisions: ['rejected'],
+      normal: true,
+      outsideWrite: true,
+      escalated: false,
+    });
+    expect(await read('workspace/inside')).toBe('ok');
+    expect(await read('outside')).toBe('unchanged');
   },
 );
 

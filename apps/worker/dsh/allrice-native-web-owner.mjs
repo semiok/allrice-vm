@@ -24,6 +24,10 @@ export const inject = [
   'allricePrincipal',
   'workspaceRegistry',
   'sessionPersistence',
+  'sessions',
+  'permissionPresets',
+  'sandboxPolicy',
+  'approval',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
@@ -1560,6 +1564,34 @@ export function managedModelPrompt(select, rules, fallback, lifetime) {
   };
 }
 
+function mountWorkspacePermissions(ctx) {
+  const { approval, permissionPresets, sandboxPolicy, sessions } = ctx;
+  const catalog = permissionPresets.catalog();
+  if (
+    approval.config.policy !== 'never' ||
+    sandboxPolicy.resolve().mode !== 'workspace-write' ||
+    catalog.defaultPreset !== 'workspace-write' ||
+    catalog.options.length !== 2 ||
+    !['read-only', 'workspace-write'].every((mode) => {
+      const preset = permissionPresets.resolve(mode);
+      return preset.sandbox === mode && preset.approval === 'never';
+    })
+  )
+    throw Error('Invalid managed workspace permission presets');
+
+  // rc.2 restores the last per-session knob events ahead of deployment
+  // defaults. Use its setter so existing sessions and forks keep their log.
+  const pin = (session) => {
+    const { mode } = sandboxPolicy.resolve({ session });
+    permissionPresets.set(
+      session,
+      mode === 'read-only' ? 'read-only' : 'workspace-write',
+    );
+  };
+  ctx.on('session/created', pin);
+  for (const session of sessions.list()) pin(session);
+}
+
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config);
 }
@@ -1578,6 +1610,7 @@ export function applyNativeWebOwner(
     commandMemoryPlugin,
     modelAdapter,
   } = config;
+  mountWorkspacePermissions(ctx);
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],

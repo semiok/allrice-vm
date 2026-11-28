@@ -175,6 +175,23 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   const patch = a.files.find((file) => file.path.endsWith('/owner.patch.json'));
   if (!patch) throw Error('actual native owner patch missing');
   const entries = JSON.parse(patch.contents);
+  expect(entries.slice(-3)).toEqual([
+    {
+      id: 'sandbox-policy',
+      config: { mode: 'workspace-write', workspaceRoot: config.workdir },
+    },
+    { id: 'approval', config: { policy: 'never' } },
+    {
+      id: 'permission',
+      config: {
+        defaultPreset: 'workspace-write',
+        presets: {
+          'read-only': { sandbox: 'read-only', approval: 'never' },
+          'workspace-write': { sandbox: 'workspace-write', approval: 'never' },
+        },
+      },
+    },
+  ]);
   const terminalIds = ['terminal-controller', 'ui-sidebar-terminal'];
   expect(
     entries.filter(({ id }: { id?: string }) => terminalIds.includes(id ?? '')),

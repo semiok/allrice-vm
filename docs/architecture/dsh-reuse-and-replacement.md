@@ -939,6 +939,8 @@ rc.2 的 Web runtime config 整块替换，须同时保留 `openBrowser:false`�
 
 R1 的员工 Host 在发布 local auth 前，用公开 `workspaceRegistry.create` 登记现有工作目录。已存会话按该 Host 的持久化 header 补原生成员关系。外层新建和无位置的原生新建现场解析当前的原生工作区，交给 `session/create({workspaceId})`，fork 由 rc.2 按源会话的原生工作区继承。原生 `workspace/follow` 可以直接消费同一关系。AllRice 保留现有员工身份、会话归属和 VM 隔离。
 
+受管员工 Guest 的启动 overlay 使用 rc.2 公开 `sandbox-policy`、`approval` 和 `permission` 配置，默认 `workspace-write + never`。DSH 的 Session 复用原生 preset setter，恢复曾写入 `ask` 的会话时追加原生策略事件，保留严格的只读模式。通用设置的读取继续可用，管理的 permission 默认不接受浏览器写入。DSH 本地命令如需扩大权限直接拒绝，MET-267 的工作区与进程限额和宿主外发审批继续由各自原有路径执行。
+
 4.0 Run 补账沿用此 authenticated owner。Guest 接收当前进程的原生 `session/event`，将实际终态与公开 `SessionPersistence.open(id, 'read')` 读到的同一物理条目比对。Host 按原 Run 和执行记录核同一原生所有者，在终态事务复核线程、员工和 VM scope，再写入现有 Run 及事件。缺少已认证的本地 owner 时，Host 的独占只读取证仅能从仍运行且已挂载的原盘读到 journal 内容。现有工作区写权限覆盖旧 journal，读口结果不能独立证明 DSH 事件，因此未装入自动结算。缺少真实终态证明的 Run 保留原状态。
 
 ## MET273/274：固定cut与宿主committed source

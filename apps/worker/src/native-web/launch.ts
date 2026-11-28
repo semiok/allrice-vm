@@ -328,6 +328,24 @@ export function apply(ctx, config) {
                 },
               ]
             : []),
+          {
+            id: 'sandbox-policy',
+            config: { mode: 'workspace-write', workspaceRoot: config.workdir },
+          },
+          { id: 'approval', config: { policy: 'never' } },
+          {
+            id: 'permission',
+            config: {
+              defaultPreset: 'workspace-write',
+              presets: {
+                'read-only': { sandbox: 'read-only', approval: 'never' },
+                'workspace-write': {
+                  sandbox: 'workspace-write',
+                  approval: 'never',
+                },
+              },
+            },
+          },
         ]),
         mode: 0o600,
       },
