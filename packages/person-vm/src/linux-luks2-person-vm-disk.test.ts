@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -22,6 +23,7 @@ import {
   type LinuxDiskKernel,
 } from './linux-luks2-state.ts';
 import type { Command } from './process.ts';
+import type { VmRecord } from './store.ts';
 
 const vm = '550e8400-e29b-41d4-a716-446655440000';
 const storageUuid = '550e8400-e29b-41d4-a716-446655440012';
@@ -36,6 +38,31 @@ const binding: PersonVmBinding = {
 };
 const signal = new AbortController().signal;
 const roots = new Set<string>();
+
+function provisioningLease() {
+  const row: VmRecord = {
+    vmId: vm,
+    personId: binding.personId,
+    organizationId: binding.organizationId,
+    leaseEpoch: binding.leaseEpoch,
+    phase: 'failed',
+    diskTier: 'warm',
+    diskRetained: true,
+    nativeCreated: false,
+    instanceId: null,
+    egressReceipt: null,
+    verifiedWebSlotCapacity: null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    gatewayPorts: [],
+    holds: [],
+    lastActivityAt: '2026-11-28T00:00:00.000Z',
+    stoppedAt: null,
+    idleSince: null,
+    activityObservedAt: null,
+  };
+  return { row, signal, guard: vi.fn(async () => {}) };
+}
 
 afterEach(async () => {
   for (const root of roots) {
@@ -114,7 +141,6 @@ async function fixture() {
         return JSON.stringify({
           filesystems: [
             {
-              uuid: assertions.fsUuid,
               'maj:min': linuxDeviceNumber(
                 (await lstat(root, { bigint: true })).dev,
               ),
@@ -217,6 +243,7 @@ async function fixture() {
         deviceForMap(last).xfsUuid = second?.split('uuid=')[1];
         return '';
       case linuxTools.blkid:
+        if (last?.startsWith('/dev/block/')) return assertions.fsUuid + '\n';
         return 'TYPE=xfs\nUUID=' + deviceForMap(last).xfsUuid + '\n';
       case linuxTools.mount: {
         const device = deviceForMap(command.args.at(-2));
@@ -341,6 +368,8 @@ async function fixture() {
       return '4:4026531840';
     },
     async blockDevice(path) {
+      if (path.startsWith('/dev/block/'))
+        return linuxDeviceNumber((await lstat(root, { bigint: true })).dev);
       const row = all().find(
         (row) => row.loop !== undefined && path === '/dev/loop' + row.loop,
       );
@@ -385,24 +414,26 @@ async function fixture() {
     },
   };
   const info = await lstat(root, { bigint: true });
-  const adapter = new LinuxLuks2PersonVmDisk({
-    keys,
-    root,
-    rootIdentity: { uuid: storageUuid, inode: String(info.ino) },
-    capacityGiB: 1,
-    runner: command,
-    kernel,
-    async withCurrentDisk(candidate, disk, signal, use) {
-      signal.throwIfAborted();
-      expect(disk.vmId).toBe(candidate.vmId);
-      if (JSON.stringify(candidate) !== JSON.stringify(assertions.use))
-        throw Error('fixture lease expired');
-      return use();
-    },
-  });
+  const restart = () =>
+    new LinuxLuks2PersonVmDisk({
+      keys,
+      root,
+      rootIdentity: { uuid: storageUuid, inode: String(info.ino) },
+      capacityGiB: 1,
+      runner: command,
+      kernel,
+      async withCurrentDisk(candidate, disk, signal, use) {
+        signal.throwIfAborted();
+        expect(disk.vmId).toBe(candidate.vmId);
+        if (JSON.stringify(candidate) !== JSON.stringify(assertions.use))
+          throw Error('fixture lease expired');
+        return use();
+      },
+    });
   return {
     root,
-    adapter,
+    adapter: restart(),
+    restart,
     keys,
     history,
     assertions,
@@ -506,6 +537,80 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
       'for B',
     );
   });
+
+  it.each(['loop', 'mapper', 'mount'] as const)(
+    'resumes an attach interrupted after %s on a fresh adapter',
+    async (cut) => {
+      const f = await fixture();
+      await f.adapter.create(disk, signal);
+      const settings = { env: {}, signal };
+      const mapperName = f.command.mock.calls
+        .find(
+          ([call]) =>
+            call.args[0] === 'open' && !call.args.includes('--test-passphrase'),
+        )?.[0]
+        .args.at(-1);
+      if (!mapperName) throw Error('fixture: missing mapper name');
+      const loop = (
+        await f.command({
+          ...settings,
+          executable: linuxTools.loop,
+          args: ['--find', '--show', '--nooverlap', '--', f.image()],
+        })
+      ).trim();
+      if (cut !== 'loop') {
+        const key = await f.keys.read(vm);
+        try {
+          await f.command({
+            ...settings,
+            executable: linuxTools.crypt,
+            args: [
+              'open',
+              '--type',
+              'luks2',
+              '--key-file',
+              '-',
+              loop,
+              mapperName,
+            ],
+            input: key,
+          });
+        } finally {
+          key.fill(0);
+        }
+      }
+      const mount = join(f.root, 'mounts', vm);
+      if (cut === 'mount') {
+        await mkdir(mount, { mode: 0o700 });
+        await f.command({
+          ...settings,
+          executable: linuxTools.mount,
+          args: [
+            '-t',
+            'xfs',
+            '-o',
+            'nodev,nosuid',
+            '--',
+            '/dev/mapper/' + mapperName,
+            mount,
+          ],
+        });
+        await expect(lstat(join(mount, 'work'))).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      }
+      const restarted = f.restart();
+      const dispatched = vi.fn();
+      expect(await restarted.attach(disk, signal, dispatched)).toBe(mount);
+      expect(dispatched).toHaveBeenCalledTimes(cut === 'mount' ? 0 : 1);
+      expect(
+        (await restarted.issueOwnedWorkDisk(disk, binding, signal))
+          .workDirectory,
+      ).toBe(join(mount, 'work'));
+      await restarted.detach(disk, signal);
+      expect(await restarted.verifyAttachedMount(disk, signal)).toBeNull();
+    },
+  );
 
   it('moves only detached images across tiers with unchanged physical identity', async () => {
     const f = await fixture();
@@ -731,6 +836,7 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
   it('recovers an interrupted staging allocation before re-creating', async () => {
     const f = await fixture();
     expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'absent' });
+    await mkdir(join(f.root, 'journal'), { mode: 0o700 });
     const journal = join(f.root, 'journal', vm + '.json');
     const luksUuid = '550e8400-e29b-41d4-a716-446655440010';
     await writeFile(
@@ -750,11 +856,32 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     const staging = journal + '.' + luksUuid + '.alloc';
     await writeFile(staging, Buffer.alloc(15), { mode: 0o600 });
     expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
-    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(true);
+    await expect(f.adapter.create(disk, signal)).rejects.toThrow(
+      'CLEANUP_INCOMPLETE',
+    );
+    const lease = provisioningLease();
+    lease.row.instanceId = 'already-dispatched';
+    await expect(
+      f.adapter.recoverIncompleteCreation(lease, signal),
+    ).rejects.toThrow('LEASE_LOST');
+    expect(await lstat(staging)).toBeTruthy();
+    lease.row.instanceId = null;
+    lease.guard.mockImplementationOnce(async () => {
+      lease.row.leaseEpoch += 1;
+    });
+    await expect(
+      f.adapter.recoverIncompleteCreation(lease, signal),
+    ).rejects.toThrow('LEASE_LOST');
+    expect(await lstat(staging)).toBeTruthy();
+    expect(
+      await f.adapter.recoverIncompleteCreation(provisioningLease(), signal),
+    ).toBe(true);
     await expect(lstat(staging)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
     await f.adapter.create(disk, signal);
-    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(false);
+    expect(
+      await f.adapter.recoverIncompleteCreation(provisioningLease(), signal),
+    ).toBe(false);
     expect(await f.adapter.inspect(vm, signal)).toMatchObject({
       state: 'ready',
     });
@@ -769,11 +896,13 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     );
     expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'unknown' });
     await expect(
-      f.adapter.recoverIncompleteCreation(disk, signal),
+      f.adapter.recoverIncompleteCreation(provisioningLease(), signal),
     ).rejects.toThrow('CLEANUP_INCOMPLETE');
     expect(f.keys.delete).not.toHaveBeenCalled();
     f.assertions.busy = false;
-    expect(await f.adapter.recoverIncompleteCreation(disk, signal)).toBe(true);
+    expect(
+      await f.adapter.recoverIncompleteCreation(provisioningLease(), signal),
+    ).toBe(true);
     expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
     f.assertions.fault = undefined;
     await f.adapter.create(disk, signal);
@@ -810,6 +939,24 @@ describe('Linux LUKS2 PersonVmDiskPort', () => {
     expect(
       f.inputRefs.every((bytes) => bytes.every((byte) => byte === 0)),
     ).toBe(true);
+  });
+
+  it('does no filesystem initialization during inspection and ignores crashed atomic journal temporary files', async () => {
+    const f = await fixture();
+    expect(await f.adapter.inspect(vm, signal)).toEqual({ state: 'absent' });
+    expect(await readdir(f.root)).toEqual([]);
+    await mkdir(join(f.root, 'journal'), { mode: 0o700 });
+    await writeFile(
+      join(
+        f.root,
+        'journal',
+        vm + '.json.550e8400-e29b-41d4-a716-446655440016',
+      ),
+      '{}',
+      { mode: 0o600 },
+    );
+    expect(await f.adapter.listFormalDiskIds(signal)).toEqual([]);
+    expect(await f.adapter.confirmAbsence(vm, signal)).toBe(true);
   });
 
   it('rejects a writable protected root before doing storage work', async () => {

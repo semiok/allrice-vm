@@ -32,6 +32,7 @@ import {
   type LinuxDiskObservation,
 } from './linux-luks2-state.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
+import type { VmLease } from './store.ts';
 import type { OwnedWorkDiskReceipt } from './template-snapshot-contract.ts';
 
 const uuid = z.uuid();
@@ -162,8 +163,8 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
   private readonly env: Record<string, string>;
   private readonly bytes: number;
   private readonly uid: bigint;
-  private readonly issued = new WeakMap<OwnedWorkDiskReceipt, object>();
-  private readonly generations = new Map<string, object>();
+  readonly #issued = new WeakMap<OwnedWorkDiskReceipt, object>();
+  readonly #generations = new Map<string, object>();
   private pending = Promise.resolve();
 
   constructor(private readonly options: LinuxDiskOptions) {
@@ -215,7 +216,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     return done;
   }
 
-  private async roots(signal: AbortSignal) {
+  private async roots(signal: AbortSignal, initialize = false) {
     const root = this.options.root;
     let storageDevice = '';
     for (let path = root; ; path = dirname(path)) {
@@ -240,7 +241,6 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
       .object({
         filesystems: z.tuple([
           z.object({
-            uuid,
             'maj:min': z.string(),
           }),
         ]),
@@ -249,26 +249,42 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         JSON.parse(
           await this.execute(
             'findmnt',
-            ['--json', '--list', '--target', root, '--output', 'UUID,MAJ:MIN'],
+            ['--json', '--list', '--target', root, '--output', 'MAJ:MIN'],
             signal,
           ),
         ),
       ).filesystems[0];
+    const liveDevice = linuxDeviceNumber(BigInt(storageDevice));
+    requireDisk(outer['maj:min'] === liveDevice);
+    const block = '/dev/block/' + liveDevice;
+    requireDisk((await this.kernel.blockDevice(block)) === liveDevice);
+    const fsUuid = (
+      await this.execute(
+        'blkid',
+        ['-p', '-s', 'UUID', '-o', 'value', '--', block],
+        signal,
+      )
+    ).trim();
+    requireDisk(
+      fsUuid === this.options.rootIdentity.uuid &&
+        (await this.kernel.blockDevice(block)) === liveDevice,
+    );
     const again = await lstat(root, { bigint: true });
     requireDisk(
-      outer.uuid === this.options.rootIdentity.uuid &&
-        outer['maj:min'] === linuxDeviceNumber(BigInt(storageDevice)) &&
-        String(again.dev) === storageDevice &&
+      String(again.dev) === storageDevice &&
         String(again.ino) === this.options.rootIdentity.inode,
     );
     for (const name of [...tiers, 'journal', 'mounts']) {
       const path = join(root, name);
-      await mkdir(path, { mode: Number(ownedDirectory) }).catch(
-        (error: NodeJS.ErrnoException) => {
-          if (error.code !== 'EEXIST') throw error;
-        },
-      );
-      await this.privateDirectory(path, storageDevice);
+      if (initialize) {
+        await mkdir(path, { mode: Number(ownedDirectory) }).catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code !== 'EEXIST') throw error;
+          },
+        );
+      }
+      if (await optional(() => lstat(path)))
+        await this.privateDirectory(path, storageDevice);
     }
     return { root, storageDevice };
   }
@@ -629,8 +645,16 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         (await this.options.keys.listDiskIds(signal)).map(checkedId),
       );
       for (const directory of [...tiers, 'journal', 'mounts']) {
-        for (const name of await readdir(join(root, directory))) {
+        for (const name of (await optional(() =>
+          readdir(join(root, directory)),
+        )) ?? []) {
           const id = directory === 'mounts' ? name : (name.split('.')[0] ?? '');
+          if (
+            directory === 'journal' &&
+            name.startsWith(id + '.json.') &&
+            uuid.safeParse(name.slice((id + '.json.').length)).success
+          )
+            continue;
           ids.add(checkedId(id));
         }
       }
@@ -738,7 +762,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
   }
 
   private async closeOwned(disk: PersonDisk, signal: AbortSignal) {
-    this.generations.delete(disk.vmId);
+    this.#generations.delete(disk.vmId);
     let state = await this.ensureLayout(disk, signal);
     if (state.observed.mount) {
       await this.execute('umount', ['--', state.layout.mount], signal);
@@ -767,14 +791,63 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     return layout.journal + '.' + record.luksUuid + '.alloc';
   }
 
-  /** Under the same exclusive physical lease as create. Only ever retires a
-   * disk that was never declared ready. Unknown native state retains everything. */
-  recoverIncompleteCreation(disk: PersonDisk, signal: AbortSignal) {
-    return this.serial(signal, () => this.recoverAllocation(disk, signal));
+  /** Call inside Linux provisioning's existing lease, before its read-only
+   * inspect. Reclaim only an unpublished allocation of this exact row. */
+  recoverIncompleteCreation(
+    lease: Pick<VmLease, 'row' | 'signal' | 'guard'>,
+    signal: AbortSignal,
+  ) {
+    const owned = AbortSignal.any([signal, lease.signal]);
+    return this.serial(owned, async () => {
+      const row = lease.row;
+      if (!row) return false;
+      const {
+        vmId,
+        personId,
+        organizationId,
+        leaseEpoch,
+        diskTier: tier,
+      } = row;
+      const owner = { vmId, personId, organizationId };
+      const assertUnpublished = () => {
+        const current = lease.row;
+        requireDisk(
+          current &&
+            current.vmId === vmId &&
+            current.personId === personId &&
+            current.organizationId === organizationId &&
+            current.leaseEpoch === leaseEpoch &&
+            current.diskTier === tier &&
+            current.diskRetained &&
+            (current.phase === 'starting' || current.phase === 'failed') &&
+            current.instanceId === null &&
+            !current.nativeCreated &&
+            !current.egressReceipt &&
+            !current.gatewayPorts.length &&
+            !current.holds.length,
+          'LEASE_LOST',
+        );
+      };
+      assertUnpublished();
+      await lease.guard(owner);
+      owned.throwIfAborted();
+      assertUnpublished();
+      const recovered = await this.recoverAllocation({ vmId, tier }, owned);
+      await lease.guard(owner);
+      assertUnpublished();
+      owned.throwIfAborted();
+      return recovered;
+    });
   }
 
-  private async recoverAllocation(disk: PersonDisk, signal: AbortSignal) {
+  private async recoverAllocation(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    expectedLuksUuid?: string,
+  ) {
     const state = await this.ensureLayout(disk, signal);
+    if (expectedLuksUuid !== undefined)
+      requireDisk(state.record?.luksUuid === expectedLuksUuid, 'LEASE_LOST');
     if (state.record?.phase === 'allocating') {
       requireDisk(
         state.record.tier === disk.tier &&
@@ -804,7 +877,8 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
 
   create(disk: PersonDisk, signal: AbortSignal) {
     return this.serial(signal, async () => {
-      await this.recoverAllocation(disk, signal);
+      checkedId(disk.vmId);
+      await this.roots(signal, true);
       const prior = await this.ensureLayout(disk, signal);
       if (prior.record?.phase === 'ready') {
         await this.verifyHeader(prior, signal);
@@ -888,7 +962,11 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         });
         return image;
       } catch {
-        await this.recoverAllocation(disk, AbortSignal.timeout(30_000));
+        await this.recoverAllocation(
+          disk,
+          AbortSignal.timeout(30_000),
+          reservation.luksUuid,
+        );
         return unavailable();
       }
     });
@@ -911,17 +989,39 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     return child;
   }
 
+  private async ensureWorkDirectory(state: DiskState) {
+    requireDisk(state.observed.mount);
+    await mkdir(join(state.layout.mount, 'work'), {
+      mode: Number(ownedDirectory),
+    }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    return this.workDirectory(state);
+  }
+
   attach(disk: PersonDisk, signal: AbortSignal, beforeDispatch?: () => void) {
     return this.serial(signal, async () => {
-      const state = await this.ensureLayout(disk, signal);
-      requireDisk(state.record?.phase === 'ready');
+      let state = await this.ensureLayout(disk, signal);
+      requireDisk(state.record?.phase === 'ready' && state.file);
       await this.verifyHeader(state, signal);
       if (state.observed.mount) {
         await this.verifyXfs(state, signal);
-        await this.workDirectory(state);
+        await this.ensureWorkDirectory(state);
+        signal.throwIfAborted();
         return state.layout.mount;
       }
-      requireDisk(detached(state.observed));
+      if (!detached(state.observed)) {
+        // A prior attach may have been interrupted before mount dispatch.
+        // The caller owns this disk under the physical lease. Only a fully
+        // identified, unmounted and unheld mapping can be reconciled here.
+        const identity = state.file.identity;
+        state = await this.closeOwned(disk, signal);
+        requireDisk(
+          state.record?.phase === 'ready' &&
+            state.file &&
+            exactImage(state.file.identity, identity),
+        );
+      }
       await mkdir(state.layout.mount, { mode: Number(ownedDirectory) }).catch(
         (error: NodeJS.ErrnoException) => {
           if (error.code !== 'EEXIST') throw error;
@@ -934,7 +1034,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
       requireDisk((await readdir(state.layout.mount)).length === 0);
       signal.throwIfAborted();
       beforeDispatch?.();
-      this.generations.delete(disk.vmId);
+      this.#generations.delete(disk.vmId);
       try {
         const opened = await this.openMapper(disk, state, signal, false);
         requireDisk(opened.observed.mapper);
@@ -957,13 +1057,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
           mounted.observed.mount &&
             mounted.observed.mapper?.device === opened.observed.mapper.device,
         );
-        const work = join(state.layout.mount, 'work');
-        await mkdir(work, { mode: Number(ownedDirectory) }).catch(
-          (error: NodeJS.ErrnoException) => {
-            if (error.code !== 'EEXIST') throw error;
-          },
-        );
-        await this.workDirectory(mounted);
+        await this.ensureWorkDirectory(mounted);
         signal.throwIfAborted();
         return state.layout.mount;
       } catch {
@@ -1070,7 +1164,7 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
 
   delete(...[disk, signal, erase]: Parameters<PersonVmDiskPort['delete']>) {
     return this.serial(signal, async () => {
-      this.generations.delete(disk.vmId);
+      this.#generations.delete(disk.vmId);
       let state = await this.assertDetached(disk, signal);
       if (!state.record) {
         requireDisk(
@@ -1085,7 +1179,9 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
               (await this.options.keys.confirmAbsence(disk.vmId)),
           );
           await optional(() => rmdir(empty.layout.mount));
-          await syncDiskPoolDirectory(dirname(empty.layout.mount));
+          await optional(() =>
+            syncDiskPoolDirectory(dirname(empty.layout.mount)),
+          );
         }
         return;
       }
@@ -1170,9 +1266,9 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
         ].join(':'),
         workDirectory,
       });
-      let generation = this.generations.get(current.vmId);
-      if (!generation) this.generations.set(current.vmId, (generation = {}));
-      this.issued.set(receipt, generation);
+      let generation = this.#generations.get(current.vmId);
+      if (!generation) this.#generations.set(current.vmId, (generation = {}));
+      this.#issued.set(receipt, generation);
       return receipt;
     });
   }
@@ -1184,10 +1280,10 @@ export class LinuxLuks2PersonVmDisk implements PersonVmDiskPort {
     signal: AbortSignal,
   ) {
     return this.scopedReceipt(disk, binding, signal, async (state, current) => {
-      const generation = this.generations.get(current.vmId);
+      const generation = this.#generations.get(current.vmId);
       requireDisk(
         generation &&
-          this.issued.get(receipt) === generation &&
+          this.#issued.get(receipt) === generation &&
           sameBinding(receipt.binding, current),
         'LEASE_LOST',
       );
