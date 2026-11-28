@@ -820,17 +820,30 @@ export function EmployeeNativePage({
         switching.restored = true;
         return;
       }
-      if (query === displayedQuery.current) return;
+      if (query === displayedQuery.current) {
+        if (navigating) nextQuery.current = query;
+        return;
+      }
       const params = new URLSearchParams(query);
       const selection = DEntrySelectionInputSchema.safeParse(
         Object.fromEntries(params),
       );
       if (
         selection.success &&
-        params.size === Object.keys(selection.data).length &&
-        beginLiveSwitch(selection.data, true)
-      )
-        return;
+        params.size === Object.keys(selection.data).length
+      ) {
+        const restored = selection.data;
+        if (
+          restored.threadId === selectedEmployee?.threadId &&
+          restored.workspaceId === selectedEmployee?.workspaceId &&
+          restored.employeeInstanceId === selectedEmployee?.employeeInstanceId
+        ) {
+          nextQuery.current = query;
+          if (!navigating) selectedQuery = displayedQuery.current = query;
+          return;
+        }
+        if (beginLiveSwitch(restored, true)) return;
+      }
       nextQuery.current = query;
       if (switching || query !== displayedQuery.current) applyQuery();
     };

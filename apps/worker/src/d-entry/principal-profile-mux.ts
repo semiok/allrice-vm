@@ -145,6 +145,7 @@ async function runOwner(
   let transport: OwnedPage | undefined;
   let shared: ReturnType<typeof pageStreams> | undefined;
   let handoff: Promise<void> | undefined;
+  let restarting: Map<string, Frame> | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false;
   const notify = (error: unknown) => {
@@ -275,7 +276,12 @@ async function runOwner(
         );
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
-        const retiring = shared ? (previous.resources?.openIds() ?? []) : [];
+        const retiring = shared
+          ? previous.resources?.retire(root.rootNativeSessionId)
+          : undefined;
+        restarting = new Map(
+          retiring?.pending.map((opening) => [opening.streamId, opening]),
+        );
         endPage(previous);
         await join(previous);
         generation.stop.signal.throwIfAborted();
@@ -285,7 +291,7 @@ async function runOwner(
         connected.throwIfAborted();
         mount(generation, page);
         staged = undefined;
-        await send({
+        const published = send({
           type: 'item',
           streamId: id,
           value: {
@@ -294,9 +300,13 @@ async function runOwner(
             threadId: command.threadId,
             scopeId: page.scope.opened.scopeId,
             nativeSessionId: root.rootNativeSessionId,
-            ...(retiring.length && { retiredStreams: retiring }),
+            ...(retiring?.end.length && { retiredStreams: retiring.end }),
           },
         });
+        for (const opening of restarting.values())
+          generation.resources?.accept(opening);
+        restarting = undefined;
+        await published;
         publishedScopeId = page.scope.opened.scopeId;
       },
       previousPage,
@@ -414,6 +424,7 @@ async function runOwner(
         if (!current?.resources || requestedClose) throw denied();
         const local = current.resources;
         const id = frame.streamId;
+        if (frame.type === 'cancel') restarting?.delete(id);
         const stable =
           shared &&
           (frame.type === 'open'
@@ -514,6 +525,7 @@ function pageStreams(
       sendInput(input: DEntryPageInput): void;
       work: Promise<void>;
       isOpen(): boolean;
+      beforeSnapshot(nativeId: string): Frame | undefined;
     }
   >();
   const scopeId = page.scope.opened.scopeId;
@@ -526,6 +538,8 @@ function pageStreams(
     let settled = false;
     let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
     let newRoot: string | undefined;
+    let followedId: string | undefined;
+    let openingSent = false;
     let buffered = 0;
     let input = Promise.resolve();
     let inputError = Promise.resolve();
@@ -559,6 +573,7 @@ function pageStreams(
             address.kind === 'session'
               ? address.sessionId
               : address.childSessionId;
+          followedId = id;
           if (await page.authorizeFollow(id, child)) newRoot = id;
         }
         follow = await page.watchFollow(child);
@@ -612,6 +627,7 @@ function pageStreams(
           if (newRoot) await page.authorizeFollow(newRoot, child);
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
+          openingSent = true;
           await send({ type: 'item', streamId: id, value: item.value });
         }
         follow?.signal.throwIfAborted();
@@ -653,6 +669,8 @@ function pageStreams(
       work,
       cancel: () => controller.abort(),
       isOpen: () => !settled && !child.aborted,
+      beforeSnapshot: (nativeId) =>
+        !openingSent && followedId === nativeId ? frame : undefined,
       sendInput(command) {
         if (settled || child.aborted) return;
         const bytes = Buffer.byteLength(JSON.stringify(command));
@@ -693,8 +711,19 @@ function pageStreams(
   return {
     signal: active,
     has: (id: string) => streams.has(id),
-    openIds: () =>
-      [...streams].filter(([, entry]) => entry.isOpen()).map(([id]) => id),
+    retire(nativeId: string) {
+      const end: string[] = [];
+      const pending: Frame[] = [];
+      for (const [id, entry] of streams) {
+        if (!entry.isOpen()) continue;
+        // rc.2 treats EOF before its first snapshot as terminal. Resume an
+        // opening follow of the target on the new scope with the same id.
+        const opening = entry.beforeSnapshot(nativeId);
+        if (opening) pending.push(opening);
+        else end.push(id);
+      }
+      return { end, pending };
+    },
     accept(frame: Frame) {
       active.throwIfAborted();
       const prior = streams.get(frame.streamId);

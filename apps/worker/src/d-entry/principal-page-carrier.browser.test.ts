@@ -1179,8 +1179,13 @@ it
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'item' && frame.value.type === 'opened')
           lastScopeId = frame.value.scopeReference.scopeId;
-        if (frame.type === 'item' && frame.value.type === 'switched')
+        if (frame.type === 'item' && frame.value.type === 'switched') {
           lastScopeId = frame.value.scopeId;
+          for (const address of followAddresses.values()) {
+            if (address.nativeId === frame.value.nativeSessionId)
+              address.scopeId = frame.value.scopeId;
+          }
+        }
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
@@ -1228,7 +1233,17 @@ it
     started = performance.now();
     await page.goto(
       realShell
-        ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
+        ? f.origin +
+            '/chatflow/4.0?' +
+            new URLSearchParams(
+              scenario === 'switch'
+                ? {
+                    threadId: f.selection.threadId,
+                    workspaceId: f.selection.workspaceId,
+                    employeeInstanceId: f.selection.employeeInstanceId,
+                  }
+                : f.selection,
+            )
         : f.origin,
       coldAssets ? { waitUntil: 'commit' } : undefined,
     );
@@ -1800,6 +1815,25 @@ it
       expectedNativeId = createdNativeId;
     }
     if (nativeCreate) {
+      const holdOldOpening = scenario === 'native-create' && !createAfterSwitch;
+      let oldOpeningReleased = false;
+      if (holdOldOpening) {
+        let held = false;
+        f.host.catalog.beforeFollow = async ({ address }, signal) => {
+          if (
+            held ||
+            address.kind !== 'session' ||
+            address.sessionId !== createdNativeId
+          )
+            return;
+          held = true;
+          if (!signal.aborted)
+            await new Promise<void>((resolve) => {
+              signal.addEventListener('abort', () => resolve(), { once: true });
+            });
+          oldOpeningReleased = true;
+        };
+      }
       const mark = randomUUID();
       const frame = page.locator('iframe');
       const initialSockets = socketCount;
@@ -1915,6 +1949,7 @@ it
       await expect
         .poll(() => followed.has(createdNativeId + '/' + lastScopeId))
         .toBe(true);
+      if (holdOldOpening) expect(oldOpeningReleased).toBe(true);
       const draft = '原生新会话草稿';
       await editor.fill(draft, { timeout: 15_000 });
       const draftPrefix =

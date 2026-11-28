@@ -447,8 +447,8 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const lifetime = AbortSignal.any([admitted, ended.signal]);
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
-          const threadWrites = new Set<Promise<unknown>>();
-          const registeredRoots = new Set<string>();
+          const threadWork = new Set<Promise<unknown>>();
+          const registeredRoots = new Map<string, DEntryHistoryRootPin>();
           let switching = false;
           let switchProof:
             | {
@@ -497,6 +497,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             });
             fence();
             return closing;
+          }
+          async function ownThreadWork<T>(invoke: () => Promise<T>) {
+            lifetime.throwIfAborted();
+            if (switching) throw denied();
+            const task = Promise.resolve().then(invoke);
+            threadWork.add(task);
+            try {
+              return await task;
+            } finally {
+              threadWork.delete(task);
+            }
           }
           function stopPage() {
             fence(stop.reason);
@@ -639,23 +650,13 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     switchProof = undefined;
                     switching = true;
                     return {
-                      drained: Promise.allSettled(threadWrites),
+                      drained: Promise.allSettled(threadWork),
                       release() {
                         switching = false;
                       },
                     };
                   },
-                  async runThreadWrite(invoke) {
-                    lifetime.throwIfAborted();
-                    if (switching) throw denied();
-                    const task = Promise.resolve().then(invoke);
-                    threadWrites.add(task);
-                    try {
-                      return await task;
-                    } finally {
-                      threadWrites.delete(task);
-                    }
-                  },
+                  runThreadWrite: ownThreadWork,
                   async watchFollow(caller) {
                     if (!authority.observation) return;
                     return openFollowAuthority(
@@ -676,17 +677,27 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     active.throwIfAborted();
                   },
                   async authorizeFollow(nativeSessionId, active) {
-                    // A native create/fork may open its freshly registered
-                    // root before the browser finishes issuing its new page.
-                    if (
-                      registeredRoots.has(nativeSessionId) &&
-                      (await page.canReuseNativeSession(
-                        nativeSessionId,
-                        active,
-                      ))
-                    )
+                    await assertCurrent(active);
+                    if (nativeSessionId === pin?.rootNativeSessionId)
+                      return false;
+                    // Create/fork can start following its new native root before
+                    // the browser installs the new page. Only its actual durable
+                    // registration can bridge that opening.
+                    const registered = registeredRoots.get(nativeSessionId);
+                    if (registered?.identity.threadId) {
+                      const next = await deps.root(auth.context, {
+                        ...input.selection,
+                        threadId: registered.identity.threadId,
+                      });
+                      if (!sameRoot(next, registered)) throw denied();
+                      active.throwIfAborted();
                       return true;
-                    await authorize(nativeSessionId, 'read', active);
+                    }
+                    // Any descendant read that was already dispatched must
+                    // settle before a normal switch retires the old catalog.
+                    await ownThreadWork(() =>
+                      authorize(nativeSessionId, 'read', active),
+                    );
                     return false;
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
@@ -750,7 +761,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     const thread = ChatSessionSchema.parse(registered.thread);
                     if (thread.id !== registered.identity.threadId)
                       throw denied();
-                    registeredRoots.add(nativeSessionId);
+                    registeredRoots.set(nativeSessionId, registered);
                     return thread;
                   },
                   async invokeTerminal(call, active) {
