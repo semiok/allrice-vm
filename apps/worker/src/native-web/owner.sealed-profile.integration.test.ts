@@ -264,7 +264,7 @@ it(
           import { resolve } from 'node:path';
           import { fileURLToPath } from 'node:url';
 
-          export const inject = ['agents', 'sessions', 'permissionPresets',
+          export const inject = ['agents', 'agentPresets', 'sessions', 'permissionPresets',
             'sandboxPolicy', 'approval', 'appReady'];
           export function apply(ctx) {
             const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -285,15 +285,17 @@ it(
               await mkdir(workspace);
               await writeFile(outside, 'unchanged');
               const id = randomUUID();
+              const { id: preset } = await ctx.agentPresets.resolve();
+              const setup = agentCtx => ctx.agentPresets.mount(agentCtx, preset);
               const fresh = await ctx.agents.create({
-                sessionId: id, meta: { cwd: workspace, agentPreset: 'standard' },
+                sessionId: id, meta: { cwd: workspace, agentPreset: preset }, setup,
               });
               const initial = effective(fresh.agent.session);
               fresh.agent.session.append('approval/policy', { policy: 'ask' });
               if (!await ctx.sessions.flush(fresh.agent.session))
                 throw Error('Missing native session persistence');
               await fresh.dispose();
-              const resumed = await ctx.agents.resume({ resumeSessionId: id });
+              const resumed = await ctx.agents.resume({ resumeSessionId: id, setup });
               try {
                 const agent = resumed.agent;
                 const session = agent.session;
@@ -319,8 +321,13 @@ it(
                   options: ctx.permissionPresets.catalog().options.map(o => o.value),
                   history: take(session, 'approval/policy').map(event => event.policy),
                   decisions: take(session, 'approval/decided').map(event => event.outcome),
-                  normal: normal.ok, outsideWrite: outsideWrite.ok,
-                  escalated: escalated.ok,
+                  normal: normal.isError ? normal.error : {
+                    exitCode: normal.value.exitCode, sandbox: normal.value.sandbox,
+                  },
+                  outsideWrite: outsideWrite.isError ? outsideWrite.error : {
+                    exitCode: outsideWrite.value.exitCode, sandbox: outsideWrite.value.sandbox,
+                  },
+                  escalated: escalated.isError,
                 };
               } finally {
                 await resumed.dispose();
@@ -350,10 +357,20 @@ it(
       normalAsks: 0,
       prompts: 0,
       decisions: ['rejected'],
-      normal: true,
-      outsideWrite: true,
-      escalated: false,
+      normal: {
+        exitCode: 0,
+        sandbox: expect.objectContaining({
+          mode: 'workspace-write',
+          denied: false,
+        }),
+      },
+      outsideWrite: {
+        exitCode: expect.any(Number),
+        sandbox: expect.objectContaining({ mode: 'workspace-write' }),
+      },
+      escalated: true,
     });
+    expect(receipt.outsideWrite.exitCode).not.toBe(0);
     expect(await read('workspace/inside')).toBe('ok');
     expect(await read('outside')).toBe('unchanged');
   },
