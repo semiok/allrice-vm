@@ -1537,17 +1537,24 @@ it
       const first = page
         .frames()
         .find((frame) => frame.url().includes(firstScope))!;
-      await first.locator('#app').evaluate((node, selection) => {
-        document.querySelector<HTMLElement>('[data-composer-input]')?.focus();
-        parent.postMessage(
-          {
-            type: 'allrice:d-entry:navigate',
-            scopeId: node.dataset.scopeId,
-            selection,
-          },
-          location.origin,
-        );
-      }, fourth!.identity);
+      await first.locator('#app').evaluate(
+        (node, selection) => {
+          document.querySelector<HTMLElement>('[data-composer-input]')?.focus();
+          parent.postMessage(
+            {
+              type: 'allrice:d-entry:navigate',
+              scopeId: node.dataset.scopeId,
+              selection,
+            },
+            location.origin,
+          );
+        },
+        {
+          workspaceId: fourth!.identity.workspaceId,
+          employeeInstanceId: d,
+          threadId: fourth!.identity.threadId,
+        },
+      );
       const activeAfterBackground = await page.evaluate(
         () =>
           new Promise<string>((resolve) =>

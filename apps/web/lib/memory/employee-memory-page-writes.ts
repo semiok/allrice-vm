@@ -142,6 +142,7 @@ export function readEmployeeMemoryPageWrites(
   host: Host,
   scopeId: string,
   employee: Employee,
+  caller?: Window,
 ) {
-  return host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__?.(scopeId, employee);
+  return host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__?.(scopeId, employee, caller);
 }
