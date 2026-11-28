@@ -75,6 +75,15 @@ export function legacyEmployeePanelDataClient(
         headers,
         { signal },
       ),
+    async downloadMaterial(input, signal) {
+      const response = await fetch(
+        `/api/v1/references/revisions/${input.revisionId}/download?` +
+          query({ workspaceId: input.workspaceId }),
+        { cache: 'no-store', credentials: 'same-origin', headers, signal },
+      );
+      if (!response.ok) return readJson(response, { read: true });
+      return response.blob();
+    },
     publishFile: (input, signal) =>
       write('/api/v1/references/publications', input, signal),
     publishUpload: (input, signal) =>
