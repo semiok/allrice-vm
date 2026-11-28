@@ -4037,6 +4037,7 @@ suite(
                   profileVerificationOwner: {},
                   nativeInstanceId: target.instanceId,
                   controlReady: () => !newEmployeeJobExited,
+                  joinStaleProfilePrincipals: unexpectedOwnerOperation,
                   verifyStartingEditor: unexpectedOwnerOperation,
                   verifyRunningEditor: unexpectedOwnerOperation,
                   createRootFor: unexpectedOwnerOperation,
