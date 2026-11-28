@@ -44,6 +44,13 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
+import {
+  createHostSearch,
+  readGuestSearch,
+  webSearchPath,
+  webSearchRoute,
+  webSearchTimeoutMs,
+} from './production-web-search.js';
 import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 import {
   matchNativeToolObservation,
@@ -76,6 +83,7 @@ type PromptOwner = NativeModelSelection &
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
     assertObservedNow(): void;
+    assertCurrent(signal: AbortSignal): Promise<void>;
     assertClaimed(
       signal: AbortSignal,
       occurrence: NativePromptOccurrence,
@@ -696,7 +704,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const uninstall = host.startup.installModelAdapter(
         async (binding, signal) => {
           const active = AbortSignal.any([live, signal]);
-          const modelInfo = await input.readModelInfo(active);
+          const modelMetadata = await input.readModelMetadata(active);
           const access = await host.providers.egressInstallation.readAccess(
             binding,
             active,
@@ -706,7 +714,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             ...access,
             provider: input.route.provider,
             model: input.route.model,
-            modelInfo,
+            ...modelMetadata,
+            webSearchEnabled: input.webSearch !== undefined,
           };
         },
       );
@@ -1059,6 +1068,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 scopeId: issue.scopeId,
                 assertObserved: watch.assertObserved,
                 assertObservedNow: watch.assertObservedNow,
+                assertCurrent: watch.assertCurrent,
                 assertClaimed: observation.assertClaimed,
                 runId: randomUUID(),
               });
@@ -1142,11 +1152,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         void task.then(settle, settle);
         return task;
       }
-      async function resolveSession(
+      async function resolveLiveSession(
         scope: NativeModelSelection,
         sessionId: string,
-        kind: NativeModelAttemptKind,
         signal: AbortSignal,
+        requireRunning = false,
       ) {
         const active = AbortSignal.any([signal, scope.revoked]);
         active.throwIfAborted();
@@ -1176,13 +1186,27 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           owner: current.owner,
           nativeSessionId: sessionId,
           requireLiveAgent: true,
+          requireRunning,
           signal: active,
         });
         if (!('nativeAddress' in resource) || !resource.nativeAddress)
           return reject();
+        return { resource, profile, active, address: resource.nativeAddress };
+      }
+      async function resolveSession(
+        scope: NativeModelSelection,
+        sessionId: string,
+        kind: NativeModelAttemptKind,
+        signal: AbortSignal,
+      ) {
+        const { resource, profile, active, address } = await resolveLiveSession(
+          scope,
+          sessionId,
+          signal,
+        );
         const attempt = await profile.owner.readNativeAttemptFor(
-          context,
-          resource.nativeAddress,
+          scope.context,
+          address,
           active,
           kind,
         );
@@ -1283,6 +1307,138 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       }
       async function assertCall(call: ModelCallBinding, signal: AbortSignal) {
         await readAuthorizedCall(call, signal);
+      }
+
+      const webSearch = input.webSearch;
+      function searchService(): ManagedHostService[] {
+        if (!webSearch) return [];
+        const { provider, bind } = webSearch;
+        const dispatchSearch = createHostSearch({
+          provider,
+          vm: host.vm,
+          admission: host.admission,
+          requestsPerPersonPerMinute: 10,
+        });
+        return [
+          {
+            id: webSearchRoute,
+            path: webSearchPath,
+            method: 'POST',
+            timeoutMs: webSearchTimeoutMs,
+            admissionOwner: 'service',
+            async resolve(request, binding, signal, assertNoCapability) {
+              return run(signal, async (active) => {
+                const reading = AbortSignal.any([
+                  active,
+                  AbortSignal.timeout(5_000),
+                ]);
+                const wanted = await readGuestSearch(request, reading);
+                if (!assertNoCapability) throw new EgressError('DENIED');
+                assertNoCapability(wanted.query);
+                const checked = new Set<string>();
+                for (const { scope: probe, observation } of selected.values()) {
+                  if (
+                    probe.adapterId !== wanted.adapterId ||
+                    probe.revoked.aborted ||
+                    !observation.inserted() ||
+                    !sameVmBinding(probe.binding, binding) ||
+                    checked.has(probe.authorityKey)
+                  )
+                    continue;
+                  checked.add(probe.authorityKey);
+                  const fact = await resolveLiveSession(
+                    probe,
+                    wanted.sessionId,
+                    active,
+                    true,
+                  ).catch((error: unknown) => {
+                    if (
+                      probe.revoked.aborted ||
+                      (error instanceof DataAccessError &&
+                        (error.code === 'not_found' ||
+                          error.code === 'authorization_denied'))
+                    )
+                      return null;
+                    throw error;
+                  });
+                  if (
+                    !fact ||
+                    fact.profile.owner.modelAdapterId !== wanted.adapterId ||
+                    fact.resource.rootNativeSessionId !== probe.root
+                  )
+                    continue;
+                  const { owner } = fact.profile;
+                  const watch = await owner.observeNativeSearchCallFor(
+                    probe.context,
+                    wanted,
+                    active,
+                  );
+                  try {
+                    const { claims, rootSessionId } = watch.proof;
+                    if (
+                      rootSessionId !== probe.root ||
+                      claims.some(
+                        (claim) =>
+                          claim.sessionId !== rootSessionId ||
+                          claim.parentSessionId !== undefined,
+                      )
+                    )
+                      throw new EgressError('DENIED');
+                    const proven = await findPromptContributors(
+                      wanted.adapterId,
+                      rootSessionId,
+                      binding,
+                      claims,
+                      active,
+                    );
+                    if (!proven) throw new EgressError('DENIED');
+                    const { first, contributors } = proven;
+                    const context = structuredClone(first.context);
+                    const revoked = AbortSignal.any([
+                      live,
+                      watch.signal,
+                      fact.profile.revoked,
+                      ...contributors.map((member) => member.revoked),
+                    ]);
+                    async function assertCurrent(caller: AbortSignal) {
+                      const current = AbortSignal.any([caller, revoked]);
+                      current.throwIfAborted();
+                      await Promise.all(
+                        contributors.map(async (member, index) => {
+                          await member.assertClaimed(current, claims[index]!);
+                          await member.assertCurrent(current);
+                        }),
+                      );
+                      current.throwIfAborted();
+                    }
+                    bind(context, binding, signal, assertCurrent);
+                    return {
+                      context,
+                      close: watch.close,
+                      dispatch: (response, caller) =>
+                        dispatchSearch(
+                          {
+                            context,
+                            binding,
+                            signal: revoked,
+                            assertCurrent,
+                            closeProof: watch.close,
+                          },
+                          wanted,
+                          response,
+                          caller,
+                        ),
+                    };
+                  } catch (error) {
+                    await watch.close();
+                    throw error;
+                  }
+                }
+                throw new EgressError('DENIED');
+              });
+            },
+          },
+        ];
       }
 
       const paths = [
@@ -1748,7 +1904,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             return image;
           });
         },
-        references,
+        references: [...references, ...searchService()],
         async readMemoryIndex(call, signal, phase) {
           const entry = calls.get(call.native.callId);
           if (!memory || !entry?.memoryEvidence || !entry.memoryAuthor)

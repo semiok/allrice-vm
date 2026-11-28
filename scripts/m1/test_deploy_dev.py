@@ -66,7 +66,7 @@ class DeployDevMigrations(unittest.TestCase):
         self.applied = os.path.join(self.tmp, 'applied.txt')
         # $CONTRACT_FILE holds psql's answer for the journal contract row ('row:<highWater>', empty: no row).
         write(os.path.join(self.stubs, 'psql'), '#!/bin/sh\n[ -z "$PSQL_FAIL" ] || exit 2\nfor a; do q=$a; done\n'
-              'case "$q" in *to_regclass*person_virtual_machines*) echo f ;; *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
+              'case "$q" in *to_regclass*person_virtual_machines*|*to_regclass*person_vm_scheduled_wakes*) echo f ;; *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
         write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\nexit 113\n', 0o755)
@@ -207,7 +207,7 @@ class DeployDevMigrations(unittest.TestCase):
         plist['KeepAlive'] = {'SuccessfulExit': False}
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
-        for mode in ('missing', 'stale', 'expired', 'deferred', 'success'):
+        for mode in ('missing', 'stale', 'expired', 'deferred', 'wake-before', 'wake-during', 'wake-after', 'success'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r"""
                   M1_LAUNCHCTL=test_launchctl
@@ -219,6 +219,15 @@ class DeployDevMigrations(unittest.TestCase):
                     if [ "${stopped:-}" = yes ]; then echo gone; else echo 'running 73001'; fi
                   }
                   vm_upgrade_candidates() { echo 0; }
+                  dev_sql() {
+                    case "$1" in
+                      *to_regclass*) echo t ;;
+                      *'select not exists'*)
+                        if [ "$MODE" = wake-before ] ||
+                          [ -f "$STATE/fixture-wake" ]; then echo f; else echo t; fi ;;
+                      *) return 1 ;;
+                    esac
+                  }
                   worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
                   DRAIN_SOCKET=/test/owner
                   DRAIN_TOKEN=fixture
@@ -227,14 +236,19 @@ class DeployDevMigrations(unittest.TestCase):
                     local valid='661e00de-c0fc-45e6-a1db-bfd158aedad8' year=2099
                     [ "$MODE" != stale ] || valid='144d2c90-65c5-44a7-b3e2-54589ab0eb79'
                     [ "$MODE" != expired ] || year=2020
+                    if [ "$MODE" = wake-during ]; then touch "$STATE/fixture-wake"; fi
                     printf '{"bootId":"%s","stopped":2,"expiresAt":"%s-01-01T00:00:00Z"}\n' "$valid" "$year"
                   }
-                  claim_drained_worker() { echo claim; }
+                  claim_drained_worker() {
+                    echo claim
+                    if [ "$MODE" = wake-after ]; then touch "$STATE/fixture-wake"; fi
+                  }
                   wait_for_drained_worker_exit() { [ "$MODE" != deferred ]; }
                   port_closed() { return 0; }
                   stop_job() { echo "stop-web $1"; }
                   mkdir -p "$STATE"
-                  stop_both
+                  rm -f "$STATE/fixture-wake"
+                  stop_both release
                 """, FILES, MODE=mode)
                 lines = p.stdout.splitlines()
                 if mode == 'success':
@@ -244,9 +258,154 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertIn('stop-web', p.stdout)
                 else:
                     self.assertNotEqual(p.returncode, 0)
-                    self.assertNotIn('bootout', lines)
+                    self.assertEqual('bootout' in lines, mode == 'wake-after')
                     self.assertNotIn('stop-web', p.stdout)
-                    self.assertEqual('claim' in lines, mode == 'deferred')
+                    self.assertEqual('claim' in lines, mode in ('deferred', 'wake-after'))
+                    if mode.startswith('wake-'):
+                        self.assertIn('outstanding Person VM wake', p.stdout)
+
+    def test_early_worker_exit_preserves_recovery_files_and_original_pid(self):
+        write(os.path.join(self.initial_release, '.local/person-vm-host.json'), '{}', 0o600)
+        manifest = os.path.join(self.initial_release, '.local/dev-build-identity.json')
+        with open(manifest) as f:
+            identity = json.load(f)
+        identity['files'] = [{'path': '.local/person-vm-host.json', 'scope': 'worker'}]
+        write(manifest, json.dumps(identity))
+        plist = self.read_plist(self.live_plist('worker'))
+        plist['KeepAlive'] = {'SuccessfulExit': False}
+        with open(self.live_plist('worker'), 'wb') as f:
+            plistlib.dump(plist, f)
+
+        for mode in ('before-wake-guard', 'before-first-read', 'late-wake-guard',
+                     'early', 'late', 'pending-wake', 'host-uninstalled'):
+            with self.subTest(mode=mode):
+                p = self.run_dd(r'''
+                  mkdir -p "$STATE"
+                  rm -f "$STATE/fixture-loaded"
+                  case "$MODE" in
+                    before-wake-guard|before-first-read) touch "$STATE/fixture-loaded" ;;
+                  esac
+                  if [ "$MODE" = before-wake-guard ]; then
+                    verify_no_committed_vm_wakes() { return 1; }
+                  elif [ "$MODE" = late-wake-guard ]; then
+                    verify_no_committed_vm_wakes() {
+                      if [ -f "$STATE/first-probe" ]; then return 1; fi
+                      touch "$STATE/first-probe"
+                    }
+                  fi
+                  job_state() {
+                    if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
+                  }
+                  worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+                  read_drain_receipt() {
+                    test -s "$INFLIGHT/worker-exit" || return 1
+                    if [ "$MODE" = late ]; then return 1; fi
+                    touch "$STATE/fixture-loaded"
+                    echo '{"bootId":"661e00de-c0fc-45e6-a1db-bfd158aedad8","stopped":0,"expiresAt":"2099-01-01T00:00:00Z"}'
+                  }
+                  DRAIN_TOKEN=fixture
+                  inflight_begin "$(penv "$WORKER_PLIST" ALLRICE_RELEASE_SHA)"
+                  stop_both release
+                ''', FILES, MODE=mode)
+                self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+                self.assertIn('Worker exit unconfirmed', p.stdout)
+                state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
+                if mode.startswith('before-'):
+                    self.assertFalse(os.path.exists(os.path.join(state, 'worker-exit')))
+                else:
+                    with open(os.path.join(state, 'worker-exit')) as f:
+                        self.assertEqual(f.read().splitlines(), [
+                            self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
+                        ])
+                self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                # The original process can disappear after the refusal was recorded.
+                write(os.path.join(self.home, 'allrice40-dev/qa/fixture-loaded'), '')
+
+                p = self.run_dd(r'''
+                  M1_LAUNCHCTL=test_launchctl
+                  test_launchctl() { test "$1" = bootout; }
+                  job_state() { if [ -n "${restored:-}" ]; then echo 'running 73002'; else echo loaded; fi; }
+                  worker_vm_recovery() {
+                    [ "$2" = 73002 ] || return 1
+                    if [ "$MODE" = host-uninstalled ]; then
+                      echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 uninstalled'
+                    else
+                      echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 host-ready'
+                    fi
+                  }
+                  wait_for_drained_worker_exit() {
+                    if [[ "$MODE" = before-* ]]; then
+                      test -z "$1" || return 1
+                    else
+                      test "$1" = 73001 || return 1
+                    fi
+                    echo joined-original
+                  }
+                  dev_sql() {
+                    case "$1" in
+                      *to_regclass*) echo t ;;
+                      *'select not exists'*) [ "$MODE" != pending-wake ] && echo t || echo f ;;
+                      *) command psql -X -At -c "$1" ;;
+                    esac
+                  }
+                  vm_upgrade_candidates() { echo 1; }
+                  stop_job() { :; }
+                  start_both_on() {
+                    restored=yes
+                    echo "restarted $1"
+                    verify_restored_vm_owner "$(release_of)" "$2"
+                  }
+                  recover
+                ''', FILES, CONTRACT='row:1', MODE=mode)
+                if mode in ('pending-wake', 'host-uninstalled'):
+                    self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+                    self.assertIn('joined-original', p.stdout)
+                    self.assertIn('restarted ' + 'a' * 40, p.stdout)
+                    self.assertNotIn('is healthy again', p.stdout)
+                    self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                    if mode == 'host-uninstalled':
+                        retry = r'''
+                          job_state() {
+                            if [ -n "${restored:-}" ]; then echo 'running 73003'
+                            elif [ -n "${removed:-}" ]; then echo gone
+                            else echo 'running 73002'
+                            fi
+                          }
+                          worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+                          worker_vm_recovery() {
+                            case "$2:$MODE" in
+                              73002:known) echo "$(worker_boot) uninstalled" ;;
+                              73003:known) echo "$(worker_boot) wake-ready" ;;
+                            esac
+                          }
+                          verify_no_committed_vm_wakes() { [ -n "${restored:-}" ]; }
+                          kill() { test "$*" = '-TERM 73002' && echo exact-worker-term; }
+                          wait_for_drained_worker_exit() { test "$1" = 73002; }
+                          M1_LAUNCHCTL=test_launchctl
+                          test_launchctl() { test "$1" = bootout && removed=yes; }
+                          stop_job() { :; }
+                          vm_upgrade_candidates() { echo 1; }
+                          start_both_on() {
+                            restored=yes
+                            verify_restored_vm_owner "$(release_of)" "$2"
+                          }
+                          recover
+                        '''
+                        unknown = self.run_dd(retry, FILES, CONTRACT='row:1', MODE='unknown')
+                        self.assertNotEqual(unknown.returncode, 0, (unknown.stdout, unknown.stderr))
+                        self.assertNotIn('exact-worker-term', unknown.stdout)
+                        self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                        resumed = self.run_dd(retry, FILES, CONTRACT='row:1', MODE='known')
+                        self.assertEqual(resumed.returncode, 0, (resumed.stdout, resumed.stderr))
+                        self.assertIn('exact-worker-term', resumed.stdout)
+                        self.assertFalse(os.path.exists(state))
+                    else:
+                        shutil.rmtree(state)
+                    continue
+                self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+                self.assertIn('joined-original', p.stdout)
+                self.assertIn('restarted ' + 'a' * 40, p.stdout)
+                self.assertFalse(os.path.exists(state))
 
     def test_archived_names_are_known(self):
         known, pending = self.check(self.release(), FILES + ARCHIVED)
@@ -447,6 +606,58 @@ class DeployDevMigrations(unittest.TestCase):
             with open(os.path.join(inflight, role + '.plist'), 'wb') as f:
                 plistlib.dump(self.plist(role, release=old), f)
         write(os.path.join(inflight, 'state'), 'switching\n' + 'a' * 40 + '\n')
+
+    def test_recovery_does_not_switch_to_another_release_with_a_committed_wake(self):
+        self.saved_release(self.release(store=False))
+        p = self.run_dd(r'''
+          dev_sql() {
+            case "$1" in
+              *to_regclass*) echo t ;;
+              *'select not exists'*) echo f ;;
+              *) return 1 ;;
+            esac
+          }
+          stop_release_worker() { echo unexpected-stop; }
+          start_both_on() { echo unexpected-start; }
+          recover
+        ''', FILES + ARCHIVED, CONTRACT='row:1')
+        self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn('outstanding Person VM wake', p.stdout)
+        self.assertNotIn('unexpected-stop', p.stdout)
+        self.assertNotIn('unexpected-start', p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.home, 'allrice40-dev/qa/deploy-inflight/state',
+        )))
+
+    def test_recovery_starts_missing_web_without_draining_the_restored_worker(self):
+        for mode in ('healthy', 'wake-pending', 'worker-exited', 'worker-stopping'):
+            with self.subTest(mode=mode):
+                self.saved_release(self.initial_release)
+                p = self.run_dd(r'''
+                  job_state() {
+                    if [ "$1" = "$WEB_LABEL" ]; then echo gone
+                    elif [ "$MODE" = worker-exited ] && [ -f "$STATE/web-ready" ]; then echo loaded
+                    else echo 'running 73002'
+                    fi
+                  }
+                  worker_vm_recovery() {
+                    if [ "$MODE" = worker-stopping ] && [ -f "$STATE/web-ready" ]; then return 1; fi
+                    echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 wake-ready'
+                  }
+                  start_job() { test "$1" = "$WEB_LABEL" && echo web-started; }
+                  wait_ready() { touch "$STATE/web-ready"; }
+                  verify_no_committed_vm_wakes() { test "$MODE" != wake-pending; }
+                  vm_upgrade_candidates() { echo 0; }
+                  stop_both() { echo unexpected-stop; return 1; }
+                  rm -f "$STATE/web-ready"
+                  recover
+                ''', FILES, CONTRACT='row:1', MODE=mode)
+                self.assertIn('web-started', p.stdout)
+                self.assertNotIn('unexpected-stop', p.stdout)
+                self.assertEqual(p.returncode == 0, mode == 'healthy', p.stdout + p.stderr)
+                self.assertEqual(os.path.isfile(os.path.join(
+                    self.home, 'allrice40-dev/qa/deploy-inflight/state',
+                )), mode != 'healthy')
 
     def test_failed_deploy_does_not_restore_a_version_that_cannot_read_the_journals(self):
         self.saved_release(self.release(store=False))

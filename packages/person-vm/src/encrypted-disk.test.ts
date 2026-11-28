@@ -11,7 +11,7 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import type { Command, CommandRunner } from './process.ts';
 import { signal } from './test-support.ts';
@@ -147,15 +147,24 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
       capacityGiB: 40,
       runner,
     });
-    await disk.create(ref, signal());
+    const freshImage = await disk.create(ref, signal());
     const image = join(volume, 'warm', ref.vmId + '.sparseimage');
     expect((await lstat(image)).mode & 0o777).toBe(0o600);
     expect((await lstat(join(keyRoot, ref.vmId + '.key'))).mode & 0o777).toBe(
       0o600,
     );
     const original = hash(await readFile(image));
+    const initialMount = await disk.inspectMount(ref, signal());
+    expect(initialMount.state).toBe('absent');
+    if (initialMount.state === 'unknown')
+      throw new Error('Missing disk identity');
+    const originalImage = initialMount.image;
+    expect(freshImage).toEqual(originalImage);
+    await expect(disk.create(ref, signal())).resolves.toBeUndefined();
     expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
-    const mount = await disk.attach(ref, signal());
+    const dispatched = vi.fn();
+    const mount = await disk.attach(ref, signal(), dispatched);
+    expect(dispatched).toHaveBeenCalledOnce();
     const start = calls.length;
     expect(await disk.verifyAttachedMount(ref, signal())).toBe(mount);
     attachments.set(image, join(root, 'different-mount'));
@@ -171,6 +180,24 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
         .filter((call) => call.executable.endsWith('hdiutil'))
         .map((call) => call.args[0]),
     ).toEqual(['imageinfo', 'info', 'imageinfo', 'info', 'imageinfo', 'info']);
+    attachments.set(other, mount);
+    const ambiguous = calls.length;
+    await expect(disk.inspectMount(ref, signal())).resolves.toEqual({
+      state: 'unknown',
+    });
+    await expect(disk.attach(ref, signal(), dispatched)).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    await expect(disk.detach(ref, signal())).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    expect(
+      calls
+        .slice(ambiguous)
+        .some(({ args }) => ['attach', 'detach'].includes(args[0]!)),
+    ).toBe(false);
+    expect(dispatched).toHaveBeenCalledOnce();
+    attachments.delete(other);
     await expect(disk.move(ref, 'cold', signal())).rejects.toMatchObject({
       code: 'CLEANUP_INCOMPLETE',
     });
@@ -179,9 +206,36 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
     });
     await disk.detach(ref, signal());
     const cold = await disk.move(ref, 'cold', signal());
+    const acrossTier = { image: originalImage, acrossTier: true } as const;
+    await expect(disk.inspectMount(ref, signal(), acrossTier)).resolves.toEqual(
+      {
+        state: 'absent',
+        image: originalImage,
+      },
+    );
+    await expect(
+      disk.inspectMount(ref, signal(), {
+        ...acrossTier,
+        image: { ...originalImage, inode: 'other-image' },
+      }),
+    ).resolves.toEqual({ state: 'unknown' });
+    attachments.set(image, join(root, 'unexpected-old-mount'));
+    await expect(disk.inspectMount(ref, signal(), acrossTier)).resolves.toEqual(
+      {
+        state: 'unknown',
+      },
+    );
+    attachments.delete(image);
     // A caller whose DB commit failed can repeat the stale source safely.
     expect(await disk.move(ref, 'cold', signal())).toEqual(cold);
     await disk.attach(cold, signal());
+    await expect(disk.inspectMount(ref, signal(), acrossTier)).resolves.toEqual(
+      {
+        state: 'attached',
+        mount,
+        image: originalImage,
+      },
+    );
     await disk.detach(cold, signal());
     const warm = await disk.move(cold, 'warm', signal());
     expect(await disk.move(cold, 'warm', signal())).toEqual(warm);

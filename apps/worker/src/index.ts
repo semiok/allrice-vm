@@ -452,14 +452,22 @@ function refreshDshRuntimeInventory() {
 }
 
 const httpAborter = new AbortController();
+let personVmRecovery: () => string = () => 'pending';
 const personVmHost = createProductionPersonVmHost({
   lifetime: httpAborter.signal,
   sources: createProductionPersonVmSources(
     createProductionNativeModelExecution(),
   ),
 }).then(
-  (host) => ({ state: 'installed' as const, host }),
+  (host) => {
+    personVmRecovery = () => host.recoveryState();
+    return { state: 'installed' as const, host };
+  },
   (error: unknown) => {
+    // The constructor joins rollback before rejecting; an aggregate rollback
+    // failure cannot certify the absence of an owner.
+    if (!(error instanceof AggregateError))
+      personVmRecovery = () => 'uninstalled';
     console.info('[MET-273] person VM Host unavailable', {
       code:
         error instanceof ProductionPersonVmHostUnavailable
@@ -636,6 +644,11 @@ const server = createServer(async (request, response) => {
                         (stopping ? 'worker_stopping' : undefined)),
             ),
             ...(serviceBuildIdentity ? { identity: serviceBuildIdentity } : {}),
+            ...(['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(
+              request.socket.remoteAddress ?? '',
+            ) && {
+              personVmRecovery: { pid: process.pid, state: personVmRecovery() },
+            }),
             nativeCloseIdentity,
             nativeArtifact,
             nativeJournalContract,

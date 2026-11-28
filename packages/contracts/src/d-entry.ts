@@ -1,3 +1,4 @@
+import { ChatSessionSchema } from './workspace.ts';
 import { z } from 'zod';
 import { UuidSchema } from './common.ts';
 
@@ -146,6 +147,24 @@ export const DEntryPageOpenedSchema = z
 export const DEntryPageClosedSchema = z
   .object({ type: z.literal('closed'), scopeId: UuidSchema })
   .strict();
+export const DEntryPageSwitchSchema = z.strictObject({
+  type: z.literal('switch'),
+  requestId: UuidSchema,
+  threadId: UuidSchema,
+});
+export const DEntryPageSwitchResultSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('switched'),
+    requestId: UuidSchema,
+    threadId: UuidSchema,
+    scopeId: UuidSchema,
+    nativeSessionId: z.string().min(1),
+  }),
+  z.strictObject({
+    type: z.literal('switch-unavailable'),
+    requestId: UuidSchema,
+  }),
+]);
 export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   carrier: z.literal('page'),
   organizationId: UuidSchema,
@@ -156,6 +175,21 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
 export const DEntryPageUnarySchema = z
   .string()
   .regex(/^[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/u);
+// Only an acknowledged, currently authorized page create/fork may carry this
+// AllRice thread id. The DSH reply body and rpcId keep their original contract.
+export const dEntryRegisteredThreadHeader = 'x-allrice-d-entry-thread';
+export function decodeDEntryRegisteredThread(header: string | null) {
+  if (!header || header.length > 4096) return;
+  try {
+    const thread = ChatSessionSchema.safeParse(
+      JSON.parse(decodeURIComponent(header)),
+    );
+    if (thread.success) return thread.data;
+  } catch {
+    // Optional presentation receipt; the DSH response remains authoritative.
+  }
+}
+
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {
     selection: DEntrySelectionInputSchema,
@@ -167,6 +201,10 @@ export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
 
 export const DEntryPageBorrowSchema = DEntrySelectionInputSchema.extend({
   scopeId: UuidSchema,
+});
+export const DEntryPageSwitchProofSchema = DEntryPageBorrowSchema.extend({
+  requestId: UuidSchema,
+  targetThreadId: UuidSchema,
 });
 const profileToken = z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/);
 export const DEntryProfileBindingSchema = DEntryPageBorrowSchema.extend({

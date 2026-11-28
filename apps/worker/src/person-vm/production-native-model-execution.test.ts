@@ -92,6 +92,7 @@ beforeEach(() => {
         close: vi.fn(async () => {}),
         assertObserved: vi.fn(async () => {}),
         assertObservedNow: vi.fn(),
+        assertCurrent: vi.fn(async () => {}),
       }),
     );
 });
@@ -297,13 +298,19 @@ function nativeFacts() {
   };
 }
 
-async function setup(nativeMemory?: Parameters<Attach>[0]['nativeMemory']) {
+async function setup(
+  nativeMemory?: Parameters<Attach>[0]['nativeMemory'],
+  withWebSearch = false,
+) {
   const lifetime = new AbortController();
   let observed!: Observer;
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
     kind: 'clear',
   }));
   const readNativeAttemptFor = vi.fn();
+  const observeNativeSearchCallFor = vi.fn();
+  const bindWebSearch =
+    vi.fn<NonNullable<Parameters<Attach>[1]['webSearch']>['bind']>();
   const adapterId = 'a'.repeat(64);
   const model = 'fixture-codex';
   const nativeInstanceId = randomUUID();
@@ -321,6 +328,7 @@ async function setup(nativeMemory?: Parameters<Attach>[0]['nativeMemory']) {
       modelAdapterId: adapterId,
       readNativeRootWakeFor: readRootWake,
       readNativeAttemptFor,
+      observeNativeSearchCallFor,
       nativeInstanceId,
     },
     endpoint,
@@ -350,6 +358,9 @@ async function setup(nativeMemory?: Parameters<Attach>[0]['nativeMemory']) {
       assertRouteCurrent: async () => lifetime.signal,
       route: { provider: 'openai-codex', model },
       bindReference,
+      ...(withWebSearch && {
+        webSearch: { provider: { search: vi.fn() }, bind: bindWebSearch },
+      }),
     } as unknown as Parameters<Attach>[1],
   );
   return {
@@ -357,7 +368,12 @@ async function setup(nativeMemory?: Parameters<Attach>[0]['nativeMemory']) {
     runJournalOwners,
     readNativeAttemptFor,
     bindReference,
+    bindWebSearch,
+    observeNativeSearchCallFor,
     resolveReference: attached.references?.[0]?.resolve,
+    resolveSearch: attached.references?.find(
+      (service) => service.id === 'web-search',
+    )?.resolve,
     selection: { adapterId, provider: 'openai-codex', model },
     profile,
     async admit(
@@ -552,6 +568,124 @@ it('in a new Host, selects the persisted B only after a newly adopted steer prov
       'AUTHORIZATION_DENIED',
     );
     expect(publication.root).not.toHaveBeenCalled();
+  } finally {
+    uninstall();
+    await f.close();
+  }
+});
+
+it('binds Search to the exact root occurrence when a child shares its request ID', async () => {
+  const f = await setup(undefined, true);
+  const context = login();
+  const root = SessionId(issue.root.nativeSessionId);
+  const child = { sessionId: SessionId('native-child'), parentSessionId: root };
+  const revoked = new AbortController().signal;
+  const requestId = randomUUID();
+  const rootPrompt = nativeFacts();
+  const childPrompt = nativeFacts();
+  const occurrence = {
+    sessionId: root,
+    scopeId: issue.scopeId,
+    requestId,
+    messageId: 'adopted-root',
+    turn: 1,
+  };
+  const uninstall = installDEntryNativeOwnerPort({
+    async resolve() {
+      return {
+        ...f.profile,
+        revoked,
+        controlReady: () => true,
+        assertCurrent: async () => {},
+        acquirePrincipal: () => {
+          throw Error('Unexpected scope creation');
+        },
+        async readSessions() {
+          const status = {
+            updatedAt: 1,
+            blank: false,
+            running: true,
+            agentAvailable: true,
+          };
+          return {
+            ok: true,
+            value: {
+              items: [
+                { ...status, sessionId: root },
+                { ...status, ...child, origin: 'subagent' },
+              ],
+            },
+          };
+        },
+      };
+    },
+  });
+  try {
+    const admitRoot = await f.admit(context, requestId, rootPrompt);
+    rootPrompt.insert(occurrence.messageId);
+    admitRoot.accepted();
+    const admitChild = await f.admit(
+      context,
+      requestId,
+      childPrompt,
+      'queue',
+      child,
+    );
+    childPrompt.insert('pending-child');
+    admitChild.accepted();
+    const close = vi.fn(async () => {});
+    const proof = { rootSessionId: root, claims: [occurrence] };
+    f.observeNativeSearchCallFor.mockResolvedValue({
+      proof,
+      signal: revoked,
+      close,
+    });
+    const resolve = f.resolveSearch;
+    if (!resolve) throw Error('Native Search service unavailable');
+    const send = () => {
+      const body = Buffer.from(
+        JSON.stringify({
+          adapterId: f.selection.adapterId,
+          sessionId: root,
+          query: 'test',
+          ticket: randomUUID(),
+        }),
+      );
+      const request = Object.assign(Readable.from([body]), {
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      });
+      return resolve(
+        request as unknown as IncomingMessage,
+        binding,
+        revoked,
+        vi.fn(),
+      );
+    };
+    const admitted = await send();
+    expect(admitted).toMatchObject({ context });
+    const assertCurrent = f.bindWebSearch.mock.lastCall?.[3];
+    if (!assertCurrent) throw Error('Search authority unavailable');
+    await assertCurrent(revoked);
+    expect(rootPrompt.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      occurrence,
+    );
+    expect(childPrompt.observation.assertClaimed).not.toHaveBeenCalled();
+    await admitted.close?.();
+
+    f.observeNativeSearchCallFor.mockResolvedValue({
+      proof: {
+        ...proof,
+        claims: [{ ...occurrence, messageId: 'different-occurrence' }],
+      },
+      signal: revoked,
+      close,
+    });
+    await expect(send()).rejects.toHaveProperty('code', 'DENIED');
+    expect(close).toHaveBeenCalledTimes(2);
   } finally {
     uninstall();
     await f.close();

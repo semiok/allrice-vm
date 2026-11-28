@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  readContentPrincipal,
   readPersonVmWakeRoster,
 } from '@allrice/database';
 import {
@@ -11,7 +12,16 @@ import {
   type ScheduleCatalogEntry,
 } from '@deepseek-ai/dsh-schedule';
 import { SessionId } from '@deepseek-ai/dsh-session';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { PersonVmError } from '@allrice/person-vm';
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
 import { createProductionScheduledWake } from './production-scheduled-wake.js';
@@ -37,6 +47,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     database = await createRuntimeFixtureDatabase({ ownSchemaOnly: true });
     db = database.db;
   }, 120_000);
+
+  beforeEach(async () => {
+    // This suite owns its schema, but several cases intentionally leave
+    // claims in flight. A host-wide query must not see another case's claim.
+    await db`delete from person_vm_scheduled_wakes`;
+  });
 
   afterAll(async () => {
     await database?.close();
@@ -200,9 +216,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(
       await db`select 1 from allrice_sessions where user_id=${f.binding.personId}`,
     ).toEqual([]);
-    const catalog = vi.fn();
+    const activityCatalogs = vi.fn();
     const host = createProductionScheduledWake({
-      startup: { catalog },
+      startup: { activityCatalogs },
       database: db,
       lifetime: signal,
       source: { start: f.start, assertDeliverable: vi.fn() },
@@ -229,7 +245,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await expect(
         host.assertScheduledIdleCurrent(current, roster!, signal),
       ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
-      expect(catalog).not.toHaveBeenCalled();
+      expect(activityCatalogs).not.toHaveBeenCalled();
     } finally {
       await host.close();
       await f.store().settle(claim!, { state: 'ready' });
@@ -245,15 +261,23 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       readPersonVmWakeRoster(tx, f.binding, [f.origin]),
     );
     expect(roster).not.toBeNull();
-    const catalog = vi.fn().mockReturnValue({
+    const catalog = {
       endpoint: f.origin,
-      receipt: { rosterDigest: roster!.digest, endpoints: [f.origin] },
+      receipt: {
+        binding: f.binding,
+        rosterDigest: 'original-receipt-of-a-slotted-owner',
+        endpoints: [
+          f.origin,
+          { ...f.origin, employeeInstanceId: randomUUID() },
+        ],
+      },
       revoked: signal,
       bindingRef: f.origin.bindingRef,
       owner: { readScheduleCatalog: f.catalog },
-    });
+    };
+    const activityCatalogs = vi.fn().mockReturnValue([]);
     const host = createProductionScheduledWake({
-      startup: { catalog },
+      startup: { activityCatalogs },
       database: db,
       lifetime: signal,
       source: { start: f.start, assertDeliverable: vi.fn() },
@@ -275,6 +299,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         blocked: true,
         reason: 'SCHEDULE_WAKE_UNAVAILABLE',
       });
+      await expect(
+        host.prepareUpgradeStop(request, signal),
+      ).resolves.toMatchObject({
+        blocked: true,
+      });
+      activityCatalogs.mockReturnValue([catalog]);
       await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
         ok: true,
         nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
@@ -316,6 +346,22 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         stop,
       );
       expect(stop).toHaveBeenCalledTimes(1);
+      // Before the physical stop is joined, a prepared plan alone is not a
+      // commitment. Once joined, even failed lifecycle publication must not
+      // let a release suspend its recovery and miss the wake.
+      const stopMarker = (result: 'started' | 'succeeded') =>
+        db`insert into person_vm_audit
+          (person_id,organization_id,vm_id,request_id,action,result,lease_epoch)
+          values (${f.binding.personId},${f.binding.organizationId},${f.binding.vmId},
+            ${requestId},'stop.idle-dispatch',${result},${f.binding.leaseEpoch})`;
+      await stopMarker('started');
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toBeNull();
+      await stopMarker('succeeded');
+      await db`update person_virtual_machines set phase='failed'
+        where person_id=${f.binding.personId}`;
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
+        new Date(Date.parse(scheduledAt) - 120_000),
+      );
       await f.stop(requestId);
       await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
         new Date(Date.parse(scheduledAt) - 120_000),
@@ -839,6 +885,70 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T05:28:00.000Z' });
   });
 
+  it.each(['native snapshot', 'original login'] as const)(
+    'rejects a prepared ordinary idle stop after revoking the %s',
+    async (revoked) => {
+      const f = await fixture();
+      await publishFixtureAuthority(f);
+      f.reviseTime(new Date(Date.now() + 600_000).toISOString());
+      const planId = randomUUID();
+      await expect(
+        f.module().prepareStopWithWake(f.binding, planId, signal),
+      ).resolves.toMatchObject({ ok: true });
+      const roster = await db.begin((tx) =>
+        readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+      );
+      expect(roster).not.toBeNull();
+      await db`update person_virtual_machines
+      set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+      where person_id=${f.binding.personId}`;
+      const context = {
+        actor: { type: 'user' as const, id: f.binding.personId },
+        sessionId: randomUUID(),
+        organizationId: f.binding.organizationId,
+        workspaceId: f.origin.workspaceId,
+      };
+      await db`insert into allrice_sessions (id, user_id, token_hash, expires_at)
+      values (${context.sessionId},${context.actor.id},${randomUUID().replaceAll('-', '').repeat(2)},now()+interval '1 hour')`;
+      const host = createProductionScheduledWake({
+        startup: { activityCatalogs: vi.fn() },
+        database: db,
+        lifetime: signal,
+        source: { start: f.start, assertDeliverable: vi.fn() },
+      });
+      try {
+        const stop = vi.fn(async () => {});
+        const dispatch = () =>
+          host.dispatchScheduledIdleStop(
+            f.binding,
+            roster!,
+            planId,
+            signal,
+            stop,
+            async (tx) => {
+              if (!(await readContentPrincipal(context, tx, true)))
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          );
+        await dispatch();
+        expect(stop).toHaveBeenCalledTimes(1);
+        if (revoked === 'native snapshot') await f.invalidate(planId);
+        else
+          await db`update allrice_sessions set revoked_at=clock_timestamp()
+        where id=${context.sessionId}`;
+        await expect(dispatch()).rejects.toMatchObject({
+          code: 'AUTHORIZATION_DENIED',
+        });
+        expect(stop).toHaveBeenCalledTimes(1);
+        const [vm] = await db`select phase from person_virtual_machines
+        where person_id=${f.binding.personId}`;
+        expect(vm?.phase).toBe('running');
+      } finally {
+        await host.close();
+      }
+    },
+  );
+
   it('refuses to dispatch an explicitly invalidated snapshot', async () => {
     const f = await fixture();
     const host = f.module();
@@ -900,9 +1010,17 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(staged).toEqual([]);
   });
 
-  it.each([false, true])(
-    'audits an unconfirmed start after the VM advanced (revoked: %s)',
-    async (revoked) => {
+  it.each([
+    ['starting', false, 'retained'],
+    ['starting', true, 'retained'],
+    ['running', false, 'retained'],
+    ['running', true, 'retained'],
+    ['stopped', false, 'retained'],
+    ['stopped', true, 'retained'],
+    ['stopped', false, 'released'],
+  ] as const)(
+    'audits an unconfirmed start after the VM advanced to %s (revoked: %s, owner: %s)',
+    async (phase, revoked, lease) => {
       const f = await fixture(),
         planId = randomUUID();
       await expect(
@@ -911,14 +1029,28 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await f.stop(planId);
       const claim = await f.store().claim(300_000);
       expect(claim).not.toBeNull();
+      const owner = lease === 'released' ? null : randomUUID();
       await db`update person_virtual_machines
-      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting'
+      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase=${phase},
+        egress_receipt=${phase === 'running' ? db.json({}) : null},
+        lease_owner=${owner},
+        lease_expires_at=case when ${owner}::uuid is null then null else now()-interval '1 second' end
       where person_id=${f.binding.personId}`;
       if (revoked) await f.invalidate(planId);
+      expect(await f.store().nextCommittedWakeAt(signal)).toBeInstanceOf(Date);
       await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
       where plan_id=${planId}`;
+      await db.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${'person-vm:' + f.binding.personId},0))`;
+        expect(await f.store().recordExpiredUnrecoverableClaim()).toBe(false);
+      });
       expect(await f.module().runDueOnce(signal)).toBe(true);
       expect(await f.module().runDueOnce(signal)).toBe(false);
+      expect(await f.store().nextCommittedWakeAt(signal)).toBeNull();
+      expect(
+        await db`select lease_owner from person_virtual_machines
+        where person_id=${f.binding.personId}`,
+      ).toEqual([{ lease_owner: owner }]);
       expect(f.start).not.toHaveBeenCalled();
       expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
       const [row] = await db`select w.state,a.error_code

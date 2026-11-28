@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEntryNativeOwnerRequestSchema,
   DEntryPageRpcRequestSchema,
+  dEntryRegisteredThreadHeader,
 } from '@allrice/contracts';
 import type {
   DEntryPrincipalControlScope,
@@ -133,124 +134,139 @@ export function createDEntryPageRpc(
             signal,
             async (page, active) => {
               const { endpoint } = input;
-              const authorizeAttachment = () =>
-                authorizeDEntryNativeInvocation(
-                  page.authorize,
-                  endpoint,
-                  input.payload,
-                  'http',
-                  active,
-                );
-              const attachment =
-                endpoint === 'session/attachment'
-                  ? await authorizeAttachment()
-                  : undefined;
-              let args = input.payload.args;
-              let forkSource: DEntryPageForkSource | undefined;
-              if (endpoint === 'session/create') {
-                const { request } = TYPERT_REMOTE.methods[endpoint]
-                  .input({ strict: true })
-                  .create()
-                  .parse(args);
-                const { sessionId, ...create } = request;
-                // rc.2 will mint a missing client-supplied id. A locator may
-                // only be reused after confirming an existing owned Session.
-                args = {
-                  request:
-                    sessionId &&
-                    (await page.canReuseNativeSession(sessionId, active))
-                      ? request
-                      : create,
-                };
-              } else if (endpoint === 'session/fork') {
-                const { request } = TYPERT_REMOTE.methods[endpoint]
-                  .input({ strict: true })
-                  .create()
-                  .parse(args);
-                forkSource = await page.authorizeForkSource(
-                  request.sessionId,
-                  active,
-                );
-              }
-              if (!isRemoteJsonValue(args))
-                throw new SyntaxError('Invalid entry request');
-              await page.assertCurrent(active);
-              let native: Response;
-              let created: string | undefined;
-              try {
-                if (attachment) {
-                  const result = await page.scope.invoke(
-                    {
-                      scopeId: input.scopeId,
-                      endpoint: attachment.endpoint,
-                      args: attachment.payload.args,
-                    } as DEntryScopedUnaryCall,
+              const invoke = async () => {
+                const authorizeAttachment = () =>
+                  authorizeDEntryNativeInvocation(
+                    page.authorize,
+                    endpoint,
+                    input.payload,
+                    'http',
                     active,
                   );
-                  native = encodeScopedResult(rpcId, result);
-                } else {
-                  const call = {
-                    kind: 'page' as const,
-                    scopeId: input.scopeId,
-                    endpoint,
-                    args: args as Record<string, JsonValue>,
+                const attachment =
+                  endpoint === 'session/attachment'
+                    ? await authorizeAttachment()
+                    : undefined;
+                let args = input.payload.args;
+                let forkSource: DEntryPageForkSource | undefined;
+                if (endpoint === 'session/create') {
+                  const { request } = TYPERT_REMOTE.methods[endpoint]
+                    .input({ strict: true })
+                    .create()
+                    .parse(args);
+                  const { sessionId, ...create } = request;
+                  // rc.2 will mint a missing client-supplied id. A locator may
+                  // only be reused after confirming an existing owned Session.
+                  args = {
+                    request:
+                      sessionId &&
+                      (await page.canReuseNativeSession(sessionId, active))
+                        ? request
+                        : create,
                   };
-                  const result =
-                    endpoint === 'terminal/create' ||
-                    endpoint === 'terminal/close'
-                      ? await page.invokeTerminal(call, active)
-                      : await page.scope.invokePage(call, active);
-                  if (
-                    endpoint === 'session/create' ||
-                    endpoint === 'session/fork'
-                  ) {
-                    created = TYPERT_REMOTE.methods[endpoint].result
-                      .create()
-                      .parse(result.value).sessionId;
-                  }
-                  native = encodeResult(
-                    rpcId,
-                    result.value,
-                    result.attachments,
+                } else if (endpoint === 'session/fork') {
+                  const { request } = TYPERT_REMOTE.methods[endpoint]
+                    .input({ strict: true })
+                    .create()
+                    .parse(args);
+                  forkSource = await page.authorizeForkSource(
+                    request.sessionId,
+                    active,
                   );
                 }
-              } catch (error) {
-                const failure = pageRemoteFailure(error);
-                if (
-                  !(error instanceof RemoteError) &&
-                  failure.message === 'PRINCIPAL_JOIN_UNKNOWN'
-                )
-                  throw error;
-                native = Response.json(
-                  reply(rpcId, { ok: false, error: failure }),
-                );
-              }
-              if (created)
-                await page.registerNativeSession(created, forkSource, active);
-              const bytes = Buffer.from(await native.arrayBuffer());
-              await writeOwned(
-                active,
-                () =>
-                  response
-                    .writeHead(native.status, {
-                      'content-type': native.headers.get('content-type')!,
-                      'content-length': String(bytes.length),
-                      'cache-control': 'private, no-store',
-                    })
-                    .end(bytes),
-                async () => {
-                  await page.assertCurrent(active);
-                  if (!attachment) return;
-                  const next = await authorizeAttachment();
+                if (!isRemoteJsonValue(args))
+                  throw new SyntaxError('Invalid entry request');
+                await page.assertCurrent(active);
+                let native: Response;
+                let created: string | undefined;
+                try {
+                  if (attachment) {
+                    const result = await page.scope.invoke(
+                      {
+                        scopeId: input.scopeId,
+                        endpoint: attachment.endpoint,
+                        args: attachment.payload.args,
+                      } as DEntryScopedUnaryCall,
+                      active,
+                    );
+                    native = encodeScopedResult(rpcId, result);
+                  } else {
+                    const call = {
+                      kind: 'page' as const,
+                      scopeId: input.scopeId,
+                      endpoint,
+                      args: args as Record<string, JsonValue>,
+                    };
+                    const result =
+                      endpoint === 'terminal/create' ||
+                      endpoint === 'terminal/close'
+                        ? await page.invokeTerminal(call, active)
+                        : await page.scope.invokePage(call, active);
+                    if (
+                      endpoint === 'session/create' ||
+                      endpoint === 'session/fork'
+                    ) {
+                      created = TYPERT_REMOTE.methods[endpoint].result
+                        .create()
+                        .parse(result.value).sessionId;
+                    }
+                    native = encodeResult(
+                      rpcId,
+                      result.value,
+                      result.attachments,
+                    );
+                  }
+                } catch (error) {
+                  const failure = pageRemoteFailure(error);
                   if (
-                    next?.resource.bindingRef !==
-                      attachment.resource.bindingRef ||
-                    next.resource.parentNativeSessionId !==
-                      attachment.resource.parentNativeSessionId
+                    !(error instanceof RemoteError) &&
+                    failure.message === 'PRINCIPAL_JOIN_UNKNOWN'
                   )
-                    throw new DataAccessError('authorization_denied');
-                },
-              );
+                    throw error;
+                  native = Response.json(
+                    reply(rpcId, { ok: false, error: failure }),
+                  );
+                }
+                const registeredThread = created
+                  ? await page.registerNativeSession(
+                      created,
+                      forkSource,
+                      active,
+                    )
+                  : undefined;
+                const bytes = Buffer.from(await native.arrayBuffer());
+                await writeOwned(
+                  active,
+                  () =>
+                    response
+                      .writeHead(native.status, {
+                        'content-type': native.headers.get('content-type')!,
+                        'content-length': String(bytes.length),
+                        'cache-control': 'private, no-store',
+                        ...(registeredThread && {
+                          [dEntryRegisteredThreadHeader]: encodeURIComponent(
+                            JSON.stringify(registeredThread),
+                          ),
+                        }),
+                      })
+                      .end(bytes),
+                  async () => {
+                    await page.assertCurrent(active);
+                    if (!attachment) return;
+                    const next = await authorizeAttachment();
+                    if (
+                      next?.resource.bindingRef !==
+                        attachment.resource.bindingRef ||
+                      next.resource.parentNativeSessionId !==
+                        attachment.resource.parentNativeSessionId
+                    )
+                      throw new DataAccessError('authorization_denied');
+                  },
+                );
+              };
+              if (endpoint === 'session/create' || endpoint === 'session/fork')
+                await page.runThreadWrite(invoke);
+              else await invoke();
             },
             async (error, active) => {
               await writeOwned(active, () =>

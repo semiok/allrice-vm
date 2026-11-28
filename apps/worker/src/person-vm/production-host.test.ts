@@ -293,7 +293,10 @@ async function receiptFixture() {
     },
   );
   vi.spyOn(input.providers.disk, 'create').mockImplementation(
-    physical.disk.create,
+    async (disk, active) => {
+      const created = await physical.disk.create(disk, active);
+      return created ? created : undefined;
+    },
   );
   vi.spyOn(input.providers.disk, 'inspect').mockImplementation(
     physical.disk.inspect,
@@ -550,7 +553,7 @@ it('refuses to prepare a scheduled stop without the production wake source', asy
   expect(io.dedicated).not.toHaveBeenCalled();
 });
 
-it('resumes startup and wake if final drain recovery made a near-term wake eligible', async () => {
+it('resumes startup and wake if a drain recovery makes a wake eligible', async () => {
   const { context } = nativeEntryFixture();
   const memory = new MemoryStore();
   const physical = harness(memory);
@@ -561,7 +564,7 @@ it('resumes startup and wake if final drain recovery made a near-term wake eligi
   const value = fixture();
   value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
   io.upgradeOperator.mockResolvedValueOnce(context.actor.id);
-  const nextWake = vi.fn().mockResolvedValueOnce(null);
+  const nextWake = vi.fn().mockResolvedValue(null);
   const wake = {
     nextCommittedWakeAt: nextWake,
     start: vi.fn(),
@@ -573,16 +576,16 @@ it('resumes startup and wake if final drain recovery made a near-term wake eligi
     dispatchUpgradeStop: vi.fn(),
     prepareStopWithWake: vi.fn(),
     prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
   };
   io.upgradeWake.mockReturnValueOnce(wake);
   const list = vi
     .spyOn(PostgresPersonVmStore.prototype, 'listUpgradeCandidates')
-    .mockResolvedValueOnce([row!])
-    .mockResolvedValueOnce([]);
+    .mockResolvedValueOnce([row!, { ...row!, vmId: randomUUID() }]);
   const recover = vi
     .spyOn(PersonVmService.prototype, 'stopRunningForUpgrade')
     .mockImplementationOnce(async () => {
-      nextWake.mockResolvedValueOnce(new Date(Date.now() - 1_000));
+      nextWake.mockResolvedValueOnce(new Date(Date.now() + 86_400_000));
     });
   const reopen = vi.fn();
   vi.spyOn(PersonVmService.prototype, 'fenceWorkerStartup').mockReturnValueOnce(
@@ -592,14 +595,110 @@ it('resumes startup and wake if final drain recovery made a near-term wake eligi
   await expect(host.drainForUpgrade(context, signal())).rejects.toMatchObject({
     code: 'ACTIVITY_UNKNOWN',
   });
-  expect(list).toHaveBeenCalledTimes(2);
+  expect(list).toHaveBeenCalledTimes(1);
   expect(recover).toHaveBeenCalledTimes(1);
-  expect(nextWake).toHaveBeenCalledTimes(2);
+  expect(nextWake).toHaveBeenCalledTimes(4);
   expect(reopen).toHaveBeenCalledTimes(1);
   expect(wake.resume).toHaveBeenCalledTimes(1);
+  expect(host.recoveryState()).toBe('drain-required');
   await expect(host.assertWorkerShutdownSafe(signal())).rejects.toMatchObject({
     code: 'RUNTIME_NOT_READY',
   });
+});
+
+it('requires an exact explicit shutdown claim and leaves every committed wake with the scheduler', async () => {
+  const { context } = nativeEntryFixture();
+  const value = fixture();
+  value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
+  io.upgradeOperator.mockResolvedValue(context.actor.id);
+  const future = new Date(Date.now() + 86_400_000);
+  const nextCommittedWakeAt = vi.fn().mockResolvedValue(future);
+  const wake = {
+    nextCommittedWakeAt,
+    start: vi.fn(),
+    resume: vi.fn(),
+    close: vi.fn(async () => {}),
+    pause: vi.fn(async () => {}),
+    assertScheduledIdleCurrent: vi.fn(),
+    dispatchScheduledIdleStop: vi.fn(),
+    dispatchUpgradeStop: vi.fn(),
+    prepareStopWithWake: vi.fn(),
+    prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
+  };
+  io.upgradeWake.mockReturnValueOnce(wake);
+  const list = vi
+    .spyOn(PostgresPersonVmStore.prototype, 'listUpgradeCandidates')
+    .mockResolvedValue([]);
+  const { host } = await open(value);
+  await expect(host.drainForUpgrade(context, signal())).rejects.toMatchObject({
+    code: 'ACTIVITY_UNKNOWN',
+  });
+  expect(wake.pause).not.toHaveBeenCalled();
+  expect(list).not.toHaveBeenCalled();
+
+  nextCommittedWakeAt.mockResolvedValue(null);
+  const receipt = await host.drainForUpgrade(context, signal());
+  await expect(host.assertWorkerShutdownSafe(signal())).rejects.toMatchObject({
+    code: 'RUNTIME_NOT_READY',
+  });
+  await expect(
+    host.assertWorkerShutdownSafe(signal(), 'stale'),
+  ).rejects.toMatchObject({
+    code: 'RUNTIME_NOT_READY',
+  });
+  nextCommittedWakeAt.mockResolvedValue(future);
+  await expect(
+    host.assertWorkerShutdownSafe(signal(), receipt.expiresAt),
+  ).rejects.toMatchObject({
+    code: 'ACTIVITY_UNKNOWN',
+  });
+  nextCommittedWakeAt.mockResolvedValue(null);
+  await host.assertWorkerShutdownSafe(signal(), receipt.expiresAt);
+  await host.assertWorkerShutdownSafe(signal());
+});
+
+it('joins the claimed wake before fencing its next epoch on ordinary shutdown', async () => {
+  const value = fixture();
+  value.bound.scheduledWake = { start: vi.fn(), assertDeliverable: vi.fn() };
+  const order: string[] = [];
+  let finishWake!: () => void;
+  const activeWake = new Promise<void>((resolve) => {
+    finishWake = resolve;
+  });
+  io.upgradeWake.mockReturnValueOnce({
+    nextCommittedWakeAt: vi.fn().mockResolvedValue(null),
+    start: vi.fn(),
+    resume: vi.fn(),
+    close: vi.fn(async () => {}),
+    pause: vi.fn(async () => {
+      order.push('pause');
+      await activeWake;
+      order.push('wake joined');
+    }),
+    assertScheduledIdleCurrent: vi.fn(),
+    dispatchScheduledIdleStop: vi.fn(),
+    dispatchUpgradeStop: vi.fn(),
+    prepareStopWithWake: vi.fn(),
+    prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
+  });
+  vi.spyOn(
+    PersonVmService.prototype,
+    'fenceWorkerStartup',
+  ).mockImplementationOnce(() => {
+    order.push('fence');
+    return () => {};
+  });
+  const { host } = await open(value);
+  const shutdown = host.assertWorkerShutdownSafe(signal());
+  try {
+    await vi.waitFor(() => expect(order).toEqual(['pause']));
+  } finally {
+    finishWake();
+  }
+  await shutdown;
+  expect(order).toEqual(['pause', 'wake joined', 'fence']);
 });
 
 it('constructs the real store/service/admission/startup with one SQL factory and the same nondefault platform snapshot', async () => {

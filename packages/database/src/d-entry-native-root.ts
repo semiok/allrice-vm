@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { TransactionSql } from 'postgres';
 import {
+  ChatSessionSchema,
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
   UuidSchema,
@@ -306,7 +307,30 @@ export async function registerDEntryPageNativeRoot(
         forkedFromNativeSessionId !== existing.forkedFromNativeSessionId
       )
         return deny();
-      return existing;
+      const [row] =
+        await tx`select id,employee_assignment_id,employee_version_id,title,
+        created_at,updated_at,pinned_at from allrice_chat_sessions
+        where id=${existing.identity.threadId} and organization_id=${identity.organizationId}
+          and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
+          and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
+          and execution_generation='4.0' and visibility='private' and archived_at is null for share`;
+      if (!row) return deny();
+      const thread = ChatSessionSchema.parse({
+        id: row.id,
+        ownerId: identity.personId,
+        organizationId: identity.organizationId,
+        workspaceId: identity.workspaceId,
+        employeeInstanceId: identity.employeeInstanceId,
+        employeeAssignmentId: row.employee_assignment_id,
+        employeeVersionId: row.employee_version_id,
+        title: row.title,
+        visibility: 'private',
+        createdAt: row.created_at.toISOString(),
+        updatedAt: row.updated_at.toISOString(),
+        archivedAt: null,
+        pinnedAt: row.pinned_at?.toISOString() ?? null,
+      });
+      return { ...existing, thread };
     }
     const thread = await createAssignedChatSession(
       context,
@@ -336,7 +360,7 @@ export async function registerDEntryPageNativeRoot(
         'chat_session',${thread.id},'recorded',${forkSource ? 'host_native_fork' : 'host_native_create'},
         ${context.requestId},${tx.json({ operationId: claim.operationId, releaseRevision: policy.revision })})`;
     signal.throwIfAborted();
-    return projectPin(pin, claim.identity);
+    return { ...projectPin(pin, claim.identity), thread };
   });
 }
 

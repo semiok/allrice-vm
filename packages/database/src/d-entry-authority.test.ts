@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import {
   createDEntryAuthorityFeed,
+  DEntryTicketObserverClosed,
   watchDEntryNativeAuthority,
   watchDEntryNativeRosterAuthority,
   watchDEntryHistoryAuthority,
@@ -102,6 +103,86 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('fences native page follow synchronously on matching authority and VM hints', async () => {
+    const watcher = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      new AbortController().signal,
+      feed(),
+    );
+    try {
+      const fenced = vi.fn();
+      const detach = watcher.observation!.subscribe(fenced);
+      const client = state.clients[0]!;
+      const hint = (table: string, id: string) =>
+        client.emit('notification', {
+          channel: 'allrice_d_entry_authority',
+          payload: JSON.stringify({
+            schema: 'isolated',
+            table,
+            id,
+            personId: identity.personId,
+            organizationId: identity.organizationId,
+            workspaceId: identity.workspaceId,
+          }),
+        });
+      hint('allrice_sessions', randomUUID());
+      expect(fenced).not.toHaveBeenCalled();
+      const before = state.identity.mock.calls.length;
+      hint('allrice_sessions', context.sessionId);
+      expect(fenced).toHaveBeenCalledOnce();
+      expect(state.identity).toHaveBeenCalledTimes(before);
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      expect(fenced).toHaveBeenCalledTimes(2);
+      detach();
+      hint('allrice_sessions', context.sessionId);
+      expect(fenced).toHaveBeenCalledTimes(2);
+      client.emit('end');
+      expect(watcher.revoked.aborted).toBe(true);
+    } finally {
+      await watcher.close();
+    }
+  });
+
+  it('distinguishes the closed original ticket observer from revoked authority during a thread observation', async () => {
+    const source = feed();
+    const observed = deferred();
+    const resume = deferred();
+    vi.spyOn(source, 'observeThroughCommit').mockImplementationOnce(
+      async () => {
+        observed.resolve();
+        await resume.promise;
+      },
+    );
+    const signal = new AbortController().signal;
+    const owner = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      source,
+      async () => {},
+    );
+    const pending = owner.assertTicketThread!(signal);
+    try {
+      await Promise.race([observed.promise, pending]);
+      await owner.close();
+      expect(owner.revoked.aborted).toBe(false);
+    } finally {
+      resume.resolve();
+      await Promise.allSettled([pending]);
+      await owner.close();
+    }
+    await expect(pending).rejects.toBeInstanceOf(DEntryTicketObserverClosed);
+    await expect(owner.assertTicketThread!(signal)).rejects.toMatchObject({
+      code: 'authorization_denied',
+    });
+  });
+
   it('retires a stuck marker connection at the deadline and waits for the actual query to settle', async () => {
     const source = feed();
     const controller = new AbortController();

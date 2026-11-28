@@ -1,10 +1,20 @@
+import { EmployeeEntryError } from './entry-client';
 import {
   DEntryPageClosedSchema,
   DEntryPageOpenedSchema,
+  DEntryPageSwitchResultSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
-import { parseRemoteStreamServerMessage } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
+import {
+  parseRemoteStreamClientMessage,
+  parseRemoteStreamServerMessage,
+} from '@deepseek-ai/dsh-api-gateway/stream-protocol';
+
+type SwitchedPage = Extract<
+  ReturnType<typeof DEntryPageSwitchResultSchema.parse>,
+  { type: 'switched' }
+>;
 
 export {
   pageClosing,
@@ -58,6 +68,16 @@ export function openNativePageCarrier(
     nativeMuxUrl(location.origin, identity.organizationId, selection),
   );
   let scopeId: string | undefined;
+  let carrierSelection = selection;
+  let nativeMux: MessagePort | undefined;
+  let switching:
+    | {
+        id: string;
+        threadId: string;
+        proof: AbortController;
+        result: ReturnType<typeof pendingPageResult<SwitchedPage | undefined>>;
+      }
+    | undefined;
   let requested = false,
     complete = false,
     dispatched = false,
@@ -71,11 +91,21 @@ export function openNativePageCarrier(
     send({ type: 'item', value: 'close' });
     send({ type: 'end' });
   }
+  function closeMux() {
+    if (!nativeMux) return;
+    nativeMux.postMessage({ type: 'close' });
+    nativeMux.close();
+    nativeMux = undefined;
+  }
   function fail(reason: unknown) {
     if (complete) return;
     complete = true;
+    closeMux();
     onRevoked();
     ready.reject(reason);
+    switching?.proof.abort(reason);
+    switching?.result.reject(reason);
+    switching = undefined;
     // Local transport closure is still observed independently below.
     socket.close();
     return reason;
@@ -104,7 +134,12 @@ export function openNativePageCarrier(
       if (typeof event.data !== 'string')
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
-      if (frame.streamId !== id) throw Error('Unexpected native page stream');
+      if (frame.streamId !== id) {
+        if (requested) return;
+        if (!nativeMux) throw Error('Unexpected native page stream');
+        nativeMux.postMessage({ type: 'frame', data: event.data });
+        return;
+      }
       if (setupCancelled) throw Error('Unexpected native page terminal');
       if (
         frame.type === 'error' &&
@@ -127,6 +162,28 @@ export function openNativePageCarrier(
       if (frame.type !== 'item' || gotClosed)
         throw Error('Unexpected native page terminal');
       if (scopeId) {
+        if (switching) {
+          const decoded = DEntryPageSwitchResultSchema.safeParse(frame.value);
+          if (decoded.success) {
+            const value = decoded.data;
+            if (
+              value.requestId !== switching.id ||
+              (value.type === 'switched' &&
+                value.threadId !== switching.threadId)
+            )
+              throw Error('Unexpected native page switch acknowledgement');
+            const { result } = switching;
+            switching = undefined;
+            if (value.type === 'switched') {
+              scopeId = value.scopeId;
+              carrierSelection = { ...selection, threadId: value.threadId };
+              nativeMux?.close();
+              nativeMux = undefined;
+            }
+            result.resolve(value.type === 'switched' ? value : undefined);
+            return;
+          }
+        }
         if (
           !requested ||
           DEntryPageClosedSchema.parse(frame.value).scopeId !== scopeId
@@ -152,6 +209,7 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'close',
     (event) => {
+      closeMux();
       if (!dispatched) {
         fail(failure ?? Error('Native page carrier did not open'));
         joined.resolve();
@@ -168,19 +226,116 @@ export function openNativePageCarrier(
     },
     { once: true },
   );
+  function close() {
+    if (!requested && !complete) {
+      requested = true;
+      const reason = new DOMException('Page closed', 'AbortError');
+      switching?.proof.abort(reason);
+      switching?.result.reject(reason);
+      closeMux();
+      ready.reject(new DOMException('Page closed', 'AbortError'));
+      if (socket.readyState === WebSocket.OPEN) end();
+      if (socket.readyState === WebSocket.CONNECTING) socket.close();
+    }
+    return joined.promise;
+  }
   return {
     ready: ready.promise,
     get dispatched() {
       return dispatched;
     },
-    close() {
-      if (!requested && !complete) {
-        requested = true;
-        ready.reject(new DOMException('Page closed', 'AbortError'));
-        if (socket.readyState === WebSocket.OPEN) end();
-        if (socket.readyState === WebSocket.CONNECTING) socket.close();
-      }
-      return joined.promise;
+    switchThread(threadId: string, requestId: string) {
+      if (
+        !scopeId ||
+        !nativeMux ||
+        switching ||
+        requested ||
+        complete ||
+        socket.readyState !== WebSocket.OPEN
+      )
+        return Promise.resolve(undefined);
+      const result = pendingPageResult<SwitchedPage | undefined>();
+      const proof = new AbortController();
+      switching = { id: requestId, threadId, proof, result };
+      const query = new URLSearchParams({
+        ...carrierSelection,
+        scopeId,
+        requestId,
+        targetThreadId: threadId,
+      });
+      // A current same-origin cookie must prove that this is the login owning
+      // the published scope, independently of the token captured by the socket.
+      void fetch('/api/v1/d-entry/profile/switch?' + query, {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        redirect: 'error',
+        signal: proof.signal,
+      })
+        .then((response) => {
+          if (response.status !== 204)
+            throw new EmployeeEntryError(response.status);
+          if (switching?.id !== requestId || requested) return;
+          try {
+            send({
+              type: 'item',
+              value: { type: 'switch', requestId, threadId },
+            });
+          } catch (error) {
+            failure = fail(error);
+          }
+        })
+        .catch((error: unknown) => {
+          if (switching?.id !== requestId || requested) return;
+          switching = undefined;
+          // A check over HTTP does not report the health of the old socket.
+          // The caller uses its existing explicit close-and-join protocol.
+          result.reject(error);
+        });
+      return result.promise;
     },
+    attachMux(port: MessagePort, requestedScope = scopeId) {
+      if (
+        !scopeId ||
+        scopeId !== requestedScope ||
+        nativeMux ||
+        requested ||
+        complete ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        port.postMessage({ type: 'close' });
+        port.close();
+        return;
+      }
+      nativeMux = port;
+      port.onmessage = (event) => {
+        if (nativeMux !== port || requested || complete) return;
+        try {
+          if (event.data?.type === 'close') {
+            void close().catch(() => {});
+            return;
+          }
+          if (
+            event.data?.type !== 'frame' ||
+            typeof event.data.data !== 'string'
+          )
+            throw Error('Invalid native resource frame');
+          const frame = parseRemoteStreamClientMessage(event.data.data);
+          if (
+            frame.streamId === id ||
+            (frame.type === 'open' && frame.endpoint === '$d-entry/page')
+          )
+            throw Error('A borrowed mux cannot control its page');
+          socket.send(event.data.data);
+        } catch (error) {
+          failure = fail(error);
+        }
+      };
+      port.onmessageerror = () => {
+        failure = fail(Error('Invalid native resource frame'));
+      };
+      port.postMessage({ type: 'open' });
+    },
+    close,
   };
 }

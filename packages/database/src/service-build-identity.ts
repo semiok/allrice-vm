@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, readdir, lstat, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, readFile, readdir, lstat, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, relative, resolve, sep } from 'node:path';
+import {
+  MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS,
+  readPlatformPersonVmConfiguration,
+} from '@allrice/contracts';
 import { z } from 'zod';
 import { platformRepository } from './platform-repository-credential-contracts.ts';
 
@@ -9,6 +14,12 @@ const checksum = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
 const role = z.enum(['web', 'worker']);
 export type ServiceBuildRole = z.infer<typeof role>;
+const serviceEntrypoints = {
+  web: '/apps/web/server.mjs',
+  worker: '/apps/worker/dist/index.js',
+} as const;
+const personVmConfig = '.local/person-vm-host.json';
+const buildManifestPath = '.local/dev-build-identity.json';
 const relativePath = z
   .string()
   .min(1)
@@ -354,7 +365,6 @@ export async function prepareServiceBuildManifest(input: {
   await walk(root, 'apps/worker/dist', 'worker', files, input.observe);
   // The optional private Host file belongs to this same release seal. Do not
   // walk a directory here: this exact path must identify one regular file.
-  const personVmConfig = '.local/person-vm-host.json';
   let hasPersonVmConfig = false;
   try {
     const stat = await lstat(join(root, personVmConfig));
@@ -452,19 +462,12 @@ export async function verifyServiceBuildIdentity(input: {
   // build in the same worktree cannot attest that running development process.
   if (input.mode !== 'production') return null;
   const entrypoint = await realpath(input.entrypoint);
-  const ending =
-    input.service === 'web'
-      ? '/apps/web/server.mjs'
-      : '/apps/worker/dist/index.js';
+  const ending = serviceEntrypoints[input.service];
   if (!entrypoint.endsWith(ending)) return null;
   const root = entrypoint.slice(0, -ending.length);
   let bytes: Buffer;
   try {
-    bytes = await bytesAt(
-      root,
-      '.local/dev-build-identity.json',
-      input.observe,
-    );
+    bytes = await bytesAt(root, buildManifestPath, input.observe);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw Error('DEV_BUILD_IDENTITY_INVALID');
@@ -560,4 +563,128 @@ export function readServiceBuildIdentity(
     );
   }
   return cache.get(service)!;
+}
+
+async function readSealedPersonVmHostFile(
+  service: ServiceBuildRole,
+  build: Pick<
+    ServiceBuildIdentity,
+    'mode' | 'manifestDigest' | 'sourceSha' | 'sourceTree'
+  >,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  try {
+    const launcher = process.argv[1];
+    const {
+      mode,
+      manifestDigest: expectedDigest,
+      sourceSha,
+      sourceTree,
+    } = build;
+    if (!launcher || mode !== 'production')
+      throw Error('DEV_BUILD_IDENTITY_INVALID');
+    const entrypoint = await realpath(launcher);
+    signal?.throwIfAborted();
+    const ending = serviceEntrypoints[service];
+    if (!entrypoint.endsWith(ending)) throw Error('DEV_BUILD_IDENTITY_INVALID');
+    const root = entrypoint.slice(0, -ending.length);
+    const manifestBytes = await bytesAt(root, buildManifestPath);
+    signal?.throwIfAborted();
+    if (manifestBytes.length > 4 * 1024 ** 2)
+      throw Error('DEV_BUILD_IDENTITY_INVALID');
+    const { manifestDigest, ...manifest } = ServiceBuildManifestSchema.parse(
+      JSON.parse(manifestBytes.toString('utf8')),
+    );
+    if (
+      digest(JSON.stringify(manifest)) !== manifestDigest ||
+      manifestDigest !== expectedDigest ||
+      manifest.sourceSha !== sourceSha ||
+      manifest.sourceTree !== sourceTree
+    )
+      throw Error('DEV_BUILD_IDENTITY_INVALID');
+    const selected = manifest.files.filter(
+      (file) => file.path === personVmConfig,
+    );
+    if (!selected.length) return null;
+    const expected = selected[0]!;
+    if (selected.length !== 1 || expected.scope !== 'worker')
+      throw Error('DEV_BUILD_IDENTITY_INVALID');
+    const file = await open(
+      join(root, personVmConfig),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    let bytes: Buffer;
+    try {
+      signal?.throwIfAborted();
+      const stat = await file.stat();
+      signal?.throwIfAborted();
+      if (
+        !stat.isFile() ||
+        (stat.mode & 0o777) !== 0o600 ||
+        stat.uid !== process.getuid?.() ||
+        stat.size !== expected.bytes
+      )
+        throw Error('DEV_BUILD_IDENTITY_INVALID');
+      bytes = await file.readFile();
+      signal?.throwIfAborted();
+      if (
+        bytes.length !== expected.bytes ||
+        digest(bytes) !== expected.checksum
+      )
+        throw Error('DEV_BUILD_IDENTITY_INVALID');
+    } finally {
+      await file.close();
+    }
+    signal?.throwIfAborted();
+    const { employeePortSlots: configured, ...configuration } = z
+      .record(z.string(), z.unknown())
+      .parse(JSON.parse(bytes.toString('utf8')));
+    const employeePortSlots =
+      readPlatformPersonVmConfiguration().employeePortSlots;
+    if (
+      typeof configured === 'number' &&
+      Number.isInteger(configured) &&
+      configured >= 1 &&
+      configured <= MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS
+    )
+      return { configuration, employeePortSlots: configured, manifestDigest };
+    if (configured !== undefined)
+      console.warn('[person-vm.host-configuration]', {
+        field: 'employeePortSlots',
+        reason: 'invalid_slot_count',
+        fallback: employeePortSlots,
+      });
+    return { configuration, employeePortSlots, manifestDigest };
+  } catch {
+    signal?.throwIfAborted();
+    throw Error('DEV_BUILD_IDENTITY_INVALID');
+  }
+}
+
+/** The verified Worker entrypoint is the only consumer of private Host fields. */
+export async function readSealedPersonVmHostConfiguration(
+  build: ServiceBuildIdentity,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  if (build.service !== 'worker') throw Error('DEV_BUILD_IDENTITY_INVALID');
+  return readSealedPersonVmHostFile('worker', build, signal);
+}
+
+/** Web and Worker enrollment use the same sealed scalar as the VM provider. */
+export async function readServicePersonVmEmployeePortSlots() {
+  const fallback = readPlatformPersonVmConfiguration().employeePortSlots;
+  if (!process.argv[1]) return fallback;
+  const entrypoint = await realpath(process.argv[1]);
+  const service = entrypoint.endsWith(serviceEntrypoints.worker)
+    ? 'worker'
+    : entrypoint.endsWith(serviceEntrypoints.web)
+      ? 'web'
+      : undefined;
+  if (!service) return fallback;
+  const build = await readServiceBuildIdentity(service);
+  if (!build) return fallback;
+  const sealed = await readSealedPersonVmHostFile(service, build);
+  return sealed?.employeePortSlots ?? fallback;
 }

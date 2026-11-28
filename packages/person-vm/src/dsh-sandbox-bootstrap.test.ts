@@ -7,6 +7,7 @@ import { runInNewContext } from 'node:vm';
 import { afterEach, expect, test } from 'vitest';
 import {
   DSH_SANDBOX_ROOT,
+  launchDshPublicProxy,
   launchDshSandbox,
   prepareDshSandbox,
   verifyDshRuntimeDisk,
@@ -150,6 +151,29 @@ test('sets the actual Node process PATH after the agentd environment prefix', ()
   );
   expect(result.status).toBe(0);
   expect(JSON.parse(result.stdout)).toEqual([path, f.final]);
+});
+
+test('loads the proxy environment from a private file after the original guest launcher', () => {
+  const f = setup();
+  const config = join(f.root, 'proxy.conf');
+  const proxy = 'http://vm-proxy:synthetic@172.16.0.5:34567/';
+  fs.writeFileSync(config, proxy + '\n172.16.0.5\n', { mode: 0o600 });
+  const result = spawnSync(
+    '/bin/sh',
+    [
+      '-c',
+      launchDshPublicProxy,
+      'allrice-public-proxy',
+      '/bin/sh',
+      '-c',
+      'test "$http_proxy" = "$HTTP_PROXY" && test "$https_proxy" = "$HTTPS_PROXY" && printf "%s\\n%s\\n" "$https_proxy" "$NO_PROXY"',
+    ],
+    { encoding: 'utf8', env: { ALLRICE_PUBLIC_PROXY_CONFIG: config } },
+  );
+  expect(result.status).toBe(0);
+  expect(result.stdout).toBe(
+    proxy + '\nlocalhost,127.0.0.1,[::1],172.16.0.5\n',
+  );
 });
 
 test('checks the live ext4 mount and verifies both directly executed files', () => {

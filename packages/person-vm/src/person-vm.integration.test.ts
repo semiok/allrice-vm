@@ -6,13 +6,18 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { assertRuntimeFixtureDatabase } from '../../database/src/runtime-fixture-database.ts';
 import { PostgresPersonVmStore } from './store.ts';
-import { PersonVmError, PERSON_VM_COLD_MS } from './contract.ts';
+import {
+  PersonVmError,
+  PERSON_VM_COLD_MS,
+  type PersonVmBinding,
+} from './contract.ts';
 import { context, harness, running, signal } from './test-support.ts';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import type { CommandRunner } from './process.ts';
 import { PersonVmService } from './person-vm.ts';
 import { PersonVmDiskPool } from './disk-pool.ts';
 import type { PersonVmStartingScope } from './guest-bootstrap.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 // Actual adapter and filesystem renames, with a synthetic hdiutil protocol.
 // These bytes are NOT encrypted and no VM, mount, or hdiutil process is started.
@@ -101,6 +106,7 @@ suite(
       for (const migration of [
         '0002_identity.sql',
         '0247_person_virtual_machines.sql',
+        '0259_person_vm_verified_web_slot_capacity.sql',
       ]) {
         await db.unsafe(
           await readFile(
@@ -299,6 +305,469 @@ suite(
         await admin`select pg_terminate_backend(${rows[0]!.pid}) as killed`;
       expect(killed!.killed).toBe(true);
     }
+    it('publishes the observed owner while the real lease still holds the exact orphan predecessor', async () => {
+      const h = harness(store);
+      const { rc, binding: predecessor } = await running(h);
+      h.states.set(predecessor.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      await db`update person_virtual_machines set phase='starting'
+        where person_id=${predecessor.personId}`;
+      let release!: () => void, entered!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const paused = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const originalStatus = h.native.status;
+      h.native.status = async (binding, active) => {
+        if (binding.instanceId === predecessor.instanceId) {
+          entered();
+          await barrier;
+        }
+        return originalStatus(binding, active);
+      };
+      let ownerToken: string | undefined;
+      let newInstance: PersonVmBinding | undefined;
+      const work = h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: predecessor.vmId,
+            instanceId: null,
+            leaseEpoch: predecessor.leaseEpoch + 1,
+            assertAuthority: async () => {},
+            orphanedStart: {
+              predecessor,
+              observeLease(token) {
+                ownerToken = token;
+              },
+              observeInstance(binding) {
+                newInstance = binding;
+              },
+            },
+          },
+        },
+        signal(),
+      );
+      try {
+        await Promise.race([
+          paused,
+          work.then(() => {
+            throw Error('orphan start did not pause under the lease');
+          }),
+        ]);
+        expect(ownerToken).toEqual(expect.any(String));
+        expect(newInstance).toBeUndefined();
+        await expect(store.read(rc.actor.id)).resolves.toMatchObject({
+          ...predecessor,
+          phase: 'starting',
+          leaseOwner: ownerToken,
+        });
+        await expect(
+          store.withLease(
+            rc.actor.id,
+            { now: h.now, ttlMs: 5000 },
+            async () => {},
+          ),
+        ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+      } finally {
+        release();
+        await Promise.allSettled([work]);
+      }
+      await expect(work).resolves.toMatchObject({
+        vmId: predecessor.vmId,
+        ready: true,
+      });
+      expect(newInstance).toMatchObject({
+        vmId: predecessor.vmId,
+        leaseEpoch: predecessor.leaseEpoch + 1,
+      });
+      expect(newInstance?.instanceId).not.toBe(predecessor.instanceId);
+      await expect(h.service.resolve(rc, signal())).resolves.toEqual(
+        newInstance,
+      );
+    });
+    it.each(['joined', 'unlock failed', 'rolled back'] as const)(
+      'checks the PG release candidate before COMMIT, before its acknowledgement and through join (%s)',
+      async (outcome) => {
+        const h = harness(store);
+        const { rc, binding } = await running(h);
+        h.states.set(binding.vmId, 'stopped');
+        await h.service.stop(rc, signal());
+        function barrier() {
+          let release!: () => void;
+          const reached = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return { reached, release };
+        }
+        const returning = barrier();
+        const letReturning = barrier();
+        const committing = barrier();
+        const letCommit = barrier();
+        const committed = barrier();
+        const letCommitAck = barrier();
+        const unlock = barrier();
+        const letUnlock = barrier();
+        const end = barrier();
+        const letEnd = barrier();
+        const raw = openWorker();
+        const delayed = new Proxy(raw, {
+          apply(tag, receiver, args) {
+            const first: unknown = args[0]?.[0];
+            if (
+              typeof first !== 'string' ||
+              !first.includes('pg_advisory_unlock(')
+            )
+              return Reflect.apply(tag, receiver, args);
+            unlock.release();
+            return letUnlock.reached.then(() =>
+              Reflect.apply(tag, receiver, args),
+            );
+          },
+          get(tag, property, receiver) {
+            if (property === 'begin')
+              return (write: (tx: postgres.TransactionSql) => Promise<void>) =>
+                tag
+                  .begin(async (tx) => {
+                    const delayedUpdate = new Proxy(tx, {
+                      apply(query, instance, args) {
+                        return Promise.resolve(
+                          Reflect.apply(query, instance, args),
+                        ).then(async (result) => {
+                          returning.release();
+                          await letReturning.reached;
+                          return result;
+                        });
+                      },
+                    });
+                    await write(delayedUpdate);
+                    committing.release();
+                    await letCommit.reached;
+                    if (outcome === 'rolled back')
+                      throw Error('fixture release rollback');
+                  })
+                  .then(async (result) => {
+                    committed.release();
+                    await letCommitAck.reached;
+                    return result;
+                  });
+            if (property !== 'end') return Reflect.get(tag, property, receiver);
+            return async (...args: Parameters<postgres.Sql['end']>) => {
+              end.release();
+              await letEnd.reached;
+              await tag.end(...args);
+            };
+          },
+        });
+        const held = new PostgresPersonVmStore(() => delayed);
+        const fail = new PersonVmError('CLEANUP_INCOMPLETE');
+        const release = {
+          token: '',
+          evidence: [] as { token: string; version: string; stage: string }[],
+        };
+        const work = held.withLease(
+          binding.personId,
+          {
+            now: h.now,
+            ttlMs: h.options.leaseTtlMs,
+            observeRelease(token, version, stage) {
+              release.evidence.push({ token, version, stage });
+            },
+          },
+          async (lease) => {
+            release.token = lease.ownerToken!;
+            await lease.save({ ...lease.row!, phase: 'failed' });
+            throw fail;
+          },
+        );
+        const reached = (gate: ReturnType<typeof barrier>) =>
+          Promise.race([
+            gate.reached,
+            work,
+            end.reached.then(() => {
+              throw Error(
+                'session ended without reaching the expected release stage',
+              );
+            }),
+          ]);
+        async function stamp() {
+          const [row] = await db<{ version: string; owner: string | null }[]>`
+            select xmin::text as version, lease_owner as owner
+            from person_virtual_machines
+            where person_id=${binding.personId} and instance_id=${binding.instanceId}
+              and lease_epoch=${binding.leaseEpoch} and phase='failed'`;
+          return row!;
+        }
+        async function oldLockStillHeld() {
+          await expect(
+            store.withLease(
+              binding.personId,
+              { now: h.now, ttlMs: 5000 },
+              async () => {},
+            ),
+          ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+        }
+        try {
+          await reached(returning);
+          const original = await stamp();
+          expect(original.owner).toBe(release.token);
+          expect(release.evidence).toEqual([]);
+
+          letReturning.release();
+          await reached(committing);
+          const [candidate] = release.evidence;
+          expect(candidate).toEqual({
+            token: release.token,
+            version: expect.any(String),
+            stage: 'written',
+          });
+          expect(candidate?.version).not.toBe(original.version);
+          expect(await stamp()).toEqual(original);
+          await oldLockStillHeld();
+
+          letCommit.release();
+          if (outcome !== 'rolled back') {
+            await reached(committed);
+            expect(await stamp()).toEqual({
+              owner: null,
+              version: candidate!.version,
+            });
+            expect(release.evidence).toEqual([candidate]);
+            await oldLockStillHeld();
+
+            letCommitAck.release();
+            await reached(unlock);
+            if (outcome === 'unlock failed') {
+              // This exact connection's next unlock now returns false from PG.
+              const [unlocked] = await raw`
+                select pg_advisory_unlock(hashtextextended(${'person-vm:' + binding.personId},0)) as unlocked`;
+              expect(unlocked?.unlocked).toBe(true);
+            }
+            letUnlock.release();
+          }
+          await Promise.race([end.reached, work]);
+          const finalStage = outcome === 'joined' ? 'joined' : 'unconfirmed';
+          expect(release.evidence).toEqual([
+            candidate,
+            ...(outcome === 'joined'
+              ? []
+              : [{ ...candidate, stage: finalStage }]),
+          ]);
+          if (outcome === 'rolled back')
+            expect(await stamp()).toEqual(original);
+          letEnd.release();
+          await expect(work).rejects.toBe(fail);
+          expect(release.evidence).toEqual([
+            candidate,
+            { ...candidate, stage: finalStage },
+          ]);
+        } finally {
+          letReturning.release();
+          letCommit.release();
+          letCommitAck.release();
+          letUnlock.release();
+          letEnd.release();
+          await Promise.allSettled([work]);
+        }
+      },
+    );
+
+    it('returns the original lease release versions for two failed starts at one predecessor', async () => {
+      const h = harness(store);
+      const { rc, binding: predecessor } = await running(h);
+      h.states.set(predecessor.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      await db`update person_virtual_machines set phase='starting'
+        where person_id=${predecessor.personId}`;
+      h.states.set(predecessor.vmId, 'unknown');
+      const nextStore = new PostgresPersonVmStore(openWorker);
+      const otherWorker = new PersonVmService({
+        ...h.options,
+        store: nextStore,
+      });
+      const releases: { token: string; rowVersion: string }[] = [];
+      for (const worker of [h.service, otherWorker]) {
+        let claimed: string | undefined;
+        const failures: string[] = [];
+        await expect(
+          worker.prewarm(
+            rc,
+            {
+              trigger: 'page',
+              target: {
+                vmId: predecessor.vmId,
+                instanceId: null,
+                leaseEpoch: predecessor.leaseEpoch + 1,
+                assertAuthority: async () => {},
+                orphanedStart: {
+                  predecessor,
+                  observeLease(token) {
+                    claimed = token;
+                  },
+                  observeInstance() {
+                    throw Error(
+                      'unknown native state must not publish a generation',
+                    );
+                  },
+                  observeFailure(token, phase) {
+                    expect(token).toBe(claimed);
+                    failures.push(phase);
+                  },
+                  observeRelease(token, rowVersion, stage) {
+                    expect(token).toBe(claimed);
+                    if (stage === 'joined')
+                      releases.push({ token, rowVersion });
+                  },
+                },
+              },
+            },
+            signal(),
+          ),
+        ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+        expect(failures).toEqual(['starting']);
+        const [current] = await db<{ rowVersion: string }[]>`
+          select xmin::text as "rowVersion" from person_virtual_machines
+          where person_id=${predecessor.personId}
+            and lease_owner is null and lease_expires_at is null`;
+        expect(releases.at(-1)).toEqual({
+          token: claimed,
+          rowVersion: current?.rowVersion,
+        });
+        expect(current?.rowVersion).toEqual(expect.any(String));
+        await expect(store.read(predecessor.personId)).resolves.toMatchObject({
+          ...predecessor,
+          phase: 'starting',
+          leaseOwner: null,
+        });
+      }
+      expect(releases).toHaveLength(2);
+      expect(releases[0]!.token).not.toBe(releases[1]!.token);
+      expect(releases[0]!.rowVersion).not.toBe(releases[1]!.rowVersion);
+    });
+
+    it('reopens a running legacy employee and records the stopped conversion width only after readiness', async () => {
+      const h = harness(store);
+      const rc = context();
+      const employees: PersonVmWebRoster['entries'][number][] = [];
+      const addEmployee = () =>
+        employees.push({
+          workspaceId: randomUUID(),
+          employeeInstanceId: randomUUID(),
+          employeeRevision: 1,
+          employeeVersionId: randomUUID(),
+        });
+      addEmployee();
+      let legacy = true;
+      const starts: string[] = [];
+      const slots = Array.from({ length: 8 }, (_, index) => ({
+        hostPort: 32180 + index,
+        guestPort: 32180 + index,
+      }));
+      h.native.prepareWebEndpoints = async (binding, roster) => ({
+        binding,
+        rosterDigest: roster.digest,
+        endpoints: roster.entries.map((entry, index) => ({
+          ...entry,
+          ...slots[index]!,
+        })),
+        ...(legacy ? {} : { slots }),
+      });
+      h.native.assertWebEndpoints = async (receipt) => {
+        expect(await h.native.status(receipt.binding, signal())).toBe(
+          'running',
+        );
+      };
+      h.native.startWithWebEndpoints = async (receipt, active) => {
+        expect(await h.native.status(receipt.binding, active)).toBe('stopped');
+        expect(receipt.slots).toEqual(slots);
+        starts.push(
+          ...receipt.endpoints.map(
+            ({ employeeInstanceId }) => employeeInstanceId,
+          ),
+        );
+        await h.native.start(receipt.binding, active);
+      };
+      h.runtime.retireAfterNativeStop = async () => {};
+      const service = new PersonVmService({
+        ...h.options,
+        nativeWeb: {
+          async prepare() {
+            const facts = {
+              personId: rc.actor.id,
+              organizationId: rc.organizationId,
+              entries: [...employees].sort((a, b) =>
+                a.employeeInstanceId.localeCompare(b.employeeInstanceId),
+              ),
+            };
+            return {
+              ...facts,
+              digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+            };
+          },
+        },
+      });
+      const prewarm = () => service.prewarm(rc, { trigger: 'page' }, signal());
+      const person = () => store.read(rc.actor.id);
+      const original = await prewarm();
+      await expect(prewarm()).resolves.toMatchObject({
+        vmId: original.vmId,
+        ready: true,
+      });
+      await expect(person()).resolves.toMatchObject({
+        verifiedWebSlotCapacity: null,
+      });
+
+      await expect(service.stop(rc, signal())).rejects.toMatchObject({
+        code: 'ACTIVITY_UNKNOWN',
+      });
+      h.states.set(original.vmId, 'stopped');
+      await service.stop(rc, signal());
+      addEmployee();
+      legacy = false;
+      h.setReadiness({
+        authenticated: true,
+        editorReady: false,
+        canSend: false,
+      });
+      await expect(prewarm()).rejects.toMatchObject({
+        code: 'RUNTIME_NOT_READY',
+      });
+      await expect(person()).resolves.toMatchObject({
+        phase: 'stopped',
+        verifiedWebSlotCapacity: null,
+      });
+      h.setReadiness({ authenticated: true, editorReady: true, canSend: true });
+      await expect(prewarm()).resolves.toMatchObject({
+        vmId: original.vmId,
+        ready: true,
+      });
+      expect(starts.slice(-2)).toEqual(
+        expect.arrayContaining(
+          employees.map(({ employeeInstanceId }) => employeeInstanceId),
+        ),
+      );
+      const proof = { verifiedWebSlotCapacity: 8 };
+      await expect(person()).resolves.toMatchObject({
+        ...proof,
+        phase: 'running',
+      });
+
+      h.states.set(original.vmId, 'stopped');
+      await service.stop(rc, signal());
+      await expect(person()).resolves.toMatchObject({
+        ...proof,
+        phase: 'stopped',
+      });
+      h.authorizeDiskDelete(true);
+      await service.delete(rc, { deleteDisk: true }, signal());
+      await expect(person()).resolves.toMatchObject({
+        phase: 'deleted',
+        verifiedWebSlotCapacity: null,
+      });
+    });
     it('bounds a blocked diagnostic insert on its own connection and leaves the VM lease usable', async () => {
       const h = harness(store);
       const rc = context();
@@ -1041,6 +1510,124 @@ suite(
         }
       },
     );
+    it.each(['previous warm receipt', 'fresh cold attach'] as const)(
+      'settles %s after an actual cold rename and rejected PG tier write',
+      async (mode) => {
+        const fixture = await syntheticDisk();
+        const h = harness(store);
+        const rc = context();
+        for (const part of [
+          'inspect',
+          'inspectMount',
+          'create',
+          'attach',
+          'move',
+          'delete',
+        ] as const)
+          Object.assign(h.disk, {
+            [part]: fixture.disk[part].bind(fixture.disk),
+          });
+        let loseReceipt = false;
+        const detaches: string[] = [];
+        h.disk.detach = async (disk, active) => {
+          await fixture.disk.detach(disk, active);
+          detaches.push(disk.tier);
+          if (loseReceipt) {
+            loseReceipt = false;
+            throw new PersonVmError('PROVIDER_FAILED');
+          }
+        };
+        try {
+          const { binding } = await running(h, rc);
+          const image = (tier: string) =>
+            join(fixture.volume, tier, binding.vmId + '.sparseimage');
+          const original = await readFile(image('warm'));
+          h.states.set(binding.vmId, 'stopped');
+          await h.service.stop(rc, signal());
+          detaches.length = 0;
+
+          const proofs: string[] = [];
+          const owner = new PersonVmService({
+            ...h.options,
+            native: {
+              ...h.native,
+              async assertRetainedStartup(target, mount) {
+                expect(target).toEqual(binding);
+                const tracked = [...fixture.attachments.entries()];
+                expect(tracked).toHaveLength(1);
+                expect(tracked[0]?.[1]).toBe(mount);
+                proofs.push(tracked[0]![0]);
+              },
+            },
+          });
+          const preflight = () =>
+            owner.reconcileStoppedEntryForPrewarm(rc, binding, signal(), true);
+          if (mode === 'previous warm receipt') {
+            loseReceipt = true;
+            await expect(preflight()).rejects.toMatchObject({
+              code: 'CLEANUP_INCOMPLETE',
+            });
+            expect(proofs).toEqual([image('warm')]);
+            expect(detaches).toEqual(['warm']);
+            expect(fixture.attachments.size).toBe(0);
+          }
+
+          h.advance(PERSON_VM_COLD_MS + 1);
+          await db`alter table person_virtual_machines
+            add constraint fixture_reject_cold_tier check (disk_tier <> 'cold')`;
+          try {
+            await expect(
+              h.service.reconcileIdle(rc, signal()),
+            ).rejects.toMatchObject({
+              code: '23514',
+            });
+          } finally {
+            await db`alter table person_virtual_machines
+              drop constraint fixture_reject_cold_tier`;
+          }
+          await expect(readFile(image('warm'))).rejects.toMatchObject({
+            code: 'ENOENT',
+          });
+          expect(await readFile(image('cold'))).toEqual(original);
+          const stale = await store.read(binding.personId);
+          expect(stale).toMatchObject({
+            ...binding,
+            phase: 'stopped',
+            diskTier: 'warm',
+            leaseOwner: null,
+          });
+          const cold = { vmId: binding.vmId, tier: 'cold' as const };
+          if (mode === 'previous warm receipt') {
+            // An attachment on the other layer is a refusal, even when
+            // this exact retained image was originally ours.
+            await fixture.disk.attach(cold, signal());
+            await expect(
+              owner.settleRetainedStartupMounts(signal()),
+            ).rejects.toMatchObject({
+              code: 'CLEANUP_INCOMPLETE',
+            });
+            expect(fixture.attachments.has(image('cold'))).toBe(true);
+            expect(detaches).toEqual(['warm']);
+            await fixture.disk.detach(cold, signal());
+          } else {
+            await expect(preflight()).resolves.toBe(true);
+            expect(proofs).toEqual([image('cold')]);
+            expect(detaches).toEqual(['cold']);
+          }
+          await owner.settleRetainedStartupMounts(signal());
+          await owner.settleRetainedStartupMounts(signal());
+          expect(detaches).toEqual([
+            mode === 'previous warm receipt' ? 'warm' : 'cold',
+          ]);
+          expect(fixture.attachments.size).toBe(0);
+          expect(await store.read(binding.personId)).toEqual(stale);
+          expect(await readFile(image('cold'))).toEqual(original);
+        } finally {
+          await rm(fixture.root, { recursive: true, force: true });
+        }
+      },
+    );
+
     it('只create未start：rename后PG断线，无instance恢复实际cold位置并授权删除完整盘/key', async () => {
       const fixture = await syntheticDisk(),
         h = harness(store),

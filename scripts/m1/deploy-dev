@@ -69,9 +69,22 @@ recovery_pair() { # Web plist, Worker plist, [expected SHA]
   [ "$(release_of "$1")" = "$rel/apps/web" ] && dev_release_config "$rel" "${3:-$(penv "$2" ALLRICE_RELEASE_SHA)}"
 }
 ready_sha() { # url role release -> prints a matching verified sourceSha
-  curl -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
+  curl -q --noproxy '*' -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
+worker_vm_recovery() { # release pid [ready] -> exact boot/owner or ready SHA
+  local port owners proof
+  local args=(ready worker "$1")
+  if [ "${3:-}" != ready ]; then args+=("$2"); fi
+  port=$(worker_port) || return 1
+  owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
+  [ "$owners" = "$2" ] || return 1
+  proof=$(curl -q --noproxy '*' -fsS -m 5 "http://127.0.0.1:$port/health/ready" 2>/dev/null |
+    "$M1_PY" "$M1_TOOLS/service_target.py" "${args[@]}") || return 1
+  owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
+  [ "$owners" = "$2" ] && [ -n "$proof" ] || return 1
+  printf '%s\n' "$proof"
+}
 worker_boot() { # prints the bootId the ready Worker reports, or nothing; never fails
-  { curl -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
+  { curl -q --noproxy '*' -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
 try: b=str(json.load(sys.stdin)["identity"]["bootId"])
 except Exception: b=""
 print(b if re.fullmatch("[0-9a-f-]{36}",b) else "")' ; }
@@ -114,6 +127,40 @@ vm_upgrade_candidates() {
   printf '%s\n' "$count"
 }
 
+# Check across installed versions. Older Workers can still prepare a wake
+# during drain, even when there was none before requesting it.
+verify_no_committed_vm_wakes() {
+  local present clear
+  present=$(dev_sql "select to_regclass('public.person_vm_scheduled_wakes') is not null") || return 1
+  case "$present" in
+    f) return 0 ;;
+    t) ;;
+    *) return 1 ;;
+  esac
+  clear=$(dev_sql "select not exists(
+    select 1 from public.person_vm_scheduled_wakes where state='claimed'
+    union all
+    select 1 from public.person_vm_scheduled_wakes p
+    join public.person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
+    cross join lateral (
+      select a.request_id, a.result from public.person_vm_audit a
+      where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+        and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+        and (
+          (vm.phase in ('stopped','cold') and vm.egress_receipt is null
+            and a.action='stop' and a.result='succeeded')
+          or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch'))
+      order by a.id desc limit 1
+    ) stop
+    where vm.disk_retained and p.revoked_at is null
+      and p.wake_at is not null and p.state='waiting'
+      and stop.request_id=p.plan_id and stop.result='succeeded')") || return 1
+  if [ "$clear" != t ]; then
+    say "An outstanding Person VM wake must stay with the current Worker. Release blocked."
+    return 1
+  fi
+}
+
 worker_drain_cli() {
   local boot=$1 pid=$2
   shift 2
@@ -136,7 +183,7 @@ wait_for_drained_worker_exit() { # pid, plist, release, port
       "running $pid") ;;
       loaded)
         output=$("$M1_LAUNCHCTL" print "gui/$M1_UID/$WORKER_LABEL") || return 1
-        if ! kill -0 "$pid" 2>/dev/null &&
+        if { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } &&
           printf '%s\n' "$output" | /usr/bin/awk '
             $1=="last" && $2=="exit" && $3=="code" && $4=="=" { seen++; code=$5 }
             $1=="pid" && $2=="=" { pid++ }
@@ -157,7 +204,8 @@ record_worker_exit_intent() {
 }
 
 stop_release_worker() {
-  local plist rel port process boot receipt count target status i pid expire
+  local plist rel port process boot receipt count target status i pid expire owner
+  local mode=${1:-release}
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
   port=$(worker_port) || return 1
@@ -182,6 +230,7 @@ PYTHON
       say "Person VMs require a current Worker drain receipt. Release blocked."
       return 1
     }
+    verify_no_committed_vm_wakes || return 1
     RELEASE_STOP_ATTEMPTED=1
     stop_job "$WORKER_LABEL" "$port" "$plist" "$rel"
     return
@@ -189,8 +238,11 @@ PYTHON
 
   process=$(job_state "$WORKER_LABEL" "$plist" "$rel") || return 1
   if [ "$process" = gone ]; then
-    count=$(vm_upgrade_candidates) || return 1
-    [ "$count" = 0 ] && port_closed "$port" || {
+    if [ "$mode" = release ]; then
+      count=$(vm_upgrade_candidates) || return 1
+      [ "$count" = 0 ] || return 1
+    fi
+    port_closed "$port" || {
       say "Worker absent and Person VM stop is unconfirmed. Release blocked."
       return 1
     }
@@ -199,18 +251,30 @@ PYTHON
   if [ "$process" = loaded ]; then
     # Resume a previously acknowledged graceful shutdown that ended before
     # launchd registration was removed. It cannot authorize a live process.
-    [ -f "$INFLIGHT/worker-exit" ] || return 1
-    [ "$(sed -n '1p' "$INFLIGHT/worker-exit")" = "$rel" ] || return 1
-    pid=$(sed -n '2p' "$INFLIGHT/worker-exit")
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    count=$(vm_upgrade_candidates) || return 1
-    [ "$count" = 0 ] || return 1
+    if [ -f "$INFLIGHT/worker-exit" ]; then
+      [ "$(sed -n '1p' "$INFLIGHT/worker-exit")" = "$rel" ] || return 1
+      pid=$(sed -n '2p' "$INFLIGHT/worker-exit")
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    else
+      # This job may have exited before the first PID could be recorded.
+      # Only exact same-version recovery can restart it without that witness.
+      RELEASE_STOP_UNCONFIRMED=1
+      [ "$mode" = restore ] || return 1
+      pid=""
+    fi
+    if [ "$mode" = release ]; then
+      count=$(vm_upgrade_candidates) || return 1
+      [ "$count" = 0 ] || return 1
+    fi
     wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
     "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$WORKER_LABEL" || return 1
     return
   fi
   [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
   pid=${process#running }
+  RELEASE_STOP_UNCONFIRMED=1
+  boot=$(worker_boot) || return 1
+  record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   # Only an agent staged with this policy stays loaded with no process after a
   # successful SIGTERM. Unconditional KeepAlive starts a replacement Worker.
   if ! "$M1_PY" -c 'import plistlib,sys
@@ -219,24 +283,47 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     say "Current Worker launch policy does not support a graceful release handoff. Release blocked."
     return 1
   fi
-  boot=$(worker_boot) || return 1
+  owner=""
+  if [ "$mode" = restore ]; then owner=$(worker_vm_recovery "$rel" "$pid") || owner=""; fi
+  if [ -n "$boot" ] && [ "$owner" = "$boot uninstalled" ]; then
+    # The identical sealed boot proved that its Host never installed and
+    # constructor cleanup has joined. Request graceful exit of that PID.
+    RELEASE_STOP_UNCONFIRMED=1
+    [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" = "$process" ] &&
+      [ "$(worker_vm_recovery "$rel" "$pid")" = "$owner" ] &&
+      kill -TERM "$pid" &&
+      wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
+    RELEASE_STOP_ATTEMPTED=1; RELEASE_STOP_UNCONFIRMED=""
+    "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$WORKER_LABEL" || return 1
+    [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" = gone ] && port_closed "$port"
+    return
+  fi
+  if [ "$mode" = restore ] && { [ -z "$boot" ] || [ "$owner" != "$boot drain-required" ]; }; then
+    say "The original Worker is still running without a confirmed recovery action."
+    return 1
+  fi
+  verify_no_committed_vm_wakes || return 1
   if [ -z "$boot" ] || [ -z "$DRAIN_TOKEN" ] || ! receipt=$(read_drain_receipt "$boot" "$pid"); then
+    if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ]; then
+      RELEASE_STOP_UNCONFIRMED=1
+    fi
     say "Person VM drain missing or refused. Verify the current Worker socket and active tasks before retrying."
     return 1
   fi
+  # Preserve the old release, PID and plists if the Worker has already
+  # disappeared. Recovery can join the loaded job using that exact witness.
+  if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ] ||
+    [ "$(worker_boot)" != "$boot" ]; then
+    RELEASE_STOP_UNCONFIRMED=1
+    say "The Worker identity changed. Release blocked."
+    return 1
+  fi
+  validate_drain_receipt "$boot" <<<"$receipt" || return 1
+  verify_no_committed_vm_wakes || return 1
   count=$(vm_upgrade_candidates) || return 1
   [ "$count" = 0 ] || return 1
   target="gui/$M1_UID/$WORKER_LABEL"
-  # A refused, changed, or unconfirmed Worker must never fall through to
-  # forceful bootout. The exact boot consumes the handoff and exits itself.
-  if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ] ||
-    [ "$(worker_boot)" != "$boot" ] ||
-    ! validate_drain_receipt "$boot" <<<"$receipt"; then
-    say "The Worker identity or drain receipt changed. Release blocked."
-    return 1
-  fi
   expire=$("$M1_PY" -c 'import json,sys; print(json.load(sys.stdin)["expiresAt"])' <<<"$receipt") || return 1
-  record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   RELEASE_STOP_UNCONFIRMED=1
   if ! claim_drained_worker "$boot" "$pid" "$expire" ||
     ! wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port"; then
@@ -257,7 +344,15 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
 }
 
 stop_both() {
-  stop_release_worker || return 1
+  local mode=${1:-release}
+  if [ "$mode" = release ] && ! verify_no_committed_vm_wakes; then
+    # The old protocol can exit on a concurrent signal before its first
+    # launchd read. Keep the original pair even on a wake-gate refusal.
+    RELEASE_STOP_UNCONFIRMED=1
+    return 1
+  fi
+  stop_release_worker "$mode" || return 1
+  if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
   RELEASE_STOP_ATTEMPTED=1
   stop_job "$WEB_LABEL" "$(web_port)"
 }
@@ -293,13 +388,19 @@ snapshot() ( # name -> 0 when $SNAPSHOTS/<name> is complete
     | while read -r old; do rm -rf -- "$old" || echo "could not prune $old" >&2; done
   exit 0
 )
-start_both_on() { # sha -> start Worker then Web, both must identify this release
+start_both_on() { # sha [restore wake evidence: yes/no]
   recovery_pair "$WEB_PLIST" "$WORKER_PLIST" "$1" || return 1
   local rel; rel=$(release_of) || return 1
   start_job "$WORKER_LABEL" "$WORKER_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 180 worker "$rel" || { say "worker did not become ready on ${1:0:8}"; return 1; }
   start_job "$WEB_LABEL" "$WEB_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(web_port)/api/health/ready" "$1" 120 web "$rel" || { say "web did not become ready on ${1:0:8}"; return 1; }
+  # Recovery needs a fresh Worker response after Web startup. The Worker
+  # can already have closed the listener while launchd still shows a PID.
+  if [ "$#" -eq 2 ]; then
+    verify_restored_vm_owner "$rel" "$2" || return 1
+    wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 1 worker "$rel" || return 1
+  fi
 }
 
 # Point both plists at a release: script paths, working dirs, cordis config, SHA, and
@@ -392,6 +493,41 @@ refuse_restore() { # phase previous_sha reason
   log_deploy kind failed phase "$1" reason "$reason" restored no manualIntervention required log "$BLOG" || true
   return 1
 }
+verify_restored_vm_owner() { # original sealed release, required wake tick (yes/no), optional expected process
+  local count process proof
+  verify_no_committed_vm_wakes || return 1
+  count=$(vm_upgrade_candidates) || return 1
+  if [ "$count" = 0 ] && [ "$2" != yes ]; then
+    [ -z "${3:-}" ] ||
+      { [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ] &&
+        worker_vm_recovery "$1" "${3#running }" ready >/dev/null &&
+        [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ]; }
+    return
+  fi
+  process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1") || return 1
+  [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
+  [ -z "${3:-}" ] || [ "$process" = "$3" ] || return 1
+  proof=$(worker_vm_recovery "$1" "${process#running }") || return 1
+  if [[ "$proof" == *' wake-ready' ]] ||
+    { [ "$2" != yes ] && [[ "$proof" == *' host-ready' ]]; }; then
+    [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$process" ]
+    return
+  fi
+  say "Restored Worker VM ownership is unconfirmed. Recovery remains incomplete."
+  return 1
+}
+
+resume_restored_web() { # preserve the already running original Worker
+  local sha=$1 rel=$2 state
+  state=$(job_state "$WEB_LABEL" "$WEB_PLIST" "$rel/apps/web") || return 1
+  case "$state" in
+    gone) start_job "$WEB_LABEL" "$WEB_PLIST" || return 1 ;;
+    loaded) "$M1_LAUNCHCTL" kickstart "gui/$M1_UID/$WEB_LABEL" || return 1 ;;
+    running\ *) ;;
+    *) return 1 ;;
+  esac
+  wait_ready "http://127.0.0.1:$(web_port)/api/health/ready" "$sha" 120 web "$rel"
+}
 # Put the saved launchd files back, restart both and check they are healthy on the
 # previous SHA. Every step is checked: on any failure the saved files stay for a person.
 restore() {
@@ -399,7 +535,25 @@ restore() {
   local why rel; rel=$(release_of "$INFLIGHT/worker.plist") || return 1
   recovery_pair "$INFLIGHT/web.plist" "$INFLIGHT/worker.plist" "$prev" && dev_plist_pair || return 1
   say "restoring the previous version ${prev:0:8}"
-  stop_both || { say "could not stop the services to restore them"; return 1; }
+  local mode=release need_wake=no process proof
+  if ! verify_no_committed_vm_wakes; then need_wake=yes; fi
+  # A loaded or absent Worker can be recovered with its original sealed
+  # configuration. Replacing a different release must pass the wake guard.
+  if cmp -s "$INFLIGHT/worker.plist" "$(dev_plist worker)" &&
+    cmp -s "$INFLIGHT/web.plist" "$(dev_plist web)"; then
+    mode=restore
+    process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$rel") || return 1
+    if [[ "$process" =~ ^running\ [1-9][0-9]*$ ]]; then
+      proof=$(worker_vm_recovery "$rel" "${process#running }") || proof=""
+      if [[ "$proof" == *' host-ready' || "$proof" == *' wake-ready' ]]; then
+        check_migrations_known "$rel" && check_contract_known "$rel" &&
+          resume_restored_web "$prev" "$rel" &&
+          verify_restored_vm_owner "$rel" "$need_wake" "$process"
+        return
+      fi
+    fi
+  fi
+  stop_both "$mode" || { say "could not stop the services to restore them"; return 1; }
   if ! why=$(check_migrations_known "$rel"); then
     refuse_restore restore-migrations "$prev" "$why"; return 1
   fi
@@ -410,7 +564,9 @@ restore() {
   cp -p "$INFLIGHT/web.plist" "$WEB_PLIST" && cp -p "$INFLIGHT/worker.plist" "$WORKER_PLIST" \
     && cmp -s "$INFLIGHT/web.plist" "$WEB_PLIST" && cmp -s "$INFLIGHT/worker.plist" "$WORKER_PLIST" \
     || { say "could not put back the saved launchd files from $INFLIGHT"; return 1; }
-  start_both_on "$prev" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
+  # Health alone does not prove this boot recovered its wake owner. Keep
+  # the restored Worker running and retain the witness until plans settle.
+  start_both_on "$prev" "$need_wake" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
   say "previous version ${prev:0:8} is healthy again"
 }
 # Keep a final error/signal handler while the EXIT cleanup runs; replacing an
@@ -441,7 +597,8 @@ on_exit() { # rc
   if [ -n "$INFLIGHT_MINE" ] && [ -f "$INFLIGHT/state" ]; then
     local phase; phase=$(sed -n 1p "$INFLIGHT/state")
     say "did not finish (phase '$phase', exit $rc)"
-    if [ "$phase" = stopping ] && [ -n "$RELEASE_STOP_UNCONFIRMED" ]; then
+    if [ "$phase" = stopping ] && { [ -n "$RELEASE_STOP_UNCONFIRMED" ] ||
+      { [ -z "$RELEASE_STOP_ATTEMPTED" ] && [ -f "$INFLIGHT/worker-exit" ]; }; }; then
       log_deploy kind failed phase "$phase" reason "${FAIL_REASON:-exit $rc}" restored unconfirmed log "$BLOG" || true
       say "Worker exit unconfirmed. Saved launchd files: $INFLIGHT. Inspect the old Worker's shutdown status before recovery."
     elif [ "$phase" = stopping ] && [ -z "$RELEASE_STOP_ATTEMPTED" ]; then
@@ -634,7 +791,7 @@ rollback() { # [release-dir]
   rollback_gate "$target" "$sha" # a deploy that ended meanwhile may have raised either
   say "rolling back to $(basename "$target") (${sha:0:8}); database migrations are not reverted"
   inflight_begin "$cur_sha"
-  stop_both || die "services did not stop"
+  stop_both release || die "services did not stop"
   inflight_phase switching
   activate_plists
   start_both_on "$sha" || die "rollback target did not become healthy"
@@ -733,7 +890,7 @@ deploy() {
   local down_at boot; down_at=$(date +%s); boot=$(worker_boot)
   inflight_begin "$cur_sha"
   say "stopping web and worker"
-  stop_both || die "services did not stop"
+  stop_both release || die "services did not stop"
   report_after_stop "$boot"
   pre_migrate_snapshot "$(basename "$rel")" "$pending" "$snap"
   inflight_phase migrating

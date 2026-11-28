@@ -11,6 +11,7 @@ import {
 } from '@allrice/database';
 import {
   PersonVmError,
+  sameVmBinding,
   type PersonVmIdleStopRequest,
   type PersonVmBinding,
   type PersonVmScheduledIdleAuthority,
@@ -142,7 +143,10 @@ function receiptId(planId: string, employeeInstanceId: string) {
 }
 
 export function createProductionScheduledWake(input: {
-  startup: Pick<ReturnType<typeof createAssignedNativeWebStartup>, 'catalog'>;
+  startup: Pick<
+    ReturnType<typeof createAssignedNativeWebStartup>,
+    'activityCatalogs'
+  >;
   database: ReturnType<typeof getDatabase>;
   source: ProductionScheduledWakeSource;
   lifetime: AbortSignal;
@@ -155,6 +159,7 @@ export function createProductionScheduledWake(input: {
   const ledger = createPostgresNativeScheduleObservationLedger(input.database);
   let runner: Promise<void> | undefined;
   let tick: Promise<boolean> | undefined;
+  let lastCompletedTick: number | undefined;
   let paused = false;
   let closing: Promise<void> | undefined;
 
@@ -211,18 +216,26 @@ export function createProductionScheduledWake(input: {
             roster.entries.length === 0
           )
             throw new PersonVmError('AUTHORIZATION_DENIED');
+          const owners = input.startup.activityCatalogs(binding, signal);
+          const byEmployee = new Map(
+            owners.map((catalog) => [
+              catalog.endpoint.employeeInstanceId,
+              catalog,
+            ]),
+          );
+          if (
+            owners.length !== roster.entries.length ||
+            byEmployee.size !== owners.length
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
           const catalogs = roster.entries.map((entry) => {
-            const catalog = input.startup.catalog(
-              binding,
-              entry.employeeInstanceId,
-            );
+            const catalog = byEmployee.get(entry.employeeInstanceId);
+            if (!catalog) throw new PersonVmError('AUTHORIZATION_DENIED');
             const exposed = catalog.endpoint;
             catalog.revoked.throwIfAborted();
             if (
-              catalog.receipt.rosterDigest !== roster.digest ||
-              catalog.receipt.endpoints.length !== roster.entries.length ||
+              !sameVmBinding(catalog.receipt.binding, binding) ||
               exposed.workspaceId !== entry.workspaceId ||
-              exposed.employeeInstanceId !== entry.employeeInstanceId ||
               exposed.employeeVersionId !== entry.employeeVersionId ||
               exposed.employeeRevision !== entry.employeeRevision
             )
@@ -409,7 +422,9 @@ export function createProductionScheduledWake(input: {
             try {
               tick = wake.runDueOnce(lifetime);
               await tick;
+              lastCompletedTick = performance.now();
             } catch {
+              lastCompletedTick = undefined;
               if (!lifetime.aborted)
                 console.error('[person-vm] scheduled wake tick failed');
             } finally {
@@ -422,6 +437,14 @@ export function createProductionScheduledWake(input: {
         if (!lifetime.aborted) throw error;
       });
       void runner.catch(() => {});
+    },
+    readyForRecovery() {
+      return (
+        !lifetime.aborted &&
+        !paused &&
+        lastCompletedTick !== undefined &&
+        performance.now() - lastCompletedTick < 15_000
+      );
     },
     async pause(signal: AbortSignal) {
       signal.throwIfAborted();

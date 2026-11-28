@@ -264,6 +264,8 @@ export async function withOwnedPersonVmAuthorityTransaction<T>(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
+    /** Includes joined native stops awaiting lifecycle publication. Release
+     * must leave their recovery and wake with the current Worker. */
     async nextCommittedWakeAt(signal: AbortSignal): Promise<Date | null> {
       const active = AbortSignal.any([signal, AbortSignal.timeout(3_000)]);
       active.throwIfAborted();
@@ -281,18 +283,28 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           await tx`set local statement_timeout = '2s'`;
           active.throwIfAborted();
           const [row] = await tx<{ earliest: Date | null }[]>`
-        select min(greatest(p.wake_at,p.retry_at,p.claim_until)) as earliest
+        select min(at) as earliest from (
+        select greatest(p.wake_at,p.retry_at) as at
         from person_virtual_machines vm
         join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
-        where vm.phase in ('stopped','cold') and vm.disk_retained
-          and vm.egress_receipt is null and p.revoked_at is null
-          and p.wake_at is not null and p.state in ('waiting','claimed')
-          and p.plan_id=(
-            select a.request_id from person_vm_audit a
-            where a.person_id=vm.person_id and a.organization_id=vm.organization_id
-              and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
-              and a.action='stop' and a.result='succeeded'
-            order by a.id desc limit 1)`;
+        cross join lateral (
+          select a.request_id, a.result from person_vm_audit a
+          where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+            and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+            and (
+              (vm.phase in ('stopped','cold') and vm.egress_receipt is null
+                and a.action='stop' and a.result='succeeded')
+              or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch'))
+          order by a.id desc limit 1
+        ) stop
+        where vm.disk_retained and p.revoked_at is null
+          and p.wake_at is not null and p.state='waiting'
+          and stop.request_id=p.plan_id and stop.result='succeeded'
+        union all
+        -- An in-flight claim can already be starting the next epoch.
+        select greatest(wake_at,claim_until) as at
+          from person_vm_scheduled_wakes where state='claimed'
+        ) committed`;
           active.throwIfAborted();
           return row?.earliest ?? null;
         });
@@ -421,7 +433,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
                 and vm.egress_receipt is null, false) as stopped
             ) as source
             where p.state='claimed' and p.claim_until<=now()
-              and vm.lease_owner is null and (p.revoked_at is not null or not source.stopped)
+              and (p.revoked_at is not null or not source.stopped)
+              and (vm.lease_owner is null or (
+                vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
+                and vm.lease_epoch>p.lease_epoch
+                and vm.lease_expires_at<=clock_timestamp()
+              ))
+              and pg_try_advisory_xact_lock(hashtextextended('person-vm:' || p.person_id::text,0))
             order by p.claim_until,p.plan_id
             limit 1 for update of p skip locked
           ) as expired where w.plan_id=expired.plan_id

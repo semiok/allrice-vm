@@ -4,6 +4,7 @@ import { TimestampSchema, UuidSchema } from './common.ts';
 // New selections use the current catalog. Read schemas also accept retired IDs
 // because existing Run snapshots must retain the model that actually ran.
 export const PLATFORM_WORK_MODELS = [
+  'gpt-6.2-sol',
   'gpt-6.1-sol',
   'gpt-6-sol',
   'gpt-6-luna',
@@ -18,6 +19,7 @@ const RETIRED_PLATFORM_WORK_MODELS = [
   'gpt-5.4-mini',
 ] as const;
 export const PLATFORM_WORK_MODEL_LABELS = {
+  'gpt-6.2-sol': 'GPT-6.2 Sol',
   'gpt-6.1-sol': 'GPT-6.1 Sol',
   'gpt-6-sol': 'GPT-6 Sol',
   'gpt-6-luna': 'GPT-6 Luna',

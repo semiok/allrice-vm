@@ -19,6 +19,8 @@ prepare/assertActive/revoke 均 host-only，不是可让模型调用的工具。
 
 v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），闲置停机只由 host 依据活动事实执行，默认 20 分钟。
 
+员工端口位在新 VM 创建或旧 v1 VM 确认停止后的转换时一次发布，仅宿主回环可达。运维可在发布封存的 `.local/person-vm-host.json` 顶层设置 `employeePortSlots`。合法值为 1–20 的整数，缺字段默认 20，非法值记录字段名、原因和回退值后使用 20。Web 配额与 Worker 原生发布读同一封存值。已核实的 v2 物理槽宽随 VM 记录持久保存，配置上调或下调都不改变它。保盘保留槽宽，彻底擦除完成后清除原宽度。槽位总数独立于同时运行的员工数。
+
 普通路由的 MET-268/MET-271 调用 host-only `resolve(RequestContext, signal)` 与 `assertCurrentBinding(RequestContext, binding, signal)`。两者重新核本人/企业现权、运行阶段、精确 instance/epoch 与出口活性；不返回 ownerToken、不暴露内部表。RequestContext 必须来自各自可信会话/受管连接，不能由 guest header 或 JSON 反序列化生成。resolve 是本次快照，各次实际请求仍须 assert；启动/停止/接管中的租约不发新路由。
 
 正式共享 admission 路径另消费根出口 `PersonVmAdmissionBindingPort.assertAdmissionBinding(context, binding, signal)`，由同一个 `PersonVmService` 提供；未创建 shared host 即拒绝，不接另一 factory/DB 的权威。此口只核当前 user/企业、完整五字段、shared revoked 与内部 exact egress receipt，不公开 receipt/capability/ownerToken，不判断 ready 或授 dispatch 权。正常 freeze/physical lease 不构成资格错误；后续实际工作仍必须在同一 shared boundary 的 admit/queued/activate/finish 内，starting/stop/epoch/recovery 保证不变。egress.assertActive 只核本地 exact receipt，不能反调 VM 校验形成递归。
@@ -122,9 +124,9 @@ macOS 对原盘及原密钥建立无覆盖的正式文件引用，核实同 inod
 deploy-dev --release-manager --require-person-vm-config 3<"$private_session_file"
 ```
 
-脚本在切换前调用 `person-vm-drain`，以当前 Worker 的实际 PID 定位其私有 Unix socket。遇到多个 socket、缺失回执、候选仍在运行或活动未知时，发布停止。Worker 只按原生停机门卫处理空闲 VM，忙碌时最多等待到发布排空期限。定时唤醒离交接太近也会拒绝。回执包含 `bootId`、已停机数及 `expiresAt`。同一进程在有效期内消费回执并优雅退出，脚本确认退出、端口关闭和库存清空后才切换。回退和恢复同样核对实际当前 Worker。旧版 LaunchAgent 如不支持此协议，请由发布负责人先按旧版维护流程确认 VM 全部停机并停止旧 Worker，再开始首次迁移。
+脚本在切换前调用 `person-vm-drain`，以当前 Worker 的实际 PID 定位其私有 Unix socket。遇到多个 socket、缺失回执、候选仍在运行或活动未知时，发布停止。Worker 只按原生停机门卫处理空闲 VM，忙碌时最多等待到发布排空期限。快照、迁移和新版启动耗时没有确定上界。有待执行的已承诺唤醒（包括原生停机已确认、生命周期记录仍待完成），或排空会产生新的唤醒义务时，发布、跨版本恢复和回退停止，现有 Worker 继续负责唤醒。回执包含 `bootId`、已停机数及 `expiresAt`。脚本先记录原进程和启动配置，再向同一进程提交有期限的关闭请求。普通信号不能消费回执。脚本确认正常退出、端口关闭、库存清空且没有遗留唤醒后才切换。恢复同样核对实际 Worker 和保存的退出记录。旧版 LaunchAgent 如不支持此协议，请由发布负责人先按旧版维护流程确认 VM 全部停机并停止旧 Worker，再开始首次迁移。
 
-数据库仍记录为运行中而当前 Worker 没有旧 Gateway 回执的 VM，会记录待接管告警。网页自动打开、恢复标签页和后台预热均不触发停机。本人点「打开员工」后，Worker 复核账号现权、独占物理租约、上一版 Worker 已退出及旧端口所有权，才停止确切 VM、读回、卸盘并写入 `stop.upgrade`。网页显示「版本已更新，正在重新启动员工」，随后以同一保留盘启动新代次。原生日程保留在盘上，由既有闲置停机流程重新登记。更换物理只读制品仍须验证原生挂载与封签的交接。
+数据库仍记录为运行中而当前 Worker 没有旧 Gateway 回执的 VM，会记录待接管告警。网页自动打开、恢复标签页和后台预热均不触发停机。本人点「打开员工」后，Worker 复核账号现权、独占物理租约、上一版 Worker 已退出及旧端口所有权，才停止确切 VM、读回、卸盘并写入 `stop.upgrade`。网页显示「版本已更新，正在重新启动员工」，随后以同一保留盘启动新代次。停机后的读回若失败，带有本代停机派发记录的 VM 可以在相同围栏下重新确认终态并完成清理。原生日程保留在盘上，由既有闲置停机流程重新登记。更换物理只读制品仍须验证原生挂载与封签的交接。
 
 ### 平台管理员删除
 

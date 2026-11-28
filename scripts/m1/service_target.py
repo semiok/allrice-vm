@@ -284,13 +284,23 @@ def main():
             sys.exit(f'{path}: expected a matching sealed 4.0 release')
         return
     if sys.argv[1] == 'ready':
-        role, path = sys.argv[2:]
+        role, path, *recovery = sys.argv[2:]
         identity = release_identity(Path(path))
         if identity:
             try:
                 doc = json.load(sys.stdin)
                 if ready_identity(doc, role, identity):
-                    print(identity['sourceSha'])
+                    if not recovery:
+                        print(identity['sourceSha'])
+                    elif role == 'worker' and len(recovery) == 1:
+                        proof = doc.get('personVmRecovery')
+                        boot = doc['identity'].get('bootId')
+                        if (isinstance(proof, dict) and type(proof.get('pid')) is int
+                                and str(proof['pid']) == recovery[0]
+                                and isinstance(boot, str)
+                                and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot)
+                                and proof.get('state') in ('uninstalled', 'host-ready', 'wake-ready', 'drain-required')):
+                            print(boot, proof['state'])
             except ValueError:
                 pass
         return
