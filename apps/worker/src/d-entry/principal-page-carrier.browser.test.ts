@@ -56,6 +56,7 @@ it
     'outer-create',
     'wallet-storage',
     'wallet-messages',
+    'wallet-owned-error',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -72,8 +73,7 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const wallet =
-      scenario === 'wallet-storage' || scenario === 'wallet-messages';
+    const wallet = scenario.startsWith('wallet-');
     const realShell = switching || nativeCreate || coldAssets || wallet;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
@@ -1033,62 +1033,94 @@ it
     ]);
     const page = await context.newPage();
     if (wallet) {
-      await page.addInitScript((denyStorage) => {
-        const child = window !== parent;
-        if (child && !location.pathname.includes('/document')) return;
-        const denied = () => {
-          throw new DOMException(
-            'Access to storage is not allowed from this context',
-            'SecurityError',
-          );
-        };
-        if (denyStorage) {
-          Object.defineProperty(window, 'localStorage', { get: denied });
-          Object.defineProperty(Storage.prototype, 'getItem', {
-            value: denied,
-          });
-          for (const name of ['caches', 'indexedDB'])
-            Object.defineProperty(window, name, { get: denied });
-        }
-        const noise = {
-          target: 'metamask-inpage',
-          data: { name: 'ObjectMultiplex' },
-        };
-        let bursts = 0;
-        const broadcast = setInterval(() => {
-          const peer = child
-            ? parent
-            : document.querySelector('iframe')?.contentWindow;
-          if (!peer) return;
-          for (let i = 0; i < 24; i++) peer.postMessage(noise, location.origin);
-          document.documentElement.dataset.walletBursts = String(++bursts);
-          if (bursts === 40) clearInterval(broadcast);
-        }, 10);
-        if (!child) return;
-        const append = Element.prototype.append;
-        Element.prototype.append = function (...nodes) {
-          if (
-            this === document.head &&
-            !document.documentElement.hasAttribute(
-              'data-wallet-registration-noise',
-            ) &&
-            nodes.some(
-              (node) => node instanceof HTMLScriptElement && node.textContent,
-            )
-          ) {
-            document.documentElement.dataset.walletRegistrationNoise = '1';
-            const injected = document.createElement('script');
-            injected.textContent =
-              "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
-            append.call(this, injected);
-            injected.remove();
-            const extra = document.createElement('script');
-            extra.src = '/wallet-extension-chunk.js';
-            append.call(this, extra);
+      await page.addInitScript(
+        ({ denyStorage, ownedError }) => {
+          const child = window !== parent;
+          if (child && !location.pathname.includes('/document')) return;
+          const denied = () => {
+            throw new DOMException(
+              'Access to storage is not allowed from this context',
+              'SecurityError',
+            );
+          };
+          if (denyStorage) {
+            Object.defineProperty(window, 'localStorage', { get: denied });
+            Object.defineProperty(Storage.prototype, 'getItem', {
+              value: denied,
+            });
+            for (const name of ['caches', 'indexedDB'])
+              Object.defineProperty(window, name, { get: denied });
           }
-          append.apply(this, nodes);
-        };
-      }, scenario === 'wallet-storage');
+          const noise = {
+            target: 'metamask-inpage',
+            data: { name: 'ObjectMultiplex' },
+          };
+          let bursts = 0;
+          const broadcast = setInterval(() => {
+            const peer = child
+              ? parent
+              : document.querySelector('iframe')?.contentWindow;
+            if (!peer) return;
+            const scopeId = child
+              ? document.getElementById('app')?.dataset.scopeId
+              : undefined;
+            for (let i = 0; i < 24; i++)
+              peer.postMessage({ ...noise, scopeId }, location.origin);
+            document.documentElement.dataset.walletBursts = String(++bursts);
+            if (bursts === 40) clearInterval(broadcast);
+          }, 10);
+          if (!child) return;
+          const append = Element.prototype.append;
+          Element.prototype.append = function (...nodes) {
+            if (
+              this === document.head &&
+              !document.documentElement.hasAttribute(
+                'data-wallet-registration-noise',
+              ) &&
+              nodes.some(
+                (node) => node instanceof HTMLScriptElement && node.textContent,
+              )
+            ) {
+              document.documentElement.dataset.walletRegistrationNoise = '1';
+              if (ownedError) {
+                for (const node of nodes)
+                  if (node instanceof HTMLScriptElement && node.textContent)
+                    node.textContent +=
+                      "\n;throw Error('Owned bundle registration failed');";
+                return append.apply(this, nodes);
+              }
+              const scopeId = document.getElementById('app')!.dataset.scopeId;
+              parent.dispatchEvent(
+                new MessageEvent('message', {
+                  origin: location.origin,
+                  source: window,
+                  data: { type: 'allrice:d-entry:startup-failed', scopeId },
+                }),
+              );
+              window.dispatchEvent(
+                new MessageEvent('message', {
+                  origin: location.origin,
+                  source: parent,
+                  data: { type: 'allrice:d-entry:revoked', scopeId },
+                }),
+              );
+              const injected = document.createElement('script');
+              injected.textContent =
+                "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
+              append.call(this, injected);
+              injected.remove();
+              const extra = document.createElement('script');
+              extra.src = '/wallet-extension-chunk.js';
+              append.call(this, extra);
+            }
+            append.apply(this, nodes);
+          };
+        },
+        {
+          denyStorage: scenario === 'wallet-storage',
+          ownedError: scenario === 'wallet-owned-error',
+        },
+      );
     }
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
@@ -1255,6 +1287,15 @@ it
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
+    if (scenario === 'wallet-owned-error') {
+      await page
+        .getByRole('heading', { name: '暂时打不开工作台' })
+        .waitFor({ timeout: 15_000 });
+      expect(errors).toContain('Owned bundle registration failed');
+      expect(workspaceBaselines).toHaveLength(0);
+      await context.close();
+      return;
+    }
     if (coldAssets) {
       const alert = page.getByRole('heading', { name: '工作台资源下载超时' });
       await expect
@@ -1385,10 +1426,18 @@ it
     if (wallet) {
       expect(await editor.innerText()).toContain('未发送的原生草稿');
       await expect.poll(() => page.locator('iframe').isVisible()).toBe(true);
-      await page.locator('html[data-wallet-bursts]').waitFor();
-      await workbench
-        .locator('html[data-wallet-bursts][data-wallet-registration-noise="1"]')
-        .waitFor();
+      expect(
+        await page.getByRole('heading', { name: '工作台已就绪' }).count(),
+      ).toBe(0);
+      await page
+        .locator('html[data-wallet-bursts]')
+        .waitFor({ state: 'attached' });
+      const childRoot = workbench.locator('html');
+      expect(await childRoot.getAttribute('data-wallet-bursts')).toBeTruthy();
+      expect(
+        await childRoot.getAttribute('data-wallet-registration-noise'),
+        JSON.stringify({ errors, scopedBundleReads, earlyUrls }),
+      ).toBe('1');
       expect(errors).toContain('Wallet content script noise');
       expect(errors).not.toContain(
         'Access to storage is not allowed from this context',
