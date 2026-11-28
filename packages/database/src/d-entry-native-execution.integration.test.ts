@@ -220,11 +220,14 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     const coordinate = (parts: (string | number)[]) =>
       createHash('sha256').update(JSON.stringify(parts)).digest('hex');
     const file = '/work/report.md';
-    const capture = (callId: string, bytes: string) => ({
+    const capture = (callId: string, bytes: string, callSequence = 17) => ({
       ticket: randomUUID(),
       sessionId: rootSessionId,
       turn: 1,
       callId,
+      callSequence,
+      attemptId: attempt.attemptId,
+      cursor: attempt.cursor,
       files: [{ path: file, base64: Buffer.from(bytes).toString('base64') }],
     });
     const stored = new Map<string, string>();
@@ -297,7 +300,7 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     expect(await findDEntryNativeDelivery(context, selection, pathDigest)).toBe(
       pendingObject?.id,
     );
-    const second = capture('second-present', 'new immutable bytes');
+    const second = capture('first-present', 'new immutable bytes', 26);
     await publishCapturedDEntryDelivery(
       candidate,
       second,
@@ -317,7 +320,7 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         context,
         selection,
         pathDigest,
-        coordinate([1, 'first-present', 0]),
+        coordinate([1, 17, 'first-present', 0]),
       ),
     ).toBe(pendingObject?.id);
     await expect(
@@ -325,7 +328,7 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         context,
         selection,
         pathDigest,
-        coordinate([1, 'first-present', 1]),
+        coordinate([1, 17, 'first-present', 1]),
       ),
     ).rejects.toThrow();
     await expect(

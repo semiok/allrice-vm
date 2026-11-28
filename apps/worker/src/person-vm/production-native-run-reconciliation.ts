@@ -17,6 +17,26 @@ import type { createAssignedNativeWebStartup } from '../native-web/composition.j
 import type { NativeWebOwner } from '../native-web/owner.js';
 import { dEntryNativeRunJournalSelection } from './retained-native-run-reader.js';
 
+type NativeOwners = Pick<
+  ReturnType<typeof createAssignedNativeWebStartup>,
+  'runJournalOwners'
+>;
+function ownerScope(
+  location: ReturnType<NativeOwners['runJournalOwners']>[number],
+) {
+  const { binding } = location.receipt;
+  return {
+    organizationId: binding.organizationId,
+    workspaceId: location.endpoint.workspaceId,
+    personId: binding.personId,
+    vmId: binding.vmId,
+    vmInstanceId: binding.instanceId,
+    leaseEpoch: binding.leaseEpoch,
+    employeeInstanceId: location.endpoint.employeeInstanceId,
+    employeeRelease: location.endpoint.employeeVersionId,
+  };
+}
+
 const pendingDeliveries = z.array(DEntryNativeDeliveryClaimSchema).max(4);
 async function reconcileDeliveries(
   owner: NativeWebOwner,
@@ -32,6 +52,7 @@ async function reconcileDeliveries(
   );
   for (const offer of offers) {
     signal.throwIfAborted();
+    const active = AbortSignal.any([signal, AbortSignal.timeout(45_000)]);
     try {
       const { candidates } = await listDEntryNativeRunCandidates(
         scope,
@@ -48,6 +69,8 @@ async function reconcileDeliveries(
             prompt.adapterId === owner.modelAdapterId &&
             attempt.sessionId === offer.sessionId &&
             attempt.turn === offer.turn &&
+            attempt.cursor === offer.cursor &&
+            attempt.attemptId === offer.attemptId &&
             attempt.leaseEpoch === scope.leaseEpoch &&
             attempt.vmInstanceId === scope.vmInstanceId,
         );
@@ -55,26 +78,38 @@ async function reconcileDeliveries(
       const capture = DEntryNativeDeliveryCaptureSchema.parse(
         await owner.exchangeNativeDeliveryFor(
           { ...offer, action: 'delivery-read' },
-          signal,
+          active,
         ),
       );
       if (
         capture.ticket !== offer.ticket ||
         capture.sessionId !== offer.sessionId ||
         capture.turn !== offer.turn ||
-        capture.callId !== offer.callId
+        capture.callId !== offer.callId ||
+        capture.callSequence !== offer.callSequence ||
+        capture.cursor !== offer.cursor ||
+        capture.attemptId !== offer.attemptId
       )
         continue;
       await publishCapturedDEntryDelivery(
         candidate,
         capture,
         storage,
-        (tx) => assertDEntryNativeDeliveryRun(tx, candidate, scope, signal),
-        signal,
+        async (tx) => {
+          await assertDEntryNativeDeliveryRun(tx, candidate, scope, active);
+          if (
+            (await owner.exchangeNativeDeliveryFor(
+              { ...offer, action: 'delivery-live' },
+              active,
+            )) !== true
+          )
+            throw new PersonVmError('LEASE_LOST');
+        },
+        active,
       );
       await owner.exchangeNativeDeliveryFor(
         { ...offer, action: 'delivery-ack' },
-        signal,
+        active,
       );
     } catch {
       // A lost response or a transient write retries the original in-memory
@@ -83,17 +118,53 @@ async function reconcileDeliveries(
   }
 }
 
+/** Delivery traffic has its own short poll and one in-flight request per
+ * owner. A slow terminal scan or a busy peer cannot hold another owner. */
+export async function reconcileNativeDeliveries(
+  startup: NativeOwners,
+  storage: StoragePort,
+  signal: AbortSignal,
+) {
+  const active = new Map<NativeWebOwner, Promise<void>>();
+  let sweeping: Promise<void> | undefined;
+  let nextSweep = 0;
+  try {
+    while (!signal.aborted) {
+      for (const location of startup.runJournalOwners()) {
+        const { owner, revoked } = location;
+        if (!owner.modelAdapterId || revoked.aborted || active.has(owner))
+          continue;
+        const current = AbortSignal.any([signal, revoked]);
+        active.set(
+          owner,
+          reconcileDeliveries(owner, ownerScope(location), storage, current)
+            .catch(() => {})
+            .finally(() => active.delete(owner)),
+        );
+      }
+      if (!sweeping && Date.now() >= nextSweep) {
+        nextSweep = Date.now() + 60_000;
+        sweeping = sweepDEntryNativeDeliveryReservations(storage, signal)
+          .catch(() => {})
+          .finally(() => {
+            sweeping = undefined;
+          });
+      }
+      await wait(2_000, undefined, { signal, ref: false });
+    }
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  } finally {
+    await Promise.allSettled([...active.values(), sweeping]);
+  }
+}
+
 /** Retry the durable ledger while the original native owner can attest the
  * terminal event from its process memory. */
 export async function reconcileNativeRunTerminals(
-  startup: Pick<
-    ReturnType<typeof createAssignedNativeWebStartup>,
-    'runJournalOwners'
-  >,
+  startup: NativeOwners,
   signal: AbortSignal,
-  storage?: StoragePort,
 ) {
-  let nextSweep = 0;
   const positions = new WeakMap<
     NativeWebOwner,
     Parameters<typeof listDEntryNativeRunCandidates>[1]
@@ -101,25 +172,11 @@ export async function reconcileNativeRunTerminals(
   while (!signal.aborted) {
     const local = startup.runJournalOwners();
     for (const location of local) {
-      const { owner, endpoint, receipt } = location;
-      const { binding } = receipt;
+      const { owner } = location;
       if (!owner.modelAdapterId || signal.aborted || location.revoked.aborted)
         continue;
       const active = AbortSignal.any([signal, location.revoked]);
-      const scope = {
-        organizationId: binding.organizationId,
-        workspaceId: endpoint.workspaceId,
-        personId: binding.personId,
-        vmId: binding.vmId,
-        vmInstanceId: binding.instanceId,
-        leaseEpoch: binding.leaseEpoch,
-        employeeInstanceId: endpoint.employeeInstanceId,
-        employeeRelease: endpoint.employeeVersionId,
-      };
-      if (storage)
-        await reconcileDeliveries(owner, scope, storage, active).catch(
-          () => {},
-        );
+      const scope = ownerScope(location);
       const page = await listDEntryNativeRunCandidates(
         scope,
         positions.get(owner),
@@ -162,12 +219,6 @@ export async function reconcileNativeRunTerminals(
         }
       }
       positions.set(owner, page.next);
-    }
-    if (storage && !signal.aborted && Date.now() >= nextSweep) {
-      nextSweep = Date.now() + 60_000;
-      await sweepDEntryNativeDeliveryReservations(storage, signal).catch(
-        () => {},
-      );
     }
     await wait(10_000, undefined, { signal, ref: false }).catch(
       (error: unknown) => {

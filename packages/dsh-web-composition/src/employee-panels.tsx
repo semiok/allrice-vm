@@ -14,6 +14,7 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client';
 import type {} from '@deepseek-ai/dsh-client-ui-deliverables/client';
 import type {} from '@deepseek-ai/dsh-api-remotes/client';
 import type {} from '@deepseek-ai/dsh-api-session-controller/client';
@@ -543,7 +544,7 @@ function exactDeliveryAddress(address: string) {
 }
 
 function NativeDeliveryVersionAction({
-  owner,
+  actionUrl,
   sessionId,
   ctx,
   binding,
@@ -552,7 +553,7 @@ function NativeDeliveryVersionAction({
   binding: EmployeePanelsBinding;
 }) {
   const snapshot = useOwner(binding, sessionId);
-  const coords = presentedCoordinates(owner.actionUrl, sessionId);
+  const coords = presentedCoordinates(actionUrl, sessionId);
   if (!coords || !snapshot?.files.dataClient) return null;
   return (
     <button
@@ -578,17 +579,22 @@ function NativeDeliveryVersionAction({
   );
 }
 
-function nativeDeliveryAddress(address: string) {
+function nativeDeliveryAddress(ctx: Context, address: string) {
   const file = parseFileAddress(address);
   if (
     file?.scope !== 'session' ||
     (file.path.startsWith('/') && !file.path.startsWith('/work/'))
   )
     return;
-  // The journal stores the canonical path. Keep the wire lookup free of file
-  // names and raw filesystem paths.
-  const parts = file.path
-    .replace(/^\/work\//u, '')
+  const canonical = file.path.startsWith('/')
+    ? file.path
+    : [
+        ctx.sessions?.list.getSnapshot().byId[file.sessionId]?.cwd,
+        file.path,
+      ].join('/');
+  if (!canonical.startsWith('/work/')) return;
+  const parts = canonical
+    .slice('/work/'.length)
     .split('/')
     .filter((part) => part && part !== '.');
   if (
@@ -604,6 +610,37 @@ function nativeDeliveryAddress(address: string) {
     path: '/work/' + parts.join('/'),
     name: parts.at(-1)!,
   };
+}
+
+/** A file address does not encode its triggering view. Only addresses
+ * announced by a loaded native delivery card belong to this extension. */
+function visibleNativeDelivery(ctx: Context, address: string) {
+  const file = nativeDeliveryAddress(ctx, address);
+  if (!file) return;
+  try {
+    const chat = ctx.uiConversation
+      .binding(file.sessionId)
+      .target('chat')
+      .getSnapshot();
+    if (
+      chat?.nodes.values().some(({ location }) => {
+        if (location.kind !== 'turn' && location.kind !== 'step') return false;
+        const data = location.turn.data as {
+          get(
+            key: 'deliverables',
+          ): { presented?: readonly { path: string }[] } | undefined;
+        };
+        return (
+          data
+            .get('deliverables')
+            ?.presented?.some(({ path }) => path === file.path) ?? false
+        );
+      })
+    )
+      return file;
+  } catch {
+    // A disposed native Session does not own any deliverable addresses.
+  }
 }
 
 async function deliveryDigest(value: readonly (string | number)[]) {
@@ -625,9 +662,17 @@ function EmployeeNativeDelivery({
 }) {
   const snapshot = useOwner(binding, sessionId);
   const { tab } = useTabInfo();
+  const visit = tab.navigation.revision;
   const lifetime = useMemo(
     () => new AbortController(),
-    [sessionId, tab.signal, tab.contentId, tab.visible, snapshot?.scopeKey],
+    [
+      sessionId,
+      tab.signal,
+      tab.contentId,
+      tab.visible,
+      snapshot?.scopeKey,
+      visit,
+    ],
   );
   useEffect(() => () => lifetime.abort(), [lifetime]);
   const signal = useMemo(
@@ -642,7 +687,7 @@ function EmployeeNativeDelivery({
     objectId: string | null;
   }>();
   useEffect(() => {
-    const address = nativeDeliveryAddress(tab.contentId);
+    const address = nativeDeliveryAddress(ctx, tab.contentId);
     const exact = exactDeliveryAddress(tab.contentId);
     if (
       !tab.visible ||
@@ -696,9 +741,30 @@ function EmployeeNativeDelivery({
           typeof value.callId !== 'string'
         )
           throw Error('DELIVERY_VERSION_UNAVAILABLE');
+        const call =
+          page.ok &&
+          page.value.records
+            .map(({ event }) => event)
+            .filter((event) => {
+              if (event.type !== 'tool/call' || event.seq >= exact.sequence)
+                return false;
+              const data = event.data as {
+                name?: string;
+                turn?: number;
+                callId?: string;
+              };
+              return (
+                data.name === 'present' &&
+                data.turn === value.turn &&
+                data.callId === value.callId
+              );
+            })
+            .sort((a, b) => b.seq - a.seq)[0];
+        if (!call) throw Error('DELIVERY_VERSION_UNAVAILABLE');
         path = value.files?.[exact.index]?.path;
         occurrence = await deliveryDigest([
           value.turn!,
+          call.seq,
           value.callId,
           exact.index,
         ]);
@@ -776,9 +842,12 @@ export function apply(ctx: Context) {
           ],
           priority: 'extension',
           canOpen: (address) =>
-            !!(nativeDeliveryAddress(address) ?? exactDeliveryAddress(address)),
+            !!(
+              visibleNativeDelivery(scope, address) ??
+              exactDeliveryAddress(address)
+            ),
           title: (address) =>
-            nativeDeliveryAddress(address)?.name ?? '交付成果',
+            nativeDeliveryAddress(scope, address)?.name ?? '交付成果',
         }),
       );
       scope.slots.inject('sidebar.right.pane.tab', () =>

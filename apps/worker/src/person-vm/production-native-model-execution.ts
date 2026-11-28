@@ -53,7 +53,10 @@ import {
   webSearchRoute,
   webSearchTimeoutMs,
 } from './production-web-search.js';
-import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
+import {
+  reconcileNativeDeliveries,
+  reconcileNativeRunTerminals,
+} from './production-native-run-reconciliation.js';
 import {
   matchNativeToolObservation,
   nativeAdoptedTextProofVersion,
@@ -2035,8 +2038,12 @@ export function createProductionNativeModelExecution(
       };
       installed = owner;
       void run(live, (active) =>
-        reconcileNativeRunTerminals(host.startup, active, deliveryStorage),
+        reconcileNativeRunTerminals(host.startup, active),
       ).catch(() => {});
+      if (deliveryStorage)
+        void run(live, (active) =>
+          reconcileNativeDeliveries(host.startup, deliveryStorage, active),
+        ).catch(() => {});
       return owner;
     },
   };

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "pnpm run clean && tsc -p tsconfig.build.json && cp dsh/allrice-native-web-owner.mjs dist/guest-native-web-owner.mjs && cp dsh/allrice-native-run-journal.mjs dist/allrice-native-run-journal.mjs && node scripts/maintenance-source-proof.mjs",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && cp dsh/allrice-native-web-owner.mjs dist/guest-native-web-owner.mjs && cp dsh/allrice-native-run-journal.mjs dist/allrice-native-run-journal.mjs && cp dsh/allrice-native-delivery-capture.mjs dist/allrice-native-delivery-capture.mjs && node scripts/maintenance-source-proof.mjs",
     "clean": "rm -rf dist",
     "dev": "node --env-file-if-exists=../../.env --watch dist/index.js",
     "start": "node dist/index.js",

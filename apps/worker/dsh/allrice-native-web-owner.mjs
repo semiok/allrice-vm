@@ -1776,7 +1776,6 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
-          'sessionProjections',
           'fs',
           'workingDirectory',
           'tools',
@@ -1858,9 +1857,12 @@ export function applyNativeWebOwner(
               const value = await request.json();
               if (
                 value?.adapterId === id &&
-                ['delivery-pending', 'delivery-read', 'delivery-ack'].includes(
-                  value.action,
-                )
+                [
+                  'delivery-pending',
+                  'delivery-read',
+                  'delivery-live',
+                  'delivery-ack',
+                ].includes(value.action)
               )
                 return delivery(value);
               if (

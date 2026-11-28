@@ -265,6 +265,16 @@ it
           { type: 'user/message', data: message, surfaceOp: 'append' },
           { type: 'step/start', data: { turn: 1, step: 1 } },
           {
+            type: 'tool/call',
+            data: {
+              turn: 1,
+              step: 1,
+              callId: 'present-file-fixture',
+              name: 'present',
+              arguments: { files: [{ path: deliveryPath }] },
+            },
+          },
+          {
             type: 'deliverables/presented',
             data: {
               turn: 1,
@@ -595,7 +605,7 @@ it
           if (exact)
             expect(exact).toBe(
               createHash('sha256')
-                .update(JSON.stringify([1, 'present-file-fixture', 0]))
+                .update(JSON.stringify([1, 4, 'present-file-fixture', 0]))
                 .digest('hex'),
             );
           return await copy(

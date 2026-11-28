@@ -206,7 +206,12 @@ export async function prepareNativeWebLaunch(
     'utf8',
   );
   const deliverySource = await readFile(
-    new URL('../../dsh/allrice-native-delivery-capture.mjs', import.meta.url),
+    new URL(
+      modelAdapter
+        ? '../../dist/allrice-native-delivery-capture.mjs'
+        : '../../dsh/allrice-native-delivery-capture.mjs',
+      import.meta.url,
+    ),
     'utf8',
   );
   const modelOwner = `${directory}/owner-with-model.mjs`;

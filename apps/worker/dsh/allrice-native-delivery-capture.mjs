@@ -6,6 +6,25 @@ import { posix } from 'node:path';
 
 const maximumFileBytes = 8_000_000;
 const maximumBatchBytes = 16_000_000;
+const deliveryExtensions = new Set([
+  '.md',
+  '.markdown',
+  '.txt',
+  '.csv',
+  '.tsv',
+  '.json',
+  '.html',
+  '.htm',
+  '.pdf',
+  '.docx',
+  '.xlsx',
+  '.pptx',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.zip',
+]);
 
 function isBoundaryPath(path, root) {
   return (
@@ -94,10 +113,14 @@ export async function captureNativeDelivery(fs, files, cwd, root, signal) {
     signal.throwIfAborted();
     if (typeof file?.path !== 'string' || !file.path.trim())
       throw Error('NATIVE_DELIVERY_FILES_INVALID');
-    const path = posix.isAbsolute(file.path)
-      ? file.path
-      : `${cwd}/${file.path}`;
-    if (!isBoundaryPath(path, root) || captured.has(path))
+    let input = file.path;
+    while (input.startsWith('./')) input = input.slice(2);
+    const path = posix.isAbsolute(input) ? input : `${cwd}/${input}`;
+    if (
+      !isBoundaryPath(path, root) ||
+      captured.has(path) ||
+      !deliveryExtensions.has(posix.extname(path).toLowerCase())
+    )
       throw Error('NATIVE_DELIVERY_FILES_INVALID');
     const nameIdentity = await lstat(path, { bigint: true });
     const target = await fs.resolve(path, { cwd, signal });
@@ -144,6 +167,70 @@ export function observeNativeDeliveries(
   scope,
   { root, lifetime, current, unwrap },
 ) {
+  const attempts = new WeakMap();
+  scope.on(
+    'agent/assistant-stream',
+    ({ agent, frame }) => {
+      const session = unwrap(agent.session);
+      if (!isLive(session)) return;
+      if (frame.type === 'start') {
+        attempts.set(session, {
+          attemptId: frame.attemptId,
+          cursor: session.seq - 1,
+          turn: frame.turn,
+          step: frame.step,
+          calls: new Map(),
+        });
+        return;
+      }
+      const attempt = attempts.get(session);
+      if (frame.type === 'end' && attempt?.attemptId === frame.attemptId) {
+        if (
+          frame.outcome.kind === 'committed' &&
+          frame.outcome.eventType === 'assistant/message' &&
+          attempt.assistant?.seq === frame.outcome.seq
+        )
+          attempt.committed = true;
+        else attempts.delete(session);
+      }
+    },
+    { global: true },
+  );
+  scope.on(
+    'session/event',
+    (subject, event) => {
+      const session = unwrap(subject);
+      const attempt = attempts.get(session);
+      if (!attempt || !isLive(session)) return;
+      if (event.type === 'step/end' || event.type === 'turn/end') {
+        attempts.delete(session);
+        return;
+      }
+      if (
+        event.data?.turn !== attempt.turn ||
+        event.data?.step !== attempt.step
+      )
+        return;
+      if (event.type === 'assistant/message') attempt.assistant = event;
+      if (
+        event.type === 'tool/call' &&
+        event.data.name === 'present' &&
+        attempt.committed &&
+        attempt.assistant.seq < event.seq &&
+        attempt.assistant.data.message.content.filter(
+          (block) =>
+            block.type === 'tool-call' &&
+            block.id === event.data.callId &&
+            block.name === 'present',
+        ).length === 1
+      )
+        attempt.calls.set(
+          event.data.callId,
+          attempt.calls.has(event.data.callId) ? null : event.seq,
+        );
+    },
+    { global: true },
+  );
   const executing = new Map();
   const pending = new Map();
   const unavailable = () => ({
@@ -165,9 +252,15 @@ export function observeNativeDeliveries(
     const session = unwrap(exec.agent.session);
     if (executing.size + pending.size >= 4 || !isLive(session)) return next();
     const signal = globalThis.AbortSignal.any([lifetime, exec.signal]);
-    const boundary = scope.sessionProjections.stateOf(session, 'turnBoundary');
-    if (!boundary?.lastTurn || boundary.openTurnStartSeq === null)
+    const attempt = attempts.get(session);
+    const callSequence = attempt?.calls.get(exec.callId);
+    if (
+      !callSequence ||
+      exec.parent !== undefined ||
+      unwrap(scope.agents.get(session.id)) !== unwrap(exec.agent)
+    )
       return next();
+    attempt.calls.delete(exec.callId);
     executing.set(exec.token, null);
     try {
       const cwd = await scope.workingDirectory.ensure(exec.agent, signal);
@@ -181,7 +274,8 @@ export function observeNativeDeliveries(
       const result = await next();
       if (
         !result.isError &&
-        result.value?.turn === boundary.lastTurn &&
+        result.value?.turn === attempt.turn &&
+        attempts.get(session) === attempt &&
         isLive(session)
       ) {
         const files = await finish(result.value.files);
@@ -189,8 +283,11 @@ export function observeNativeDeliveries(
           session,
           signal,
           files,
-          turn: boundary.lastTurn,
+          turn: attempt.turn,
+          attemptId: attempt.attemptId,
+          cursor: attempt.cursor,
           callId: exec.callId,
+          callSequence,
         });
       } else {
         executing.delete(exec.token);
@@ -241,11 +338,17 @@ export function observeNativeDeliveries(
     const headers = { 'cache-control': 'no-store' };
     const live = (entry) =>
       entry && !entry.signal.aborted && isLive(entry.session);
-    const proof = (ticket, { session, turn, callId }) => ({
+    const proof = (
+      ticket,
+      { session, turn, callId, callSequence, attemptId, cursor },
+    ) => ({
       ticket,
       sessionId: session.id,
       turn,
       callId,
+      callSequence,
+      attemptId,
+      cursor,
     });
     if (value.action === 'delivery-pending')
       return globalThis.Response.json(
@@ -259,7 +362,10 @@ export function observeNativeDeliveries(
       !live(entry) ||
       entry.session.id !== value.sessionId ||
       entry.turn !== value.turn ||
-      entry.callId !== value.callId
+      entry.callId !== value.callId ||
+      entry.callSequence !== value.callSequence ||
+      entry.attemptId !== value.attemptId ||
+      entry.cursor !== value.cursor
     )
       return new globalThis.Response(null, { status: 404 });
     if (value.action === 'delivery-read')
@@ -267,6 +373,8 @@ export function observeNativeDeliveries(
         { ...proof(value.ticket, entry), files: entry.files },
         { headers },
       );
+    if (value.action === 'delivery-live')
+      return globalThis.Response.json(true, { headers });
     entry.finish(true);
     return globalThis.Response.json(true, { headers });
   };

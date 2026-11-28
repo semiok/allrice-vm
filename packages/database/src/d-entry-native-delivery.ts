@@ -41,6 +41,7 @@ const formats = {
   jpg: ['jpeg', 'image/jpeg'],
   jpeg: ['jpeg', 'image/jpeg'],
   webp: ['webp', 'image/webp'],
+  zip: ['zip', 'application/zip'],
 } as const satisfies Record<string, readonly [DeliveryFormat, string]>;
 
 function fileFormat(path: string) {
@@ -88,6 +89,9 @@ export const DEntryNativeDeliveryClaimSchema = z.strictObject({
   sessionId: z.string().min(1).max(256),
   turn: z.number().int().positive(),
   callId: z.string().min(1).max(256),
+  callSequence: z.number().int().positive(),
+  attemptId: z.string().min(1).max(256),
+  cursor: z.number().int().nonnegative(),
 });
 export const DEntryNativeDeliveryCaptureSchema =
   DEntryNativeDeliveryClaimSchema.extend({
@@ -120,6 +124,9 @@ export async function publishCapturedDEntryDelivery(
   if (
     capture.sessionId !== attempt.sessionId ||
     capture.turn !== attempt.turn ||
+    capture.attemptId !== attempt.attemptId ||
+    capture.cursor !== attempt.cursor ||
+    capture.callSequence <= attempt.cursor ||
     attempt.kind !== 'assistant'
   )
     throw new DataAccessError('not_found');
@@ -133,7 +140,12 @@ export async function publishCapturedDEntryDelivery(
     unique.add(path);
     const prefix = requestPrefix(capture.sessionId, path);
     const occurrence = sha256(
-      JSON.stringify([capture.turn, capture.callId, index]),
+      JSON.stringify([
+        capture.turn,
+        capture.callSequence,
+        capture.callId,
+        index,
+      ]),
     );
     const requestId = prefix + occurrence;
     const id = objectIdFor(

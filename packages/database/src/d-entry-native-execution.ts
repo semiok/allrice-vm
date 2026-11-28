@@ -393,7 +393,10 @@ export async function listDEntryNativeRunCandidates(
   owner: DEntryNativeRunJournalOwner,
   after?: ScanCursor,
   limit = 64,
-  delivery?: Pick<DEntryNativeDeliveryClaim, 'sessionId' | 'turn'>,
+  delivery?: Pick<
+    DEntryNativeDeliveryClaim,
+    'sessionId' | 'turn' | 'attemptId' | 'cursor'
+  >,
 ) {
   const sql = getDatabase();
   const rows = await sql<
@@ -437,6 +440,8 @@ export async function listDEntryNativeRunCandidates(
               kind: 'assistant',
               sessionId: delivery.sessionId,
               turn: delivery.turn,
+              attemptId: delivery.attemptId,
+              cursor: delivery.cursor,
               vmInstanceId: owner.vmInstanceId,
               leaseEpoch: owner.leaseEpoch,
             })}`

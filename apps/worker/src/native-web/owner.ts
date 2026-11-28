@@ -1537,7 +1537,7 @@ export async function openNativeWebOwner(input: {
         request:
           | { action: 'delivery-pending' }
           | (DEntryNativeDeliveryClaim & {
-              action: 'delivery-read' | 'delivery-ack';
+              action: 'delivery-read' | 'delivery-live' | 'delivery-ack';
             }),
         caller: AbortSignal,
       ) {
