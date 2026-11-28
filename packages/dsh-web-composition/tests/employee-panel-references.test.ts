@@ -170,8 +170,9 @@ it('binds the saved reference to the currently selected root after an in-place s
     materials: { ...first.materials, sessionId: nextThread },
     files: { ...first.files, sessionId: nextThread },
   };
+  let nextView: EmployeePanelsSnapshot = next;
   const port = f.bindOwner(f.lifetime.signal, (id) =>
-    id === sessionId ? first : id === nextId ? next : null,
+    id === sessionId ? first : id === nextId ? nextView : null,
   );
   expect(port.useReference?.(f.request)).toBe(true);
   const [[oldChip]] = f.insertReference.mock.calls as unknown as [
@@ -195,6 +196,13 @@ it('binds the saved reference to the currently selected root after an in-place s
     [{ ref: string }],
     [{ ref: string }],
   ];
+  f.fetch.mockImplementationOnce(async () => {
+    nextView = {
+      ...next,
+      filePreview: { objectId: uid(30), close() {} },
+    };
+    return new Response(JSON.stringify(f.result));
+  });
   expect(await f.codec.serialize(nextChip.ref, f.lifetime.signal)).toContain(
     revision.checksum,
   );

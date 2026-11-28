@@ -153,11 +153,11 @@ export function apply(ctx: Context) {
       function Capture({ sessionId, inputActions }: InputDock) {
         useEffect(() => {
           editors.set(sessionId, inputActions);
-          notify();
+          if (currentReferences) notify();
           return () => {
             if (editors.get(sessionId) === inputActions) {
               editors.delete(sessionId);
-              notify();
+              if (currentReferences) notify();
             }
           };
         }, [sessionId, inputActions]);
