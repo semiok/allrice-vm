@@ -507,7 +507,7 @@ export async function recoverProductionPersonVmModelOwner(
         if (endpoint) await (await endpoint).close();
         if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
         await closeDatabase();
-        process.exitCode = 0;
+        process.exit(0);
       } catch {
         shutdownStatus = receipt;
         if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;

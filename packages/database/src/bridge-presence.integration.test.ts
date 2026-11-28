@@ -175,6 +175,7 @@ suite(
         const client = await vi.importActual<typeof Client>('./core/client.ts');
         const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
         url.searchParams.set('application_name', applicationName);
+        url.searchParams.set('ssl', 'false');
         vi.stubEnv('DATABASE_URL', url.toString());
         const previous = database;
         const web = (database = client.getDatabase());
@@ -238,6 +239,34 @@ suite(
       10000,
     );
 
+    it('leaves a target-session notification socket with its original pool until database close', async () => {
+      const client = await vi.importActual<typeof Client>('./core/client.ts');
+      const applicationName = 'bridge-target-' + randomUUID();
+      const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+      url.searchParams.set('application_name', applicationName);
+      url.searchParams.set('target_session_attrs', 'read-write');
+      vi.stubEnv('DATABASE_URL', url.toString());
+      const previous = database;
+      database = client.getDatabase();
+      const pids = () =>
+        admin`select pid from pg_stat_activity where application_name=${applicationName}`;
+      try {
+        const close = await createBridgeConnectionAuthority().subscribe(
+          () => {},
+        );
+        const subscribed = await pids();
+        expect(subscribed).toHaveLength(1);
+        await close();
+        expect(await pids()).toEqual(subscribed);
+        await client.closeDatabase();
+        await vi.waitFor(async () => expect(await pids()).toEqual([]));
+      } finally {
+        database = previous;
+        vi.unstubAllEnvs();
+        await client.closeDatabase();
+      }
+    });
+
     it('joins the capacity LISTEN socket even when its proxy keeps the TCP peer open', async () => {
       const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
       const sockets: Socket[] = [];
@@ -261,7 +290,7 @@ suite(
       const routed = new URL(url);
       routed.port = String(address.port);
       const owner = openPostgresNotifications(
-        routed.toString(),
+        { connectionString: routed.toString() },
         ['allrice_model_gateway_capacity'],
         () => {},
       );

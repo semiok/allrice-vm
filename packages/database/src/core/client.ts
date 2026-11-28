@@ -2,7 +2,6 @@ import postgres from 'postgres';
 import { openPostgresNotifications } from './notification-client.ts';
 
 let client: ReturnType<typeof postgres> | undefined;
-let clientUrl: string | undefined;
 let diagnostics: ReturnType<typeof postgres> | undefined;
 const closeHooks = new Set<() => Promise<void>>();
 
@@ -17,17 +16,14 @@ export function getDatabase() {
     throw new Error('DATABASE_URL is required');
   }
 
-  if (!client) {
-    client = postgres(databaseUrl, {
-      connect_timeout: 5,
-      idle_timeout: 20,
-      max: process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 10 : 5,
-      connection: {
-        application_name: `allrice-${process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 'worker' : 'app'}`,
-      },
-    });
-    clientUrl = databaseUrl;
-  }
+  client ??= postgres(databaseUrl, {
+    connect_timeout: 5,
+    idle_timeout: 20,
+    max: process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 10 : 5,
+    connection: {
+      application_name: `allrice-${process.env.ALLRICE_SERVICE_ROLE === 'worker' ? 'worker' : 'app'}`,
+    },
+  });
 
   return client;
 }
@@ -38,36 +34,66 @@ export function openDatabaseNotifications(
   receive: (channel: string, payload: string) => void,
   options: { onListen?(): void } = {},
 ) {
-  if (database !== client || !clientUrl)
+  if (database !== client)
     throw Error('Notification connection must use the process database');
-  const { host, ssl, target_session_attrs, keep_alive } = database.options;
-  if (host.length !== 1 || ssl || target_session_attrs) {
-    // Keep the original driver's host selection and TLS policy for DSNs
-    // whose connection semantics differ between the two drivers.
-    const listener = createDedicatedDatabase(database);
-    let closing: Promise<void> | undefined;
+  const parsed = database.options;
+  const { host, port, ssl, target_session_attrs, keep_alive, connection } =
+    parsed;
+  const password: unknown = Reflect.get(parsed, 'pass');
+  if (
+    host.length !== 1 ||
+    !host[0] ||
+    !port[0] ||
+    ssl ||
+    target_session_attrs ||
+    typeof password !== 'string' ||
+    Object.keys(connection).some(
+      (key) => key !== 'application_name' && key !== 'options',
+    )
+  ) {
+    // Keep the existing process pool as the physical owner for specialized
+    // connection settings. This close only fences the subscription callback.
+    let closed = false;
     const ready = (async () => {
       for (const channel of channels) {
-        if (closing) return;
-        await listener.listen(
+        if (closed) return;
+        await database.listen(
           channel,
           (payload) => {
-            if (!closing) receive(channel, payload);
+            if (!closed) receive(channel, payload);
           },
-          options.onListen,
+          () => {
+            if (!closed) options.onListen?.();
+          },
         );
       }
     })();
     return {
       ready,
-      close: () => (closing ??= listener.end({ timeout: 5 })),
+      close() {
+        closed = true;
+        return Promise.resolve();
+      },
     };
   }
-  return openPostgresNotifications(clientUrl, channels, receive, {
-    applicationName: database.options.connection.application_name,
-    keepAliveMs: (keep_alive ?? 0) * 1000,
-    onListen: options.onListen,
-  });
+  return openPostgresNotifications(
+    {
+      host: host[0],
+      port: port[0],
+      database: parsed.database,
+      user: parsed.user,
+      password: () => password,
+      ssl: false,
+      sslnegotiation: 'postgres',
+      options: connection.options ? String(connection.options) : undefined,
+      application_name: connection.application_name,
+      keepAlive: Boolean(keep_alive),
+      keepAliveInitialDelayMillis: (keep_alive ?? 0) * 1000,
+    },
+    channels,
+    receive,
+    options.onListen,
+  );
 }
 
 /** A caller-owned client from the trusted client's entire public configuration.
@@ -125,5 +151,4 @@ export async function closeDatabase() {
   for (const hook of closeHooks) await hook();
   await client.end({ timeout: 5 });
   client = undefined;
-  clientUrl = undefined;
 }

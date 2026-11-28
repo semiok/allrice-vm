@@ -1,18 +1,14 @@
 import { Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Client, escapeIdentifier } from 'pg';
+import { Client, escapeIdentifier, type ClientConfig } from 'pg';
 
 /** One owner for the socket and its retry timer. Do not let the driver create
  * another LISTEN connection after the caller has joined close. */
 export function openPostgresNotifications(
-  databaseUrl: string,
+  config: ClientConfig,
   channels: readonly string[],
   receive: (channel: string, payload: string) => void,
-  options: {
-    applicationName?: string;
-    keepAliveMs?: number;
-    onListen?(): void;
-  } = {},
+  onListen?: () => void,
 ) {
   const stopped = new AbortController();
   let endCurrent: (() => Promise<void>) | undefined;
@@ -29,11 +25,8 @@ export function openPostgresNotifications(
         socket.once('close', () => resolve());
       });
       const client = new Client({
-        connectionString: databaseUrl,
+        ...config,
         stream: () => socket,
-        application_name: options.applicationName,
-        keepAlive: Boolean(options.keepAliveMs),
-        keepAliveInitialDelayMillis: options.keepAliveMs,
         connectionTimeoutMillis: 5000,
         query_timeout: 5000,
       });
@@ -68,7 +61,7 @@ export function openPostgresNotifications(
           await client.query(`LISTEN ${escapeIdentifier(channel)}`);
         }
         stopped.signal.throwIfAborted();
-        options.onListen?.();
+        onListen?.();
         ready();
         await disconnected;
       } catch (error) {
