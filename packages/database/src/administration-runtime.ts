@@ -8,7 +8,12 @@ export async function readAdministrationRuntimeTimeline(
   context: RequestContext,
   sessionIdInput: string,
   organizationIdInput: string | null,
-) {
+): Promise<
+  Awaited<
+    | ReturnType<typeof listDshRuntimeEventTimeline>
+    | ReturnType<typeof nativeAdminTimeline>
+  >
+> {
   const sessionId = UuidSchema.parse(sessionIdInput).toLowerCase();
   const db = getDatabase();
   await requireCurrentPlatformAdmin(context, db, false);
