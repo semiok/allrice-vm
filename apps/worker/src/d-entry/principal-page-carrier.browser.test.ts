@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { EventEmitter, on } from 'node:events';
 import { cp, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -9,7 +10,11 @@ import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
-import type { SessionHistoryRecord } from '@deepseek-ai/dsh-api-session-controller/types';
+import type {
+  SessionControlFrame,
+  SessionHistoryRecord,
+} from '@deepseek-ai/dsh-api-session-controller/types';
+import * as database from '@allrice/database';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
@@ -54,6 +59,9 @@ it
     'unattached',
     'native-create',
     'outer-create',
+    'sidebar-create-after-switch',
+    'native-title',
+    'native-title-reopen',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -66,8 +74,11 @@ it
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
     const outerCreate = scenario === 'outer-create';
-    const nativeCreate = outerCreate || scenario.startsWith('native-create');
+    const sidebarCreate = scenario === 'sidebar-create-after-switch';
+    const nativeCreate =
+      outerCreate || sidebarCreate || scenario.startsWith('native-create');
     const createAfterSwitch =
+      sidebarCreate ||
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const realShell = switching || nativeCreate || coldAssets;
@@ -100,6 +111,97 @@ it
       '.wasm': 'application/wasm',
     };
     const f = await fixture({ ...live, directory: release.directory });
+    const titleChanges = new EventEmitter();
+    let projectionSeq = 0;
+    let nativeTitle: string | undefined;
+    let forkTitle: string | undefined;
+    let titleAfterLockTimeout: string | undefined;
+    const titleReads: (string | undefined)[] = [];
+    const projectedTitles: string[] = [];
+    const projectedThreads: (string | null)[] = [];
+    const titleRead = deferred();
+    const allowTitleWrite = deferred();
+    const reopening = scenario === 'native-title-reopen';
+    if (reopening || scenario === 'native-title') {
+      if (reopening) {
+        nativeTitle = '上次关闭前的原生标题';
+        projectionSeq = 1;
+        f.host.catalog.onRename = ({ sessionId, title }) => {
+          if (sessionId === 'native-forked') forkTitle = title;
+          else nativeTitle = title;
+          return { title, seq: ++projectionSeq };
+        };
+        f.host.catalog.snapshotRecords = (sessionId) =>
+          sessionId === 'root'
+            ? [
+                {
+                  type: 'event',
+                  event: {
+                    type: 'session/title',
+                    seq: 1,
+                    time: 1,
+                    data: {
+                      title: nativeTitle!,
+                      source: { kind: 'user' },
+                      messageSeqs: [],
+                    },
+                  },
+                },
+              ]
+            : [];
+      }
+      f.host.catalog.readProjections = (sessionId) => {
+        const title = sessionId === 'root' ? nativeTitle : forkTitle;
+        return title
+          ? {
+              kind: 'sequenced',
+              asOfSeq: projectionSeq,
+              values: { title },
+            }
+          : null;
+      };
+      f.host.catalog.controlFrames = async function* (signal) {
+        try {
+          for await (const [frame] of on(titleChanges, 'projection', {
+            signal,
+          }))
+            yield frame as SessionControlFrame;
+        } catch (error) {
+          if (!signal.aborted) throw error;
+        }
+      };
+      const sync = vi
+        .spyOn(database, 'syncDEntryNativeRootTitle')
+        .mockImplementation(async (context, pin, binding, read, signal) => {
+          expect(context.actor.id).toBe(f.identity.personId);
+          expect(pin.identity).toEqual({
+            ...f.identity,
+            threadId: pin.identity.threadId,
+          });
+          expect(binding).toMatchObject(f.binding);
+          const title = await read(signal);
+          titleReads.push(title);
+          if (!reopening && !projectedTitles.length) {
+            titleRead.resolve();
+            await allowTitleWrite.promise;
+          }
+          if (titleAfterLockTimeout) {
+            nativeTitle = titleAfterLockTimeout;
+            titleAfterLockTimeout = undefined;
+            projectionSeq++;
+            throw Object.assign(Error('fixture title lock timeout'), {
+              code: '55P03',
+            });
+          }
+          if (title) {
+            projectedTitles.push(title);
+            projectedThreads.push(pin.identity.threadId);
+          }
+        });
+      closes.push(async () => {
+        sync.mockRestore();
+      });
+    }
     let otherThread = randomUUID();
     let outerCreated = false;
     const revokeOther =
@@ -1028,6 +1130,27 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (sidebarCreate) {
+      await page.addInitScript(() => {
+        if (window !== top) return;
+        window.addEventListener(
+          'message',
+          (event) => {
+            if (
+              document.documentElement.dataset.fixtureHoldSecondSwitch ===
+                'yes' &&
+              event.origin === location.origin &&
+              event.source ===
+                document.querySelector('iframe')?.contentWindow &&
+              event.data?.type === 'allrice:d-entry:thread-switch-prepared'
+            ) {
+              event.stopImmediatePropagation();
+            }
+          },
+          { capture: true },
+        );
+      });
+    }
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
       page.on('request', (request) => {
@@ -1320,6 +1443,131 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (reopening || scenario === 'native-title') {
+      const row = workbench.locator(
+        `[data-row-key="session:${f.selection.threadId}"]`,
+      );
+      if (reopening) {
+        await row.getByText(nativeTitle!, { exact: true }).waitFor();
+        await vi.waitFor(() => expect(projectedTitles).toEqual([nativeTitle]));
+        if (!lastScopeId) throw Error('Missing fixture page carrier');
+        const title = '新的原生手动标题';
+        const nativeRpc = (endpoint: string, request: object) =>
+          page.request.post(`${f.origin}/api/v1/d-entry/native-rpc`, {
+            data: {
+              selection: f.selection,
+              scopeId: lastScopeId,
+              rpcId: randomUUID(),
+              endpoint,
+              payload: { args: { request } },
+            },
+          });
+        const renameResponse = await nativeRpc('session/rename', {
+          sessionId: 'root',
+          title,
+        });
+        expect(await renameResponse.json()).toMatchObject({
+          result: { ok: true, value: { title } },
+        });
+        expect(projectedTitles.at(-1)).toBe(title);
+
+        const original = await f.root();
+        f.findRoot.mockImplementation(async (_context, _identity, _vm, id) => {
+          if (id === 'root') return original;
+          const registration = f.registerRoot.mock.calls.findIndex(
+            ([, , fact]) => fact.nativeSessionId === id,
+          );
+          return f.registerRoot.mock.results[registration]?.value;
+        });
+        forkTitle = '派生会话继承的标题';
+        const forkResponse = await nativeRpc('session/fork', {
+          sessionId: 'root',
+        });
+        expect(await forkResponse.json()).toMatchObject({
+          result: { ok: true, value: { sessionId: 'native-forked' } },
+        });
+        const forkIndex = f.registerRoot.mock.calls.findIndex(
+          ([, , fact]) => fact.nativeSessionId === 'native-forked',
+        );
+        expect(forkIndex).toBeGreaterThanOrEqual(0);
+        const registered = await f.registerRoot.mock.results[forkIndex]!.value;
+        expect(registered.rootNativeSessionId).toBe('native-forked');
+        await vi.waitFor(() => expect(projectedTitles.at(-1)).toBe(forkTitle));
+        const renamedFork = await nativeRpc('session/rename', {
+          sessionId: 'native-forked',
+          title: '另一个已登记的原生根',
+        });
+        expect(await renamedFork.json()).toMatchObject({
+          result: { ok: true },
+        });
+        expect(projectedTitles.at(-1)).toBe('另一个已登记的原生根');
+        expect(projectedThreads).toEqual([
+          f.selection.threadId,
+          f.selection.threadId,
+          registered.thread.id,
+          registered.thread.id,
+        ]);
+        await context.close();
+        return;
+      }
+      await row.getByText('第一条已存在对话', { exact: true }).waitFor();
+      await vi.waitFor(() =>
+        expect(titleChanges.listenerCount('projection')).toBe(1),
+      );
+      const titles = ['打招呼并询问助手身份', '我手动重命名的标题'];
+      try {
+        for (const [index, title] of titles.entries()) {
+          nativeTitle = title;
+          const seq = ++projectionSeq;
+          titleChanges.emit('projection', {
+            type: 'projection',
+            sessionId: 'child',
+            key: 'title',
+            value: '子会话标题',
+            seq,
+          });
+          titleChanges.emit('projection', {
+            type: 'projection',
+            sessionId: 'root',
+            key: 'title',
+            value: title,
+            seq,
+          });
+          await row.getByText(title, { exact: true }).waitFor();
+          if (index === 0) await titleRead.promise;
+        }
+        expect(projectedTitles).toEqual([]);
+      } finally {
+        allowTitleWrite.resolve();
+      }
+      await vi.waitFor(() => expect(projectedTitles).toEqual(titles));
+      expect(projectedThreads).toEqual([
+        f.selection.threadId,
+        f.selection.threadId,
+      ]);
+      const observedTitle = '写入遇到锁超时的标题';
+      const currentTitle = '一次写入超时后重读的标题';
+      const readsBeforeTimeout = titleReads.length;
+      titleAfterLockTimeout = currentTitle;
+      nativeTitle = observedTitle;
+      titleChanges.emit('projection', {
+        type: 'projection',
+        sessionId: 'root',
+        key: 'title',
+        value: nativeTitle,
+        seq: ++projectionSeq,
+      });
+      await row.getByText(observedTitle, { exact: true }).waitFor();
+      await vi.waitFor(() =>
+        expect(projectedTitles).toEqual([...titles, currentTitle]),
+      );
+      expect(titleReads.slice(readsBeforeTimeout)).toEqual([
+        observedTitle,
+        currentTitle,
+      ]);
+      await context.close();
+      return;
+    }
     const dock = (nativeId: string) =>
       workbench.locator(
         '[data-sidebar-right-session="' +
@@ -1675,7 +1923,7 @@ it
       );
       await expect.poll(nativeSession).toBe(outerNativeId);
       expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
-      expect(switchProofRequests).toBe(initialProofs + 1);
+      expect(switchProofRequests).toBe(initialProofs);
       expect(await editor.textContent()).toBe('');
       expect(await firstReply.count()).toBe(0);
       for (const [thread, nativeId] of [
@@ -1721,6 +1969,20 @@ it
           (url) => url.searchParams.get('threadId') === otherThread,
         );
         await editor.fill('切换后保留的草稿', { timeout: 15_000 });
+        if (sidebarCreate) {
+          expect(
+            await workbench
+              .locator(`[data-row-key="session:${otherThread}"]`)
+              .getAttribute('aria-selected'),
+          ).toBe('true');
+          expect(
+            await editor.evaluate((node) =>
+              node
+                .closest('[data-conversation-session]')
+                ?.getAttribute('data-conversation-session'),
+            ),
+          ).toBe('root-' + otherThread);
+        }
       }
       const platform = await editor.evaluate(
         (node) => node.ownerDocument.defaultView!.navigator.platform,
@@ -1732,8 +1994,10 @@ it
         : /win/iu.test(platform)
           ? 'Control+Alt+N'
           : 'Control+Shift+Period';
+      const proofsBeforeCreate = switchProofRequests;
+      if (sidebarCreate) expect(proofsBeforeCreate).toBeGreaterThan(0);
       try {
-        if (createAfterSwitch) {
+        if (createAfterSwitch && !sidebarCreate) {
           await workbench.locator('#app').evaluate((node) => {
             window.addEventListener('message', (event) => {
               if (
@@ -1745,8 +2009,20 @@ it
           });
           holdCreatedResponse = true;
         }
-        await editor.press(chord, { timeout: 10_000 });
-        if (createAfterSwitch) {
+        if (sidebarCreate) {
+          // The first switch proved its new scope. The same-scope create
+          // must open even if a redundant second handoff cannot complete.
+          await page.evaluate(() => {
+            document.documentElement.dataset.fixtureHoldSecondSwitch = 'yes';
+          });
+          await workbench
+            .getByRole('button', {
+              name: '和 Fixture employee 开新会话',
+              exact: true,
+            })
+            .click();
+        } else await editor.press(chord, { timeout: 10_000 });
+        if (createAfterSwitch && !sidebarCreate) {
           try {
             await createdResponse.promise;
             const before = switchProofRequests;
@@ -1774,6 +2050,7 @@ it
           (url) => url.searchParams.get('threadId') === createdThread,
           { timeout: 20_000 },
         );
+        if (sidebarCreate) expect(switchProofRequests).toBe(proofsBeforeCreate);
       } catch (error) {
         deliverCreatedResponse.resolve();
         throw new Error(
@@ -1798,11 +2075,18 @@ it
           }),
           { cause: error },
         );
+      } finally {
+        if (sidebarCreate)
+          await page.evaluate(() => {
+            delete document.documentElement.dataset.fixtureHoldSecondSwitch;
+          });
       }
       const row = workbench.locator(
         '[data-row-key="session:' + createdThread + '"]',
       );
       await row.waitFor({ timeout: 15_000 });
+      if (sidebarCreate)
+        await row.and(workbench.locator('[aria-selected="true"]')).waitFor();
       await expect
         .poll(
           () =>
