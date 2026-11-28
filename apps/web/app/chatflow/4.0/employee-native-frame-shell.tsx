@@ -25,6 +25,7 @@ type Controller = {
   retire(): Promise<boolean>;
   element(): HTMLIFrameElement | null;
   select(selection: DEntrySelectionInput, reopen: boolean): void;
+  restore(query: string): void;
 };
 
 export type EmployeeFrameOwner = {
@@ -119,7 +120,12 @@ export function EmployeeNativeFrameShell({
   const publish = useCallback((id: number, intent: Intent, push: boolean) => {
     const record = directory.current.get(id);
     if (!record) return;
-    reportURL(record.query, push && !intent.fromHistory);
+    if (intent.fromHistory) {
+      if (record.query !== intent.query)
+        record.controller.restore(intent.query);
+      return;
+    }
+    reportURL(record.query, push);
     const selected = readFrameIntent(record.query);
     if (
       selected &&

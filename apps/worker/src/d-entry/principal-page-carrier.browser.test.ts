@@ -1521,11 +1521,14 @@ it
       const pending = workbench.locator('[data-employee-transition]');
       await pending.getByText('正在打开工作台', { exact: true }).waitFor();
       expect(await workbench.locator('#chat-sidebar').isVisible()).toBe(true);
-      expect(
-        await workbench
-          .locator('[data-conversation-header-leading]')
-          .isVisible(),
-      ).toBe(true);
+      const header = await workbench
+        .locator('header:has(> [data-conversation-header-leading])')
+        .boundingBox();
+      const transition = await pending.boundingBox();
+      expect(header?.height).toBeGreaterThan(0);
+      expect(transition?.y).toBeGreaterThanOrEqual(
+        header!.y + header!.height - 0.5,
+      );
       await choose(a);
       resumeDocument.resolve();
       await pending.waitFor({ state: 'detached' });

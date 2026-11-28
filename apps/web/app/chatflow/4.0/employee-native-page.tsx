@@ -876,10 +876,13 @@ function EmployeeNativePane({
       else void close();
     };
     window.addEventListener('pagehide', leaving);
-    const restoreQuery = () => {
-      if (location.pathname !== '/chatflow/4.0') return;
-      nextQuery.current = location.search.slice(1);
+    const restore = (query: string) => {
+      nextQuery.current = query;
       if (nextQuery.current !== displayedQuery.current) applyQuery();
+    };
+    const restoreQuery = () => {
+      if (location.pathname === '/chatflow/4.0')
+        restore(location.search.slice(1));
     };
     if (!owner) window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
@@ -1008,6 +1011,7 @@ function EmployeeNativePane({
     const unregister = owner?.register({
       element: () => frame.current,
       select: requestNavigation,
+      restore,
       async retire() {
         navigating = true;
         unbindMemoryWrites?.();
