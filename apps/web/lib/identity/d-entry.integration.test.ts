@@ -644,6 +644,36 @@ suite(
             signal,
           ),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        const locked = deferred<void>();
+        const unlock = deferred<void>();
+        const holder = fixture.db.begin(async (tx) => {
+          await tx`select id from allrice_chat_sessions where id=${f.thread.id} for no key update`;
+          locked.resolve();
+          await unlock.promise;
+        });
+        let writeFailure: unknown;
+        let blocked: Promise<void> | undefined;
+        try {
+          await Promise.race([locked.promise, holder]);
+          blocked = sync(async () => '遇到行锁的标题').catch(
+            (error: unknown) => {
+              writeFailure = error;
+            },
+          );
+          await vi.waitFor(
+            () =>
+              expect(writeFailure).toMatchObject({
+                message: 'employee_access_busy',
+              }),
+            { timeout: 7000 },
+          );
+          expect(await readStored()).toBe('本人手动命名');
+        } finally {
+          unlock.resolve();
+          await Promise.allSettled([holder, blocked]);
+        }
+
         await expect(
           sync(async () => {
             await revokeSession(f.login.token);

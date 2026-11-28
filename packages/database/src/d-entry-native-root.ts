@@ -23,6 +23,7 @@ import {
   resolveEmployeeSessionInstance,
 } from './employees/employee-instances.ts';
 import { readContentPrincipal } from './content-maintenance.ts';
+import { employeeAccessTransaction } from './employees/employee-access-cancellation.ts';
 import { createAssignedChatSession } from './workspace/service.ts';
 
 const hostSchema = z
@@ -235,32 +236,48 @@ export async function syncDEntryNativeRootTitle(
     signal.throwIfAborted();
     if (!title) return;
 
-    const applied = await sql.begin(async (tx) => {
-      const employee = await resolveEmployeeSessionInstance(
-        scope,
-        before.employee_assignment_id,
-        identity.employeeInstanceId,
-        tx,
-      );
-      if (
-        employee.revision !== identity.employeeRevision ||
-        employee.source.employeeVersionId !== identity.employeeVersionId
-      )
-        return deny();
-      const [locked] = await row(tx, true);
-      if (!locked) return deny();
-      ensureRoot(locked.d_entry_native_root);
-      if (locked.version !== before.version) return false;
-      const policy = await readDEntryReleasePolicy(tx, true);
-      if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
-      await lockRunningVm(tx, { ...binding, vmId: root.vmId }, identity);
-      signal.throwIfAborted();
-      // Even a rename back to the stored title fences older observations.
-      const [written] = await tx`update allrice_chat_sessions set title=${title}
+    const applied = await employeeAccessTransaction(
+      sql,
+      async (tx) => {
+        signal.throwIfAborted();
+        // A title is a projection. Its locks must not hold page handoff open.
+        await tx`set local lock_timeout = '500ms'`;
+        await tx`set local statement_timeout = '1500ms'`;
+        const employee = await resolveEmployeeSessionInstance(
+          scope,
+          before.employee_assignment_id,
+          identity.employeeInstanceId,
+          tx,
+        );
+        if (
+          employee.revision !== identity.employeeRevision ||
+          employee.source.employeeVersionId !== identity.employeeVersionId
+        )
+          return deny();
+        const [locked] = await row(tx, true);
+        if (!locked) return deny();
+        ensureRoot(locked.d_entry_native_root);
+        if (locked.version !== before.version) return false;
+        const policy = await readDEntryReleasePolicy(tx, true);
+        if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
+        await lockRunningVm(tx, { ...binding, vmId: root.vmId }, identity);
+        signal.throwIfAborted();
+        // Even a rename back to the stored title fences older observations.
+        const [written] =
+          await tx`update allrice_chat_sessions set title=${title}
         where id=${identity.threadId} returning id`;
-      if (!written) return deny();
+        if (!written) return deny();
+        signal.throwIfAborted();
+        return true;
+      },
+      {
+        retryLockBusy: () => !signal.aborted,
+        retryDeadlock: true,
+        retrySite: 'd_entry_native_title',
+      },
+    ).catch((error: unknown) => {
       signal.throwIfAborted();
-      return true;
+      throw error;
     });
     if (applied) return;
   }
