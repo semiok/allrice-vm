@@ -1,3 +1,5 @@
+import { nativeScopedModelPatches } from './model-task-presets.js';
+import type { ModelRouteKey, ScopedModelRule } from '@allrice/model-gateway';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -56,17 +58,29 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  scoped?: Readonly<{
+    rules: readonly ScopedModelRule[];
+    compaction?: ModelRouteKey;
+    title?: ModelRouteKey;
+    models: readonly {
+      provider: string;
+      model: string;
+      modelInfo: LlmResolvedModelInfo;
+    }[];
+  }>;
 }>;
 
 async function managedModelFiles(directory: string, cliPath: string) {
   const resolve = createRequire(import.meta.url);
   const dist = dirname(resolve.resolve('@allrice/model-gateway'));
   const modules = await Promise.all(
-    ['dsh-provider.js', 'contract.js'].map(async (name) => ({
-      path: posix.join(directory, name),
-      contents: await readFile(join(dist, name), 'utf8'),
-      mode: 0o600,
-    })),
+    ['dsh-provider.js', 'contract.js', 'scoped-routes.js'].map(
+      async (name) => ({
+        path: posix.join(directory, name),
+        contents: await readFile(join(dist, name), 'utf8'),
+        mode: 0o600,
+      }),
+    ),
   );
   return [
     ...modules,
@@ -206,9 +220,10 @@ export async function prepareNativeWebLaunch(
               mode: 0o600,
               contents: `import { applyNativeWebOwner } from './owner.mjs';
 import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+import { selectScopedModel } from './model-gateway/scoped-routes.js';
 export { inject, name } from './owner.mjs';
 export function apply(ctx, config) {
-  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter);
+  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter, selectScopedModel);
 }
 `,
             },
@@ -270,6 +285,12 @@ export function apply(ctx, config) {
               ]
             : []),
           ...(commandMemory ?? []),
+          ...(modelAdapter?.scoped
+            ? [
+                { id: 'web-search-deepseek', disabled: true },
+                ...nativeScopedModelPatches(modelAdapter.scoped),
+              ]
+            : []),
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },

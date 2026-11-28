@@ -1,6 +1,7 @@
 import {
   createNativeModelCallReferences,
   ModelGatewayError,
+  sameModelRoute,
   type ModelGatewayAuthority,
 } from '@allrice/model-gateway';
 import type { PersonVmRuntimePort } from '@allrice/person-vm';
@@ -12,26 +13,15 @@ import {
   type ResolveProductionDEntrySendRoute,
 } from './production-dentry-source.js';
 import { createProductionEgressAuthority } from './production-egress-authority.js';
-import { createProductionCodexRuntime } from './production-codex-runtime.js';
-import { createProductionOpenAiRuntime } from './production-openai-runtime.js';
+import {
+  createProductionModelRouting,
+  type ProductionModelRouting,
+} from './production-model-routing.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
-type ModelRuntime = Awaited<ReturnType<typeof createProductionModelRuntime>>;
+type ModelRuntime = ProductionModelRouting['fallback'];
 type CallReferences = ReturnType<typeof createNativeModelCallReferences>;
-
-function createProductionModelRuntime(
-  ...args: Parameters<typeof createProductionCodexRuntime>
-) {
-  switch (process.env.ALLRICE_DSH_MODEL_PROVIDER ?? 'openai-codex') {
-    case 'openai-codex':
-      return createProductionCodexRuntime(...args);
-    case 'openai':
-      return createProductionOpenAiRuntime(...args);
-    default:
-      throw new ModelGatewayError('BINDING_INVALID');
-  }
-}
 
 async function closeSources(
   owners: readonly (() => Promise<void> | undefined)[],
@@ -57,6 +47,10 @@ export interface ProductionNativeModelExecution {
       readModelInfo: ModelRuntime['readModelInfo'];
       assertRouteCurrent: ModelRuntime['assertCurrent'];
       confirmTransportStopped: ModelRuntime['confirmTransportStopped'];
+      scoped?: Pick<
+        ProductionModelRouting,
+        'select' | 'assertCurrent' | 'guestCatalog' | 'applies'
+      >;
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
     },
@@ -80,7 +74,7 @@ export function createProductionPersonVmSources(
       let native:
         | Awaited<ReturnType<ProductionNativeModelExecution['attach']>>
         | undefined;
-      const modelRuntime = await createProductionModelRuntime(
+      const routing = await createProductionModelRouting(
         lifetime,
         host.modelOwnerId,
         (...args) => {
@@ -89,25 +83,28 @@ export function createProductionPersonVmSources(
           return native.readModelImage(...args);
         },
       );
+      const modelRuntime = routing.fallback;
+      const modelLifetime = routing.scoped ? lifetime : modelRuntime.revoked;
       const authority = execution.authority;
-      const calls = createNativeModelCallReferences(
-        authority,
-        modelRuntime.revoked,
-      );
+      const calls = createNativeModelCallReferences(authority, modelLifetime);
       let entry: ReturnType<typeof installProductionDEntrySource> | undefined;
       try {
         const egress = createProductionEgressAuthority({
           startup,
           modelAuthority: authority,
-          modelRoute: modelRuntime.route,
+          modelRoute: routing.scoped
+            ? (call) =>
+                sameModelRoute(call, routing.select(call.vm, call.native))
+            : modelRuntime.route,
           lifetime,
         });
         native = await execution.attach(host, {
           route: modelRuntime.route,
-          routeRevoked: modelRuntime.revoked,
+          routeRevoked: modelLifetime,
           readModelInfo: modelRuntime.readModelInfo,
           assertRouteCurrent: modelRuntime.assertCurrent,
-          confirmTransportStopped: modelRuntime.confirmTransportStopped,
+          confirmTransportStopped: routing.confirmTransportStopped,
+          scoped: routing.scoped ? routing : undefined,
           bindReference: (call, signal) =>
             egress.bindModelCall(call, signal, 'model-reference'),
           issueCall: calls.issue,
@@ -123,14 +120,13 @@ export function createProductionPersonVmSources(
               host.vm.assertRunningReadiness(context, binding, active),
             ),
           async resolveSendRoute(input, signal) {
-            const active = AbortSignal.any([
-              lifetime,
-              modelRuntime.revoked,
-              signal,
-            ]);
-            const generation = await modelRuntime.assertCurrent(active);
+            const active = AbortSignal.any([lifetime, modelLifetime, signal]);
+            const configured = routing.applies(input.binding);
+            const generation = configured
+              ? modelLifetime
+              : await modelRuntime.assertCurrent(active);
             const guest = await owned.resolveSendRoute(input, active);
-            await modelRuntime.assertCurrent(active);
+            if (!configured) await modelRuntime.assertCurrent(active);
             active.throwIfAborted();
             generation.throwIfAborted();
             guest.revoked.throwIfAborted();
@@ -151,7 +147,8 @@ export function createProductionPersonVmSources(
         return {
           runtime: {
             async readiness(binding, signal) {
-              await modelRuntime.assertCurrent(signal);
+              if (!routing.applies(binding))
+                await modelRuntime.assertCurrent(signal);
               return installed.readiness(binding, signal);
             },
             activity: owned.activity.bind(owned),
@@ -172,7 +169,7 @@ export function createProductionPersonVmSources(
             bindModelCall: egress.bindModelCall,
             policy: { routes: [] },
             services: owned.references ?? [],
-            close: modelRuntime.close,
+            close: routing.close,
           },
           model: {
             authority,
@@ -180,9 +177,16 @@ export function createProductionPersonVmSources(
             route: modelRuntime.route,
             transport: modelRuntime.transport,
             scopeStream: modelRuntime.scopeStream,
+            ...(routing.scoped
+              ? {
+                  selectProvider: routing.provider,
+                  closeTransport: routing.close,
+                  confirmTransportStopped: routing.confirmTransportStopped,
+                }
+              : {}),
             async resolveCall(headers, binding, signal) {
-              await modelRuntime.assertCurrent(signal);
               const call = await calls.resolveCall(headers, binding, signal);
+              await routing.assertCurrent(call, signal);
               owned.redeem?.(call, signal);
               return call;
             },
@@ -192,7 +196,7 @@ export function createProductionPersonVmSources(
         const failures = await closeSources([
           () => entry?.close(),
           () => native?.close(),
-          modelRuntime.close,
+          routing.close,
         ]);
         if (failures.length)
           throw new AggregateError(

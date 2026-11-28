@@ -126,6 +126,12 @@ export type ProductionPersonVmHostSources = Readonly<{
       llm: Parameters<typeof createDshGatewayProvider>[0];
       route: Parameters<typeof createDshGatewayProvider>[1];
       scopeStream?: DshGatewayStreamScope;
+      selectProvider?(binding: ModelCallBinding): GatewayProvider;
+      closeTransport?(): Promise<void>;
+      confirmTransportStopped?(
+        ownerId: string,
+        signal: AbortSignal,
+      ): Promise<string>;
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
@@ -428,9 +434,11 @@ export function createProductionPersonVmHost(input: {
       let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      const transport = sourceOwner?.model.transport;
-      if (transport) await settle([transport.close]);
-      if (transport && modelOwner?.reconcileClosedOwner && providers) {
+      const closeTransport =
+        sourceOwner?.model.closeTransport ??
+        sourceOwner?.model.transport?.close;
+      if (closeTransport) await settle([closeTransport]);
+      if (closeTransport && modelOwner?.reconcileClosedOwner && providers) {
         const cleanup = AbortSignal.timeout(
           providers.configuration.lifecycle.cleanupTimeoutMs,
         );
@@ -756,15 +764,19 @@ export function createProductionPersonVmHost(input: {
       const modelOwner = createModelGateway({
         ownerId: modelOwnerId,
         authority: modelSource.authority,
-        provider: createDshGatewayProvider(
-          modelSource.llm,
-          modelRoute,
-          modelSource.transport?.fetchOwned,
-          modelSource.transport?.beforeDispatch,
-          modelSource.scopeStream,
-        ),
+        provider:
+          modelSource.selectProvider ??
+          createDshGatewayProvider(
+            modelSource.llm,
+            modelRoute,
+            modelSource.transport?.fetchOwned,
+            modelSource.transport?.beforeDispatch,
+            modelSource.scopeStream,
+          ),
         store: storeModel,
-        confirmTransportStopped: modelSource.transport?.stoppedEvidence,
+        confirmTransportStopped:
+          modelSource.confirmTransportStopped ??
+          modelSource.transport?.stoppedEvidence,
         admission: {
           boundary: admission,
           participant: admission.participant('gateway'),
@@ -786,8 +798,9 @@ export function createProductionPersonVmHost(input: {
           signal.throwIfAborted();
           if (
             !sameVmBinding(call.vm, binding) ||
-            call.provider !== modelRoute.provider ||
-            call.model !== modelRoute.model ||
+            (!modelSource.selectProvider &&
+              (call.provider !== modelRoute.provider ||
+                call.model !== modelRoute.model)) ||
             call.context.actor.type !== 'user' ||
             call.context.actor.id !== binding.personId ||
             call.context.organizationId !== binding.organizationId

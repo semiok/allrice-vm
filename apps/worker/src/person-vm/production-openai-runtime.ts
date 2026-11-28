@@ -6,7 +6,9 @@ import {
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
+  classifyDeepSeek,
   classifyOpenAiResponses,
+  DEEPSEEK_API_BASE_URL,
   createOwnedModelTransport,
   ModelGatewayError,
   OPENAI_RESPONSES_BASE_URL,
@@ -17,34 +19,71 @@ import {
   type ReadProductionModelImage,
 } from './production-model-images.js';
 
-const provider = 'openai';
-const keyName = 'ALLRICE_OPENAI_API_KEY';
+// Only exact models verified for this opt-in Responses capability.
+const openAiSearchModels = new Set(['gpt-4.1-mini', 'gpt-6.2-astra']);
+
+export type ManagedApiRoute =
+  | Readonly<{
+      provider: 'openai';
+      model: string;
+      protocol: 'responses';
+      search?: boolean;
+    }>
+  | Readonly<{
+      provider: 'deepseek';
+      model: string;
+      protocol: 'chat' | 'responses';
+      search?: boolean;
+    }>;
 
 export async function createProductionOpenAiRuntime(
   lifetime: AbortSignal,
   ownerId: string,
   readModelImage?: ReadProductionModelImage,
+  configured?: ManagedApiRoute,
+  allowUnavailable = false,
 ) {
   lifetime.throwIfAborted();
-  const model = process.env.ALLRICE_DSH_OPENAI_MODEL;
-  const approved = process.env.ALLRICE_DSH_OPENAI_WEB_SEARCH_MODEL;
-  const key = process.env[keyName];
+  const provider = configured?.provider ?? 'openai';
+  const protocol = configured?.protocol ?? 'responses';
+  const model = configured?.model ?? process.env.ALLRICE_DSH_OPENAI_MODEL;
+  const legacySearchModel = process.env.ALLRICE_DSH_OPENAI_WEB_SEARCH_MODEL;
+  const search = configured
+    ? configured.search === true
+    : legacySearchModel !== undefined && legacySearchModel === model;
   if (
     !model ||
     model.length > 128 ||
     model.trim() !== model ||
-    (approved !== undefined && approved !== model)
+    (!configured &&
+      legacySearchModel !== undefined &&
+      legacySearchModel !== model) ||
+    (search &&
+      (protocol !== 'responses' ||
+        (provider === 'deepseek'
+          ? model !== 'deepseek-v4-pro'
+          : !openAiSearchModels.has(model))))
   )
     throw new ModelGatewayError('BINDING_INVALID');
-  if (!key || key.trim() !== key)
+  const keyName =
+    provider === 'openai'
+      ? 'ALLRICE_OPENAI_API_KEY'
+      : 'ALLRICE_DEEPSEEK_API_KEY';
+  const key = process.env[keyName];
+  const credential = key && key.trim() === key ? key : undefined;
+  const requireCredentialAtBoot = !configured && !allowUnavailable;
+  if (requireCredentialAtBoot && !credential)
     throw new ModelGatewayError('AUTHORIZATION_DENIED');
 
   const route: DshGatewayRoute = Object.freeze({
     provider,
     model,
     transport: 'sse',
-    classify: classifyOpenAiResponses,
-    ...(approved === model ? { hostedWebSearch: true as const } : {}),
+    classify:
+      provider === 'openai'
+        ? classifyOpenAiResponses
+        : (input, init) => classifyDeepSeek(protocol, input, init),
+    ...(search ? { hostedWebSearch: true as const } : {}),
   });
   const stop = new AbortController();
   const revoked = AbortSignal.any([lifetime, stop.signal]);
@@ -54,7 +93,10 @@ export async function createProductionOpenAiRuntime(
   context.provide(
     DSH_LAUNCH_ENVIRONMENT_KEY,
     createLaunchEnvironmentSnapshot([
-      { source: 'process', values: { [keyName]: key } },
+      {
+        source: 'process',
+        values: credential ? { [keyName]: credential } : {},
+      },
     ]),
   );
   const images = readModelImage
@@ -77,7 +119,7 @@ export async function createProductionOpenAiRuntime(
   }
   async function assertCurrent(signal?: AbortSignal) {
     signal?.throwIfAborted();
-    if (process.env[keyName] !== key)
+    if (!credential || process.env[keyName] !== credential)
       stop.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
     revoked.throwIfAborted();
     return revoked;
@@ -104,11 +146,36 @@ export async function createProductionOpenAiRuntime(
       .plugin(PiAi, {
         providers: {
           [provider]: {
-            api: 'openai-responses',
+            api:
+              protocol === 'chat' ? 'openai-completions' : 'openai-responses',
             apiKeyEnv: keyName,
-            baseURL: OPENAI_RESPONSES_BASE_URL,
+            baseURL:
+              provider === 'openai'
+                ? OPENAI_RESPONSES_BASE_URL
+                : DEEPSEEK_API_BASE_URL,
             transport: 'sse',
-            models: [{ id: model }],
+            models: [
+              {
+                id: model,
+                ...(provider === 'deepseek'
+                  ? { reasoningEfforts: false as const }
+                  : {}),
+                ...(provider === 'openai' && model === 'gpt-6.2-astra'
+                  ? {
+                      contextWindow: 1_050_000,
+                      maxTokens: 128_000,
+                      input: ['text', 'image'],
+                      reasoningEfforts: {
+                        low: 'low',
+                        medium: 'medium',
+                        high: 'high',
+                        xhigh: 'xhigh',
+                        max: 'max',
+                      },
+                    }
+                  : {}),
+              },
+            ],
           },
         },
       })
@@ -118,7 +185,7 @@ export async function createProductionOpenAiRuntime(
       model,
       revoked,
     );
-    await assertCurrent();
+    if (requireCredentialAtBoot) await assertCurrent();
     const llm: Pick<LlmRuntime, 'prepareCall'> = {
       async prepareCall(config, signal) {
         if (config.provider !== provider || config.model !== model)
@@ -153,6 +220,10 @@ export async function createProductionOpenAiRuntime(
       revoked,
       assertCurrent,
       close,
+      async readCatalogModelInfo(signal: AbortSignal) {
+        signal.throwIfAborted();
+        return modelInfo;
+      },
       async readModelInfo(signal: AbortSignal) {
         await assertCurrent(signal);
         return modelInfo;

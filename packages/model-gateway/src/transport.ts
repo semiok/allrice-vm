@@ -1,3 +1,8 @@
+import {
+  DEEPSEEK_CHAT_URL,
+  DEEPSEEK_RESPONSES_URL,
+  prepareDeepSeekChatRequest,
+} from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
@@ -156,6 +161,9 @@ export function createMeteredTransport(options: {
       };
       const observer = new WireUsageObserver(classification.protocol);
       const nativeClose = observeNativeClose();
+      const confirmedClose = async () =>
+        (await nativeClose.confirmed()) ||
+        (await options.provider.confirmTransportClosed?.()) === true;
       let started = false;
       let dispatched = false;
       let transportJoined = false;
@@ -227,11 +235,15 @@ export function createMeteredTransport(options: {
         let request = new Request(input, requestInit);
         const approved = options.provider.hostedWebSearch;
         const publicResponses =
-          request.url === OPENAI_RESPONSES_URL &&
+          ((options.binding.provider === 'openai' &&
+            request.url === OPENAI_RESPONSES_URL) ||
+            (options.binding.provider === 'deepseek' &&
+              request.url === DEEPSEEK_RESPONSES_URL)) &&
           request.method === 'POST' &&
           classification.kind === 'model' &&
-          classification.protocol === 'openai-responses' &&
-          options.binding.provider === 'openai';
+          classification.protocol === 'openai-responses';
+        const requireCloseProof =
+          publicResponses || options.provider.requireTransportProof;
         const hostedSearch =
           publicResponses &&
           options.binding.native.attemptKind === 'assistant' &&
@@ -242,6 +254,16 @@ export function createMeteredTransport(options: {
             request,
             options.binding.model,
             hostedSearch,
+            options.binding.provider === 'deepseek',
+          );
+        else if (
+          options.binding.provider === 'deepseek' &&
+          request.url === DEEPSEEK_CHAT_URL &&
+          classification.protocol === 'openai-chat-completions'
+        )
+          request = await prepareDeepSeekChatRequest(
+            request,
+            options.binding.model,
           );
         const dispatchInit: RequestInit & { duplex: 'half' } = {
           body:
@@ -268,7 +290,7 @@ export function createMeteredTransport(options: {
         status = response.status;
         if (!response.body) {
           if (
-            publicResponses &&
+            requireCloseProof &&
             !(await nativeClose.waitForSettlement(requestSignal))
           )
             throw new ModelGatewayError('LEDGER_UNAVAILABLE');
@@ -297,11 +319,11 @@ export function createMeteredTransport(options: {
             // reader.cancel is awaited; an abort request alone never releases a slot.
             try {
               await reader.cancel(requestSignal.reason);
-              if (publicResponses && !(await nativeClose.confirmed()))
+              if (requireCloseProof && !(await confirmedClose()))
                 throw new ModelGatewayError('LEDGER_UNAVAILABLE');
               transportJoined = true;
             } catch (error) {
-              if (await nativeClose.confirmed()) {
+              if (await confirmedClose()) {
                 transportJoined = true;
                 cleanup();
                 await finish(
@@ -412,7 +434,7 @@ export function createMeteredTransport(options: {
         // the dispatched request stopped. Use the same real native close facts
         // as the reader path; keep unknown wire facts and its exact slot.
         if (dispatched && !transportJoined) {
-          transportJoined = await nativeClose.confirmed();
+          transportJoined = await confirmedClose();
           if (!transportJoined) {
             closureKnown = false;
             ledgerFailure ??= error;

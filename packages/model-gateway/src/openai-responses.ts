@@ -55,13 +55,7 @@ function isNeutralContent(value: unknown, assistant = false): boolean {
   );
 }
 
-/** Every host API attempt uses stateless, provider-neutral history. The SDK
- * can supply local function calls/results, but cannot supply hosted state. */
-export async function prepareOpenAiResponsesRequest(
-  request: Request,
-  model: string,
-  hostedSearch: boolean,
-): Promise<Request> {
+export async function readModelJsonRequest(request: Request) {
   if (
     !request.body ||
     !/^application\/json(?:\s*;|$)/i.test(
@@ -96,6 +90,33 @@ export async function prepareOpenAiResponsesRequest(
   } catch {
     throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
   }
+  return payload;
+}
+
+export function replaceModelJsonRequest(
+  request: Request,
+  payload: Record<string, unknown>,
+) {
+  const headers = new Headers(request.headers);
+  headers.delete('content-length');
+  return new Request(request.url, {
+    method: request.method,
+    headers,
+    signal: request.signal,
+    redirect: request.redirect,
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Every host API attempt uses stateless, provider-neutral history. The SDK
+ * can supply local function calls/results, but cannot supply hosted state. */
+export async function prepareOpenAiResponsesRequest(
+  request: Request,
+  model: string,
+  hostedSearch: boolean,
+  deepSeek = false,
+): Promise<Request> {
+  const payload = await readModelJsonRequest(request);
   if (
     payload.model !== model ||
     payload.stream !== true ||
@@ -154,15 +175,19 @@ export async function prepareOpenAiResponsesRequest(
     return item;
   });
   if (hostedSearch) payload.tools = [...tools, { type: 'web_search' }];
-  const headers = new Headers(request.headers);
-  headers.delete('content-length');
-  return new Request(request.url, {
-    method: request.method,
-    headers,
-    signal: request.signal,
-    redirect: request.redirect,
-    body: JSON.stringify(payload),
-  });
+  if (deepSeek) {
+    // DeepSeek Responses is stateless and does not accept SDK cache and
+    // encrypted replay extensions. Plain tool continuation needs no reasoning.
+    for (const field of [
+      'include',
+      'prompt_cache_key',
+      'prompt_cache_retention',
+      'service_tier',
+    ])
+      delete payload[field];
+    payload.reasoning = { effort: 'none' };
+  }
+  return replaceModelJsonRequest(request, payload);
 }
 
 type Citation = Readonly<{ start: number; end: number; url: string }>;

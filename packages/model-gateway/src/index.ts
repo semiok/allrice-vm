@@ -38,3 +38,6 @@ export {
   OPENAI_RESPONSES_BASE_URL,
 } from './openai-responses.ts';
 export type { DshGatewayStreamScope } from './dsh-provider.ts';
+export { sameModelRoute, selectScopedModel } from './scoped-routes.ts';
+export type { ScopedModelRule } from './scoped-routes.ts';
+export { classifyDeepSeek, DEEPSEEK_API_BASE_URL } from './deepseek-api.ts';

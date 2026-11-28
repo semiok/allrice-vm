@@ -157,9 +157,11 @@ export async function createProductionCodexRuntime(
   lifetime: AbortSignal,
   ownerId: string,
   readModelImage?: ReadProductionModelImage,
+  approvedModel?: string,
 ) {
   lifetime.throwIfAborted();
   const model =
+    approvedModel ??
     process.env.ALLRICE_DSH_CODEX_MODEL ??
     process.env.ALLRICE_CODEX_MODEL ??
     'gpt-6.1-sol';
@@ -233,6 +235,32 @@ export async function createProductionCodexRuntime(
     );
     return task;
   }
+  let catalog: ReturnType<LlmRuntime['resolveModelInfo']> | undefined;
+  function readCatalogModelInfo(signal: AbortSignal) {
+    signal.throwIfAborted();
+    return (catalog ??= (async () => {
+      const host = new Context();
+      try {
+        await host.plugin(Llm).await();
+        await host
+          .plugin(PiAi, {
+            providers: {
+              [provider]: {
+                transport: 'sse',
+                models: [managedCodexModel(model)],
+              },
+            },
+          })
+          .await();
+        return await host.llm.resolveModelInfo(provider, model, lifetime);
+      } finally {
+        await host.fiber.dispose();
+      }
+    })()).then((info) => {
+      signal.throwIfAborted();
+      return info;
+    });
+  }
   const llm: Pick<LlmRuntime, 'prepareCall'> = {
     async prepareCall(config, signal) {
       if (config.provider !== provider || config.model !== model)
@@ -268,6 +296,7 @@ export async function createProductionCodexRuntime(
   return Object.freeze({
     llm,
     route,
+    readCatalogModelInfo,
     async readModelInfo(signal: AbortSignal) {
       return (await current(signal)).modelInfo;
     },
@@ -292,6 +321,7 @@ export async function createProductionCodexRuntime(
       stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
       return (closing = Promise.allSettled([
         transport.close(),
+        catalog,
         operations.then(async () => {
           if (generation) retire(generation);
           await Promise.allSettled([...retiring]);
