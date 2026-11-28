@@ -133,6 +133,7 @@ export function createProductionPersonVmSources(
           vm: host.vm,
           admission,
           lifetime,
+          hasScopedRoutes: routing.applies,
           confirmPhysical: (context, identity, binding, active) =>
             host.current.withCurrentSelection(context, identity, active, () =>
               host.vm.assertRunningReadiness(
@@ -144,13 +145,21 @@ export function createProductionPersonVmSources(
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, modelLifetime, signal]);
-            const startupRoute = routing.freshRootRoute(input.binding);
-            const generation = await routing.assertFreshRootCurrent(
+            const startupRoute = routing.rootRoute(
+              input.binding,
+              input.rootNativeSessionId,
+            );
+            const generation = await routing.assertRootCurrent(
               input.binding,
               active,
+              input.rootNativeSessionId,
             );
             const guest = await owned.resolveSendRoute(input, active);
-            await routing.assertFreshRootCurrent(input.binding, active);
+            await routing.assertRootCurrent(
+              input.binding,
+              active,
+              input.rootNativeSessionId,
+            );
             active.throwIfAborted();
             generation.throwIfAborted();
             guest.revoked.throwIfAborted();
@@ -185,9 +194,10 @@ export function createProductionPersonVmSources(
           }),
           runtime: {
             async readiness(binding, signal) {
-              if (!routing.applies(binding))
-                await modelRuntime.assertCurrent(signal);
-              return installed.readiness(binding, signal);
+              const ready = await installed.readiness(binding, signal);
+              const route = await routing.assertRootCurrent(binding, signal);
+              route.throwIfAborted();
+              return ready;
             },
             activity: owned.activity.bind(owned),
             async close() {

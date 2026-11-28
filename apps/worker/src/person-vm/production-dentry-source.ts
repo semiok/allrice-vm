@@ -8,6 +8,7 @@ import {
 import {
   DataAccessError,
   ensureDEntryNativeRoot,
+  getDEntryHistoryRootPin,
   readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
   runDEntryAdmittedActivity,
@@ -57,6 +58,7 @@ export type ResolveProductionDEntrySendRoute = (
     identity: DEntryIdentity;
     binding: PersonVmBinding;
     modelAdapterId?: string;
+    rootNativeSessionId?: string;
   }>,
   signal: AbortSignal,
 ) => Promise<
@@ -105,6 +107,7 @@ export function installProductionDEntrySource(input: {
     signal: AbortSignal,
   ): Promise<void>;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
+  hasScopedRoutes?(binding: PersonVmBinding): boolean;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -154,6 +157,12 @@ export function installProductionDEntrySource(input: {
     return catalog.owner;
   }
 
+  function routeThread(binding: PersonVmBinding, identity: DEntryIdentity) {
+    return input.hasScopedRoutes?.(binding)
+      ? (identity.threadId ?? undefined)
+      : undefined;
+  }
+
   async function proveSelectedEmployee(
     context: RequestContext,
     identity: DEntryIdentity,
@@ -175,6 +184,7 @@ export function installProductionDEntrySource(input: {
         binding,
         identity.employeeInstanceId,
         current.signal,
+        routeThread(binding, identity),
       );
       const authenticated = input.startup.assertAuthenticatedEntry
         ? input.startup.assertAuthenticatedEntry(
@@ -277,14 +287,21 @@ export function installProductionDEntrySource(input: {
           );
           const { binding } = current.view.receipt;
           const employee = identity.employeeInstanceId;
+          const threadId = routeThread(binding, identity);
           // Gate on the existing proof for this exact local owner/employee.
           // The refresh uses its actual authenticated graph and current route.
-          input.startup.assertVerifiedEditor(binding, current.signal, employee);
+          if (!threadId)
+            input.startup.assertVerifiedEditor(
+              binding,
+              current.signal,
+              employee,
+            );
           const proof = await input.startup.ensureVerifiedEditor(
             context,
             binding,
             employee,
             current.signal,
+            threadId,
           );
           const authenticated = input.startup.assertAuthenticatedEntry
             ? input.startup.assertAuthenticatedEntry(
@@ -343,21 +360,24 @@ export function installProductionDEntrySource(input: {
           denied();
         const scope = structuredClone(context);
         const expected = Object.freeze({ ...identity });
+        const threadId = routeThread(binding, expected);
         const route = await input.startup.ensureVerifiedEditor(
           scope,
           binding,
           expected.employeeInstanceId,
           active,
+          threadId,
         );
         const revoked = AbortSignal.any([lifetime, owner.revoked, route]);
         const assertCurrent = (caller: AbortSignal) =>
           own(AbortSignal.any([revoked, caller]), async (signal) => {
             await owner.assertCurrent(scope, signal);
-            input.startup.assertVerifiedEditor(
-              binding,
-              signal,
-              expected.employeeInstanceId,
-            );
+            if (!threadId)
+              input.startup.assertVerifiedEditor(
+                binding,
+                signal,
+                expected.employeeInstanceId,
+              );
             sameHost(owner, expected);
             signal.throwIfAborted();
           });
@@ -500,7 +520,15 @@ export function installProductionDEntrySource(input: {
   >();
   const uninstallProof = input.startup.installStartingEditorProof(
     (
-      { binding, endpoint, context, modelAdapterId, profile, readModels },
+      {
+        binding,
+        endpoint,
+        context,
+        modelAdapterId,
+        threadId,
+        profile,
+        readModels,
+      },
       signal,
     ) =>
       own(signal, async (active) => {
@@ -512,7 +540,7 @@ export function installProductionDEntrySource(input: {
           employeeInstanceId: endpoint.employeeInstanceId,
           employeeRevision: endpoint.employeeRevision,
           employeeVersionId: endpoint.employeeVersionId,
-          threadId: null,
+          threadId: threadId ?? null,
         };
         const release = await timing.run('rollout', readDEntryReleasePolicy);
         active.throwIfAborted();
@@ -524,12 +552,27 @@ export function installProductionDEntrySource(input: {
           const identity = await requireDEntryNativeIdentity(scope, {
             workspaceId: endpoint.workspaceId,
             employeeInstanceId: endpoint.employeeInstanceId,
+            ...(threadId && { threadId }),
           });
           active.throwIfAborted();
           if (!sameDEntryIdentity(identity, expected)) denied();
           return identity;
         }
         const identity = await timing.run('current-authority', current);
+        const root = threadId
+          ? await getDEntryHistoryRootPin(scope, {
+              threadId,
+              workspaceId: expected.workspaceId,
+              employeeInstanceId: expected.employeeInstanceId,
+            })
+          : null;
+        active.throwIfAborted();
+        if (
+          root &&
+          (root.vmId !== binding.vmId ||
+            !sameDEntryIdentity(root.identity, identity))
+        )
+          denied();
         const seal = await timing.run('release-seal', () =>
           readWorkerEmployeeWebSeal(active),
         );
@@ -546,7 +589,13 @@ export function installProductionDEntrySource(input: {
         const resolveRoute = () =>
           timing.run('send-route', () =>
             input.resolveSendRoute(
-              { context: scope, identity, binding, modelAdapterId },
+              {
+                context: scope,
+                identity,
+                binding,
+                modelAdapterId,
+                ...(root && { rootNativeSessionId: root.rootNativeSessionId }),
+              },
               active,
             ),
           );

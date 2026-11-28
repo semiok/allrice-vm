@@ -332,13 +332,13 @@ export async function createProductionModelRouting(
         throw new ModelGatewayError('AUTHORIZATION_DENIED');
       return runtime;
     }
-    function freshRootRoute(binding: VmOwner) {
+    function rootRoute(binding: VmOwner, rootNativeSessionId?: string) {
       // A new conversation has no known native ID. Exact-session rules can
       // authorize their existing conversations, not an arbitrary future root.
       return selectScopedModel(
         rulesFor(binding),
         {
-          sessionId: '',
+          sessionId: rootNativeSessionId ?? '',
           parentSessionId: null,
           attemptKind: 'assistant',
         },
@@ -350,9 +350,15 @@ export async function createProductionModelRouting(
       close,
       scoped: config !== undefined,
       select,
-      freshRootRoute,
-      assertFreshRootCurrent(binding: VmOwner, signal: AbortSignal) {
-        return authorisedRuntime(freshRootRoute(binding)).assertCurrent(signal);
+      rootRoute,
+      assertRootCurrent(
+        binding: VmOwner,
+        signal: AbortSignal,
+        rootNativeSessionId?: string,
+      ) {
+        return authorisedRuntime(
+          rootRoute(binding, rootNativeSessionId),
+        ).assertCurrent(signal);
       },
       applies: (binding: VmOwner) => rulesFor(binding).length > 0,
       provider(call: ModelCallBinding) {

@@ -165,6 +165,8 @@ producer 的 sticky unsafe 在 CLEANUP_INCOMPLETE 后保留 durable permit；首
 
 每条规则都绑定组织和人。可组合精确原生 `sessionId`、直接父会话 `parentSessionId`、`root` 或 `subagent` 范围和原生任务档 `assistant`、`compaction`、`session-title`。第一条匹配生效，未匹配沿用默认路由。供应商和模型必须在宿主配置中注册且组合唯一。DSH 通过公开 `agent/request` 和 LLM adapter 记录普通对话实际选中的模型，宿主签发凭据前独立验证归属、调用阶段和选路。标题和压缩可按人指定独立档位，由 DSH 原生预设在准备请求前应用。维护档规则仅包含人和任务阶段，未指定时跟随该会话的宿主对话规则。只有未命中对话规则的会话走启动默认。
 
+DSH rc.2 在宿主选路钩子之前按会话的原生模型选择校验图片。保留会话切到支持图片的宿主路由时，原生选择若仍为纯文本模型，图片仍会被原生准入拒绝。普通文本请求和系统提示词使用当前受管路由。
+
 OpenAI Responses 的 `ALLRICE_OPENAI_API_KEY` 和 DeepSeek API 的 `ALLRICE_DEEPSEEK_API_KEY` 仅由 Worker 宿主加载。DeepSeek 路由只能使用官方 `/chat/completions` 或 `/responses`，每个路由严格固定一个协议。`search: true` 仅支持已批准的 OpenAI Responses 模型及 DeepSeek Responses 的 `deepseek-v4-pro`。OpenAI 首批启用的精确型号为 `gpt-4.1-mini` 和 `gpt-6.2-astra`。DeepSeek 的 Chat 和 Responses 固定使用无推理状态回放的工具续跑模式，兼容 DSH 的普通函数工具。启用宿主选路的 VM 通过 DSH 预设关闭独立 Search，保留 Fetch；批准的普通对话由网关注入供应商自带搜索，并沿用可验证的引用投影。
 
 路由使用同一网关、每人并发槽与 PostgreSQL 账本。每笔 HTTP attempt 通过 `call_id` 关联宿主签发的真实 provider/model；原始账本无需数据迁移。路由使用独立连接池和撤权信号，宿主停止证明要等所有池真实关闭。

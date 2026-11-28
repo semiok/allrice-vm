@@ -266,13 +266,16 @@ it('proves a fresh root independently of a maintenance-only rule or an exact pri
     images,
   );
   cleanups.push(unready.close);
-  expect(unready.freshRootRoute(root.vm)).toMatchObject({
+  expect(unready.rootRoute(root.vm)).toMatchObject({
     provider: 'openai',
     model: 'gpt-6.2-astra',
   });
   await expect(
-    unready.assertFreshRootCurrent(base.vm, signal),
+    unready.assertRootCurrent(base.vm, signal),
   ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  expect(unready.rootRoute(root.vm, root.native.sessionId)).toEqual(
+    modelRoutes.openai,
+  );
   config.rules.push({
     organizationId: root.vm.organizationId,
     personId: root.vm.personId,
@@ -287,9 +290,9 @@ it('proves a fresh root independently of a maintenance-only rule or an exact pri
     images,
   );
   cleanups.push(routed.close);
-  expect(routed.freshRootRoute(root.vm)).toEqual(modelRoutes.chat);
+  expect(routed.rootRoute(root.vm)).toEqual(modelRoutes.chat);
   await expect(
-    routed.assertFreshRootCurrent(root.vm, signal),
+    routed.assertRootCurrent(root.vm, signal),
   ).resolves.toMatchObject({ aborted: false });
 });
 

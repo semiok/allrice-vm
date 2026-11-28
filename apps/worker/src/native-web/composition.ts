@@ -68,6 +68,7 @@ type StartingEditorProof = (
     endpoint: Endpoint;
     context: RequestContext;
     modelAdapterId?: string;
+    threadId?: string;
     profile: Parameters<
       Parameters<NativeWebOwner['verifyStartingEditor']>[2]
     >[0];
@@ -1128,6 +1129,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       employeeInstanceId: string,
       caller: AbortSignal,
+      threadId?: string,
     ) {
       return track(async () => {
         const group = running.get(binding.vmId);
@@ -1157,6 +1159,7 @@ export function createAssignedNativeWebStartup(input: {
                 endpoint: selected.endpoint,
                 context,
                 modelAdapterId,
+                threadId,
                 profile,
                 readModels,
               },
@@ -1174,7 +1177,7 @@ export function createAssignedNativeWebStartup(input: {
         const enrolled = group.verifiedEmployees.get(employeeInstanceId);
         if (enrolled && !enrolled.aborted && !modelAdapter) return enrolled;
         // Production rechecks the route even on a sealed profile cache hit.
-        group.verifiedEmployees.set(employeeInstanceId, proof);
+        if (!threadId) group.verifiedEmployees.set(employeeInstanceId, proof);
         return proof;
       });
     },
@@ -1304,6 +1307,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       employeeInstanceId: string,
       signal: AbortSignal,
+      threadId?: string,
     ): Promise<AbortSignal>;
     assertAuthenticatedGroup(
       binding: PersonVmBinding,

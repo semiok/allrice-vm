@@ -23,6 +23,7 @@ import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
 const state = vi.hoisted(() => ({
   settings: vi.fn<typeof readPlatformModelSettings>(),
+  statementTimeout: vi.fn(async () => []),
   subscription:
     vi.fn<
       (
@@ -33,7 +34,16 @@ const state = vi.hoisted(() => ({
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
-  getDatabase: () => state.subscription,
+  getDatabase: () => ({
+    begin: (_mode: string, query: (tx: typeof state.subscription) => unknown) =>
+      query(((parts: TemplateStringsArray, connectionId: string) =>
+        parts[0].startsWith('set local statement_timeout')
+          ? state.statementTimeout()
+          : state.subscription(
+              parts,
+              connectionId,
+            )) as typeof state.subscription),
+  }),
   readPlatformModelSettings: state.settings,
 }));
 vi.mock('../codex-subscription-home.js', () => ({
@@ -240,6 +250,38 @@ it('does not enable the route without a grant from the managed store', async () 
     expect((await host.assertCurrent()).aborted).toBe(false);
   } finally {
     await host.close();
+  }
+});
+
+it('proves both transports stopped while a timed database read is still settling', async () => {
+  await saveSyntheticGrant();
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'slot-query-fixture',
+  );
+  const entered = deferred();
+  const held = deferred<{ slot: 1; revision: string }[]>();
+  state.statementTimeout.mockClear();
+  state.subscription.mockImplementationOnce(() => {
+    entered.resolve();
+    return held.promise;
+  });
+  const reading = host.assertCurrent();
+  try {
+    await entered.promise;
+    const closing = host.close();
+    const proof = await host.confirmTransportStopped(
+      'slot-query-fixture',
+      AbortSignal.timeout(1500),
+    );
+    expect(proof).toContain('undici-owner-stopped:slot-query-fixture:auth:');
+    expect(state.statementTimeout).toHaveBeenCalledOnce();
+    held.resolve([{ slot: 1, revision: '1' }]);
+    await expect(reading).rejects.toMatchObject({ code: 'ADMISSION_CLOSED' });
+    await closing;
+  } finally {
+    held.resolve([{ slot: 1, revision: '1' }]);
+    await Promise.allSettled([reading, host.close()]);
   }
 });
 

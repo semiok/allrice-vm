@@ -26,8 +26,16 @@ const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
 const oauthEndpoint = 'https://auth.openai.com/oauth/token';
 
-async function readSelectedSubscription(connectionId: string) {
-  const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
+async function readSelectedSubscription(
+  connectionId: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const [selected] = await getDatabase().begin('read only', async (tx) => {
+    signal.throwIfAborted();
+    await tx`set local statement_timeout = '3000ms'`;
+    signal.throwIfAborted();
+    return tx<{ slot: 1 | 2; revision: string }[]>`
     select slot, extract(epoch from updated_at)::text as revision
     from allrice_codex_subscriptions
     where enabled and exists (
@@ -39,7 +47,9 @@ async function readSelectedSubscription(connectionId: string) {
         and c.status='ready' and p.enabled
         and p.provider_key in ('codex','openai-codex') and p.auth_mode='chatgpt_subscription'
     )
-  `;
+    `;
+  });
+  signal.throwIfAborted();
   if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
   return selected;
 }
@@ -88,6 +98,7 @@ async function openCodexGeneration(
   model: string,
   reasoning: PlatformModelConfiguration['reasoningEffort'],
   images: ReturnType<typeof createProductionModelImages> | undefined,
+  trackAuth: <T>(work: Promise<T>) => Promise<T>,
 ) {
   lifetime.throwIfAborted();
   const historicalIds =
@@ -118,9 +129,11 @@ async function openCodexGeneration(
         return Promise.reject(new ModelGatewayError('AUTHORIZATION_DENIED'));
       // Join the original DSH operation, including writer lock and persistence.
       const release = retain();
-      return withGatewayAuthTransaction(() =>
-        super.modifyRecord(...args),
-      ).finally(release);
+      return trackAuth(
+        withGatewayAuthTransaction(() => super.modifyRecord(...args)).finally(
+          release,
+        ),
+      );
     }
   }
 
@@ -134,7 +147,7 @@ async function openCodexGeneration(
     const active = AbortSignal.any([signal, revoked]);
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
-    const current = await readSelectedSubscription(connectionId);
+    const current = await readSelectedSubscription(connectionId, active);
     active.throwIfAborted();
     if (
       !record.configured ||
@@ -226,6 +239,13 @@ export async function createProductionCodexRuntime(
   // A route may stop its model sockets without interrupting a rotating OAuth
   // grant that another route sharing this slot will subsequently need.
   const oauth = createOwnedModelTransport(ownerId + ':auth');
+  const authTransactions = new Set<Promise<unknown>>();
+  function trackAuth<T>(work: Promise<T>) {
+    authTransactions.add(work);
+    const release = () => authTransactions.delete(work);
+    void work.then(release, release);
+    return work;
+  }
   let generation: Awaited<ReturnType<typeof openCodexGeneration>> | undefined;
   let operations = Promise.resolve();
   const retiring = new Set<Promise<void>>();
@@ -254,7 +274,7 @@ export async function createProductionCodexRuntime(
           await generation.assertCurrent(active);
           return generation;
         }
-        const selection = await readSelectedSubscription(connectionId);
+        const selection = await readSelectedSubscription(connectionId, active);
         active.throwIfAborted();
         generation = await openCodexGeneration(
           revoked,
@@ -263,6 +283,7 @@ export async function createProductionCodexRuntime(
           model,
           reasoningEffort,
           images,
+          trackAuth,
         );
         active.throwIfAborted();
         return generation;
@@ -355,10 +376,16 @@ export async function createProductionCodexRuntime(
       };
     },
   };
+  let oauthStopped: Promise<void> | undefined;
   async function stoppedEvidence(candidate: string, signal: AbortSignal) {
+    signal.throwIfAborted();
+    if (candidate !== ownerId || !oauthStopped)
+      throw new ModelGatewayError('AUTHORIZATION_DENIED');
     const [modelEvidence, oauthEvidence] = await Promise.all([
       transport.stoppedEvidence(candidate, signal),
-      oauth.stoppedEvidence(candidate + ':auth', signal),
+      oauthStopped.then(() =>
+        oauth.stoppedEvidence(candidate + ':auth', signal),
+      ),
     ]);
     signal.throwIfAborted();
     return modelEvidence + '|' + oauthEvidence;
@@ -366,21 +393,21 @@ export async function createProductionCodexRuntime(
   function close() {
     if (closing) return closing;
     stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
+    oauthStopped = Promise.allSettled([...authTransactions]).then(() =>
+      oauth.close(),
+    );
     return (closing = Promise.allSettled([
       transport.close(),
+      oauthStopped,
       catalog,
       operations.then(async () => {
         if (generation) retire(generation);
         await Promise.allSettled([...retiring]);
-        try {
-          if (retirementFailures.length)
-            throw new AggregateError(
-              retirementFailures,
-              'CODEX_GENERATION_CLOSE_UNKNOWN',
-            );
-        } finally {
-          await oauth.close();
-        }
+        if (retirementFailures.length)
+          throw new AggregateError(
+            retirementFailures,
+            'CODEX_GENERATION_CLOSE_UNKNOWN',
+          );
       }),
     ]).then((results) => {
       const failures = results.flatMap((result) =>
