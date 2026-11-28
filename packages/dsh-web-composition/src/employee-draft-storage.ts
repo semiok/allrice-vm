@@ -236,7 +236,7 @@ export function installEmployeeDraftStorage({
   window.addEventListener(
     'storage',
     (event) => {
-      if (event.storageArea !== storage || !event.key) return;
+      if (!event.key || (storage && event.storageArea !== storage)) return;
       if (
         conversationKey(event.key) ||
         (event.key.startsWith(managedPrefix) &&

@@ -1482,8 +1482,15 @@ it
             parent.localStorage.setItem(otherDraft, 'kept draft');
             const next = 'dsh.conversation.root';
             localStorage.setItem(next, 'volatile draft');
+            const seen: string[] = [];
             window.addEventListener('storage', (event) => {
-              if (event.key) node.dataset.walletLastStorageEvent = event.key;
+              if (
+                event.key?.endsWith('/other/dsh.conversation.other') ||
+                event.key === 'wallet-visible-preference'
+              ) {
+                seen.push(event.key);
+                node.dataset.walletStorageEvents = JSON.stringify(seen);
+              }
             });
             parent.localStorage.setItem(
               namespace + 'other/dsh.conversation.other',
@@ -1508,9 +1515,9 @@ it
           .poll(() =>
             workbench
               .locator('#app')
-              .getAttribute('data-wallet-last-storage-event'),
+              .getAttribute('data-wallet-storage-events'),
           )
-          .toBe('wallet-visible-preference');
+          .toBe(JSON.stringify(['wallet-visible-preference']));
       }
       await context.close();
       return;
