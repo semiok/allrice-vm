@@ -1083,6 +1083,11 @@ function EntryStatus({
                 : '重试'}
           </button>
         )}
+        {status === 'unknown' && (
+          <button type="button" onClick={() => location.reload()}>
+            刷新页面
+          </button>
+        )}
         {canReturn && settled && <a href="/chatflow/4.0">返回员工页</a>}
         {status === 'sign-in' && settled && (
           <a href="/login?next=%2Fchatflow%2F4.0">重新登录</a>

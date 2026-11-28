@@ -1,4 +1,4 @@
-/* global AbortController, fetch */
+/* global AbortController, clearInterval, fetch, setInterval */
 import { on, once } from 'node:events';
 import { URL, URLSearchParams } from 'node:url';
 import process from 'node:process';
@@ -229,6 +229,19 @@ export function createDEntryNativeGateway({
             });
             peer.once('close', stop);
             peer.on('error', stop);
+            if (page && !abort.signal.aborted) {
+              // Keep the proxied browser hop alive with RFC 6455 control
+              // frames. Only the Mux closed/end exchange can prove closure.
+              const keepalive = setInterval(() => {
+                if (peer.readyState === WebSocket.OPEN) peer.ping();
+              }, 25_000);
+              keepalive.unref();
+              abort.signal.addEventListener(
+                'abort',
+                () => clearInterval(keepalive),
+                { once: true },
+              );
+            }
             const forward = async (from, to) => {
               for await (const [message, binary] of on(from, 'message', {
                 signal: abort.signal,
