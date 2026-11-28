@@ -25,5 +25,18 @@ export function hasRootTitle(frame: unknown, root: string) {
   const value = parsed.data;
   return value.type === 'projection'
     ? value.sessionId === root
-    : typeof value.value.projections[root]?.values.title === 'string';
+    : Object.hasOwn(value.value.projections, root) &&
+        typeof value.value.projections[root]?.values.title === 'string';
+}
+
+const rootSnapshot = z.object({
+  type: z.literal('snapshot'),
+  header: z.object({ id: z.string() }),
+  projections: z.object({ values: z.object({ title: z.string().min(1) }) }),
+});
+
+/** An existing title can arrive when follow loads a previously cold session. */
+export function hasRootTitleSnapshot(frame: unknown, root: string) {
+  const parsed = rootSnapshot.safeParse(frame);
+  return parsed.success && parsed.data.header.id === root;
 }

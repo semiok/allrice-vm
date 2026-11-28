@@ -60,6 +60,7 @@ it
     'native-create',
     'outer-create',
     'native-title',
+    'native-title-reopen',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -110,7 +111,37 @@ it
     let projectionSeq = 0;
     let nativeTitle: string | undefined;
     const projectedTitles: string[] = [];
-    if (scenario === 'native-title') {
+    const titleRead = deferred();
+    const allowTitleWrite = deferred();
+    const reopening = scenario === 'native-title-reopen';
+    if (reopening || scenario === 'native-title') {
+      if (reopening) {
+        nativeTitle = '上次关闭前的原生标题';
+        projectionSeq = 1;
+        f.host.catalog.onRename = ({ sessionId, title }) => {
+          expect(sessionId).toBe('root');
+          nativeTitle = title;
+          return { title, seq: ++projectionSeq };
+        };
+        f.host.catalog.snapshotRecords = (sessionId) =>
+          sessionId === 'root'
+            ? [
+                {
+                  type: 'event',
+                  event: {
+                    type: 'session/title',
+                    seq: 1,
+                    time: 1,
+                    data: {
+                      title: nativeTitle!,
+                      source: { kind: 'user' },
+                      messageSeqs: [],
+                    },
+                  },
+                },
+              ]
+            : [];
+      }
       f.host.catalog.readProjections = (sessionId) =>
         sessionId === 'root' && nativeTitle
           ? {
@@ -137,6 +168,10 @@ it
           expect(pin.rootNativeSessionId).toBe('root');
           expect(binding).toMatchObject(f.binding);
           const title = await read(signal);
+          if (!reopening && !projectedTitles.length) {
+            titleRead.resolve();
+            await allowTitleWrite.promise;
+          }
           if (title) projectedTitles.push(title);
         });
       closes.push(async () => {
@@ -1363,38 +1398,65 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
-    if (scenario === 'native-title') {
+    if (reopening || scenario === 'native-title') {
       const row = workbench.locator(
         `[data-row-key="session:${f.selection.threadId}"]`,
       );
+      if (reopening) {
+        await row.getByText(nativeTitle!, { exact: true }).waitFor();
+        await vi.waitFor(() => expect(projectedTitles).toEqual([nativeTitle]));
+        if (!lastScopeId) throw Error('Missing fixture page carrier');
+        const title = '新的原生手动标题';
+        const renameResponse = await page.request.post(
+          `${f.origin}/api/v1/d-entry/native-rpc`,
+          {
+            data: {
+              selection: f.selection,
+              scopeId: lastScopeId,
+              rpcId: randomUUID(),
+              endpoint: 'session/rename',
+              payload: { args: { request: { sessionId: 'root', title } } },
+            },
+          },
+        );
+        expect(await renameResponse.json()).toMatchObject({
+          result: { ok: true, value: { title } },
+        });
+        expect(projectedTitles.at(-1)).toBe(title);
+        await context.close();
+        return;
+      }
       await row.getByText('第一条已存在对话', { exact: true }).waitFor();
       await vi.waitFor(() =>
         expect(titleChanges.listenerCount('projection')).toBe(1),
       );
-      for (const title of ['打招呼并询问助手身份', '我手动重命名的标题']) {
-        nativeTitle = title;
-        const seq = ++projectionSeq;
-        titleChanges.emit('projection', {
-          type: 'projection',
-          sessionId: 'child',
-          key: 'title',
-          value: '子会话标题',
-          seq,
-        });
-        titleChanges.emit('projection', {
-          type: 'projection',
-          sessionId: 'root',
-          key: 'title',
-          value: title,
-          seq,
-        });
-        await row.getByText(title, { exact: true }).waitFor();
-        await vi.waitFor(() => expect(projectedTitles.at(-1)).toBe(title));
+      const titles = ['打招呼并询问助手身份', '我手动重命名的标题'];
+      try {
+        for (const [index, title] of titles.entries()) {
+          nativeTitle = title;
+          const seq = ++projectionSeq;
+          titleChanges.emit('projection', {
+            type: 'projection',
+            sessionId: 'child',
+            key: 'title',
+            value: '子会话标题',
+            seq,
+          });
+          titleChanges.emit('projection', {
+            type: 'projection',
+            sessionId: 'root',
+            key: 'title',
+            value: title,
+            seq,
+          });
+          await row.getByText(title, { exact: true }).waitFor();
+          if (index === 0) await titleRead.promise;
+        }
+        expect(projectedTitles).toEqual([]);
+      } finally {
+        allowTitleWrite.resolve();
       }
-      expect(projectedTitles).toEqual([
-        '打招呼并询问助手身份',
-        '我手动重命名的标题',
-      ]);
+      await vi.waitFor(() => expect(projectedTitles).toEqual(titles));
       await context.close();
       return;
     }

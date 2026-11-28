@@ -646,7 +646,7 @@ suite(
         ).rejects.toMatchObject({ code: 'authorization_denied' });
         await expect(
           sync(async () => {
-            await revokeSession(f.token);
+            await revokeSession(f.login.token);
             return '失权后标题';
           }),
         ).rejects.toMatchObject({ code: 'authorization_denied' });

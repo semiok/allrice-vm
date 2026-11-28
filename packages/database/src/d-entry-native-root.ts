@@ -160,6 +160,21 @@ export async function getDEntryNativeRootPin(
   return pin;
 }
 
+async function lockRunningVm(
+  tx: TransactionSql,
+  binding: Omit<
+    z.infer<typeof hostSchema>['binding'],
+    'personId' | 'organizationId'
+  >,
+  identity: Pick<DEntryIdentity, 'personId' | 'organizationId'>,
+) {
+  const [vm] = await tx`select vm_id from person_virtual_machines
+    where person_id=${identity.personId} and organization_id=${identity.organizationId}
+      and vm_id=${binding.vmId} and instance_id=${binding.instanceId}
+      and lease_epoch=${binding.leaseEpoch} and phase='running' for share`;
+  if (!vm) return deny();
+}
+
 /** Copy the current native projection into the registered business thread.
  * A row-version compare-and-swap prevents a late read from reverting a newer
  * native rename across pages. Never hold DB locks while reading the Guest. */
@@ -238,15 +253,11 @@ export async function syncDEntryNativeRootTitle(
       if (locked.version !== before.version) return false;
       const policy = await readDEntryReleasePolicy(tx, true);
       if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
+      await lockRunningVm(tx, { ...binding, vmId: root.vmId }, identity);
       signal.throwIfAborted();
       // Even a rename back to the stored title fences older observations.
       const [written] = await tx`update allrice_chat_sessions set title=${title}
-        where id=${identity.threadId} and exists(
-          select 1 from person_virtual_machines
-          where organization_id=${identity.organizationId} and person_id=${identity.personId}
-            and vm_id=${root.vmId} and phase='running' and instance_id=${binding.instanceId}
-            and lease_epoch=${binding.leaseEpoch}
-        ) returning id`;
+        where id=${identity.threadId} returning id`;
       if (!written) return deny();
       signal.throwIfAborted();
       return true;
@@ -361,11 +372,7 @@ export async function registerDEntryPageNativeRoot(
       return deny();
     const policy = await readDEntryReleasePolicy(tx, true);
     if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
-    const [vm] = await tx`select vm_id from person_virtual_machines
-      where person_id=${binding.personId} and organization_id=${binding.organizationId}
-        and vm_id=${binding.vmId} and instance_id=${binding.instanceId}
-        and lease_epoch=${binding.leaseEpoch} and phase='running' for share`;
-    if (!vm) return deny();
+    await lockRunningVm(tx, binding, identity);
     signal.throwIfAborted();
     if (forkSource) {
       const expected = forkSource.root;

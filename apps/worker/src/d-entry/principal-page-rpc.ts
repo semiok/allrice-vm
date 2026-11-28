@@ -210,6 +210,16 @@ export function createDEntryPageRpc(
                         .create()
                         .parse(result.value).sessionId;
                     }
+                    if (endpoint === 'session/rename') {
+                      // The native journal already owns the rename. Join the
+                      // directory projection even if no control stream is open.
+                      await page.syncNativeTitle(active).catch(() => {
+                        if (!active.aborted)
+                          console.error(
+                            '[d-entry] native session title projection failed',
+                          );
+                      });
+                    }
                     native = encodeResult(
                       rpcId,
                       result.value,
@@ -264,7 +274,11 @@ export function createDEntryPageRpc(
                   },
                 );
               };
-              if (endpoint === 'session/create' || endpoint === 'session/fork')
+              if (
+                endpoint === 'session/create' ||
+                endpoint === 'session/fork' ||
+                endpoint === 'session/rename'
+              )
                 await page.runThreadWrite(invoke);
               else await invoke();
             },

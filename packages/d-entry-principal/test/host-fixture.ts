@@ -37,6 +37,8 @@ import type {
   SessionControlFrame,
   SessionProjectionsRequest,
   SessionProjectionsValue,
+  SessionRenameRequest,
+  SessionRenameValue,
   SessionPage,
   SessionPageRequest,
   SessionPromptRequest,
@@ -164,6 +166,7 @@ class Catalog extends TypertRemoteService {
   followFrames?: (sessionId: SessionId) => AsyncIterable<SessionFollowFrame>;
   controlFrames?: (signal: AbortSignal) => AsyncIterable<SessionControlFrame>;
   readProjections?: (sessionId: SessionId) => SessionProjectionsValue;
+  onRename?: (request: SessionRenameRequest) => SessionRenameValue;
   finishFollow?: SessionId;
   afterFollow?: () => Promise<void>;
   pageRecords: SessionPage['records'] = [];
@@ -286,6 +289,16 @@ class Catalog extends TypertRemoteService {
     return this.readProjections?.(sessionId) ?? null;
   }
   @Remote({
+    name: 'rename',
+    resources: {
+      session: (request: SessionRenameRequest) => request.sessionId,
+    },
+  })
+  rename(request: SessionRenameRequest): SessionRenameValue {
+    if (!this.onRename) throw Error('No fixture title writer');
+    return this.onRename(request);
+  }
+  @Remote({
     name: 'page',
     resources: {
       session: (request: SessionPageRequest) =>
@@ -334,7 +347,10 @@ class Catalog extends TypertRemoteService {
         cursor,
         records,
         hasMore: false,
-        projections: { asOfSeq: cursor, values: {} },
+        projections: {
+          asOfSeq: cursor,
+          values: this.readProjections?.(sessionId)?.values ?? {},
+        },
         ...(request.assistantStream && { assistantStream: { revision: 0 } }),
       };
       await this.afterFollowSnapshot?.();
