@@ -744,11 +744,11 @@ export function createProductionPersonVmHost(input: {
               native.assertAuthenticatedGroup(binding, active);
               if (context && !editor)
                 await native.prepareForegroundEditor(binding, context, active);
-              const readiness = await requireRuntime().readiness(
-                binding,
-                active,
-                ...(context && editor ? ([context, editor] as const) : []),
-              );
+              const runtime = requireRuntime();
+              const readiness =
+                context && editor
+                  ? await runtime.readiness(binding, active, context, editor)
+                  : await runtime.readiness(binding, active);
               native.assertAuthenticatedGroup(binding, active);
               return readiness;
             }),
