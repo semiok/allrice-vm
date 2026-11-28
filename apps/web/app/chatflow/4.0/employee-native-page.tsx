@@ -587,7 +587,7 @@ export function EmployeeNativePage({
             cancelSwitch(target);
             if (target.restored) {
               nextQuery.current = location.search.slice(1);
-              applyQuery();
+              if (nextQuery.current !== displayedQuery.current) applyQuery();
             } else navigate(target.selection);
             return;
           }
@@ -639,7 +639,7 @@ export function EmployeeNativePage({
         cancelSwitch(target);
         if (target.restored) {
           nextQuery.current = location.search.slice(1);
-          applyQuery();
+          if (nextQuery.current !== displayedQuery.current) applyQuery();
         }
       }, liveSwitchWaitMs);
       frame.current?.contentWindow?.postMessage(

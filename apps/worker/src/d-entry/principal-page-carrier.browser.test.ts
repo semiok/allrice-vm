@@ -1574,6 +1574,18 @@ it
         if (scenario === 'switch' && attempt === 0) {
           await checkR3SelectedRoot(nativeId, target!);
           await editor.fill('另一条会话的原生草稿');
+          // The first history entry intentionally put threadId first.
+          await page.goBack({ waitUntil: 'commit' });
+          await expect.poll(() => editor.innerText()).toBe('未发送的原生草稿');
+          expect(new URL(page.url()).searchParams.keys().next().value).toBe(
+            'threadId',
+          );
+          await page.goForward({ waitUntil: 'commit' });
+          await expect
+            .poll(() => editor.innerText())
+            .toBe('另一条会话的原生草稿');
+          expect(documentLoads).toBe(1);
+          expect(socketCount).toBe(1);
         }
       }
       expect(await editor.innerText()).toBe('未发送的原生草稿');
