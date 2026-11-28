@@ -69,6 +69,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
     ).toBe('member');
   });
   it('projects run, operation, usage and artifact with real-issuer audit; no raw snapshot or common credentials', async () => {
+    const resourceId = randomUUID();
+    await f.db`insert into allrice_task_resource_waits
+      (id,run_id,job_id,organization_id,workspace_id,worker_id,lease_token,call_id,state,reason)
+      values(${resourceId},${a.task.runId},${a.worker.jobId},${a.target.organizationId},${a.target.workspaceId},
+        ${a.worker.workerId},${a.worker.leaseToken},'PRIVATE_TOOL_CALL','waiting','sandbox_capacity')`;
     const result = await inspectTenantRun(admin, a.target, a.task.runId, f.db);
     expect(result.operations[0]).toMatchObject({
       id: a.operation,
@@ -79,8 +84,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
     expect(result.artifacts[0]?.id).toBe(a.artifact.artifactId);
     expect(result.usage?.receiptCount).toBe(0);
     expect(result.usage?.totalTokens).toBeNull();
+    expect(result.executionDiagnostics?.resources).toMatchObject([
+      { id: resourceId, callId: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    ]);
     expect(JSON.stringify(result)).not.toMatch(
-      /PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT|Synthetic research goal|Synthetic finished report|Synthetic OK/,
+      /PRIVATE_TOOL_CALL|PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT|Synthetic research goal|Synthetic finished report|Synthetic OK/,
     );
     const [audit] =
       await f.db`select actor_id,metadata from allrice_audit_events where action='tenant.run.inspected' and resource_id=${a.task.runId}`;

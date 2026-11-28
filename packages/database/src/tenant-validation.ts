@@ -155,11 +155,13 @@ export async function inspectTenantRun(
       and o.snapshot->'binding'->'requestedBy'->>'id'=${subjectId} order by o.created_at,o.id limit 33`;
   const [job] =
     await db`select status,worker_id,created_at,coalesce(claimed_at,(select started_at from allrice_runs where id=${runId})) as claimed_at,heartbeat_at,completed_at from allrice_jobs where run_id=${runId} and organization_id=${organizationId} and workspace_id=${workspaceId}`;
-  const waits = await db`select *,
-    extract(epoch from (coalesce(started_at,finished_at,clock_timestamp())-queued_at))*1000 as wait_ms,
-    case when started_at is null then 0 else extract(epoch from (coalesce(finished_at,clock_timestamp())-started_at))*1000 end as execution_ms
-    from allrice_task_resource_waits where run_id=${runId} and organization_id=${organizationId} and workspace_id=${workspaceId}
-    order by queued_at desc,id limit 101`;
+  const waits =
+    await db`select w.id,w.state,w.reason,w.queued_at,w.started_at,w.finished_at,w.capacity,w.backend_id,w.error_code,
+    encode(sha256(convert_to(jsonb_build_array(w.run_id,w.call_id)::text,'UTF8')),'hex') as call_reference,
+    extract(epoch from (coalesce(w.started_at,w.finished_at,clock_timestamp())-w.queued_at))*1000 as wait_ms,
+    case when w.started_at is null then 0 else extract(epoch from (coalesce(w.finished_at,clock_timestamp())-w.started_at))*1000 end as execution_ms
+    from allrice_task_resource_waits w where w.run_id=${runId} and w.organization_id=${organizationId} and w.workspace_id=${workspaceId}
+    order by w.queued_at desc,w.id limit 101`;
   const diagnostics =
     await db`select occurred_at,reason,metadata from allrice_audit_events
     where organization_id=${organizationId} and workspace_id=${workspaceId} and resource_id=${runId} and action='execution.diagnostic'
@@ -191,7 +193,7 @@ export async function inspectTenantRun(
         recentProgressAt: progress?.at?.toISOString() ?? null,
         resources: waits.slice(0, 100).map((w) => ({
           id: w.id,
-          callId: w.call_id,
+          callId: w.call_reference,
           state: w.state,
           reason: w.reason,
           queuedAt: w.queued_at.toISOString(),
