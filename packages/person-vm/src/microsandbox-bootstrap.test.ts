@@ -146,18 +146,22 @@ it('labels a failed auth artifact read without retaining guest command output', 
 });
 
 it.each([
-  { initialize: 75, verify: 0, exit: 75 },
-  { initialize: 0, verify: 24, exit: 24 },
-  { initialize: 0, verify: 0, exit: 0 },
+  { initialize: 75, verify: 0, exit: 75, revoke: false },
+  { initialize: 0, verify: 24, exit: 24, revoke: false },
+  { initialize: 0, verify: 0, exit: 0, revoke: false },
+  { initialize: 0, verify: 0, exit: 0, revoke: true },
 ])(
-  'requires the actual shell sequence to join successfully ($initialize, $verify)',
-  async ({ initialize, verify, exit }) => {
+  'requires the actual shell sequence and an independent mkdir fence ($initialize, $verify, revoked=$revoke)',
+  async ({ initialize, verify, exit, revoke }) => {
     const { scope, binding } = fixture();
     const controls = '/opt/allrice/command-memory/' + 'a'.repeat(64);
     const state = '/run/allrice-command-memory';
     const config = state + '/config.json';
     const initializer = join(root, 'test initializer.cjs');
-    await writeFile(initializer, `process.exit(${initialize});`);
+    await writeFile(
+      initializer,
+      `process.exit(process.argv[2] === 'config file.json' ? ${initialize} : 99);`,
+    );
     let status: number | null = null;
     const command = vi.fn(async (args: string[]) => {
       if (args[0] === 'exec') {
@@ -188,7 +192,13 @@ it.each([
           success: status === 0,
           timed_out: false,
         });
-      if (args[0] === 'wait') return finished;
+      if (args[0] === 'wait') {
+        if (revoke)
+          scope.assertCurrent.mockRejectedValueOnce(
+            new PersonVmError('LEASE_LOST'),
+          );
+        return finished;
+      }
       if (args[0] === 'cp') return '';
       throw Error('unexpected native verb');
     });
@@ -197,7 +207,10 @@ it.each([
       scope,
       name: 'allrice-' + binding.vmId,
       plan: {
-        files: [{ path: config, contents: '{}', mode: 0o600 }],
+        files: [
+          { path: config, contents: '{}', mode: 0o600 },
+          { path: '/work/owner/profile.json', contents: '{}', mode: 0o600 },
+        ],
         initialize: {
           executable: 'node',
           args: [controls + '/initialize.cjs', config],
@@ -220,6 +233,14 @@ it.each([
       cleanupTimeoutMs: 2000,
       command,
     });
+    if (revoke) {
+      await expect(bootstrap).rejects.toMatchObject({ code: 'LEASE_LOST' });
+      expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+        'exec',
+        'wait',
+      ]);
+      return;
+    }
     if (exit === 0)
       await expect(bootstrap).resolves.toHaveProperty(
         'launch',
@@ -232,9 +253,18 @@ it.each([
     expect(command.mock.calls.map(([args]) => args[0])).toEqual([
       'exec',
       'wait',
+      'exec',
+      'wait',
+      'cp',
       'cp',
       'exec',
       'wait',
+    ]);
+    expect(command.mock.calls[2]?.[0].slice(-4)).toEqual([
+      '/bin/mkdir',
+      '-p',
+      '--',
+      '/work/owner',
     ]);
     expect(command.mock.calls.at(-1)?.[0][3]).toBe('initialize-and-verify');
   },

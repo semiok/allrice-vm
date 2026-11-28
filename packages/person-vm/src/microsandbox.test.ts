@@ -3040,16 +3040,12 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
     expect.arrayContaining(['--timeout', '10s', '--workdir', '/bin']),
   );
   expect(guestJobs[0]?.slice(-4)).toEqual(['/bin/mkdir', '-p', '--', '/work']);
-  expect(guestJobs[1]?.slice(-7)).toEqual([
-    '/bin/sh',
-    '-c',
-    expect.stringContaining('exec /bin/mkdir -p -- "$@"'),
-    'allrice-prepare-dsh-files',
+  expect(guestJobs[1]?.slice(-4)).toEqual([
+    '/usr/local/bin/node',
+    '-e',
     expect.stringContaining('untrusted-command-memory-state'),
     '/run/allrice-command-memory',
-    '/run/allrice-command-memory',
   ]);
-  expect(guestJobs[1]).not.toContain('--timeout');
   expect(guestJobs[2]?.slice(-9)).toEqual([
     expect.stringContaining('"$node" "$2" "$3" || exit "$?"'),
     'allrice-initialize-dsh-disk',

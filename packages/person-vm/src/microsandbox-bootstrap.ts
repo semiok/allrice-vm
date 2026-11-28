@@ -33,14 +33,6 @@ const BASE_IMAGE_PATH =
   '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
 
-// The trusted state directory is checked before mkdir handles any other
-// parents. No file transfer is part of this job.
-const prepareStateAndParents = String.raw`
-/usr/local/bin/node -e "$1" "$2" || exit "$?"
-shift 2
-exec /bin/mkdir -p -- "$@"
-`;
-
 // Keep the sealed initializer's public CLI and its native exit code. The
 // following disk proof only reads; neither result escapes a single exact wait.
 const initializeAndVerifyDisk = String.raw`
@@ -504,27 +496,17 @@ export async function bootstrapMicrosandbox(input: {
       !employee && sandbox?.cliSha256 !== undefined
         ? [sandbox.guestDirectory, sandbox.sha256, sandbox.cliSha256]
         : undefined;
-    const parents = [...new Set(files.map((file) => dirname(file.path)))];
-    if (diskProof)
-      await run({
-        executable: '/bin/sh',
-        args: [
-          '-c',
-          prepareStateAndParents,
-          'allrice-prepare-dsh-files',
-          prepareCommandMemoryState,
-          COMMAND_MEMORY_STATE_ROOT,
-          ...parents,
-        ],
-      });
-    else if (controls && !employee)
+    if (controls && !employee)
       await run({
         executable: '/usr/local/bin/node',
         args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
       });
     // cp preserves Unix permissions but doesn't create missing file parents.
-    // The sealed path has already joined the combined preparation above.
-    if (!diskProof)
+    const parents = new Set(files.map((file) => dirname(file.path)));
+    // The state job has already created and verified its own directory.
+    // Other parents still require a separate current check before mkdir.
+    if (diskProof) parents.delete(COMMAND_MEMORY_STATE_ROOT);
+    if (parents.size)
       await run({
         executable: '/bin/mkdir',
         args: ['-p', '--', ...parents],
