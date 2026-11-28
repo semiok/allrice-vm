@@ -944,7 +944,7 @@ function EmployeeNativePane({
       lifetime.signal.throwIfAborted();
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
-        owner?.revoked();
+        if (mounted || owner?.ready()) owner?.revoked();
         unbindMemoryWrites?.();
         send(pageRevoked);
         if (!prepare && !lifetime.signal.aborted) setFailed(true);
@@ -984,6 +984,7 @@ function EmployeeNativePane({
         issued.scopeId,
         identity,
         owner?.visible,
+        () => frame.current?.contentWindow ?? null,
       );
       mounted = true;
       const documentUrl = '/chatflow/4.0/document?' + params;
@@ -1066,6 +1067,7 @@ function EmployeeNativePane({
       activeLimit={activeLimit}
       settled={initialUnavailable || settled}
       stop={() => cancel.current?.()}
+      inFrameTransition={!!pendingArea}
       retry={() => {
         if (initialUnavailable) location.reload();
         else resume.current?.(status === 'restart-confirmation');
@@ -1144,12 +1146,14 @@ const messages = {
 
 function EntryStatus({
   status,
+  inFrameTransition = false,
   activeLimit,
   settled,
   stop,
   retry,
 }: {
   status: Exclude<Status, 'ready'>;
+  inFrameTransition?: boolean;
   activeLimit?: number;
   settled: boolean;
   stop(): void;
@@ -1214,9 +1218,21 @@ function EntryStatus({
             刷新页面
           </button>
         )}
-        {canReturn && settled && <a href="/chatflow/4.0">返回员工页</a>}
+        {canReturn && settled && (
+          <a
+            href="/chatflow/4.0"
+            target={inFrameTransition ? '_top' : undefined}
+          >
+            返回员工页
+          </a>
+        )}
         {status === 'sign-in' && settled && (
-          <a href="/login?next=%2Fchatflow%2F4.0">重新登录</a>
+          <a
+            href="/login?next=%2Fchatflow%2F4.0"
+            target={inFrameTransition ? '_top' : undefined}
+          >
+            重新登录
+          </a>
         )}
       </section>
     </div>

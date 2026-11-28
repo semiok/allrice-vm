@@ -31,6 +31,7 @@ type Host = Window & {
   __ALLRICE_EMPLOYEE_MEMORY_WRITES__?: (
     scopeId: string,
     employee: Employee,
+    caller?: Window,
   ) => EmployeeMemoryPageWrites | undefined;
 };
 
@@ -52,20 +53,22 @@ export function createEmployeeMemoryPageWrites() {
     string,
     {
       employee: string;
+      frame?: () => Window | null;
       bridge: EmployeeMemoryPageWrites;
     }
   >();
-  const read = (scopeId: string, employee: Employee) => {
+  const read = (scopeId: string, employee: Employee, caller?: Window) => {
     const binding = bindings.get(scopeId);
-    return binding?.employee === employeeKey(employee)
-      ? binding.bridge
-      : undefined;
+    if (binding?.employee !== employeeKey(employee)) return;
+    if (binding.frame && binding.frame() !== caller) return;
+    return binding.bridge;
   };
   return (
     host: Host,
     scopeId: string,
     employee: Employee,
     visible = () => true,
+    frame?: () => Window | null,
   ) => {
     const actor = JSON.stringify([employee.organizationId, employee.personId]);
     if (principal !== actor || owner !== host) {
@@ -120,7 +123,7 @@ export function createEmployeeMemoryPageWrites() {
         return () => listeners.delete(listener);
       },
     };
-    const binding = { employee: key, bridge };
+    const binding = { employee: key, bridge, frame };
     bindings.set(scopeId, binding);
     host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ = read;
     state.notify = notify;

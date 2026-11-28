@@ -65,12 +65,17 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
-  const pageWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
-    organizationId,
-    personId: viewerId,
-    workspaceId: selection.workspaceId,
-    employeeInstanceId: selection.employeeInstanceId,
-  });
+  const pageWrites = readEmployeeMemoryPageWrites(
+    parent,
+    scopeId,
+    {
+      organizationId,
+      personId: viewerId,
+      workspaceId: selection.workspaceId,
+      employeeInstanceId: selection.employeeInstanceId,
+    },
+    window,
+  );
   let activeThreadId = threadId;
 
   const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);

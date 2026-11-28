@@ -93,10 +93,10 @@ export function EmployeeNativeFrameShell({
     'failed',
   );
   const lifetime = useRef<AbortController | null>(null);
-  const verifyLogin = useRef<Promise<void> | undefined>(undefined);
+  const loginCheckSequence = useRef(0);
   const loginSessionId = useRef<string | undefined>(undefined);
   const replacingLogin = useRef(false);
-  const shownBefore = useRef(new Set<number>());
+  const rememberedFocus = useRef(new Map<number, HTMLElement>());
 
   const update = useCallback(
     (action: Parameters<typeof updateEmployeeFramePool>[1]) => {
@@ -234,18 +234,23 @@ export function EmployeeNativeFrameShell({
         const currentFrame = current.current.frames.find(
           (frame) => frame.id === id,
         );
-        if (!currentFrame || currentFrame.phase !== 'ready') return;
+        if (
+          !currentFrame ||
+          (currentFrame.phase !== 'ready' && currentFrame.phase !== 'opening')
+        )
+          return;
         update({ type: 'invalidate', id });
-        if (verifyLogin.current || !lifetime.current) return;
+        if (!lifetime.current) return;
+        const check = ++loginCheckSequence.current;
         const signal = lifetime.current.signal;
-        verifyLogin.current = fetch('/api/v1/auth/session', {
+        void fetch('/api/v1/auth/session', {
           cache: 'no-store',
           credentials: 'same-origin',
           signal,
         })
           .then(async (response) => {
             const value = response.ok ? await response.json() : undefined;
-            if (signal.aborted) return;
+            if (signal.aborted || check !== loginCheckSequence.current) return;
             if (
               response.status === 401 ||
               (loginSessionId.current &&
@@ -255,10 +260,7 @@ export function EmployeeNativeFrameShell({
               resetLogin();
             }
           })
-          .catch(() => {})
-          .finally(() => {
-            verifyLogin.current = undefined;
-          });
+          .catch(() => {});
       },
       navigate(
         selection: DEntrySelectionInput,
@@ -280,7 +282,7 @@ export function EmployeeNativeFrameShell({
         });
       },
       joined(id: number, confirmed: boolean) {
-        shownBefore.current.delete(id);
+        rememberedFocus.current.delete(id);
         if (!confirmed) setUnavailable('unknown');
         update({ type: 'joined', id, confirmed });
       },
@@ -353,18 +355,28 @@ export function EmployeeNativeFrameShell({
         record.controller.element()?.contentDocument?.documentElement;
       if (root) root.inert = id !== pool.visible;
     }
-    if (pool.visible === undefined) return;
-    const frame = directory.current.get(pool.visible)?.controller.element();
-    if (!frame) return;
-    if (shownBefore.current.has(pool.visible)) {
-      frame.contentDocument
-        ?.querySelector<HTMLElement>(
-          '[data-composer-input][contenteditable="true"]',
-        )
-        ?.focus({ preventScroll: true });
-    }
+    const visible = pool.visible;
+    if (visible === undefined) return;
+    const frame = directory.current.get(visible)?.controller.element();
+    const doc = frame?.contentDocument;
+    if (!frame || !doc) return;
+    const remembered = rememberedFocus.current.get(visible);
+    const rememberControl = (control: EventTarget | null) => {
+      const element = control as HTMLElement | null;
+      if (
+        element?.nodeType === 1 &&
+        element !== doc.body &&
+        !element.closest('[data-row-key^="workspace:"]')
+      )
+        rememberedFocus.current.set(visible, element);
+    };
     if (document.activeElement !== frame) frame.focus({ preventScroll: true });
-    shownBefore.current.add(pool.visible);
+    if (remembered?.isConnected && remembered.ownerDocument === doc)
+      remembered.focus({ preventScroll: true });
+    rememberControl(doc.activeElement);
+    const remember = (event: FocusEvent) => rememberControl(event.target);
+    doc.addEventListener('focusin', remember);
+    return () => doc.removeEventListener('focusin', remember);
   }, [pool.visible]);
 
   return (

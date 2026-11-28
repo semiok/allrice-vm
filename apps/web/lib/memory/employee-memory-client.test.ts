@@ -203,15 +203,42 @@ describe('native memory across chat navigation', () => {
     const host = {} as Window;
     const bind = createEmployeeMemoryPageWrites();
     const other = { ...employee, employeeInstanceId: id(42) };
+    const firstFrame = {} as Window;
+    const secondFrame = {} as Window;
     let active = 'first';
-    const retire = bind(host, 'first', employee, () => active === 'first');
-    bind(host, 'second', other, () => active === 'second');
-    const first = readEmployeeMemoryPageWrites(host, 'first', employee)!;
-    const second = readEmployeeMemoryPageWrites(host, 'second', other)!;
+    const retire = bind(
+      host,
+      'first',
+      employee,
+      () => active === 'first',
+      () => firstFrame,
+    );
+    bind(
+      host,
+      'second',
+      other,
+      () => active === 'second',
+      () => secondFrame,
+    );
+    const first = readEmployeeMemoryPageWrites(
+      host,
+      'first',
+      employee,
+      firstFrame,
+    )!;
+    const second = readEmployeeMemoryPageWrites(
+      host,
+      'second',
+      other,
+      secondFrame,
+    )!;
     expect(first).toBeDefined();
     expect(second).toBeDefined();
     expect(
-      readEmployeeMemoryPageWrites(host, 'second', employee),
+      readEmployeeMemoryPageWrites(host, 'second', other, firstFrame),
+    ).toBeUndefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second', employee, secondFrame),
     ).toBeUndefined();
     active = 'second';
     const fetcher = vi.fn(async () => ack());
@@ -224,7 +251,9 @@ describe('native memory across chat navigation', () => {
     await write(second);
     expect(fetcher).toHaveBeenCalledOnce();
     bind(host, 'new-login', { ...other, personId: id(67) });
-    expect(readEmployeeMemoryPageWrites(host, 'second', other)).toBeUndefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second', other, secondFrame),
+    ).toBeUndefined();
     await expect(write(second)).rejects.toMatchObject({ name: 'AbortError' });
     expect(fetcher).toHaveBeenCalledOnce();
   });
