@@ -124,6 +124,10 @@ export function apply(ctx: Context) {
       const dispose = Object.entries(languages).flatMap(([fallback, pack]) => [
         locale.addLanguage({ id: pack.id, label: pack.label, fallback }),
         locale.register('chat', pack.id, pack.chat),
+        locale.register('conversation', pack.id, {
+          'hero.headline': '',
+          'hero.preview': '',
+        }),
       ]);
       const adoptPublishedPreference = () => {
         // The native runtime's interim browser language has no saved

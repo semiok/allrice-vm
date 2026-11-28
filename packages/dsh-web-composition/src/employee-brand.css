@@ -1,13 +1,14 @@
 /* rc.2 has a brand mark slot, but no separate headline, badge or workspace
  * trigger slot. Only replace the native siblings of our exact slot markers. */
-span:has(> [data-allrice-hero-brand]) {
+span:has([data-allrice-hero-brand]) {
   width: auto;
   height: auto;
   max-width: 100%;
 }
 
-span:has(> [data-allrice-hero-brand]) + span,
+span:has([data-allrice-hero-brand]) + span,
 button:has(+ [data-allrice-managed-workspace]),
+button:has(+ * [data-allrice-managed-workspace]),
 [data-chat-running] > span:last-child > span[aria-hidden='true']:has(> svg) {
   display: none;
 }
