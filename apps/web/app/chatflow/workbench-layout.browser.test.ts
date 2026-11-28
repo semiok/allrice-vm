@@ -15622,6 +15622,18 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
         reference.revisionId,
       );
       expect(link.searchParams.has('file')).toBe(false);
+      expect(link.pathname).toBe('/chatflow');
+      const linkedWorkspace = f.page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        return (
+          url.pathname === '/api/v1/workspace' &&
+          url.searchParams.get('workspaceId') === workspace
+        );
+      });
+      await f.page.goto(link.href);
+      await linkedWorkspace;
+      await panel.getByRole('heading', { name: '资料原文' }).waitFor();
+
       f.materials.references = [];
       f.materials.reads.length = 0;
       await f.page.goto(link.href);

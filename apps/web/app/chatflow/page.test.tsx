@@ -99,6 +99,19 @@ describe('ChatFlow server local command capability', () => {
     expect(entry.released).toHaveBeenCalledTimes(4);
     expect(entry.find).not.toHaveBeenCalled();
   });
+  it('keeps the explicit publication deep link on its compatible material reader on the 4.0 host', async () => {
+    entry.host = 'allricevm.bplabs.xyz';
+    const result = await ChatFlowPage({
+      searchParams: Promise.resolve({
+        workspaceId: '10000000-0000-4000-8000-000000000001',
+        referenceSource: '10000000-0000-4000-8000-000000000002',
+        referenceRevision: '10000000-0000-4000-8000-000000000003',
+      }),
+    });
+    expect(result.props).toHaveProperty('workbenchEnabled');
+    expect(entry.find).not.toHaveBeenCalled();
+    expect(entry.released).not.toHaveBeenCalled();
+  });
   it('shows the trial failure instead of defaulting to the legacy writer when policy is unavailable', async () => {
     entry.host = 'allricevm.bplabs.xyz';
     entry.context.mockResolvedValue({ actor: { id: 'owner' } });

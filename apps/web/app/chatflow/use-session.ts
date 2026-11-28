@@ -21,6 +21,7 @@ import type {
   Workspace,
 } from './chatflow-types';
 import { readJson } from './chatflow-utils';
+import { readReferencePublicationLocation } from './reference-publication-link';
 import { employeeChoice, employeeChoices } from './employee-instances';
 import { createSessionSelection } from './session-selection';
 import { rememberSessionLocation } from './session-location';
@@ -187,13 +188,16 @@ export function useSession({ setError }: UseSessionOptions) {
         workspaceRef.current?.sessions.map((row) => [row.id, row.activeRunIds]),
       );
       const scope = selection.capture();
+      const publication = readReferencePublicationLocation();
+      const workspaceUrl = publication
+        ? '/api/v1/workspace?' +
+          new URLSearchParams({ workspaceId: publication.workspaceId })
+        : '/api/v1/workspace';
       const [workspaceResult, capabilityResult] = await Promise.all([
-        fetch('/api/v1/workspace', { cache: 'no-store', signal }).then(
-          (response) => {
-            signal?.throwIfAborted();
-            return readJson<{ workspace: Workspace }>(response);
-          },
-        ),
+        fetch(workspaceUrl, { cache: 'no-store', signal }).then((response) => {
+          signal?.throwIfAborted();
+          return readJson<{ workspace: Workspace }>(response);
+        }),
         fetch('/api/v1/saas/capabilities', { cache: 'no-store', signal }).then(
           (response) => {
             signal?.throwIfAborted();
