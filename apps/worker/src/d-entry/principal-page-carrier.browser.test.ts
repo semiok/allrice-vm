@@ -8,6 +8,7 @@ import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
+import type { SessionHistoryRecord } from '@deepseek-ai/dsh-api-session-controller/types';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
@@ -16,7 +17,10 @@ import {
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
-import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import {
+  deferred,
+  summary,
+} from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import {
   initialDocumentLifecycle,
   publicStartupBundleUrls,
@@ -43,6 +47,7 @@ it
     'attached',
     'unattached',
     'native-create',
+    'outer-create',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -52,10 +57,11 @@ it
   async (scenario) => {
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
-    const nativeCreate = scenario.startsWith('native-create');
+    const outerCreate = scenario === 'outer-create';
+    const nativeCreate = outerCreate || scenario.startsWith('native-create');
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
-      (nativeCreate && process.platform !== 'darwin');
+      (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const realShell = switching || nativeCreate;
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
@@ -70,7 +76,8 @@ it
       '.wasm': 'application/wasm',
     };
     const f = await fixture(release);
-    const otherThread = randomUUID();
+    let otherThread = randomUUID();
+    let outerCreated = false;
     const revokeOther =
       switching || createAfterSwitch
         ? f.registerThread(otherThread)
@@ -155,7 +162,12 @@ it
     );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       ['root', 'root-' + otherThread].includes(String(row.sessionId))
-        ? { ...row, blank: !nativeCreate, cwd: '/work' }
+        ? {
+            ...row,
+            blank: !nativeCreate,
+            cwd: '/work',
+            ...(outerCreate && { agentAvailable: true }),
+          }
         : row,
     );
     const require = createRequire(
@@ -198,38 +210,102 @@ it
       : undefined;
     const createdThread = randomUUID();
     const createdNativeId = 'native-created';
+    const outerNativeId = 'native-outer-created';
+    let expectedNativeId: string | undefined;
+    if (outerCreate) {
+      let records: readonly SessionHistoryRecord[] = [];
+      f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
+      f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
+        expect(sessionId).toBe('root');
+        expect(content).toEqual([{ type: 'text', text: '你好' }]);
+        const message = {
+          role: 'user',
+          id: randomUUID(),
+          source: { kind: 'user', rpcId: requestId },
+          content: [{ type: 'text', text: '你好' }],
+        };
+        const assistant = {
+          role: 'assistant',
+          id: randomUUID(),
+          source: { kind: 'model', provider: 'fixture', model: 'fixture' },
+          content: [{ type: 'text', text: '隔离会话的首条回复' }],
+        };
+        const events: Omit<SessionHistoryRecord['event'], 'seq' | 'time'>[] = [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'user/message', data: message, surfaceOp: 'append' },
+          { type: 'step/start', data: { turn: 1, step: 1 } },
+          {
+            type: 'assistant/message',
+            data: {
+              turn: 1,
+              step: 1,
+              message: assistant,
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              stream: [],
+            },
+            surfaceOp: 'append',
+          },
+          { type: 'step/end', data: { turn: 1, step: 1 } },
+          {
+            type: 'turn/end',
+            data: { turn: 1, reason: { kind: 'completed' } },
+          },
+        ];
+        records = events.map((event, index) => ({
+          type: 'event',
+          event: { ...event, seq: index + 1, time: Date.now() },
+        }));
+      };
+      f.host.catalog.allocateSessionId = () =>
+        summary(expectedNativeId ?? randomUUID()).sessionId;
+    }
+    const nativeIdsByThread = new Map<string, string>();
     let registered = false;
     const createReplies: unknown[] = [];
+    const promptReplies: unknown[] = [];
     const createdResponse = deferred();
     const deliverCreatedResponse = deferred();
     let holdCreatedResponse = false;
     let switchProofRequests = 0;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
+      const nativeRoots = new Map<
+        string,
+        Awaited<ReturnType<typeof registerFixture>>
+      >();
+      f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+        nativeRoots.get(id),
+      );
       f.registerRoot.mockImplementation(
         async (context, identity, receipt, active) => {
-          expect(receipt.nativeSessionId).toBe(createdNativeId);
+          const nativeId = receipt.nativeSessionId;
+          const isOuter = outerCreate && nativeId === outerNativeId;
           const registeredFixture = await registerFixture(
             context,
             identity,
             receipt,
             active,
           );
+          const threadId = isOuter
+            ? otherThread
+            : nativeId === createdNativeId
+              ? createdThread
+              : registeredFixture.thread.id;
+          if (isOuter) outerCreated = true;
           const root = {
             ...registeredFixture,
-            identity: { ...identity, threadId: createdThread },
-            thread: { ...registeredFixture.thread, id: createdThread },
+            identity: { ...identity, threadId },
+            thread: { ...registeredFixture.thread, id: threadId },
           };
           registered = true;
           f.rememberRoot(root);
-          f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
-            id === createdNativeId ? root : undefined,
-          );
+          nativeRoots.set(nativeId, root);
+          nativeIdsByThread.set(threadId, nativeId);
           const created = f.host.catalog.items.find(
-            ({ sessionId }) => sessionId === createdNativeId,
+            ({ sessionId }) => sessionId === nativeId,
           );
           if (created) Object.assign(created, { cwd: '/work', blank: true });
-          nativeWorkspace.sessionIds.push(createdNativeId);
+          nativeWorkspace.sessionIds.push(nativeId);
           f.host.host.emit('domain/changed', {
             domain: 'workspace',
             table: 'workspaces',
@@ -316,6 +392,23 @@ it
             request.resume();
             return response.writeHead(204).end();
           }
+          if (outerCreate && url.pathname === '/api/v1/sessions') {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request) chunks.push(chunk);
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            otherThread = body.operationId;
+            f.registerThread(otherThread);
+            const nativeId = 'root-' + otherThread;
+            const row = f.host.catalog.items.find(
+              (item) => item.sessionId === nativeId,
+            );
+            Object.assign(row!, { cwd: '/work', blank: true });
+            nativeWorkspace.sessionIds.push(nativeId);
+            outerCreated = true;
+            return await copy(
+              Response.json({ ...f.selection, threadId: otherThread }),
+            );
+          }
           if (url.pathname === '/chatflow/4.0') {
             return response
               .writeHead(200, { 'content-type': 'text/html' })
@@ -360,6 +453,11 @@ it
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
+          if (outerCreate && input.endpoint === 'session/prompt')
+            promptReplies.push({
+              status: result.status,
+              ...(await result.clone().json()),
+            });
           if (nativeCreate && input.endpoint === 'session/create')
             createReplies.push({
               status: result.status,
@@ -506,7 +604,8 @@ it
         };
         const identity = f.selectionIdentity(selection);
         const nativeId =
-          selection.threadId === otherThread ? 'root-' + otherThread : 'root';
+          nativeIdsByThread.get(selection.threadId) ??
+          (selection.threadId === otherThread ? 'root-' + otherThread : 'root');
         const version = {
           id: identity.employeeVersionId,
           manifest: { name: 'Fixture employee' },
@@ -524,7 +623,7 @@ it
             currentVersion: version,
             versions: [version],
           })),
-          sessions: (switching || createAfterSwitch
+          sessions: (switching || createAfterSwitch || outerCreated
             ? [
                 f.selection.threadId,
                 otherThread,
@@ -586,32 +685,36 @@ it
     const page = await context.newPage();
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
-      await page.addInitScript((linuxProfile) => {
-        if (linuxProfile)
-          Object.defineProperty(navigator, 'platform', {
-            value: 'Linux x86_64',
-          });
-        localStorage.setItem(
-          'dsh.sessions.current',
-          JSON.stringify({ sessionId: 'root' }),
-        );
-        // rc.2 defines this native command on every platform but provides no
-        // default binding for web:linux. Use its own per-profile preferences.
-        localStorage.setItem(
-          'dsh.keybindings.v1',
-          JSON.stringify({
-            schemaVersion: 1,
-            profiles: {
-              'web:linux': {
-                'session.new': {
-                  code: 'Period',
-                  modifiers: ['primary', 'shift'],
+      await page.addInitScript(
+        ({ linuxProfile, outerCreate }) => {
+          if (linuxProfile || outerCreate)
+            Object.defineProperty(navigator, 'platform', {
+              value: 'Linux x86_64',
+            });
+          if (!outerCreate)
+            localStorage.setItem(
+              'dsh.sessions.current',
+              JSON.stringify({ sessionId: 'root' }),
+            );
+          // rc.2 defines this native command on every platform but provides no
+          // default binding for web:linux. Use its own per-profile preferences.
+          localStorage.setItem(
+            'dsh.keybindings.v1',
+            JSON.stringify({
+              schemaVersion: 1,
+              profiles: {
+                'web:linux': {
+                  'session.new': {
+                    code: 'Period',
+                    modifiers: ['primary', 'shift'],
+                  },
                 },
               },
-            },
-          }),
-        );
-      }, scenario === 'native-create-linux');
+            }),
+          );
+        },
+        { linuxProfile: scenario === 'native-create-linux', outerCreate },
+      );
     }
     const streams = new Map<string, string>();
     let socketCount = 0;
@@ -947,10 +1050,94 @@ it
           })),
         }),
     );
+    const nativeSession = () =>
+      editor.evaluate((node) =>
+        node
+          .closest('[data-conversation-session]')
+          ?.getAttribute('data-conversation-session'),
+      );
+    if (outerCreate) {
+      const firstThread = f.selection.threadId;
+      const firstReply = workbench.getByText('隔离会话的首条回复', {
+        exact: true,
+      });
+      await expect.poll(nativeSession).toBe('root');
+      await editor.fill('你好');
+      await editor.press('Enter');
+      await expect
+        .poll(() => promptReplies)
+        .toMatchObject([
+          { status: 200, result: { ok: true, value: { accepted: true } } },
+        ]);
+      await page.reload();
+      try {
+        await firstReply.waitFor({ timeout: 10_000 });
+      } catch (cause) {
+        throw Error(
+          JSON.stringify({
+            errors,
+            firstItems,
+            displayed: await nativeSession(),
+          }),
+          {
+            cause,
+          },
+        );
+      }
+      await expect.poll(nativeSession).toBe('root');
+
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((node, value) => {
+        node.dataset.fixtureDocument = value;
+      }, mark);
+      const before = { documentLoads, socketCount };
+      const initialProofs = switchProofRequests;
+      const initialRegistrations = f.registerRoot.mock.calls.length;
+      expectedNativeId = outerNativeId;
+      await workbench
+        .getByRole('button', {
+          name: '和 Fixture employee 开新会话',
+          exact: true,
+        })
+        .click();
+      await page.waitForURL(
+        (url) => url.searchParams.get('threadId') === otherThread,
+        { timeout: 20_000 },
+      );
+      await expect.poll(nativeSession).toBe(outerNativeId);
+      expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
+      expect(switchProofRequests).toBe(initialProofs + 1);
+      expect(await editor.textContent()).toBe('');
+      expect(await firstReply.count()).toBe(0);
+      for (const [thread, nativeId] of [
+        [firstThread, 'root'],
+        [otherThread, outerNativeId],
+        [firstThread, 'root'],
+      ]) {
+        await workbench
+          .locator('[data-row-key="session:' + thread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === thread,
+        );
+        await expect.poll(nativeSession).toBe(nativeId);
+        if (thread === firstThread)
+          await firstReply.waitFor({ timeout: 10_000 });
+        else expect(await firstReply.count()).toBe(0);
+      }
+      expect({ documentLoads, socketCount }).toEqual(before);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+
+      expectedNativeId = createdNativeId;
+    }
     if (nativeCreate) {
       const mark = randomUUID();
       const frame = page.locator('iframe');
       const initialSockets = socketCount;
+      const initialDocuments = documentLoads;
+      const initialRegistrations = f.registerRoot.mock.calls.length;
       await frame.evaluate((node, mark) => {
         node.dataset.fixtureIdentity = mark;
       }, mark);
@@ -1096,7 +1283,7 @@ it
       expect(
         await workbench.locator('#app').getAttribute('data-fixture-document'),
       ).toBe(mark);
-      expect(documentLoads).toBe(1);
+      expect(documentLoads).toBe(initialDocuments);
       expect(socketCount).toBe(initialSockets);
       if (createAfterSwitch) {
         await workbench
@@ -1118,7 +1305,35 @@ it
           await workbench.locator('#app').getAttribute('data-fixture-document'),
         ).toBe(mark);
       }
-      expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
+      if (outerCreate) {
+        await workbench
+          .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await expect.poll(nativeSession).toBe('root');
+
+        // Reopening the second thread must win over rc.2's saved first
+        // selection, even though both roots are in the catalog.
+        const secondUrl = new URL(page.url());
+        secondUrl.searchParams.set('threadId', otherThread);
+        await page.goto(secondUrl.href);
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-native-session-id'),
+        ).toBe(outerNativeId);
+        await expect
+          .poll(nativeSession, { timeout: 10_000 })
+          .toBe(outerNativeId);
+        expect(
+          await workbench
+            .getByText('隔离会话的首条回复', { exact: true })
+            .count(),
+        ).toBe(0);
+      }
       await context.close();
       return;
     }
