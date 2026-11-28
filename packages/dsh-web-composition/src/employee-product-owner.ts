@@ -76,6 +76,7 @@ export function installEmployeeProductOwner(ctx: Context) {
   const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);
   let openRegisteredSession: ((thread: string) => boolean) | undefined;
   let startNativeSession: ((onError: () => void) => boolean) | undefined;
+  let reflectNativeTitle: (() => void) | undefined;
   let activeNativeSession: string | undefined;
   let resourceScopeId = scopeId;
   let switchingScope = false;
@@ -134,6 +135,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         ...previous,
         tree: { ...previous.tree, activeId: thread },
       });
+    reflectNativeTitle?.();
     const panel = panels.getSnapshot();
     const panelKey = resourceScopeId + '/' + thread;
     if (!panel || panel.scopeKey === panelKey) return;
@@ -192,6 +194,7 @@ export function installEmployeeProductOwner(ctx: Context) {
       const update = () => {
         activeNativeSession = native.sidebarRight.mounted.getSnapshot();
         followSelection();
+        reflectNativeTitle?.();
       };
       const unsubscribe = native.sidebarRight.mounted.subscribe(update);
       update();
@@ -212,6 +215,34 @@ export function installEmployeeProductOwner(ctx: Context) {
   ctx.inject(['uiWorkspace', 'sessions', 'workspaces', 'layout'], (native) => {
     native.effect(() => {
       const list = native.sessions.list;
+      const reflect = () => {
+        if (!activeNativeSession || !panelSelection(activeNativeSession))
+          return;
+        const current = sidebar.getSnapshot();
+        if (!current?.tree) return;
+        const catalog = list.getSnapshot();
+        const nativeId = catalog.ids.find((id) => id === activeNativeSession);
+        const title = nativeId && catalog.byId[nativeId]?.title;
+        if (!title) return;
+        const row = current.tree.sessions.find(
+          (session) => session.id === activeThreadId,
+        );
+        if (!row || row.title === title) return;
+        const sessions = current.tree.sessions.map((session) =>
+          session === row ? { ...session, title } : session,
+        );
+        sidebar.update({
+          ...current,
+          tree: {
+            ...current.tree,
+            sessions,
+            workspace: { ...current.tree.workspace, sessions },
+          },
+        });
+      };
+      reflectNativeTitle = reflect;
+      const unsubscribeTitle = list.subscribe(reflect);
+      reflect();
       const select = (thread: string) => {
         if (signal.aborted || switchingScope) return false;
         const session = list.getSnapshot().ids.find((candidate) => {
@@ -283,6 +314,8 @@ export function installEmployeeProductOwner(ctx: Context) {
         disposed = true;
         if (openRegisteredSession === select) openRegisteredSession = undefined;
         if (startNativeSession === start) startNativeSession = undefined;
+        if (reflectNativeTitle === reflect) reflectNativeTitle = undefined;
+        unsubscribeTitle();
         unsubscribe();
       };
     }, 'AllRice employee native root');
@@ -497,6 +530,7 @@ export function installEmployeeProductOwner(ctx: Context) {
       }
       sidebar.update(initial);
       followSelection();
+      reflectNativeTitle?.();
       bindEmployeeSidebar(ctx, {
         getSnapshot: sidebar.getSnapshot,
         subscribe: sidebar.subscribe,

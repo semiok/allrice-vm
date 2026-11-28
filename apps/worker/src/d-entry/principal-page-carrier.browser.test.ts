@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { EventEmitter, on } from 'node:events';
 import { cp, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -9,7 +10,11 @@ import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
-import type { SessionHistoryRecord } from '@deepseek-ai/dsh-api-session-controller/types';
+import type {
+  SessionControlFrame,
+  SessionHistoryRecord,
+} from '@deepseek-ai/dsh-api-session-controller/types';
+import * as database from '@allrice/database';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
@@ -54,6 +59,7 @@ it
     'unattached',
     'native-create',
     'outer-create',
+    'native-title',
     ...(process.platform === 'darwin'
       ? (['native-create-linux'] as const)
       : []),
@@ -100,6 +106,43 @@ it
       '.wasm': 'application/wasm',
     };
     const f = await fixture({ ...live, directory: release.directory });
+    const titleChanges = new EventEmitter();
+    let projectionSeq = 0;
+    let nativeTitle: string | undefined;
+    const projectedTitles: string[] = [];
+    if (scenario === 'native-title') {
+      f.host.catalog.readProjections = (sessionId) =>
+        sessionId === 'root' && nativeTitle
+          ? {
+              kind: 'sequenced',
+              asOfSeq: projectionSeq,
+              values: { title: nativeTitle },
+            }
+          : null;
+      f.host.catalog.controlFrames = async function* (signal) {
+        try {
+          for await (const [frame] of on(titleChanges, 'projection', {
+            signal,
+          }))
+            yield frame as SessionControlFrame;
+        } catch (error) {
+          if (!signal.aborted) throw error;
+        }
+      };
+      const sync = vi
+        .spyOn(database, 'syncDEntryNativeRootTitle')
+        .mockImplementation(async (context, pin, binding, read, signal) => {
+          expect(context.actor.id).toBe(f.identity.personId);
+          expect(pin.identity).toEqual(f.identity);
+          expect(pin.rootNativeSessionId).toBe('root');
+          expect(binding).toMatchObject(f.binding);
+          const title = await read(signal);
+          if (title) projectedTitles.push(title);
+        });
+      closes.push(async () => {
+        sync.mockRestore();
+      });
+    }
     let otherThread = randomUUID();
     let outerCreated = false;
     const revokeOther =
@@ -1320,6 +1363,41 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (scenario === 'native-title') {
+      const row = workbench.locator(
+        `[data-row-key="session:${f.selection.threadId}"]`,
+      );
+      await row.getByText('第一条已存在对话', { exact: true }).waitFor();
+      await vi.waitFor(() =>
+        expect(titleChanges.listenerCount('projection')).toBe(1),
+      );
+      for (const title of ['打招呼并询问助手身份', '我手动重命名的标题']) {
+        nativeTitle = title;
+        const seq = ++projectionSeq;
+        titleChanges.emit('projection', {
+          type: 'projection',
+          sessionId: 'child',
+          key: 'title',
+          value: '子会话标题',
+          seq,
+        });
+        titleChanges.emit('projection', {
+          type: 'projection',
+          sessionId: 'root',
+          key: 'title',
+          value: title,
+          seq,
+        });
+        await row.getByText(title, { exact: true }).waitFor();
+        await vi.waitFor(() => expect(projectedTitles.at(-1)).toBe(title));
+      }
+      expect(projectedTitles).toEqual([
+        '打招呼并询问助手身份',
+        '我手动重命名的标题',
+      ]);
+      await context.close();
+      return;
+    }
     const dock = (nativeId: string) =>
       workbench.locator(
         '[data-sidebar-right-session="' +

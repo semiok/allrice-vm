@@ -35,6 +35,8 @@ import type {
   SessionFollowFrame,
   SessionFollowRequest,
   SessionControlFrame,
+  SessionProjectionsRequest,
+  SessionProjectionsValue,
   SessionPage,
   SessionPageRequest,
   SessionPromptRequest,
@@ -160,6 +162,8 @@ class Catalog extends TypertRemoteService {
   snapshotRecords?: (sessionId: SessionId) => SessionPage['records'];
   afterFollowSnapshot?: () => Promise<void>;
   followFrames?: (sessionId: SessionId) => AsyncIterable<SessionFollowFrame>;
+  controlFrames?: (signal: AbortSignal) => AsyncIterable<SessionControlFrame>;
+  readProjections?: (sessionId: SessionId) => SessionProjectionsValue;
   finishFollow?: SessionId;
   afterFollow?: () => Promise<void>;
   pageRecords: SessionPage['records'] = [];
@@ -257,6 +261,10 @@ class Catalog extends TypertRemoteService {
         .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
     );
     yield { type: 'baseline', value: { projections } };
+    if (this.controlFrames) {
+      yield* this.controlFrames(signal);
+      return;
+    }
     await new Promise<void>((resolve) => {
       const stop = () => {
         signal.removeEventListener('abort', stop);
@@ -265,6 +273,17 @@ class Catalog extends TypertRemoteService {
       signal.addEventListener('abort', stop, { once: true });
       if (signal.aborted) stop();
     });
+  }
+  @Remote({
+    name: 'projections',
+    resources: {
+      session: (request: SessionProjectionsRequest) => request.sessionId,
+    },
+  })
+  projections({
+    sessionId,
+  }: SessionProjectionsRequest): SessionProjectionsValue {
+    return this.readProjections?.(sessionId) ?? null;
   }
   @Remote({
     name: 'page',

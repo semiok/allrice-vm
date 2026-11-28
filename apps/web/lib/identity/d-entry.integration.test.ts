@@ -107,6 +107,7 @@ import {
   getDEntryPageNativeRoot,
   registerDEntryPageNativeRoot,
   ensureDEntryNativeRoot,
+  syncDEntryNativeRootTitle,
   requireDEntryNativeIdentity,
   readDEntryEmployeeDirectory,
   preparePersonNativeWebRoster,
@@ -556,6 +557,103 @@ suite(
         expect(runs!.n).toBe(0);
         expect(create).toHaveBeenCalledTimes(1);
       } finally {
+        await clearPublished();
+      }
+    });
+
+    it('stores only the current native title for the registered 4.0 root and fences a delayed title', async () => {
+      const f = await enabledFour();
+      const fact = creation(f);
+      const binding = fact.host.binding;
+      const signal = new AbortController().signal;
+      const observed = deferred<void>();
+      const release = deferred<void>();
+      let pending: Promise<void> | undefined;
+      try {
+        const pin = await ensureDEntryNativeRoot(
+          f.context,
+          f.selection,
+          f.identity,
+          {
+            operationId: randomUUID(),
+            host: fact.host,
+            signal,
+            create: async () => fact,
+          },
+        );
+        await fixture.db`insert into person_virtual_machines
+          (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+          values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+            ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'synthetic-title' })})`;
+        const readStored = async () =>
+          (
+            await fixture.db`select title from allrice_chat_sessions where id=${f.thread.id}`
+          )[0]!.title;
+        const sync = (read: (signal: AbortSignal) => Promise<string>) =>
+          syncDEntryNativeRootTitle(f.context, pin, binding, read, signal);
+        await sync(async () => '自动生成标题');
+        expect(await readStored()).toBe('自动生成标题');
+
+        const delayed = vi
+          .fn<() => Promise<string>>()
+          .mockImplementationOnce(async () => {
+            observed.resolve();
+            await release.promise;
+            return '过时的自动标题';
+          })
+          // After the other page commits, re-read the authoritative title.
+          .mockResolvedValue('自动生成标题');
+        pending = sync(delayed);
+        void pending.catch(() => {});
+        await Promise.race([observed.promise, pending]);
+        await sync(async () => '自动生成标题'); // The user can rename back to the stored title.
+        release.resolve();
+        await pending;
+        expect(delayed).toHaveBeenCalledTimes(2);
+        expect(await readStored()).toBe('自动生成标题');
+
+        await sync(async () => '本人手动命名');
+        const misleadingTitle = vi.fn(async () => '串写标题');
+        for (const other of [
+          { ...pin, rootNativeSessionId: 'child' },
+          {
+            ...pin,
+            identity: { ...pin.identity, employeeInstanceId: randomUUID() },
+          },
+          {
+            ...pin,
+            identity: { ...pin.identity, organizationId: randomUUID() },
+          },
+        ])
+          await expect(
+            syncDEntryNativeRootTitle(
+              f.context,
+              other,
+              binding,
+              misleadingTitle,
+              signal,
+            ),
+          ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(misleadingTitle).not.toHaveBeenCalled();
+        await expect(
+          syncDEntryNativeRootTitle(
+            f.context,
+            pin,
+            { ...binding, leaseEpoch: binding.leaseEpoch + 1 },
+            misleadingTitle,
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await expect(
+          sync(async () => {
+            await revokeSession(f.token);
+            return '失权后标题';
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(await readStored()).toBe('本人手动命名');
+      } finally {
+        release.resolve();
+        await Promise.allSettled([pending]);
         await clearPublished();
       }
     });

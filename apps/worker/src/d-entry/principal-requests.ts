@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import {
   sameDEntryIdentity,
   ChatSessionSchema,
@@ -11,6 +12,7 @@ import {
   getDEntryHistoryRootPin,
   getDEntryPageNativeRoot,
   registerDEntryPageNativeRoot,
+  syncDEntryNativeRootTitle,
   resolveDEntryIdentity,
   runDEntryAdmittedActivity,
   watchDEntryNativeRosterAuthority,
@@ -89,6 +91,7 @@ export type DEntryPageHandle = Readonly<{
   ): { drained: Promise<unknown>; release(): void } | undefined;
   runThreadWrite<T>(invoke: () => Promise<T>): Promise<T>;
   assertCurrent(signal: AbortSignal): Promise<void>;
+  syncNativeTitle(signal: AbortSignal): Promise<void>;
   watchFollow(
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
@@ -650,6 +653,40 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       throw error;
                     }
                     active.throwIfAborted();
+                  },
+                  async syncNativeTitle(active) {
+                    if (!pin) return;
+                    await syncDEntryNativeRootTitle(
+                      auth.context,
+                      pin,
+                      page.vmBinding,
+                      async (signal) => {
+                        await page.assertCurrent(signal);
+                        const result = await page.scope.invokePage(
+                          {
+                            kind: 'page',
+                            scopeId,
+                            endpoint: 'session/projections',
+                            args: {
+                              request: { sessionId: pin.rootNativeSessionId },
+                            },
+                          },
+                          signal,
+                        );
+                        await page.assertCurrent(signal);
+                        const projection = TYPERT_REMOTE.methods[
+                          'session/projections'
+                        ].result
+                          .create()
+                          .parse(result.value);
+                        const title =
+                          projection?.kind === 'sequenced'
+                            ? projection.values.title
+                            : undefined;
+                        return typeof title === 'string' ? title : undefined;
+                      },
+                      active,
+                    );
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
                     await assertCurrent(active);

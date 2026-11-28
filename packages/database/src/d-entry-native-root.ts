@@ -160,6 +160,101 @@ export async function getDEntryNativeRootPin(
   return pin;
 }
 
+/** Copy the current native projection into the registered business thread.
+ * A row-version compare-and-swap prevents a late read from reverting a newer
+ * native rename across pages. Never hold DB locks while reading the Guest. */
+export async function syncDEntryNativeRootTitle(
+  context: RequestContext,
+  root: DEntryHistoryRootPin,
+  binding: Pick<
+    z.infer<typeof hostSchema>['binding'],
+    'instanceId' | 'leaseEpoch'
+  >,
+  readTitle: (signal: AbortSignal) => Promise<string | undefined>,
+  signal: AbortSignal,
+) {
+  const { identity } = root;
+  if (
+    !identity.threadId ||
+    context.organizationId !== identity.organizationId ||
+    (context.workspaceId !== null &&
+      context.workspaceId !== identity.workspaceId) ||
+    context.actor.type !== 'user' ||
+    context.actor.id !== identity.personId
+  )
+    return deny();
+  const scope = { ...context, workspaceId: identity.workspaceId };
+  const sql = getDatabase();
+  const row = (db: Sql | TransactionSql, lock = false) => db<
+    {
+      version: string;
+      employee_assignment_id: string;
+      d_entry_native_root: unknown;
+    }[]
+  >`select xmin::text as version, employee_assignment_id, d_entry_native_root
+    from allrice_chat_sessions where id=${identity.threadId}
+      and organization_id=${identity.organizationId} and workspace_id=${identity.workspaceId}
+      and owner_id=${identity.personId}
+      and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
+      and execution_generation='4.0' and visibility='private' and archived_at is null
+    ${lock ? db`for no key update` : db``}`;
+  const ensureRoot = (value: unknown) => {
+    const pin = projectPin(value, identity);
+    if (
+      pin.rootOriginDigest !== root.rootOriginDigest ||
+      pin.rootNativeSessionId !== root.rootNativeSessionId ||
+      pin.rootBindingRef !== root.rootBindingRef ||
+      pin.vmId !== root.vmId
+    )
+      deny();
+  };
+
+  while (true) {
+    signal.throwIfAborted();
+    const [before] = await row(sql);
+    if (!before) return deny();
+    ensureRoot(before.d_entry_native_root);
+    const title = ChatSessionSchema.shape.title
+      .optional()
+      .parse(await readTitle(signal));
+    signal.throwIfAborted();
+    if (!title) return;
+
+    const applied = await sql.begin(async (tx) => {
+      const employee = await resolveEmployeeSessionInstance(
+        scope,
+        before.employee_assignment_id,
+        identity.employeeInstanceId,
+        tx,
+      );
+      if (
+        employee.revision !== identity.employeeRevision ||
+        employee.source.employeeVersionId !== identity.employeeVersionId
+      )
+        return deny();
+      const [locked] = await row(tx, true);
+      if (!locked) return deny();
+      ensureRoot(locked.d_entry_native_root);
+      if (locked.version !== before.version) return false;
+      const policy = await readDEntryReleasePolicy(tx, true);
+      if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
+      signal.throwIfAborted();
+      // Even a rename back to the stored title fences older observations.
+      const [written] = await tx`update allrice_chat_sessions set title=${title}
+        where id=${identity.threadId} and exists(
+          select 1 from person_virtual_machines
+          where organization_id=${identity.organizationId} and person_id=${identity.personId}
+            and vm_id=${root.vmId} and phase='running' and instance_id=${binding.instanceId}
+            and lease_epoch=${binding.leaseEpoch}
+        ) returning id`;
+      if (!written) return deny();
+      signal.throwIfAborted();
+      return true;
+    });
+    if (applied) return;
+  }
+}
+
 async function findPageRoot(
   sql: Sql | TransactionSql,
   identity: DEntryIdentity,

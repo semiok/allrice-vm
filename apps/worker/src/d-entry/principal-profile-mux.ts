@@ -27,6 +27,7 @@ import {
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
+import { hasRootTitle } from './native-title.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -468,6 +469,20 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
+          if (
+            frame.endpoint === 'session/control' &&
+            page.root &&
+            hasRootTitle(item.value, page.root.rootNativeSessionId)
+          ) {
+            try {
+              await page.syncNativeTitle(child);
+            } catch {
+              if (!child.aborted)
+                console.error(
+                  '[d-entry] native session title projection failed',
+                );
+            }
+          }
         }
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
