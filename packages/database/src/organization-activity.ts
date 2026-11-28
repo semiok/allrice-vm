@@ -254,6 +254,10 @@ export async function listOrganizationActivityRuns(
     ['context', '正在读取上下文'],
     ['lifecycle', '正在处理'],
   ]);
+  const runningStage = (stage: string | null) => {
+    // r1-exempt(display): SQL 只投影固定事件类别，这里仅选择后台显示文案。
+    return stages.get(stage ?? '') ?? labels.running;
+  };
   return {
     organizationId,
     userId,
@@ -284,7 +288,7 @@ export async function listOrganizationActivityRuns(
                 ? '等待电脑连接'
                 : '等待确认或外部操作'
           : r.status === 'running'
-            ? (stages.get(r.last_stage ?? '') ?? labels.running)
+            ? runningStage(r.last_stage)
             : labels[r.status],
     })),
   };
