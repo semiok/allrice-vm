@@ -276,6 +276,7 @@ suite(
           randomUUID(),
           {
             readStartup: async () => ({
+              planId: randomUUID(),
               roster,
               employeeInstanceIds: [endpoint.employeeInstanceId],
               digest: roster.digest,

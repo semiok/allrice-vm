@@ -59,6 +59,7 @@ import type {
 } from './platform-deletion.ts';
 import {
   checkedWebRoster,
+  PERSON_VM_WAKE_RESUME_AUDIT,
   type PersonVmWakeStartup,
   type PersonVmWebRoster,
   type PersonVmWebEndpointReceipt,
@@ -131,6 +132,12 @@ type ScheduledStart = Readonly<{
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T>;
 }>;
+type RetainedWakeClaim = Pick<
+  ScheduledStart,
+  'readStartup' | 'withCurrentAuthority'
+> & {
+  finish(result: 'ready' | 'not-started' | 'unknown'): Promise<void>;
+};
 
 function sameWebEmployee(
   left: PersonVmWebRoster['entries'][number],
@@ -235,12 +242,12 @@ export class PersonVmService
           binding: PersonVmBinding,
           signal: AbortSignal,
         ): Promise<PersonVmWakeStartup | null>;
-        withCurrentAuthority<T>(
+        claim(
           binding: PersonVmBinding,
           digest: string,
+          ownerToken: string,
           signal: AbortSignal,
-          work: (active: AbortSignal) => Promise<T>,
-        ): Promise<T>;
+        ): Promise<RetainedWakeClaim>;
       };
       nativeCapacityAccounting?: boolean;
       /** Register the exact saved epoch before a start can touch its disk. */
@@ -1353,7 +1360,7 @@ export class PersonVmService
       retained && previousBinding
         ? await retained.read(previousBinding, signal)
         : undefined;
-    const wake = scheduledStartup ?? retainedStartup;
+    const wake = scheduledStartup ?? retainedStartup ?? undefined;
     const wakeEmployees = wake ? new Set(wake.employeeInstanceIds) : undefined;
     const maxRunning = this.options.employeeMaxRunning ?? 4;
     const launchCount = wakeEmployees
@@ -1387,6 +1394,15 @@ export class PersonVmService
         throw new PersonVmError('RUNTIME_NOT_READY');
     }
     signal.throwIfAborted();
+    const retainedClaim =
+      retained && retainedStartup && previousBinding
+        ? await retained.claim(
+            previousBinding,
+            retainedStartup.digest,
+            lease.ownerToken!,
+            signal,
+          )
+        : undefined;
     async function withWakeAuthority<T>(
       active: AbortSignal,
       work: (active: AbortSignal) => Promise<T>,
@@ -1397,9 +1413,8 @@ export class PersonVmService
           active,
           work,
         );
-      if (retained && retainedStartup && previousBinding)
-        return retained.withCurrentAuthority(
-          previousBinding,
+      if (retainedClaim && retainedStartup)
+        return retainedClaim.withCurrentAuthority(
           retainedStartup.digest,
           active,
           work,
@@ -1420,9 +1435,16 @@ export class PersonVmService
         row.activityObservedAt = null;
         row.lastActivityAt = this.now().toISOString();
         target?.orphanedStart?.observeInstance(bindingOf(row));
+        const adoption = wake && {
+          requestId: wake.planId,
+          action: PERSON_VM_WAKE_RESUME_AUDIT,
+          result: 'started' as const,
+          // The existing audit payload makes the new instance part of the proof.
+          errorCode: row.instanceId,
+        };
         if (lease.reserveStartup)
-          previousCapacityReleased = await lease.reserveStartup(row);
-        else await lease.save(row);
+          previousCapacityReleased = await lease.reserveStartup(row, adoption);
+        else await lease.save(row, adoption && { audit: adoption });
         reserved = true;
       };
       if (retainedStartup) await withWakeAuthority(signal, reserve);
@@ -1523,6 +1545,7 @@ export class PersonVmService
         if (wake && (!endpoints.slots || launchCount > endpoints.slots.length))
           throw new PersonVmError('RUNTIME_NOT_READY');
         web = Object.freeze({
+          ...(wake && { dispatchScheduledLaunch: withWakeAuthority }),
           ...(scheduledStartup
             ? {
                 purpose: 'scheduled-wake' as const,
@@ -1614,7 +1637,7 @@ export class PersonVmService
         if (wake) {
           const current = scheduled
             ? await scheduled.readStartup(active)
-            : await retained!.read(previousBinding!, active);
+            : await retainedClaim!.readStartup(active);
           if (current?.digest !== wake.digest)
             throw new PersonVmError('AUTHORIZATION_DENIED');
         }
@@ -1716,9 +1739,13 @@ export class PersonVmService
         await withWakeAuthority(signal, publish);
         this.options.observeScheduledStart?.(binding, roster!);
       } else await publish(signal);
+      await retainedClaim?.finish('ready');
       return view(row, !scheduled);
     } catch (error) {
-      if (!reserved) throw error;
+      if (!reserved) {
+        await retainedClaim?.finish('not-started');
+        throw error;
+      }
       const failure = safeError(error);
       try {
         await lease.audit(row, {
@@ -1730,6 +1757,10 @@ export class PersonVmService
       } catch {
         /* Failure audit cannot prevent physical cleanup after a lost DB connection. */
       }
+      const carryWake =
+        wake && !nativeStartAttempted
+          ? { planId: wake.planId, recorded: false }
+          : undefined;
       try {
         await this.cleanup(
           row,
@@ -1739,11 +1770,23 @@ export class PersonVmService
           {
             unstartedCapacity:
               !!wake && !nativeStartAttempted && previousCapacityReleased,
+            carryWake,
           },
         );
       } catch {
+        await retainedClaim?.finish('unknown');
         throw new PersonVmError('CLEANUP_INCOMPLETE', { cause: failure });
       }
+      await retainedClaim?.finish(
+        carryWake?.recorded ? 'not-started' : 'unknown',
+      );
+      if (
+        scheduled &&
+        carryWake?.recorded &&
+        failure.code !== 'AUTHORIZATION_DENIED' &&
+        failure.code !== 'LEASE_LOST'
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY', { cause: failure });
       throw failure;
     }
   }
@@ -2067,6 +2110,7 @@ export class PersonVmService
       requireNativeStopped?: boolean;
       /** This attempt never dispatched, and the prior epoch already released. */
       unstartedCapacity?: boolean;
+      carryWake?: { planId: string; recorded: boolean };
       onDetached?: (mount: string, signal: AbortSignal) => Promise<void>;
     },
   ) {
@@ -2076,6 +2120,7 @@ export class PersonVmService
     let failed = false;
     let egressJoined = true;
     let stopped: 'stopped' | 'absent' | undefined;
+    let canCarryWake = false;
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
       if (stopNative && !completion?.nativeAlreadyJoined) {
@@ -2179,8 +2224,25 @@ export class PersonVmService
       const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
       try {
         if (row.instanceId) {
-          await this.mounted(row, signal, lease);
+          const mount = await this.mounted(row, signal, lease);
           stopped = await stopAndConfirm(signal);
+          if (
+            completion?.carryWake &&
+            stopped === 'stopped' &&
+            row.diskRetained
+          ) {
+            try {
+              await this.options.native.assertRetainedStartup?.(
+                bindingOf(row),
+                mount,
+                signal,
+              );
+              signal.throwIfAborted();
+              canCarryWake = true;
+            } catch {
+              // Physical cleanup can still finish without a reusable wake proof.
+            }
+          }
         } else {
           const inspected = await this.reconcileDisk(row, signal, lease);
           if (!row.nativeCreated && inspected.state === 'ready')
@@ -2218,14 +2280,25 @@ export class PersonVmService
       }
     } else failed = true;
     row.phase = failed ? 'failed' : retainedDeletion ? 'deleted' : 'stopped';
+    const carry = !failed && canCarryWake && completion?.carryWake;
     await lease.save(row, {
-      audit: failed ? undefined : completion?.audit,
+      audit: carry
+        ? {
+            requestId: carry.planId,
+            action: PERSON_VM_WAKE_RESUME_AUDIT,
+            result: 'succeeded',
+            errorCode: row.instanceId!,
+          }
+        : failed
+          ? undefined
+          : completion?.audit,
       capacityReleased:
         (platformDetach || this.options.nativeCapacityAccounting === true) &&
         !failed &&
         (stopNative || completion?.unstartedCapacity === true) &&
         Boolean(row.instanceId),
     });
+    if (carry) carry.recorded = true;
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (row.instanceId) {
       const binding = bindingOf(row);

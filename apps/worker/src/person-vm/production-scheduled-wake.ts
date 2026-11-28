@@ -9,6 +9,7 @@ import {
   readPersonNativeWebRoster,
   readPersonVmWakeRoster,
   getDatabase,
+  type ScheduledWakeClaim,
 } from '@allrice/database';
 import {
   PersonVmError,
@@ -54,6 +55,76 @@ export type ProductionScheduledWakeSource = Readonly<{
   start: WakeOptions['start'];
 }>;
 
+type WakeStore = ReturnType<typeof createPostgresPersonVmScheduledWakeStore>;
+function claimAuthority(
+  store: WakeStore,
+  claim: ScheduledWakeClaim,
+  assertClaim: () => Promise<boolean>,
+): Parameters<PersonVmService['startRetainedForSchedule']>[2] {
+  return {
+    async readStartup(active) {
+      active.throwIfAborted();
+      const read = async () =>
+        (await assertClaim()) ? store.readClaimStartup(claim) : null;
+      const startup = await read().catch((cause) => {
+        throw new PersonVmError('RUNTIME_NOT_READY', { cause });
+      });
+      active.throwIfAborted();
+      if (!startup) throw new PersonVmError('AUTHORIZATION_DENIED');
+      return startup;
+    },
+    async withCurrentAuthority(digest, active, work) {
+      active.throwIfAborted();
+      const completed = await store.withClaimAuthority(
+        claim,
+        active,
+        async (startup, dispatchSignal) => {
+          if (startup.digest !== digest)
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          return { result: await work(dispatchSignal) };
+        },
+      );
+      if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');
+      return completed.result;
+    },
+  };
+}
+
+export function createProductionRetainedWake(
+  store: WakeStore,
+): NonNullable<
+  ConstructorParameters<typeof PersonVmService>[0]['retainedWake']
+> {
+  return {
+    read: store.readRetainedWake,
+    async claim(binding, digest, ownerToken, signal) {
+      const claim = await store.claimRetainedWake(
+        binding,
+        digest,
+        ownerToken,
+        signal,
+      );
+      return {
+        ...claimAuthority(store, claim, () => store.isCurrent(claim)),
+        async finish(result) {
+          if (result === 'not-started') {
+            await store.releaseUnusedClaim(claim);
+            return;
+          }
+          const settled = await store.settle(
+            claim,
+            result === 'ready'
+              ? { state: 'ready' }
+              : { state: 'unknown', reason: 'START_UNCONFIRMED' },
+          );
+          if (result === 'ready' && !settled)
+            throw new PersonVmError('LEASE_LOST');
+        },
+      };
+    },
+  };
+}
+
 export function createProductionScheduledWakeSource(
   vm: Pick<PersonVmService, 'startRetainedForSchedule'>,
   employeeMaxRunning: number,
@@ -97,33 +168,7 @@ export function createProductionScheduledWakeSource(
         await vm.startRetainedForSchedule(
           claim,
           claim.claimId,
-          {
-            async readStartup(active) {
-              active.throwIfAborted();
-              const read = async () =>
-                (await assertClaim()) ? store.readClaimStartup(claim) : null;
-              const startup = await read().catch((cause) => {
-                throw new PersonVmError('RUNTIME_NOT_READY', { cause });
-              });
-              active.throwIfAborted();
-              if (!startup) throw new PersonVmError('AUTHORIZATION_DENIED');
-              return startup;
-            },
-            async withCurrentAuthority(digest, active, work) {
-              active.throwIfAborted();
-              const completed = await store.withClaimAuthority(
-                claim,
-                active,
-                async (startup, dispatchSignal) => {
-                  if (startup.digest !== digest)
-                    throw new PersonVmError('AUTHORIZATION_DENIED');
-                  return { result: await work(dispatchSignal) };
-                },
-              );
-              if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');
-              return completed.result;
-            },
-          },
+          claimAuthority(store, claim, assertClaim),
           signal,
         );
         return 'ready';

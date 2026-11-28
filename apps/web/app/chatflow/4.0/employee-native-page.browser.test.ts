@@ -288,9 +288,12 @@ async function exerciseMultiEmployeeNavigation(
       .waitFor();
     expect(
       await waiting
-        .getByText('已有 3 个员工在运行。有空位会自动继续，也可以取消等待。', {
-          exact: true,
-        })
+        .getByText(
+          '当前工作台的 3 个运行名额已占用。有空位会自动继续，也可以取消等待。',
+          {
+            exact: true,
+          },
+        )
         .isVisible(),
     ).toBe(true);
     expect(creates).toEqual([]);

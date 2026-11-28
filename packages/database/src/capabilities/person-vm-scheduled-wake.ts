@@ -3,6 +3,7 @@ import { addAbortListener } from 'node:events';
 import { selectDEntryGeneration } from '@allrice/contracts';
 import {
   PersonVmError,
+  PERSON_VM_WAKE_RESUME_AUDIT,
   type PersonVmBinding,
   type PersonVmWakeStartup,
   type PersonVmWebRoster,
@@ -37,6 +38,8 @@ type PlanRow = {
   wake_at: Date | null;
   state: WakeState;
   attempts: number;
+  reason: string | null;
+  revoked_at: Date | null;
 };
 export type ScheduledWakeClaim = Identity & {
   claimId: string;
@@ -52,6 +55,32 @@ export type ScheduledWakeOutcome =
       reason: 'CURRENT_AUTHORITY_DENIED' | 'STALE_PLAN' | 'RETRY_LIMIT';
     }
   | { state: 'unknown'; reason: 'START_UNCONFIRMED' };
+export const PERSON_VM_WAKE_CLAIM_MS = 5 * 60_000;
+
+function planBinding(plan: PlanRow): PersonVmBinding {
+  return {
+    personId: plan.person_id,
+    organizationId: plan.organization_id,
+    vmId: plan.vm_id,
+    instanceId: plan.instance_id,
+    leaseEpoch: Number(plan.lease_epoch),
+  };
+}
+
+function claimForBinding(
+  plan: PlanRow,
+  binding: PersonVmBinding,
+  claimId: string,
+): ScheduledWakeClaim {
+  return {
+    ...binding,
+    planId: plan.plan_id,
+    receiptIds: plan.receipt_ids,
+    targetAt: plan.target_at!,
+    attempts: plan.attempts,
+    claimId,
+  };
+}
 
 function equalPlan(row: PlanRow, plan: WakePlan) {
   const receipts = plan.receiptIds.map((id) => id.toLowerCase()).sort();
@@ -199,6 +228,13 @@ async function readWakeStartup(
   receiptIds: readonly string[],
   targetAt: Date,
 ): Promise<PersonVmWakeStartup | null> {
+  const [stop] = await tx`
+    select a.request_id from person_vm_audit a
+    where a.person_id=${binding.personId} and a.organization_id=${binding.organizationId}
+      and a.vm_id=${binding.vmId} and a.lease_epoch=${binding.leaseEpoch}
+      and a.action='stop' and a.result='succeeded'
+    order by a.id desc limit 1`;
+  if (stop?.request_id !== planId) return null;
   const [row] = await tx<{ invalidated: boolean }[]>`
     select ${hasInvalidation(tx, receiptIds)} as invalidated`;
   if (row?.invalidated !== false) return null;
@@ -232,15 +268,33 @@ async function readWakeStartup(
       JSON.stringify([planId, receiptIds, roster.digest, employeeInstanceIds]),
     )
     .digest('hex');
-  return { roster, employeeInstanceIds, digest };
+  return { planId, roster, employeeInstanceIds, digest };
 }
 
-function committedStop(tx: TransactionSql, binding: PersonVmBinding) {
-  return tx`select a.request_id from person_vm_audit a
-    where a.person_id=${binding.personId} and a.organization_id=${binding.organizationId}
-      and a.vm_id=${binding.vmId} and a.lease_epoch=${binding.leaseEpoch}
-      and a.action='stop' and a.result='succeeded'
+/** An explicit resume intent is written with the new instance. It supersedes
+ * absence of an ordinary stop; only a joined no-dispatch receipt can carry
+ * the original immutable plan across that instance. */
+function wakeReceipt(sql: ISql, pendingIdleStop = false) {
+  return sql`select a.request_id,a.action,a.result from person_vm_audit a
+    where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+      and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+      and ((a.action='stop' and a.result='succeeded')
+        or (a.action=${PERSON_VM_WAKE_RESUME_AUDIT} and a.error_code=vm.instance_id::text)
+        ${pendingIdleStop ? sql`or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch')` : sql``})
     order by a.id desc limit 1`;
+}
+
+function wakePlanMatchesReceipt(sql: ISql) {
+  return sql`p.plan_id=receipt.request_id
+    and p.person_id=vm.person_id and p.organization_id=vm.organization_id and p.vm_id=vm.vm_id
+    and (receipt.action=${PERSON_VM_WAKE_RESUME_AUDIT} or
+      (p.instance_id=vm.instance_id and p.lease_epoch=vm.lease_epoch))`;
+}
+
+function wakeBinding(sql: ISql, binding: PersonVmBinding) {
+  return sql`(select ${binding.personId}::uuid as person_id,
+    ${binding.organizationId}::uuid as organization_id, ${binding.vmId}::uuid as vm_id,
+    ${binding.instanceId}::uuid as instance_id, ${binding.leaseEpoch}::bigint as lease_epoch)`;
 }
 
 async function readClaimStartup(
@@ -250,15 +304,14 @@ async function readClaimStartup(
 ): Promise<PersonVmWakeStartup | null> {
   // The physical owner can already have advanced the current epoch.
   // Recheck the immutable stopped source and its original receipt here.
-  const [plan] = await tx<{ receipt_ids: string[] }[]>`
-  select p.receipt_ids from person_vm_scheduled_wakes p
+  const [plan] = await tx<PlanRow[]>`
+  select p.* from ${wakeBinding(tx, claim)} vm
+  cross join lateral (${wakeReceipt(tx)}) receipt
+  join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(tx)}
   where p.plan_id=${claim.planId} and p.claim_id=${claim.claimId}
-    and p.person_id=${claim.personId} and p.organization_id=${claim.organizationId}
-    and p.vm_id=${claim.vmId} and p.instance_id=${claim.instanceId}
-    and p.lease_epoch=${claim.leaseEpoch} and p.state='claimed'
+    and receipt.result='succeeded' and p.state='claimed'
     and p.claim_until>clock_timestamp() and p.revoked_at is null
     and p.target_at=${claim.targetAt}
-    and p.plan_id=(${committedStop(tx, claim)})
     ${lock ? tx`for share of p` : tx``}`;
   if (
     !plan ||
@@ -268,7 +321,7 @@ async function readClaimStartup(
     return null;
   return readWakeStartup(
     tx,
-    claim,
+    planBinding(plan),
     claim.planId,
     plan.receipt_ids,
     claim.targetAt,
@@ -282,36 +335,50 @@ async function readRetainedWake(
 ): Promise<PersonVmWakeStartup | null> {
   // The caller owns the physical lease and pins the predecessor before it
   // changes epoch. A confirmed withdrawal cannot authorize an old launch.
-  const [plan] = await tx<
-    (Pick<PlanRow, 'plan_id' | 'receipt_ids' | 'target_at' | 'state'> & {
-      reason: string | null;
-    })[]
-  >`
-    select p.plan_id,p.receipt_ids,p.target_at,p.state,p.reason from person_vm_scheduled_wakes p
-    where p.person_id=${binding.personId} and p.organization_id=${binding.organizationId}
-      and p.vm_id=${binding.vmId} and p.instance_id=${binding.instanceId}
-      and p.lease_epoch=${binding.leaseEpoch} and p.revoked_at is null
-      and p.plan_id=(${committedStop(tx, binding)})
+  const [plan] = await tx<(PlanRow & { resume_result: string })[]>`
+    select p.*,receipt.result as resume_result from ${wakeBinding(tx, binding)} vm
+    cross join lateral (${wakeReceipt(tx)}) receipt
+    join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(tx)}
     ${lock ? tx`for share of p` : tx``}`;
   if (!plan?.target_at) return null;
+  if (plan.resume_result !== 'succeeded' || plan.state === 'unknown')
+    throw new PersonVmError('RUNTIME_NOT_READY');
+  if (plan.revoked_at) return null;
   // A claim issued before the physical lease still owns the scheduler's
   // attempt. Let it settle or expire without racing the foreground resume.
   if (plan.state === 'claimed') throw new PersonVmError('LEASE_CONFLICT');
   if (
     plan.state === 'blocked' &&
-    ['CURRENT_AUTHORITY_DENIED', 'STALE_PLAN'].includes(plan.reason ?? '')
+    ['CURRENT_AUTHORITY_DENIED', 'STALE_PLAN', 'RETRY_LIMIT'].includes(
+      plan.reason ?? '',
+    )
   )
     return null;
   if (plan.state !== 'waiting') throw new PersonVmError('RUNTIME_NOT_READY');
   const startup = await readWakeStartup(
     tx,
-    binding,
+    planBinding(plan),
     plan.plan_id,
     plan.receipt_ids,
     plan.target_at,
   );
   if (!startup) throw new PersonVmError('AUTHORIZATION_DENIED');
   return startup;
+}
+
+async function stoppedWakeExists(
+  tx: TransactionSql,
+  claim: ScheduledWakeClaim,
+) {
+  const [stopped] = await tx`
+    select 1 from person_virtual_machines vm
+    cross join lateral (${wakeReceipt(tx)}) receipt
+    join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(tx)}
+    where p.plan_id=${claim.planId}
+      and vm.person_id=${claim.personId} and vm.organization_id=${claim.organizationId}
+      and vm.vm_id=${claim.vmId} and vm.phase in ('stopped','cold')
+      and vm.disk_retained and vm.egress_receipt is null and receipt.result='succeeded'`;
+  return !!stopped;
 }
 
 async function audit(
@@ -394,20 +461,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         select min(at) as earliest from (
         select greatest(p.wake_at,p.retry_at) as at
         from person_virtual_machines vm
-        join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
-        cross join lateral (
-          select a.request_id, a.result from person_vm_audit a
-          where a.person_id=vm.person_id and a.organization_id=vm.organization_id
-            and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
-            and (
-              (vm.phase in ('stopped','cold') and vm.egress_receipt is null
-                and a.action='stop' and a.result='succeeded')
-              or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch'))
-          order by a.id desc limit 1
-        ) stop
+        cross join lateral (${wakeReceipt(tx, true)}) receipt
+        join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(tx)}
         where vm.disk_retained and p.revoked_at is null
           and p.wake_at is not null and p.state='waiting'
-          and stop.request_id=p.plan_id and stop.result='succeeded'
+          and receipt.result='succeeded'
+          and ((vm.phase in ('stopped','cold') and vm.egress_receipt is null)
+            or (vm.phase in ('running','failed') and receipt.action='stop.idle-dispatch'))
         union all
         -- An in-flight claim can already be starting the next epoch.
         select greatest(wake_at,claim_until) as at
@@ -474,25 +534,18 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     claim(leaseMs: number): Promise<ScheduledWakeClaim | null> {
       return sql.begin(async (tx) => {
         const claimId = randomUUID();
-        const [row] = await tx<PlanRow[]>`update person_vm_scheduled_wakes as w
+        const [row] = await tx<
+          (PlanRow & { stopped_instance: string; stopped_epoch: string })[]
+        >`update person_vm_scheduled_wakes as w
           set state='claimed',claim_id=${claimId},
             claim_until=now()+${leaseMs}::double precision * interval '1 millisecond',
             retry_at=null,attempts=w.attempts+1,reason=null,updated_at=now()
           from (
-            select p.plan_id from person_virtual_machines vm
-            join lateral (
-              select a.request_id from person_vm_audit a
-              where a.person_id=vm.person_id and a.organization_id=vm.organization_id
-                and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
-                and a.action='stop' and a.result='succeeded'
-              order by a.id desc limit 1
-            ) as last_stop on true
-            join person_vm_scheduled_wakes p on p.plan_id=last_stop.request_id
-              and p.person_id=vm.person_id and p.organization_id=vm.organization_id
-              and p.vm_id=vm.vm_id and p.instance_id=vm.instance_id
-              and p.lease_epoch=vm.lease_epoch
+            select p.plan_id, vm.instance_id, vm.lease_epoch from person_virtual_machines vm
+            cross join lateral (${wakeReceipt(tx)}) receipt
+            join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(tx)}
             where vm.phase in ('stopped','cold') and vm.disk_retained
-              and p.revoked_at is null
+              and p.revoked_at is null and receipt.result='succeeded'
               and vm.egress_receipt is null and vm.lease_owner is null
               and jsonb_array_length(vm.holds)=0
               and coalesce(p.retry_at,p.wake_at)<=now()
@@ -501,21 +554,18 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             limit 1 for update of p skip locked
           ) as due where w.plan_id=due.plan_id
             and pg_try_advisory_xact_lock(hashtextextended('person-vm:' || w.person_id::text,0))
-          returning w.*`;
+          returning w.*,due.instance_id as stopped_instance,due.lease_epoch as stopped_epoch`;
         if (!row?.target_at) return null;
         await audit(tx, row, claimId, 'claim', 'started');
-        return {
-          personId: row.person_id,
-          organizationId: row.organization_id,
-          vmId: row.vm_id,
-          instanceId: row.instance_id,
-          leaseEpoch: Number(row.lease_epoch),
-          planId: row.plan_id,
-          receiptIds: row.receipt_ids,
-          targetAt: row.target_at,
-          attempts: row.attempts,
+        return claimForBinding(
+          row,
+          {
+            ...planBinding(row),
+            instanceId: row.stopped_instance,
+            leaseEpoch: Number(row.stopped_epoch),
+          },
           claimId,
-        };
+        );
       });
     },
 
@@ -535,9 +585,10 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             select p.plan_id,p.claim_id,p.revoked_at is not null and source.stopped as denied
             from person_vm_scheduled_wakes p
             left join person_virtual_machines vm on vm.person_id=p.person_id
+            left join lateral (${wakeReceipt(tx)}) receipt on true
             cross join lateral (
-              select coalesce(vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
-                and vm.instance_id=p.instance_id and vm.lease_epoch=p.lease_epoch
+              select coalesce(${wakePlanMatchesReceipt(tx)}
+                and receipt.result='succeeded'
                 and vm.phase in ('stopped','cold') and vm.disk_retained
                 and vm.egress_receipt is null, false) as stopped
             ) as source
@@ -567,12 +618,12 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     },
 
     async isCurrent(claim: ScheduledWakeClaim): Promise<boolean> {
-      const [row] = await sql`select 1 from person_vm_scheduled_wakes
-        where person_id=${claim.personId} and organization_id=${claim.organizationId}
-          and vm_id=${claim.vmId} and instance_id=${claim.instanceId}
-          and lease_epoch=${claim.leaseEpoch} and plan_id=${claim.planId}
-          and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
-          and revoked_at is null
+      const [row] = await sql`select 1 from ${wakeBinding(sql, claim)} vm
+        cross join lateral (${wakeReceipt(sql)}) receipt
+        join person_vm_scheduled_wakes p on ${wakePlanMatchesReceipt(sql)}
+        where p.plan_id=${claim.planId} and receipt.result='succeeded'
+          and p.claim_id=${claim.claimId} and p.state='claimed' and p.claim_until>now()
+          and p.revoked_at is null
           and not ${hasInvalidation(sql, claim.receiptIds)}`;
       return !!row;
     },
@@ -597,11 +648,11 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       return startup;
     },
 
-    withRetainedWakeAuthority<T>(
+    claimRetainedWake(
       binding: PersonVmBinding,
       digest: string,
+      ownerToken: string,
       signal: AbortSignal,
-      work: (active: AbortSignal) => Promise<T>,
     ) {
       return withOwnedPersonVmAuthorityTransaction(
         sql,
@@ -612,7 +663,24 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           active.throwIfAborted();
           if (startup?.digest !== digest)
             throw new PersonVmError('AUTHORIZATION_DENIED');
-          return work(active);
+          const claimId = randomUUID();
+          const [row] = await tx<PlanRow[]>`
+            update person_vm_scheduled_wakes p
+            set state='claimed',claim_id=${claimId},
+              claim_until=clock_timestamp()+${PERSON_VM_WAKE_CLAIM_MS}::double precision * interval '1 millisecond',
+              retry_at=null,attempts=attempts+1,reason=null,updated_at=now()
+            from person_virtual_machines vm
+            where p.plan_id=${startup.planId} and p.state='waiting' and p.revoked_at is null
+              and vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+              and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+              and vm.lease_epoch=${binding.leaseEpoch} and vm.phase in ('stopped','cold')
+              and vm.lease_owner=${ownerToken} and vm.lease_expires_at>clock_timestamp()
+              and vm.disk_retained and vm.native_created and vm.egress_receipt is null
+              and jsonb_array_length(vm.holds)=0
+            returning p.*`;
+          if (!row?.target_at) throw new PersonVmError('LEASE_LOST');
+          await audit(tx, row, claimId, 'claim', 'started');
+          return claimForBinding(row, binding, claimId);
         },
       );
     },
@@ -695,14 +763,18 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
       return sql.begin(async (tx) => {
+        const stopped = await stoppedWakeExists(tx, claim);
         const [row] = await tx<
           (PlanRow & { reason: string })[]
         >`update person_vm_scheduled_wakes
-          set state=case when revoked_at is null then 'waiting' else 'blocked' end,
-            claim_id=null,claim_until=null,attempts=attempts-1,
-            reason=case when revoked_at is null then 'DISPATCH_CANCELLED' else 'STALE_PLAN' end,
+          set state=case when revoked_at is not null then 'blocked'
+              when ${stopped} then 'waiting' else 'unknown' end,
+            claim_id=null,claim_until=null,attempts=case when ${stopped} then attempts-1 else attempts end,
+            reason=case when revoked_at is not null then 'STALE_PLAN'
+              when ${stopped} then 'DISPATCH_CANCELLED' else 'START_UNCONFIRMED' end,
             updated_at=now()
           where plan_id=${claim.planId} and claim_id=${claim.claimId} and state='claimed'
+            and person_id=${claim.personId} and organization_id=${claim.organizationId} and vm_id=${claim.vmId}
           returning *`;
         if (!row) return false;
         await audit(
@@ -723,15 +795,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     ): Promise<boolean> {
       return sql.begin(async (tx) => {
         let outcome = result;
-        if (outcome.state === 'waiting') {
-          const [stopped] = await tx`select 1 from person_virtual_machines
-            where person_id=${claim.personId} and organization_id=${claim.organizationId}
-              and vm_id=${claim.vmId} and instance_id=${claim.instanceId}
-              and lease_epoch=${claim.leaseEpoch} and phase in ('stopped','cold')
-              and disk_retained and egress_receipt is null`;
-          if (!stopped)
-            outcome = { state: 'unknown', reason: 'START_UNCONFIRMED' };
-        }
+        if (
+          (outcome.state === 'waiting' ||
+            (outcome.state === 'blocked' &&
+              outcome.reason === 'RETRY_LIMIT')) &&
+          !(await stoppedWakeExists(tx, claim))
+        )
+          outcome = { state: 'unknown', reason: 'START_UNCONFIRMED' };
         const reason = 'reason' in outcome ? outcome.reason : null;
         const retryDelayMs =
           outcome.state === 'waiting' ? outcome.retryDelayMs : null;
@@ -745,6 +815,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
               now()+${retryDelayMs}::double precision * interval '1 millisecond' end,
             updated_at=now()
           where person_id=${claim.personId} and plan_id=${claim.planId}
+            and organization_id=${claim.organizationId} and vm_id=${claim.vmId}
             and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
           returning *`;
         if (!row) return false;

@@ -83,6 +83,7 @@ import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 import {
   createProductionScheduledWake,
+  createProductionRetainedWake,
   type PersonVmWakePreparation,
   type ProductionScheduledWakeSource,
 } from './production-scheduled-wake.js';
@@ -766,10 +767,7 @@ export function createProductionPersonVmHost(input: {
         diskPool,
         nativeWeb: personNativeWebRoster,
         employeeMaxRunning: employeeRuntime?.maxRunning,
-        retainedWake: {
-          read: wakeStore.readRetainedWake,
-          withCurrentAuthority: wakeStore.withRetainedWakeAuthority,
-        },
+        retainedWake: createProductionRetainedWake(wakeStore),
         runtime,
         egress,
         observeOwnedStart(binding, context) {

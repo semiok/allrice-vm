@@ -1011,7 +1011,7 @@ function EntryStatus({
           <p>
             {status === 'waiting-for-capacity' &&
               activeLimit !== undefined &&
-              `已有 ${activeLimit} 个员工在运行。`}
+              `当前工作台的 ${activeLimit} 个运行名额已占用。`}
             {description}
           </p>
           {failedOpening && (

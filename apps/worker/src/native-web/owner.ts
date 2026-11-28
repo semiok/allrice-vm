@@ -170,6 +170,7 @@ export function readNativeModelAttempt(
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
 export async function openNativeWebOwner(input: {
   scope: PersonVmBootstrapScope;
+  dispatchLaunch?: Parameters<PersonVmBootstrapScope['launch']>[1];
   launch: NativeWebLaunch;
   context?: RequestContext;
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
@@ -678,7 +679,9 @@ export async function openNativeWebOwner(input: {
     stage('launch');
     starting = setup(async () => {
       try {
-        job = await input.scope.launch(input.launch.command);
+        job = input.dispatchLaunch
+          ? await input.scope.launch(input.launch.command, input.dispatchLaunch)
+          : await input.scope.launch(input.launch.command);
         return job;
       } catch (error) {
         if (

@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  createDedicatedDatabase,
+  createEmployeeInstance,
   readContentPrincipal,
   readPersonVmWakeRoster,
 } from '@allrice/database';
@@ -12,7 +17,12 @@ import {
   type ScheduleCatalogEntry,
 } from '@deepseek-ai/dsh-schedule';
 import { SessionId } from '@deepseek-ai/dsh-session';
-import { PersonVmError } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  PersonVmService,
+  PostgresPersonVmStore,
+  PERSON_VM_WAKE_RESUME_AUDIT,
+} from '@allrice/person-vm';
 import {
   afterAll,
   beforeAll,
@@ -23,11 +33,23 @@ import {
   vi,
 } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
+import * as databaseClient from '../../../../packages/database/src/core/client.ts';
+import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.ts';
+import {
+  context,
+  harness,
+} from '../../../../packages/person-vm/src/test-support.ts';
+import { bootstrapMicrosandbox } from '../../../../packages/person-vm/src/microsandbox-bootstrap.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
 import {
   createProductionScheduledWake,
   createProductionScheduledWakeSource,
+  createProductionRetainedWake,
 } from './production-scheduled-wake.js';
+import {
+  assertCompleteNativeActivityCensus,
+  createProductionNativeActivity,
+} from './production-native-activity.js';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -209,8 +231,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         values(${employeeVersionId},${organizationId},${workspaceId},${employee!.id},
           1,'Fixture','fixture-model','', '{}'::jsonb,${'sha256:' + 'a'.repeat(64)})`;
         await tx`insert into allrice_employee_assignments
-        (id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
-        values(${employeeInstanceId},${organizationId},${workspaceId},${employee!.id},${employeeVersionId},${personId})`;
+        (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default)
+        values(${employeeInstanceId},${organizationId},${workspaceId},${employee!.id},${employeeVersionId},${personId},
+          ${employeeInstanceId === f.origin.employeeInstanceId})`;
         await tx`insert into allrice_employee_instances
         (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id)
         values(${employeeInstanceId},${organizationId},${workspaceId},${personId},
@@ -227,6 +250,333 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       return employees[0]!;
     });
   }
+
+  async function retainedFixture() {
+    const f = await fixture();
+    const selected = f.addProfile([]);
+    const unrelated = f.addProfile([]);
+    await publishFixtureAuthority(f, [selected, unrelated]);
+    const planId = randomUUID();
+    f.reviseTime('2035-11-03T07:00:00.000Z');
+    expect(
+      await f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).toMatchObject({ ok: true });
+    await f.stop(planId);
+    const store = f.store();
+    const vmStore = new PostgresPersonVmStore(() =>
+      createDedicatedDatabase(db),
+    );
+    const h = harness(vmStore);
+    await h.disk.create({ vmId: f.binding.vmId, tier: 'warm' }, signal);
+    h.states.set(f.binding.vmId, 'stopped');
+    const roster = (await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin, selected, unrelated]),
+    ))!;
+    const slots = roster.entries.map((_, index) => ({
+      hostPort: 32000 + index,
+      guestPort: 32000 + index,
+    }));
+    h.native.prepareWebEndpoints = async (binding, expected) => ({
+      binding,
+      rosterDigest: expected.digest,
+      slots,
+      endpoints: expected.entries.map((entry, index) => ({
+        ...entry,
+        ...slots[index]!,
+      })),
+    });
+    h.native.assertWebEndpoints = async () => {};
+    h.runtime.retireAfterNativeStop = async () => {};
+    h.runtime.assertScheduledReady = async () => {};
+    const vm = () =>
+      new PersonVmService({
+        ...h.options,
+        now: () => new Date(),
+        nativeWeb: { prepare: async () => roster },
+        retainedWake: createProductionRetainedWake(store),
+      });
+    const user = () =>
+      vm().prewarm(
+        context(f.binding.organizationId, f.binding.personId),
+        { trigger: 'page', selectedEmployee: selected },
+        signal,
+      );
+    const makeDue = async () => {
+      await db`update person_vm_scheduled_wakes
+        set wake_at=clock_timestamp()-interval '1 second',retry_at=null where plan_id=${planId}`;
+    };
+    const runDue = () =>
+      createPersonVmScheduledWake({
+        store,
+        ledger: createPostgresNativeScheduleObservationLedger(db),
+        capture: vi.fn(),
+        start: createProductionScheduledWakeSource(vm(), 4, db).start,
+      }).runDueOnce(signal);
+    const planStatus = async () =>
+      (
+        await db`select state,reason from person_vm_scheduled_wakes
+      where plan_id=${planId}`
+      )[0];
+    return { f, h, vmStore, planId, store, user, makeDue, runDue, planStatus };
+  }
+
+  it.each(['not dispatched', 'native started'] as const)(
+    'keeps foreground startup failure grounded in its stopped native evidence: %s',
+    async (scenario) => {
+      const x = await retainedFixture();
+      const failure = new PersonVmError('EGRESS_UNAVAILABLE');
+      if (scenario === 'not dispatched')
+        vi.spyOn(x.h.egress, 'prepare').mockRejectedValueOnce(failure);
+      else vi.spyOn(x.h.native, 'bootstrap').mockRejectedValueOnce(failure);
+      const runtime = vi.spyOn(x.h.runtime, 'start');
+      await expect(x.store.claim(300_000)).resolves.toBeNull();
+      await expect(x.user()).rejects.toMatchObject({ code: failure.code });
+      const row = await x.vmStore.read(x.f.binding.personId);
+      expect(row).toMatchObject({
+        phase: 'stopped',
+        leaseEpoch: x.f.binding.leaseEpoch + 1,
+        egressReceipt: null,
+        instanceId: expect.any(String),
+      });
+      expect(row!.instanceId).not.toBe(x.f.binding.instanceId);
+      const receipts = await db`select result,error_code from person_vm_audit
+        where request_id=${x.planId} and lease_epoch=${row!.leaseEpoch}
+          and action=${PERSON_VM_WAKE_RESUME_AUDIT} order by id`;
+      expect(receipts).toEqual(
+        (scenario === 'not dispatched'
+          ? ['started', 'succeeded']
+          : ['started']
+        ).map((result) => ({ result, error_code: row!.instanceId })),
+      );
+      await x.makeDue();
+      if (scenario === 'not dispatched') {
+        expect(x.h.log).not.toContain('native:start');
+        expect(await x.planStatus()).toMatchObject({ state: 'waiting' });
+        await expect(
+          x.store.nextCommittedWakeAt(signal),
+        ).resolves.toBeInstanceOf(Date);
+        expect(await x.runDue()).toBe(true);
+        expect(await x.runDue()).toBe(false);
+        expect(await x.planStatus()).toEqual({ state: 'ready', reason: null });
+        expect(runtime).toHaveBeenCalledOnce();
+        expect(runtime.mock.lastCall?.[3]).toMatchObject({
+          purpose: 'scheduled-wake',
+          scheduledEmployeeIds: [x.f.origin.employeeInstanceId],
+        });
+        expect(await x.vmStore.read(x.f.binding.personId)).toMatchObject({
+          phase: 'running',
+          leaseEpoch: x.f.binding.leaseEpoch + 2,
+        });
+      } else {
+        expect(await x.planStatus()).toEqual({
+          state: 'unknown',
+          reason: 'START_UNCONFIRMED',
+        });
+        expect(await x.runDue()).toBe(false);
+        await expect(x.user()).rejects.toMatchObject({
+          code: 'RUNTIME_NOT_READY',
+        });
+      }
+      expect(x.h.log.filter((entry) => entry === 'native:start')).toHaveLength(
+        1,
+      );
+    },
+  );
+
+  it('allows an exact current foreground employee after a no-start retry limit without reviving the old plan', async () => {
+    const x = await retainedFixture();
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      await x.makeDue();
+      const claim = (await x.store.claim(300_000))!;
+      expect(claim).toMatchObject({
+        attempts: attempt,
+        leaseEpoch: x.f.binding.leaseEpoch,
+      });
+      expect(
+        await x.store.settle(
+          claim,
+          attempt === 4
+            ? { state: 'blocked', reason: 'RETRY_LIMIT' }
+            : {
+                state: 'waiting',
+                reason: 'START_UNAVAILABLE',
+                retryDelayMs: 1,
+              },
+        ),
+      ).toBe(true);
+    }
+    await db`update allrice_memberships set active=false where user_id=${x.f.binding.personId}`;
+    await db`update allrice_memberships set active=true where user_id=${x.f.binding.personId}`;
+    const runtime = vi.spyOn(x.h.runtime, 'start');
+    await expect(x.user()).resolves.toMatchObject({
+      phase: 'running',
+      ready: true,
+    });
+    expect(runtime).toHaveBeenCalledOnce();
+    expect(
+      runtime.mock.lastCall?.[3]?.selectedEmployee?.employeeInstanceId,
+    ).not.toBe(x.f.origin.employeeInstanceId);
+    expect(runtime.mock.lastCall?.[3]?.scheduledEmployeeIds).toBeUndefined();
+    expect(await x.planStatus()).toEqual({
+      state: 'blocked',
+      reason: 'RETRY_LIMIT',
+    });
+    expect(await x.runDue()).toBe(false);
+  });
+
+  it.each([
+    ['foreground', 'revocation first'],
+    ['foreground', 'dispatch first'],
+    ['scheduled', 'revocation first'],
+    ['scheduled', 'dispatch first'],
+  ] as const)(
+    'serializes actual native scheduler exec on PG authority: %s / %s',
+    async (route, order) => {
+      const x = await retainedFixture();
+      const stagingRoot = await realpath(
+        await mkdtemp(join(tmpdir(), 'wake-exec-proof-')),
+      );
+      const issued = deferred<void>(),
+        allowReceipt = deferred<void>();
+      const dispatched = vi.fn(async () => {
+        issued.resolve();
+        await allowReceipt.promise;
+        return 'scheduled-job';
+      });
+      const archive = (locking: boolean) =>
+        db.begin(async (tx) => {
+          if (locking) await tx`set local lock_timeout='100ms'`;
+          await tx`update allrice_employee_instances set archived_at=now()
+        where id=${x.f.origin.employeeInstanceId}`;
+        });
+      x.h.native.bootstrap = (scope) =>
+        bootstrapMicrosandbox({
+          scope,
+          stagingRoot,
+          name: 'retained-test',
+          cleanupTimeoutMs: 1000,
+          plan: {
+            files: [
+              { path: '/work/init.cjs', contents: '//fixture', mode: 0o600 },
+              { path: '/work/launcher', contents: '#!/bin/sh', mode: 0o700 },
+            ],
+            initialize: { executable: 'node', args: ['/work/init.cjs'] },
+            launcher: '/work/launcher',
+            env: {},
+          },
+          async command(args) {
+            if (args[0] === 'exec')
+              return args.includes('scheduled-sentinel')
+                ? dispatched()
+                : 'setup-job';
+            if (args[0] === 'wait')
+              return JSON.stringify({
+                code: 0,
+                success: true,
+                timed_out: false,
+              });
+            return '';
+          },
+        });
+      x.h.runtime.start = async (_binding, _active, scope, web) => {
+        expect(web?.scheduledEmployeeIds).toEqual([
+          x.f.origin.employeeInstanceId,
+        ]);
+        const job = await scope.launch(
+          { executable: 'node', args: ['scheduled-sentinel'] },
+          async (active, work) => {
+            if (order === 'revocation first') await x.f.invalidate(x.planId);
+            return web!.dispatchScheduledLaunch!(active, work);
+          },
+        );
+        expect(job.jobId).toBe('scheduled-job');
+      };
+      if (route === 'scheduled') await x.makeDue();
+      const opening = route === 'foreground' ? x.user() : x.runDue();
+      void opening.catch(() => {});
+      try {
+        if (order === 'revocation first') {
+          if (route === 'foreground')
+            await expect(opening).rejects.toBeDefined();
+          else await expect(opening).resolves.toBe(true);
+          expect(dispatched).not.toHaveBeenCalled();
+          expect(await x.planStatus()).toEqual({
+            state: 'blocked',
+            reason: 'STALE_PLAN',
+          });
+          return;
+        }
+        await Promise.race([
+          issued.promise,
+          opening.then(() => {
+            throw Error('Native dispatch never issued');
+          }),
+        ]);
+        await expect(archive(true)).rejects.toMatchObject({ code: '55P03' });
+        allowReceipt.resolve();
+        await opening;
+        await archive(false);
+        expect(dispatched).toHaveBeenCalledOnce();
+        expect(await x.planStatus()).toEqual({ state: 'ready', reason: null });
+      } finally {
+        allowReceipt.resolve();
+        await opening.catch(() => {});
+        await rm(stagingRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('invalidates an existing idle sample after another employee is created via the current write path', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    await db`update person_virtual_machines set verified_web_slot_capacity=20 where vm_id=${f.binding.vmId}`;
+    const user = {
+      ...context(f.binding.organizationId, f.binding.personId),
+      workspaceId: f.origin.workspaceId,
+    };
+    await db`insert into allrice_sessions(id,user_id,token_hash,expires_at)
+      values(${user.sessionId},${f.binding.personId},${randomUUID().replaceAll('-', '').repeat(2)},now()+interval '1 hour')`;
+    const catalog = {
+      endpoint: f.origin,
+      revoked: signal,
+      owner: {
+        nativeActivityRevision: () => 1,
+        readScheduleCatalog: async () => [],
+        readNativeActivity: async () => ({ complete: true, work: [] }),
+      },
+    };
+    const startup = {
+      assertAuthenticatedGroup: vi.fn(() => signal),
+      activityCatalogs: vi.fn().mockReturnValue([catalog]),
+    };
+    const activity = createProductionNativeActivity(startup, signal, {
+      sampleIntervalMs: 60_000,
+      scheduleGuardMs: 120_000,
+      assertCompleteCensus: (binding, current) =>
+        assertCompleteNativeActivityCensus(startup, binding, current, db),
+    });
+    const old = await activity.observe(f.binding, signal);
+    expect(old.coverage.state).toBe('sampled');
+    const client = vi.spyOn(databaseClient, 'getDatabase').mockReturnValue(db);
+    try {
+      await expect(
+        createEmployeeInstance(user, {
+          workspaceId: user.workspaceId,
+          expectedOwnerId: f.binding.personId,
+          requestId: randomUUID(),
+          profile: { name: 'B' },
+        }),
+      ).resolves.toMatchObject({ ownerId: f.binding.personId });
+    } finally {
+      client.mockRestore();
+    }
+    expect((await activity.observe(f.binding, signal)).coverage.state).toBe(
+      'unknown',
+    );
+    expect(() =>
+      activity.assertSampleCurrent(f.binding, old.coverage.cursor!, signal),
+    ).toThrow('ACTIVITY_UNKNOWN');
+  });
 
   it('wakes active scoped native occurrences once and retains the full census for authority', async () => {
     const f = await fixture();
@@ -313,12 +663,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     await expect(
       f
         .store()
-        .withRetainedWakeAuthority(
-          f.binding,
-          beforeDue!.digest,
-          signal,
-          dispatch,
-        ),
+        .claimRetainedWake(f.binding, beforeDue!.digest, randomUUID(), signal),
     ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
     await expect(
       source.start(claim!, () => f.store().isCurrent(claim!), signal),

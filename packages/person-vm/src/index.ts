@@ -7,9 +7,11 @@ export type {
   NativeWebSetupFailure,
   PersonVmWebRosterPort,
 } from './web-endpoints.ts';
+export { PERSON_VM_WAKE_RESUME_AUDIT } from './web-endpoints.ts';
 export type {
   PersonVmMemoryGuestPlan,
   PersonVmGuestCommand,
+  PersonVmGuestLaunchDispatch,
   PersonVmJobExit,
   PersonVmManagedJob,
   PersonVmNativeWebGuestAddress,

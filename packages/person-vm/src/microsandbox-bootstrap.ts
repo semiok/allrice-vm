@@ -12,6 +12,7 @@ import {
 import type {
   PersonVmBootstrapScope,
   PersonVmGuestCommand,
+  PersonVmGuestLaunchDispatch,
   PersonVmGuestBootstrapPort,
   PersonVmJobExit,
   PersonVmManagedJob,
@@ -175,6 +176,7 @@ async function spawnMicrosandboxJob(
   input: Parameters<typeof spawnMicrosandboxManagedProbe>[0],
   commandSpec: PersonVmGuestCommand,
   lifetime: 'bootstrap-retained' | 'hot-retained' | 'probe-operation',
+  dispatch?: PersonVmGuestLaunchDispatch,
 ): Promise<PersonVmManagedProbeJob> {
   const { scope, name, command } = input;
   commandInput(commandSpec);
@@ -193,26 +195,34 @@ async function spawnMicrosandboxJob(
   for (const [key, value] of Object.entries(commandSpec.env ?? {}))
     args.push('--env', `${key}=${value}`);
   if (commandSpec.workdir) args.push('--workdir', commandSpec.workdir);
-  let jobId: string;
-  try {
-    jobId = (
-      await command(
-        [...args, '--', commandSpec.executable, ...commandSpec.args],
-        scope.signal,
-      )
-    ).trim();
-  } catch (cause) {
-    // Bootstrap retains its existing service-owned stop/status classification.
-    // Probe dispatch without a retained ID must report owner cleanup failure.
-    if (lifetime === 'bootstrap-retained') throw cause;
-    throw new PersonVmError('CLEANUP_INCOMPLETE', { cause });
-  }
-  if (!jobId || /[\s\0]/.test(jobId))
-    throw new PersonVmError(
-      lifetime === 'bootstrap-retained'
-        ? 'PROVIDER_FAILED'
-        : 'CLEANUP_INCOMPLETE',
-    );
+  const issue = async (active: AbortSignal) => {
+    active.throwIfAborted();
+    let id: string;
+    try {
+      id = (
+        await command(
+          [...args, '--', commandSpec.executable, ...commandSpec.args],
+          active,
+        )
+      ).trim();
+    } catch (cause) {
+      // A bootstrap failure is owned by the service's stop/status path.
+      if (lifetime === 'bootstrap-retained') throw cause;
+      throw new PersonVmError('CLEANUP_INCOMPLETE', { cause });
+    }
+    if (!id || /[\s\0]/.test(id))
+      throw new PersonVmError(
+        lifetime === 'bootstrap-retained'
+          ? 'PROVIDER_FAILED'
+          : 'CLEANUP_INCOMPLETE',
+      );
+    return id;
+  };
+  // Only dispatch and its exact job receipt are pinned to schedule authority.
+  // General startup assertions and the long-lived job remain outside that lock.
+  const jobId = dispatch
+    ? await dispatch(scope.signal, issue)
+    : await issue(scope.signal);
   // Cleanup uses only its independent owner budget, even after scope loss.
   async function nativeWait(signal: AbortSignal): Promise<PersonVmJobExit> {
     signal.throwIfAborted();
@@ -414,11 +424,13 @@ export async function bootstrapMicrosandbox(input: {
 
   async function spawn(
     commandSpec: PersonVmGuestCommand,
+    dispatch?: PersonVmGuestLaunchDispatch,
   ): Promise<PersonVmManagedJob> {
     const job = await spawnMicrosandboxJob(
       input,
       commandSpec,
       employee ? 'hot-retained' : 'bootstrap-retained',
+      dispatch,
     );
     return Object.freeze({
       binding: job.binding,
@@ -587,7 +599,10 @@ export async function bootstrapMicrosandbox(input: {
       active.throwIfAborted();
       return parseNativeWebAuth(text, request);
     },
-    launch: async (spec: PersonVmGuestCommand) => {
+    launch: async (
+      spec: PersonVmGuestCommand,
+      dispatch?: PersonVmGuestLaunchDispatch,
+    ) => {
       commandInput(spec);
       if (
         Object.entries(plan.env).some(
@@ -625,12 +640,15 @@ export async function bootstrapMicrosandbox(input: {
           'allrice-public-proxy',
           ...argv,
         ];
-      return spawn({
-        executable: plan.launcher,
-        args: argv,
-        env,
-        ...(spec.workdir ? { workdir: spec.workdir } : {}),
-      });
+      return spawn(
+        {
+          executable: plan.launcher,
+          args: argv,
+          env,
+          ...(spec.workdir ? { workdir: spec.workdir } : {}),
+        },
+        dispatch,
+      );
     },
   });
 }

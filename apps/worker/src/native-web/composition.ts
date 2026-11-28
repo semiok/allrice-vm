@@ -412,7 +412,7 @@ export function createAssignedNativeWebStartup(input: {
     context: RequestContext | undefined,
     startup?: Pick<
       Parameters<typeof openNativeWebOwner>[0],
-      'recordStartupFailure' | 'startupPending'
+      'recordStartupFailure' | 'startupPending' | 'dispatchLaunch'
     >,
   ) {
     return openNativeWebOwner({
@@ -686,11 +686,14 @@ export function createAssignedNativeWebStartup(input: {
             group.startingEmployees.add(employeeId);
             attemptedOwnerOpen = true;
             const scheduled = web.scheduledEmployeeIds?.includes(employeeId);
+            if (scheduled && !web.dispatchScheduledLaunch)
+              throw new PersonVmError('AUTHORIZATION_DENIED');
             const context =
               !scheduled || plan.selectedId === employeeId
                 ? web.context
                 : undefined;
             const owner = await openEmployee(scope, boundLaunch, context, {
+              ...(scheduled && { dispatchLaunch: web.dispatchScheduledLaunch }),
               recordStartupFailure: web.recordNativeFailure,
               startupPending: () => awaitingGroupSetup,
             });

@@ -447,6 +447,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
     };
     const wake = {
+      planId: randomUUID(),
       roster,
       employeeInstanceIds: entries.map(
         ({ employeeInstanceId }) => employeeInstanceId,
@@ -690,11 +691,21 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         nativeWeb: { prepare: f.interactiveRoster },
         retainedWake: {
           read,
-          async withCurrentAuthority(binding, digest, active, work) {
+          async claim(binding, digest, ownerToken) {
             expect(binding).toEqual(f.binding);
             expect(digest).toBe(wake.digest);
-            fences++;
-            return work(active);
+            expect((await f.store.read(f.binding.personId))?.leaseOwner).toBe(
+              ownerToken,
+            );
+            return {
+              readStartup: async () => wake,
+              async withCurrentAuthority(digest, active, work) {
+                expect(digest).toBe(wake.digest);
+                fences++;
+                return work(active);
+              },
+              finish: async (result) => expect(result).toBe('ready'),
+            };
           },
         },
       });
@@ -726,7 +737,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         scheduledEmployeeIds: active,
         context: f.rc,
       });
-      expect(read.mock.calls.length).toBeGreaterThan(1);
+      expect(read).toHaveBeenCalledOnce();
     },
   );
 

@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
 import type {
   PersonVmBootstrapScope,
+  PersonVmGuestLaunchDispatch,
   PersonVmWebStartup,
   PersonVmMemoryGuestPlan,
   PersonVmNativeWebGuestAddress,
@@ -1650,6 +1651,10 @@ it('scheduled bootstrap starts the native scheduler and obtains editor proof onl
   const scheduled = {
     purpose: 'scheduled-wake' as const,
     receipt: f.web.receipt,
+    dispatchScheduledLaunch: (
+      active: AbortSignal,
+      work: (active: AbortSignal) => Promise<string>,
+    ) => work(active),
     scheduledEmployeeIds: f.web.receipt.endpoints.map(
       ({ employeeInstanceId }) => employeeInstanceId,
     ),
@@ -1688,16 +1693,26 @@ it.each(['scheduled', 'foreground'] as const)(
     const receipt = { ...f.web.receipt, endpoints, slots: endpoints };
     const scheduledEmployeeIds = [due!.employeeInstanceId];
     const readScheduleCatalog = vi.fn(async () => []);
+    const dispatchScheduledLaunch: PersonVmGuestLaunchDispatch = (
+      active,
+      work,
+    ) => work(active);
     const owner = { ...catalogOwner(), readScheduleCatalog };
     open.mockResolvedValue(owner);
     const web =
       source === 'scheduled'
-        ? { purpose: 'scheduled-wake' as const, receipt, scheduledEmployeeIds }
+        ? {
+            purpose: 'scheduled-wake' as const,
+            receipt,
+            scheduledEmployeeIds,
+            dispatchScheduledLaunch,
+          }
         : {
             ...f.web,
             selectedEmployee: { ...selected!, ...f.binding },
             receipt,
             scheduledEmployeeIds,
+            dispatchScheduledLaunch,
           };
     try {
       const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
@@ -1714,6 +1729,11 @@ it.each(['scheduled', 'foreground'] as const)(
       await f.service.start(f.binding, signal(), f.scope, web);
       expect(open.mock.calls.map(([input]) => input.context)).toEqual(
         source === 'scheduled' ? [undefined] : [f.web.context, undefined],
+      );
+      expect(open.mock.calls.map(([input]) => input.dispatchLaunch)).toEqual(
+        source === 'scheduled'
+          ? [dispatchScheduledLaunch]
+          : [undefined, dispatchScheduledLaunch],
       );
       expect(readScheduleCatalog).toHaveBeenCalledOnce();
       expect(f.service.catalog(f.binding, due!.employeeInstanceId).owner).toBe(

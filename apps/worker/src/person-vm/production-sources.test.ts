@@ -204,7 +204,7 @@ it('shares the exact route and call association between A, B and the selected Co
     attach: f.attach,
   });
   const bound = await sources.bind(f.host);
-  expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm);
+  expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm, 4);
   expect(bound.scheduledWake).toBe(f.wake);
   const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
   const { context, identity, binding } = f.candidate;
