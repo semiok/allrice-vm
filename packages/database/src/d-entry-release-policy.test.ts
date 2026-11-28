@@ -189,7 +189,7 @@ it('resolves the released person’s employee from the same snapshot as policy, 
   const candidates = seen.find(({ query }) =>
     query.includes('from allrice_employee_instances'),
   );
-  expect(candidates?.params).toEqual([[org], person]);
+  expect(candidates?.params).toEqual([org, person]);
   expect(candidates?.query).toContain('a.user_id=i.owner_id and a.active');
   expect(candidates?.query).toContain('i.archived_at is null');
   expect(candidates?.query).toContain('order by i.organization_id,i.id');
@@ -285,6 +285,9 @@ it('reads the foreground busy projection in a bounded read-only transaction', as
   expect(
     await readPersonVmDiskPreparationForegroundBusy(person, signal()),
   ).toBe(true);
+  expect(data.createDedicatedDatabase).toHaveBeenCalledWith({
+    options: { fetch_types: false },
+  });
   expect(seen[0]?.query).toBe('begin read only');
   expect(seen[1]?.query).toBe("set local transaction_timeout = '5s'");
   expect(seen[2]?.query).toMatch(

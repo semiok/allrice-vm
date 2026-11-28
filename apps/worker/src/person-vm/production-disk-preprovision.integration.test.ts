@@ -220,7 +220,10 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
     const reads = await relay(
       databaseUrl,
       holdQualification ? 'qualification' : null,
-    );
+    ).catch(async (error: unknown) => {
+      await feed.close();
+      throw error;
+    });
     vi.stubEnv('DATABASE_URL', reads.url.toString());
     const outcomes: string[] = [];
     const previousFeedClosed: boolean[] = [];
@@ -278,7 +281,13 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       });
     } finally {
       try {
-        await Promise.all([owner.close(), feed.close(), reads.close()]);
+        const cleanup = await Promise.allSettled([
+          owner.close(),
+          feed.close(),
+          reads.close(),
+        ]);
+        for (const result of cleanup)
+          if (result.status === 'rejected') throw result.reason;
       } finally {
         await client.closeDatabase();
         vi.unstubAllEnvs();
@@ -376,7 +385,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
         await release.promise;
       });
       try {
-        await locked.promise;
+        await Promise.race([locked.promise, lock]);
         await withScanner(null, async (f) => {
           await expect.poll(() => f.reads.peers.length, poll).toBe(2);
           const [roster, target] = f.reads.peers;
@@ -398,7 +407,10 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
           expect(f.prepared).not.toHaveBeenCalled();
           if (action === 'disconnect') {
             expect(
-              await fixture.db`select pg_terminate_backend(${heldPid!}) as stopped`,
+              await fixture.db`select pg_terminate_backend(pid) as stopped
+                from pg_stat_activity where pid=${heldPid!}
+                  and datname=current_database() and usename=current_user
+                  and client_addr='127.0.0.1'::inet and client_port=${peer.port!}`,
             ).toEqual([{ stopped: true }]);
           } else {
             await f.owner.close();
