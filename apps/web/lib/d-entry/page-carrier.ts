@@ -181,8 +181,9 @@ export function openNativePageCarrier(
                 value.threadId !== switching.threadId)
             )
               throw Error('Unexpected native page switch acknowledgement');
-            const { result } = switching;
+            const { result, proof } = switching;
             switching = undefined;
+            proof.abort();
             if (value.type === 'switched') {
               scopeId = value.scopeId;
               carrierSelection = { ...selection, threadId: value.threadId };

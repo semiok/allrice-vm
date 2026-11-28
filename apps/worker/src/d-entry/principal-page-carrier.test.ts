@@ -244,8 +244,9 @@ it('replaces the borrowed root while keeping native employee events on the same 
   const revoked = f.registerThread(target);
   const { peer, scopeId, receive } = await open(f, true);
   expect(
-    f.data.resolveAdmissionOwner.mock.calls
-      .map(([input]) => input.access)
+    vi
+      .mocked(f.data.resolveAdmissionOwner)
+      .mock.calls.map(([input]) => input.access)
       .sort(),
   ).toEqual(['employee-streams', 'page']);
   const requestId = randomUUID();

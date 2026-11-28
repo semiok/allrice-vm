@@ -921,6 +921,7 @@ export function EmployeeNativePage({
       ) {
         await waitForVisibleEntry(lifetime.signal);
         selectedQuery = params.toString();
+        timer = window.setTimeout(() => finish('failed'), entryWaitMs);
         const attempt = (carrier = connect(warm, selection, true));
         const upgradeTimer = window.setTimeout(() => {
           if (!attempt.dispatched) void attempt.close().catch(() => {});
@@ -937,6 +938,7 @@ export function EmployeeNativePage({
           await attempt.close();
           carrier = undefined;
           remoteRevoked = false;
+          window.clearTimeout(timer);
         } finally {
           window.clearTimeout(upgradeTimer);
         }
