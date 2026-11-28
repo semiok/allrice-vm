@@ -1218,6 +1218,8 @@ suite(
             lateRecorded.close();
           }
           await policy('fixture-late-recorded-restored', true);
+          await page.reload();
+          await materials();
           await openUpload();
           await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
           const [stillUnknown] = await Promise.all([

@@ -201,16 +201,14 @@ async function checkPublication(
   );
   signal.throwIfAborted();
   const saved = response.result;
-  if (
-    response.status !== 'recorded' ||
-    !saved ||
-    !('sourceId' in saved) ||
-    (receipt.operation !== 'change-publication' &&
-      (response.ready !== true || !('revisionId' in saved)))
-  )
+  if (response.status !== 'recorded' || !saved || !('sourceId' in saved))
     return;
-  if (receipt.operation === 'publish-upload' && response.archived)
-    return { outcome: 'archived' };
+  if (receipt.operation !== 'change-publication') {
+    if (!('revisionId' in saved)) return;
+    if (receipt.operation === 'publish-upload' && response.archived)
+      return { outcome: 'archived' };
+    if (response.ready !== true) return;
+  }
   // A background read can refresh the list, but only a matching submission
   // can acknowledge the result and retire its intent.
   return { outcome: 'recorded', saved } as const;
