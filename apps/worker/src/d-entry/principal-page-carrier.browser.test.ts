@@ -1057,12 +1057,13 @@ it
               bundles: publicIndex,
             });
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
-        response.writeHead(200, { 'content-type': 'text/html' })
-          .end(`<!doctype html>
+        const lifecycle = `<script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>`;
+        const html = `<!doctype html>
+          ${refreshBenchmark ? lifecycle : ''}
           ${usePublicFiles ? managedPreloads : ''}
           ${usePublicFiles ? nativeStyles : ''}
           <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
-          <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
+          ${refreshBenchmark ? '' : lifecycle}
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
@@ -1071,7 +1072,19 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
+          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`;
+        const encoded = refreshBenchmark ? gzipSync(html) : undefined;
+        response
+          .writeHead(200, {
+            'content-type': 'text/html',
+            'cache-control': 'private, no-store',
+            ...(encoded && {
+              'content-encoding': 'gzip',
+              'content-length': encoded.byteLength,
+              vary: 'accept-encoding',
+            }),
+          })
+          .end(encoded ?? html);
       } catch {
         response.writeHead(500).end();
       }

@@ -2,7 +2,7 @@ import {
   downloadProfileResource,
   profileDownloadLimits,
   sealedProfileBundleFetch,
-} from './profile-download';
+} from './profile-download.js';
 
 export const publicProfileStartupPath =
   /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/(?:bundles\/[a-f0-9]{64}\.js|managed\/(?:employee-web-entry\.(?:css|js)|[\w-]+\.js)|native\/assets\/(?:index|vendor)-[\w-]+\.css)(?![\s\S])/;
