@@ -1126,6 +1126,27 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (sidebarCreate) {
+      await page.addInitScript(() => {
+        if (window !== top) return;
+        window.addEventListener(
+          'message',
+          (event) => {
+            if (
+              document.documentElement.dataset.fixtureHoldSecondSwitch ===
+                'yes' &&
+              event.origin === location.origin &&
+              event.source ===
+                document.querySelector('iframe')?.contentWindow &&
+              event.data?.type === 'allrice:d-entry:thread-switch-prepared'
+            ) {
+              event.stopImmediatePropagation();
+            }
+          },
+          { capture: true },
+        );
+      });
+    }
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
       page.on('request', (request) => {
@@ -1446,17 +1467,28 @@ it
         });
         expect(projectedTitles.at(-1)).toBe(title);
 
-        f.findRoot.mockResolvedValue(await f.root());
+        const original = await f.root();
+        f.findRoot.mockImplementation(async (_context, _identity, _vm, id) => {
+          if (id === 'root') return original;
+          const registration = f.registerRoot.mock.calls.findIndex(
+            ([, , fact]) => fact.nativeSessionId === id,
+          );
+          return f.registerRoot.mock.results[registration]?.value;
+        });
+        forkTitle = '派生会话继承的标题';
         const forkResponse = await nativeRpc('session/fork', {
           sessionId: 'root',
         });
         expect(await forkResponse.json()).toMatchObject({
           result: { ok: true, value: { sessionId: 'native-forked' } },
         });
-        const registered = await f.registerRoot.mock.results[0]!.value;
-        f.findRoot.mockImplementation(async (_context, _identity, _vm, id) =>
-          id === 'native-forked' ? registered : undefined,
+        const forkIndex = f.registerRoot.mock.calls.findIndex(
+          ([, , fact]) => fact.nativeSessionId === 'native-forked',
         );
+        expect(forkIndex).toBeGreaterThanOrEqual(0);
+        const registered = await f.registerRoot.mock.results[forkIndex]!.value;
+        expect(registered.rootNativeSessionId).toBe('native-forked');
+        await vi.waitFor(() => expect(projectedTitles.at(-1)).toBe(forkTitle));
         const renamedFork = await nativeRpc('session/rename', {
           sessionId: 'native-forked',
           title: '另一个已登记的原生根',
@@ -1468,6 +1500,7 @@ it
         expect(projectedThreads).toEqual([
           f.selection.threadId,
           f.selection.threadId,
+          registered.thread.id,
           registered.thread.id,
         ]);
         await context.close();
@@ -1879,7 +1912,7 @@ it
       );
       await expect.poll(nativeSession).toBe(outerNativeId);
       expect(f.registerRoot).toHaveBeenCalledTimes(initialRegistrations + 1);
-      expect(switchProofRequests).toBe(initialProofs + 1);
+      expect(switchProofRequests).toBe(initialProofs);
       expect(await editor.textContent()).toBe('');
       expect(await firstReply.count()).toBe(0);
       for (const [thread, nativeId] of [
@@ -1950,6 +1983,8 @@ it
         : /win/iu.test(platform)
           ? 'Control+Alt+N'
           : 'Control+Shift+Period';
+      const proofsBeforeCreate = switchProofRequests;
+      if (sidebarCreate) expect(proofsBeforeCreate).toBeGreaterThan(0);
       try {
         if (createAfterSwitch && !sidebarCreate) {
           await workbench.locator('#app').evaluate((node) => {
@@ -1963,14 +1998,19 @@ it
           });
           holdCreatedResponse = true;
         }
-        if (sidebarCreate)
+        if (sidebarCreate) {
+          // The first switch proved its new scope. The same-scope create
+          // must open even if a redundant second handoff cannot complete.
+          await page.evaluate(() => {
+            document.documentElement.dataset.fixtureHoldSecondSwitch = 'yes';
+          });
           await workbench
             .getByRole('button', {
               name: '和 Fixture employee 开新会话',
               exact: true,
             })
             .click();
-        else await editor.press(chord, { timeout: 10_000 });
+        } else await editor.press(chord, { timeout: 10_000 });
         if (createAfterSwitch && !sidebarCreate) {
           try {
             await createdResponse.promise;
@@ -1999,6 +2039,7 @@ it
           (url) => url.searchParams.get('threadId') === createdThread,
           { timeout: 20_000 },
         );
+        if (sidebarCreate) expect(switchProofRequests).toBe(proofsBeforeCreate);
       } catch (error) {
         deliverCreatedResponse.resolve();
         throw new Error(
@@ -2023,6 +2064,11 @@ it
           }),
           { cause: error },
         );
+      } finally {
+        if (sidebarCreate)
+          await page.evaluate(() => {
+            delete document.documentElement.dataset.fixtureHoldSecondSwitch;
+          });
       }
       const row = workbench.locator(
         '[data-row-key="session:' + createdThread + '"]',

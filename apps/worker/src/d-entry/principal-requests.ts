@@ -805,6 +805,8 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     const thread = ChatSessionSchema.parse(registered.thread);
                     if (thread.id !== registered.identity.threadId)
                       throw denied();
+                    // A fork can inherit a title before its SQL registration.
+                    if (forkSource) page.requestNativeTitle(nativeSessionId);
                     return thread;
                   },
                   async invokeTerminal(call, active) {

@@ -241,7 +241,13 @@ export async function syncDEntryNativeRootTitle(
 
   while (true) {
     signal.throwIfAborted();
-    const [before] = await row(sql);
+    const [before] = await sql.begin('read only', async (tx) => {
+      await tx`set local lock_timeout = '500ms'`;
+      await tx`set local statement_timeout = '1500ms'`;
+      signal.throwIfAborted();
+      return row(tx);
+    });
+    signal.throwIfAborted();
     if (!before) return deny();
     ensureRoot(before.d_entry_native_root);
     const title = ChatSessionSchema.shape.title

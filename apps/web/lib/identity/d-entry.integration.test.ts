@@ -674,6 +674,15 @@ suite(
           await Promise.allSettled([holder, blocked]);
         }
 
+        await fixture.db.begin(async (tx) => {
+          await tx`lock table allrice_chat_sessions in access exclusive mode`;
+          const readBlockedTitle = vi.fn(async () => '锁住时不读取原生标题');
+          await expect(sync(readBlockedTitle)).rejects.toMatchObject({
+            code: '55P03',
+          });
+          expect(readBlockedTitle).not.toHaveBeenCalled();
+        });
+
         await expect(
           sync(async () => {
             await revokeSession(f.login.token);
