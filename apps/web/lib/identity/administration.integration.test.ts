@@ -26,7 +26,10 @@ import {
   GET as bulkRollout,
   PUT as replaceRollout,
 } from '../../app/api/v1/admin/d-entry-release-policy/route';
-import { projectRuntimeTimelineEvents } from '../../app/runtime-console/runtime-timeline';
+import {
+  aggregateRuntimeTimelineEvents,
+  projectRuntimeTimelineEvents,
+} from '../../app/runtime-console/runtime-timeline';
 
 const cookie = vi.hoisted(() => ({ token: '' }));
 vi.mock('next/headers', () => ({
@@ -440,9 +443,16 @@ integration('MET-288 live administration HTTP contract', () => {
       summary: 'PRIVATE_TOOL_OUTPUT',
     };
     const next = Number(seq!.next) + 1;
+    const compaction = {
+      source: 'dsh',
+      presentation: 'compaction',
+      label: 'PRIVATE_COMPACTION',
+    };
     await fixture.db`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
       values(${organizationId},${workspaceId},${runId},${next},'tool.started',${fixture.db.json(toolRecord)}),
-      (${organizationId},${workspaceId},${runId},${next + 1},'tool.completed',${fixture.db.json(toolRecord)})`;
+      (${organizationId},${workspaceId},${runId},${next + 1},'tool.completed',${fixture.db.json(toolRecord)}),
+      (${organizationId},${workspaceId},${runId},${next + 2},'harness.native',${fixture.db.json({ ...compaction, status: 'started', sourceEventType: 'compaction/start' })}),
+      (${organizationId},${workspaceId},${runId},${next + 3},'harness.native',${fixture.db.json({ ...compaction, status: 'completed', sourceEventType: 'compaction/end' })})`;
     await fixture.db`update allrice_chat_sessions set title='PRIVATE_SESSION_TITLE' where id=${sessionId}`;
     const dashboard = await activity(
       request(
@@ -509,14 +519,22 @@ integration('MET-288 live administration HTTP contract', () => {
       ]),
     });
     expect(JSON.stringify(body)).not.toMatch(
-      /PRIVATE_TOOL|Synthetic research goal|Synthetic finished report/,
+      /PRIVATE_TOOL|PRIVATE_COMPACTION|Synthetic research goal|Synthetic finished report/,
     );
     const projected = projectRuntimeTimelineEvents(turn.events).filter(
-      ({ sequence }) => sequence >= next,
+      ({ sequence }) => sequence === next || sequence === next + 1,
     );
     expect(projected).toMatchObject([
       { sequence: next, status: 'completed', kind: 'tool', detail: null },
     ]);
+    expect(aggregateRuntimeTimelineEvents(turn.events)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'compaction',
+          status: 'completed',
+        }),
+      ]),
+    );
     expect(
       (await eventsRead(member.token, sessionId, organizationId)).status,
     ).toBe(403);

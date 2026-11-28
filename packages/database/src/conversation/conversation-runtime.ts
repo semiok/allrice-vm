@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import {
   UuidSchema,
   type RuntimeRunUsage,
@@ -155,26 +154,20 @@ function mapAdministrativeRuntimeEvent(row: DshRuntimeEventRow) {
           ? String(payload.status)
           : 'info';
   const id = `${row.run_id}:${row.sequence}`;
-  const callId =
-    kind === 'tool' || kind === 'search'
-      ? row.event_type === 'harness.native'
-        ? safeRecord(payload.nativePayload).callId
-        : payload.toolCallId
-      : null;
-  const key =
-    typeof callId === 'string' && callId.trim() && callId.length <= 160
-      ? `${row.run_id}:tool:${createHash('sha256')
-          .update(JSON.stringify([payload.source, callId]))
-          .digest('hex')}`
-      : id;
+  const toolKey = safeText(payload.toolKey, 64);
   return {
     id,
-    key,
+    key: toolKey ? `${row.run_id}:tool:${toolKey}` : id,
     runId: row.run_id,
     sequence: row.sequence,
     kind,
     status,
-    title: kind,
+    title:
+      kind === 'compaction' &&
+      status === 'completed' &&
+      payload.compactionEnded === true
+        ? '上下文已整理'
+        : kind,
     detail: null,
     occurredAt: timestamp(row.occurred_at),
   };
@@ -642,8 +635,18 @@ export async function listDshRuntimeEventTimeline(
       event.sequence, event.event_type,
       ${
         admin
-          ? sql`jsonb_build_object('source',event.payload->>'source',
-        'presentation',event.payload->>'presentation','status',event.payload->>'status')`
+          ? sql`jsonb_build_object(
+          'source',event.payload->>'source',
+          'presentation',event.payload->>'presentation',
+          'status',event.payload->>'status',
+          'compactionEnded',event.payload->>'sourceEventType'='compaction/end',
+          'toolKey',case when jsonb_typeof(diagnostic.call_id)='string'
+                       and length(diagnostic.call_id #>> '{}') between 1 and 160
+                       and btrim(diagnostic.call_id #>> '{}') <> ''
+            then encode(sha256(convert_to(jsonb_build_array(
+              employee_run.run_id,event.payload->>'source',diagnostic.call_id
+            )::text,'UTF8')),'hex')
+          end)`
           : sql`event.payload`
       } as payload,
       event.occurred_at
@@ -669,6 +672,18 @@ export async function listDshRuntimeEventTimeline(
         and event.payload->>'source' is distinct from ${nativeModelReceiptSource}
       order by event.sequence desc limit ${selectedRun ? 150 : null}::int
     ) event on true
+    ${
+      admin
+        ? sql`left join lateral (
+          select case
+            when event.event_type='harness.native'
+              and event.payload->>'presentation' in ('tool','search')
+              then event.payload #> '{nativePayload,callId}'
+            when event.event_type like 'tool.%' then event.payload->'toolCallId'
+          end as call_id
+        ) diagnostic on true`
+        : sql``
+    }
     where employee_run.session_id = ${sessionId}
       ${
         admin
