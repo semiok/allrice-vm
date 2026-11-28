@@ -28,7 +28,8 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from './composition.js';
-import { dEntryNativePublicUrl } from './launch.js';
+import * as NativeLaunch from './launch.js';
+const { dEntryNativePublicUrl } = NativeLaunch;
 const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
@@ -285,6 +286,85 @@ it.each(['proved', 'unproved'] as const)(
     }
   },
 );
+it('proves the exact scoped thread during starting without using running-only or threadless proof', async () => {
+  const f = fixture();
+  const employee = { ...f.web.receipt.endpoints[0]!, ...f.binding };
+  const editor = { employee, threadId: randomUUID() };
+  const web = {
+    ...f.web,
+    selectedEmployee: employee,
+    editorThreadId: editor.threadId,
+  };
+  const proof = new AbortController();
+  const model = {
+    provider: 'openai-codex',
+    model: 'gpt-6.2-sol',
+    modelInfo: { provider: 'openai-codex', id: 'gpt-6.2-sol', name: 'Fixture' },
+  };
+  f.service.installModelAdapter(async () => ({
+    ...model,
+    origin: 'http://192.0.2.5:34100',
+    capability: 'synthetic-model-capability',
+    scoped: { rules: [], models: [model] },
+  }));
+  const verify = vi.fn(async () => proof.signal);
+  f.service.installStartingEditorProof(verify);
+  const prepareLaunch = NativeLaunch.prepareNativeWebLaunch;
+  // This test exercises startup evidence. Leave production artifact
+  // construction to the build gates, which have the compiled Worker files.
+  const stage = vi
+    .spyOn(NativeLaunch, 'prepareNativeWebLaunch')
+    .mockImplementation((config, binding, profile, memory) =>
+      prepareLaunch(config, binding, profile, memory),
+    );
+  const owner = {
+    ...catalogOwner(),
+    verifyStartingEditor: vi.fn<NativeWebOwner['verifyStartingEditor']>(
+      async (_scope, active, check) =>
+        check(
+          {
+            revoked: active,
+            readImmutableGraph: vi.fn(),
+            readImmutableBundle: vi.fn(),
+          },
+          vi.fn(),
+          active,
+        ),
+    ),
+    verifyRunningEditor: vi.fn(),
+  };
+  open.mockResolvedValue(owner);
+  try {
+    await f.service.memoryGuestPlan(f.binding, signal(), web);
+    expect(stage.mock.calls[0]?.[4]).toMatchObject({ scoped: { rules: [] } });
+    await f.service.start(f.binding, signal(), f.scope, web);
+    expect(verify).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ threadId: editor.threadId }),
+      expect.any(AbortSignal),
+    );
+    f.startup.abort();
+    vi.mocked(f.scope.assertCurrent).mockRejectedValue(
+      new Error('closed bootstrap scope'),
+    );
+    expect(
+      f.service.assertStartingEditor(f.binding, web.context, editor, signal()),
+    ).toBe(proof.signal);
+    expect(owner.verifyRunningEditor).not.toHaveBeenCalled();
+    expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow();
+    expect(() =>
+      f.service.assertStartingEditor(
+        f.binding,
+        web.context,
+        { ...editor, threadId: randomUUID() },
+        signal(),
+      ),
+    ).toThrow(expect.objectContaining({ code: 'RUNTIME_NOT_READY' }));
+  } finally {
+    stage.mockRestore();
+    await f.service.close();
+  }
+});
+
 it('starts only the selected employee on a fresh five-profile disk and keeps all five usable after stop and restore', async () => {
   const f = capacityFixture(
     createProductionEmployeeRuntime({}, { readAttachedProbe: vi.fn() }, 20)!,

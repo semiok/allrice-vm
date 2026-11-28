@@ -16,6 +16,7 @@ import {
 import { EgressError, type ManagedHostService } from '@allrice/egress-gateway';
 import {
   ModelGatewayError,
+  sameModelRoute,
   type ModelCallBinding,
 } from '@allrice/model-gateway';
 import {
@@ -223,7 +224,7 @@ async function assertPersistedExecution(
 const wireSelection = z
   .object({
     sessionId: z.string().min(1).max(256),
-    provider: z.literal('openai-codex'),
+    provider: z.enum(['openai-codex', 'openai', 'deepseek']),
     model: z.string().min(1).max(128),
     adapterId: z.string().regex(/^[a-f0-9]{64}$/),
     recipient: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
@@ -437,7 +438,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const uninstall = host.startup.installModelAdapter(
         async (binding, signal) => {
           const active = AbortSignal.any([live, signal]);
-          const modelMetadata = await input.readModelMetadata(active);
+          const scoped = await input.scoped?.guestCatalog(binding, active);
+          const modelMetadata = scoped
+            ? {
+                modelInfo: scoped.defaultModelInfo,
+                historicalModels: scoped.historicalModels,
+              }
+            : await input.readModelMetadata(active);
           const access = await host.providers.egressInstallation.readAccess(
             binding,
             active,
@@ -445,10 +452,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           active.throwIfAborted();
           return {
             ...access,
+            ...(scoped ? { scoped } : {}),
             provider: input.route.provider,
             model: input.route.model,
             ...modelMetadata,
-            webSearchEnabled: input.webSearch !== undefined,
+            webSearchEnabled: !scoped && input.webSearch !== undefined,
           };
         },
       );
@@ -720,7 +728,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 mode,
                 active,
               );
-              const route = await input.assertRouteCurrent(active);
+              const route = input.scoped?.applies(binding)
+                ? live
+                : await input.assertRouteCurrent(active);
               const authority = acquirePromptWatch(authorityKey, (watching) =>
                 watchDEntryNativeRosterAuthority(
                   context,
@@ -987,6 +997,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             return reject();
         }
       }
+      const assertCallRoute = (call: ModelCallBinding, signal: AbortSignal) =>
+        input.scoped
+          ? input.scoped.assertCurrent(call, signal)
+          : input.assertRouteCurrent(signal);
       async function readAuthorizedCall(
         call: ModelCallBinding,
         signal: AbortSignal,
@@ -999,7 +1013,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             JSON.stringify(call) !== JSON.stringify(owned.call)
           )
             return reject();
-          await input.assertRouteCurrent(active);
+          await assertCallRoute(call, active);
           if (owned.persisted) await assertPersistedExecution(call, active);
           const { resource, profile, attempt } = await resolveSession(
             owned.scope,
@@ -1025,7 +1039,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             profile.owner.modelAdapterId !== call.native.profile
           )
             return reject();
-          await input.assertRouteCurrent(active);
+          await assertCallRoute(call, active);
           return { owner: profile.owner, attempt };
         });
       }
@@ -1051,6 +1065,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             timeoutMs: webSearchTimeoutMs,
             admissionOwner: 'service',
             async resolve(request, binding, signal, assertNoCapability) {
+              if (input.scoped?.applies(binding))
+                throw new EgressError('DENIED');
               return run(signal, async (active) => {
                 const reading = AbortSignal.any([
                   active,
@@ -1177,11 +1193,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         admissionOwner: 'service',
         async resolve(request, binding, signal) {
           return run(signal, async (active) => {
-            const route = await input.assertRouteCurrent(active);
             const wanted = await readSelection(request, active);
             if (
-              wanted.provider !== input.route.provider ||
-              wanted.model !== input.route.model
+              !input.scoped?.applies(binding) &&
+              !sameModelRoute(wanted, input.route)
             )
               return reject();
             let matched:
@@ -1298,6 +1313,21 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   sourceTurn: attempt.sourceTurn,
                 },
               );
+              const native = {
+                instanceId: profile.owner.nativeInstanceId,
+                profile: profile.owner.modelAdapterId!,
+                sessionId: resource.nativeSessionId,
+                rootSessionId: resource.rootNativeSessionId,
+                parentSessionId: resource.parentNativeSessionId,
+                callId: randomUUID(),
+                attemptKind: attempt.kind,
+                attemptId: attempt.id,
+                attemptTurn: attempt.turn,
+                attemptCursor: attempt.cursor,
+              };
+              const selectedRoute =
+                input.scoped?.select(binding, native) ?? input.route;
+              if (!sameModelRoute(wanted, selectedRoute)) return reject();
               matched = {
                 scope,
                 owner: profile.owner,
@@ -1314,23 +1344,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   employeeInstanceId: scope.identity.employeeInstanceId,
                   employeeRelease: scope.identity.employeeVersionId,
                   allriceThreadRef: resource.threadId,
-                  native: {
-                    instanceId: profile.owner.nativeInstanceId,
-                    profile: profile.owner.modelAdapterId!,
-                    sessionId: resource.nativeSessionId,
-                    rootSessionId: resource.rootNativeSessionId,
-                    parentSessionId: resource.parentNativeSessionId,
-                    callId: randomUUID(),
-                    attemptKind: attempt.kind,
-                    attemptId: attempt.id,
-                    attemptTurn: attempt.turn,
-                    attemptCursor: attempt.cursor,
-                  },
+                  native,
                   executionGeneration: '4.0',
                   gatewayRelease:
                     host.providers.applicationBuild.manifestDigest,
-                  provider: wanted.provider,
-                  model: wanted.model,
+                  provider: selectedRoute.provider,
+                  model: selectedRoute.model,
                 },
               };
               break;
@@ -1347,6 +1366,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               delegated,
               inheritedPromptIndexes,
             } = matched;
+            const route = await assertCallRoute(call, active);
             const callId = call.native.callId;
             const deadline = AbortSignal.timeout(30_000);
             const effective = AbortSignal.any([
@@ -1517,9 +1537,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           entry.delivery = active;
           active.addEventListener('abort', entry.revoke, { once: true });
         },
-        async resolveSendRoute({ modelAdapterId }, signal) {
+        async resolveSendRoute({ modelAdapterId, binding }, signal) {
           const active = AbortSignal.any([signal, live]);
-          await input.assertRouteCurrent(active);
+          if (!input.scoped?.applies(binding))
+            await input.assertRouteCurrent(active);
           if (!modelAdapterId) throw new PersonVmError('RUNTIME_NOT_READY');
           active.throwIfAborted();
           return {
