@@ -286,7 +286,9 @@ it(
               await writeFile(outside, 'unchanged');
               const id = randomUUID();
               const { id: preset } = await ctx.agentPresets.resolve();
-              const setup = agentCtx => ctx.agentPresets.mount(agentCtx, preset);
+              const setup = async agentCtx => {
+                await ctx.agentPresets.mount(agentCtx, preset);
+              };
               const fresh = await ctx.agents.create({
                 sessionId: id, meta: { cwd: workspace, agentPreset: preset }, setup,
               });
@@ -336,7 +338,7 @@ it(
             ctx.appReady.onReady(() => {
               void prove().then(
                 result => writeFile(receipt, JSON.stringify(result)),
-                error => writeFile(receipt, JSON.stringify({ error: String(error) })),
+                error => writeFile(receipt, JSON.stringify({ error: error.stack ?? String(error) })),
               );
             });
           }
