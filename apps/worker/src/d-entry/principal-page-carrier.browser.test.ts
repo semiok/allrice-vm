@@ -1622,6 +1622,7 @@ it
       await editor.fill('第二位员工的独立草稿');
       const secondScope = await scope();
       expect(secondScope).not.toBe(firstScope);
+      const network = { documentLoads, socketCount };
       const first = page
         .frames()
         .find((frame) => frame.url().includes(firstScope))!;
@@ -1660,7 +1661,6 @@ it
         b,
       );
 
-      const network = { documentLoads, socketCount };
       const samples = [];
       for (let attempt = 0; attempt < 3; attempt++) {
         samples.push({ employee: 'A', elapsedMs: await open(a) });
@@ -2044,6 +2044,59 @@ it
         ).toBe(mark);
         expect(await editor.innerText()).toBe('另一条会话的原生草稿');
         expect((await f.invokeThread(original, otherThread)).status).toBe(200);
+        expect(documentLoads).toBe(before.documentLoads + 1);
+        expect(socketCount).toBe(before.socketCount + 1);
+        const restoreThread = f.selection.threadId;
+        const restoreRelease = deferred<void>();
+        const oldAddress = new URL(page.url());
+        oldAddress.searchParams.set('threadId', restoreThread);
+        const currentAddress = page.url();
+        await page.evaluate(
+          ({ previous, current }) => {
+            history.replaceState(history.state, '', previous);
+            history.pushState(history.state, '', current);
+          },
+          { previous: oldAddress.href, current: currentAddress },
+        );
+        let restoreRequested = false;
+        await page.route(
+          (url) =>
+            url.pathname === '/api/v1/d-entry/profile/switch' &&
+            url.searchParams.get('targetThreadId') === restoreThread,
+          async (route) => {
+            restoreRequested = true;
+            await restoreRelease.promise;
+            await route.continue();
+          },
+          { times: 1 },
+        );
+        const selectEmployee = async (employeeInstanceId: string) => {
+          await workbench
+            .locator('[data-row-key="workspace:' + employeeInstanceId + '"]')
+            .click();
+          await page.waitForURL(
+            (url) =>
+              url.searchParams.get('employeeInstanceId') === employeeInstanceId,
+            { waitUntil: 'commit' },
+          );
+        };
+        try {
+          await page.goBack({ waitUntil: 'commit' });
+          await expect.poll(() => restoreRequested).toBe(true);
+          await selectEmployee(next.employeeInstanceId);
+          await selectEmployee(f.selection.employeeInstanceId);
+          expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+        } finally {
+          restoreRelease.resolve();
+        }
+        await expect.poll(() => editor.innerText()).toBe('未发送的原生草稿');
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === restoreThread,
+          { waitUntil: 'commit', timeout: 5_000 },
+        );
+        expect(
+          await workbench.locator('#app').getAttribute('data-fixture-document'),
+        ).toBe(mark);
         expect(documentLoads).toBe(before.documentLoads + 1);
         expect(socketCount).toBe(before.socketCount + 1);
         await page.goto(
