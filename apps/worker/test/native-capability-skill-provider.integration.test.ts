@@ -112,7 +112,6 @@ suite(
       });
       return {
         context,
-        assignment,
         scope: {
           workspaceId: publication.workspaceId,
           instanceId: instance.id,
@@ -234,7 +233,7 @@ suite(
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
       const instance = await createEmployeeInstance(context, {
         workspaceId: host.scope.workspaceId,
-        assignmentId: host.assignment.id,
+        expectedOwnerId: context.actor.id,
         requestId: randomUUID(),
         profile: { name: 'Other Skill fixture' },
       });

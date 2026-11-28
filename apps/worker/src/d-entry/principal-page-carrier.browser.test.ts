@@ -1221,16 +1221,18 @@ it
         (method) => method === 'skills/list',
       ).length;
       expect(originalReads).toBeGreaterThan(0);
+      const priorSubscriptions = f.host.catalog.follows.length;
       f.setFixtureSkills([]);
       await expect
-        .poll(() => unary.filter((method) => method === 'skills/list').length, {
-          timeout: 12_000,
-        })
-        .toBeGreaterThan(originalReads);
+        .poll(() => f.host.catalog.follows.length, { timeout: 12_000 })
+        .toBeGreaterThan(priorSubscriptions);
       await editor.waitFor();
       await editor.press('Escape');
       await editor.fill('');
       await editor.press('/');
+      await expect
+        .poll(() => unary.filter((method) => method === 'skills/list').length)
+        .toBeGreaterThan(originalReads);
       expect(
         await workbench.getByText('bound-qa-skill', { exact: false }).count(),
       ).toBe(0);

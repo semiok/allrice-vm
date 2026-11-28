@@ -138,7 +138,9 @@ export function openNativePageCarrier(
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
       if (frame.streamId !== id) {
-        if (requested) return;
+        // Already-delivered old-generation frames can follow the reset
+        // notice. Reconnect opens new native reads from their normal cursors.
+        if (requested || refreshingSkills) return;
         if (!nativeMux) throw Error('Unexpected native page stream');
         nativeMux.postMessage({ type: 'frame', data: event.data });
         return;

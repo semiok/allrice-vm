@@ -305,7 +305,10 @@ export function createDEntryPrincipalControl(
           signal: AbortSignal,
           changed: () => void,
           lost: (error: unknown) => void,
-        ): Promise<() => void>;
+        ): Promise<{
+          close(): void;
+          throughCommit(signal: AbortSignal): Promise<void>;
+        }>;
       },
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
@@ -352,7 +355,8 @@ export function createDEntryPrincipalControl(
             const handle = TYPERT_REMOTE.methods[
               'allricePrincipal/openScope'
             ].invoke(root.remote, { issue }, input.carrier);
-            let skillWatch: Promise<void> | undefined;
+            let skillWatch:
+              ReturnType<NonNullable<typeof skillSource>['watch']> | undefined;
             let catalog: string | undefined;
             let skillGeneration = 0;
             let feedLost = false;
@@ -399,17 +403,17 @@ export function createDEntryPrincipalControl(
                 })(),
               );
             };
-            const watchSkills = () =>
-              (skillWatch ??=
-                skillSource
-                  ?.watch(business, skillChanged, () => {
-                    feedLost = true;
-                    skillChanged();
-                  })
-                  .then((stop) => {
-                    if (business.aborted) stop();
-                    else detachSkills = stop;
-                  }) ?? Promise.resolve());
+            const watchSkills = (source: NonNullable<typeof skillSource>) =>
+              (skillWatch ??= source
+                .watch(business, skillChanged, () => {
+                  feedLost = true;
+                  skillChanged();
+                })
+                .then((observation) => {
+                  if (business.aborted) observation.close();
+                  else detachSkills = observation.close;
+                  return observation;
+                }));
             relay = new Relay(
               handle,
               issue.scopeId,
@@ -436,14 +440,18 @@ export function createDEntryPrincipalControl(
                       };
                       try {
                         if (skillSource) {
-                          await watchSkills();
+                          const watch = await watchSkills(skillSource);
+                          if (read.kind === 'list') catalog ??= '[]';
                           const generation = skillGeneration;
                           if (!feedLost) {
                             const readResult = await skillSource.read(
                               read,
                               active,
                             );
-                            if (generation === skillGeneration)
+                            // This listener cut joins commits during the SQL
+                            // reads, before a catalog or body can escape.
+                            await watch.throughCommit(active);
+                            if (!feedLost && generation === skillGeneration)
                               result = readResult;
                           }
                         }

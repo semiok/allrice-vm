@@ -360,6 +360,8 @@ async function runOwner(
           )
             continue; // An in-place thread handoff can supersede the notice.
           await generation.resources?.close();
+          if (generation !== current || generation.stop.signal.aborted)
+            continue;
           page.signal.throwIfAborted();
           generation.skillsChanged = false;
           generation.resources = pageStreams(

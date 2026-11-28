@@ -927,9 +927,8 @@ class PrincipalService extends TypertRemoteService {
     };
     scope.abort.signal.addEventListener('abort', withdraw, { once: true });
     if (scope.abort.signal.aborted) withdraw();
-    const input = invocation
-      .uplink<PrincipalScopeCommand>()
-      [Symbol.asyncIterator]();
+    const uplink = invocation.uplink<PrincipalScopeCommand>();
+    const input = uplink[Symbol.asyncIterator]();
     const pump = commands(input, gate.stop, scope.skills).catch((error) => {
       gate.stop();
       throw error;

@@ -16,3 +16,7 @@ create trigger allrice_d_entry_employee_skill_binding_changed
 create trigger allrice_d_entry_skill_source_changed
   after update or delete on allrice_dsh_skills
   for each row execute function allrice_d_entry_authority_changed();
+
+create trigger allrice_d_entry_platform_skill_source_changed
+  after update or delete on allrice_platform_dsh_skills
+  for each row execute function allrice_d_entry_authority_changed();

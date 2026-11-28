@@ -170,7 +170,11 @@ function defaultFeed() {
 /** Hint only. The production owner compares its own exact catalog before
  * resetting the retained browser connection. */
 export async function subscribeDEntrySkillChanges(
-  identity: Pick<DEntryIdentity, 'organizationId' | 'workspaceId' | 'personId'>,
+  identity: Pick<
+    DEntryIdentity,
+    'organizationId' | 'workspaceId' | 'personId' | 'employeeInstanceId'
+  >,
+  loginId: string,
   signal: AbortSignal,
   changed: () => void,
   lost: (error: unknown) => void,
@@ -180,30 +184,48 @@ export async function subscribeDEntrySkillChanges(
   >`select current_schema() schema`;
   signal.throwIfAborted();
   if (!row?.schema) throw new DataAccessError('authorization_denied');
-  const { schema } = row;
-  return defaultFeed().subscribe(
+  const feed = defaultFeed();
+  const close = await feed.subscribe(
     {
       changed(change) {
+        if (signal.aborted) return;
+        if (change.table === 'person_virtual_machines') {
+          if (change.personId === identity.personId) changed();
+          return;
+        }
+        if (change.schema !== row.schema) return;
+        if (change.table === 'allrice_sessions') {
+          if (change.id === loginId) changed();
+          return;
+        }
+        if (change.table === 'allrice_users') {
+          if (change.id === identity.personId) changed();
+          return;
+        }
+        if (change.table === 'allrice_organizations') {
+          if (change.id === identity.organizationId) changed();
+          return;
+        }
         if (
-          signal.aborted ||
-          change.schema !== schema ||
-          change.organizationId !== identity.organizationId ||
-          (change.workspaceId && change.workspaceId !== identity.workspaceId) ||
-          (change.personId && change.personId !== identity.personId)
+          change.organizationId &&
+          change.organizationId !== identity.organizationId
         )
           return;
+        if (change.workspaceId && change.workspaceId !== identity.workspaceId)
+          return;
+        if (change.personId && change.personId !== identity.personId) return;
         if (
-          change.table === 'allrice_personal_skill_bindings' ||
-          change.table === 'allrice_personal_skill_installations' ||
-          change.table === 'allrice_employee_dsh_skill_bindings' ||
-          change.table === 'allrice_dsh_skills'
+          change.table === 'allrice_employee_instances' &&
+          change.id !== identity.employeeInstanceId
         )
-          changed();
+          return;
+        changed();
       },
       lost,
     },
     signal,
   );
+  return { close, throughCommit: feed.observeThroughCommit };
 }
 
 export async function closeDEntryAuthorityFeeds() {
@@ -551,7 +573,8 @@ async function watchDEntryAuthority(
             change.table === 'allrice_personal_skill_bindings' ||
             change.table === 'allrice_personal_skill_installations' ||
             change.table === 'allrice_employee_dsh_skill_bindings' ||
-            change.table === 'allrice_dsh_skills'
+            change.table === 'allrice_dsh_skills' ||
+            change.table === 'allrice_platform_dsh_skills'
           )
             return;
           if (
