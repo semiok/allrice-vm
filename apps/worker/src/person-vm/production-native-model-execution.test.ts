@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
+import type * as Database from '@allrice/database';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deferredPromptFact,
@@ -24,7 +25,10 @@ const mocks = vi.hoisted(() => ({
   watch: vi.fn(),
   query: vi.fn(),
 }));
-vi.mock('@allrice/database', () => ({
+vi.mock('@allrice/database', async (importOriginal) => ({
+  createApplicationBuiltinModuleAuthority: (
+    await importOriginal<typeof Database>()
+  ).createApplicationBuiltinModuleAuthority,
   getDEntryNativeRootPin: mocks.pin,
   getDatabase: () =>
     Object.assign(mocks.query, { json: (value: unknown) => value }),
