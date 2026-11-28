@@ -835,46 +835,56 @@ export function apply(ctx: Context) {
     ['allriceEmployeePanels', 'sidebarRightTabs', 'sidebarRight', 'layout'],
     (scope) => {
       const binding = scope.allriceEmployeePanels;
-      scope.effect(() =>
-        scope.sidebarRightTabs.register({
-          id: nativeDeliveryTab,
-          kind: nativeDeliveryTab,
-          patterns: [
-            'dsh-resource://file/session/[\\s\\S]+',
-            exactDeliveryResource + '[\\s\\S]+',
-          ],
-          priority: 'extension',
-          canOpen: (address) =>
-            !!(
-              visibleNativeDelivery(scope, address) ??
-              exactDeliveryAddress(address)
+      scope.inject(
+        ['uiConversation', 'sessions', 'remote'],
+        (deliveryScope) => {
+          deliveryScope.effect(() =>
+            deliveryScope.sidebarRightTabs.register({
+              id: nativeDeliveryTab,
+              kind: nativeDeliveryTab,
+              patterns: [
+                'dsh-resource://file/session/[\\s\\S]+',
+                exactDeliveryResource + '[\\s\\S]+',
+              ],
+              priority: 'extension',
+              canOpen: (address) =>
+                !!(
+                  visibleNativeDelivery(deliveryScope, address) ??
+                  exactDeliveryAddress(address)
+                ),
+              title: (address) =>
+                nativeDeliveryAddress(deliveryScope, address)?.name ??
+                '交付成果',
+            }),
+          );
+          deliveryScope.slots.inject('sidebar.right.pane.tab', () =>
+            deliveryScope.slots.register(
+              { name: 'sidebar.right.pane.tab', key: nativeDeliveryTab },
+              (props: PropsRuntime<'sidebar.right.pane.tab'>) => (
+                <EmployeeNativeDelivery
+                  {...props}
+                  ctx={deliveryScope}
+                  binding={binding}
+                />
+              ),
             ),
-          title: (address) =>
-            nativeDeliveryAddress(scope, address)?.name ?? '交付成果',
-        }),
-      );
-      scope.slots.inject('sidebar.right.pane.tab', () =>
-        scope.slots.register(
-          { name: 'sidebar.right.pane.tab', key: nativeDeliveryTab },
-          (props: PropsRuntime<'sidebar.right.pane.tab'>) => (
-            <EmployeeNativeDelivery {...props} ctx={scope} binding={binding} />
-          ),
-        ),
-      );
-      scope.slots.inject('deliverables.file.actions', () =>
-        scope.slots.register(
-          {
-            name: 'deliverables.file.actions',
-            id: 'allrice-native-delivery-version',
-          },
-          (props: PropsRuntime<'deliverables.file.actions'>) => (
-            <NativeDeliveryVersionAction
-              {...props}
-              ctx={scope}
-              binding={binding}
-            />
-          ),
-        ),
+          );
+          deliveryScope.slots.inject('deliverables.file.actions', () =>
+            deliveryScope.slots.register(
+              {
+                name: 'deliverables.file.actions',
+                id: 'allrice-native-delivery-version',
+              },
+              (props: PropsRuntime<'deliverables.file.actions'>) => (
+                <NativeDeliveryVersionAction
+                  {...props}
+                  ctx={deliveryScope}
+                  binding={binding}
+                />
+              ),
+            ),
+          );
+        },
       );
       for (const kind of Object.keys(
         employeePanelKinds,

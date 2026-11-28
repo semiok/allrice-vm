@@ -117,6 +117,7 @@ export async function publishCapturedDEntryDelivery(
   storage: StoragePort,
   current: (transaction: TransactionSql) => Promise<void>,
   signal: AbortSignal,
+  db = getDatabase(),
 ) {
   const capture = DEntryNativeDeliveryCaptureSchema.parse(input);
   const { organizationId, workspaceId, ownerId, runId, prompt, attempt } =
@@ -181,7 +182,6 @@ export async function publishCapturedDEntryDelivery(
     };
     return { path, bytes, prefix, requestId, object, format };
   });
-  const db = getDatabase();
   async function authorize(tx: TransactionSql) {
     signal.throwIfAborted();
     await lockWorkspaceStorageQuota(tx, organizationId, workspaceId);
@@ -356,8 +356,8 @@ export async function findDEntryNativeDelivery(
 export async function sweepDEntryNativeDeliveryReservations(
   storage: StoragePort,
   signal: AbortSignal,
+  db = getDatabase(),
 ) {
-  const db = getDatabase();
   signal.throwIfAborted();
   await db`
     with expired as (

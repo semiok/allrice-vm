@@ -242,6 +242,7 @@ it
     const deliveryPath = '/work/team/hello-word.md';
     const deliveryObjectId = randomUUID();
     const earlierDeliveryId = randomUUID();
+    let deliveryReads = 0;
     if (outerCreate) {
       f.host.catalog.items = f.host.catalog.items.map((item) =>
         item.sessionId === 'root' ? { ...item, cwd: '/work/team' } : item,
@@ -282,7 +283,7 @@ it
             data: {
               turn: 1,
               callId: 'present-file-fixture',
-              files: [{ path: deliveryPath }],
+              files: [{ path: deliveryPath }, { path: '/private/foreign.md' }],
             },
           },
           {
@@ -598,6 +599,7 @@ it
         if (outerCreate && url.pathname.endsWith('/api/present.host'))
           return await copy(headlessPresentedHost());
         if (outerCreate && url.pathname === panelPath + 'deliverables/native') {
+          deliveryReads++;
           expect(url.searchParams.get('threadId')).toBe(f.selection.threadId);
           expect(url.searchParams.get('coordinate')).toBe(
             createHash('sha256')
@@ -620,8 +622,8 @@ it
         if (
           outerCreate &&
           url.pathname === panelPath + 'deliverables' &&
-          [deliveryObjectId, earlierDeliveryId].includes(
-            url.searchParams.get('objectId') ?? '',
+          [deliveryObjectId, earlierDeliveryId].some(
+            (id) => id === url.searchParams.get('objectId'),
           )
         ) {
           return await copy(
@@ -1777,8 +1779,16 @@ it
           .count(),
       ).toBe(0);
       await closeWorkbenchPane('root', 'hello-word.md');
-      await workbench.getByRole('button', { name: '查看此版本详情' }).click();
+      const detail = workbench.getByRole('button', { name: '查看此版本详情' });
+      await detail.first().click();
       await workbench.getByText('该次交付固定版本', { exact: true }).waitFor();
+      await closeWorkbenchPane('root', '交付成果');
+      expect(deliveryReads).toBe(2);
+      await detail.last().click();
+      await workbench
+        .getByText('文件尚未归档到交付成果。', { exact: true })
+        .waitFor();
+      expect(deliveryReads).toBe(2);
       await closeWorkbenchPane('root', '交付成果');
 
       const mark = randomUUID();

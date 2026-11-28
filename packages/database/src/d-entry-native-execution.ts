@@ -397,8 +397,8 @@ export async function listDEntryNativeRunCandidates(
     DEntryNativeDeliveryClaim,
     'sessionId' | 'turn' | 'attemptId' | 'cursor'
   >,
+  sql = getDatabase(),
 ) {
-  const sql = getDatabase();
   const rows = await sql<
     {
       run_id: string;

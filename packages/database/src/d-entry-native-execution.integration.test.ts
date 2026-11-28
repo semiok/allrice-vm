@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { StoragePort } from '@allrice/contracts';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as database from './core/client.ts';
+import { lockWorkspaceStorageQuota } from './core/storage-quota.ts';
 import { DataAccessError } from './data.ts';
 import { createDEntryAuthorityFeed } from './d-entry-authority.ts';
 import * as rootPin from './d-entry-native-root.ts';
@@ -384,6 +385,43 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       { version: 1, visibility: 'private', state: 'ready' },
       { version: 2, visibility: 'private', state: 'ready' },
     ]);
+
+    let didLock!: () => void;
+    let releaseLock!: () => void;
+    const held = new Promise<void>((resolve) => {
+      didLock = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lock = db.begin(async (tx) => {
+      await lockWorkspaceStorageQuota(tx, organizationId, workspaceId);
+      didLock();
+      await release;
+    });
+    const bounded = database.createDedicatedDatabase(db, {
+      max: 1,
+      lockTimeoutMs: 150,
+      statementTimeoutMs: 800,
+    });
+    try {
+      await held;
+      await expect(
+        publishCapturedDEntryDelivery(
+          candidate,
+          capture('blocked-lock', 'never staged'),
+          storage,
+          assertCurrent,
+          signal,
+          bounded,
+        ),
+      ).rejects.toMatchObject({ code: '55P03' });
+      expect(stored.size).toBe(2);
+    } finally {
+      releaseLock();
+      await lock;
+      await bounded.end({ timeout: 1 });
+    }
 
     const abandoned = capture('unacknowledged', 'abandoned bytes');
     await expect(

@@ -4,6 +4,8 @@ import { z } from 'zod';
 import {
   isDEntryNativeRunJournalCurrent,
   assertDEntryNativeDeliveryRun,
+  createDedicatedDatabase,
+  getDatabase,
   DEntryNativeDeliveryClaimSchema,
   DEntryNativeDeliveryCaptureSchema,
   publishCapturedDEntryDelivery,
@@ -43,6 +45,7 @@ async function reconcileDeliveries(
   scope: DEntryNativeRunJournalOwner,
   storage: StoragePort,
   signal: AbortSignal,
+  sql: ReturnType<typeof getDatabase>,
 ) {
   const offers = pendingDeliveries.parse(
     await owner.exchangeNativeDeliveryFor(
@@ -59,6 +62,7 @@ async function reconcileDeliveries(
         undefined,
         64,
         offer,
+        sql,
       );
       const candidate = candidates
         .reverse()
@@ -106,6 +110,7 @@ async function reconcileDeliveries(
             throw new PersonVmError('LEASE_LOST');
         },
         active,
+        sql,
       );
       await owner.exchangeNativeDeliveryFor(
         { ...offer, action: 'delivery-ack' },
@@ -125,6 +130,18 @@ export async function reconcileNativeDeliveries(
   storage: StoragePort,
   signal: AbortSignal,
 ) {
+  if (signal.aborted) return;
+  const sql = createDedicatedDatabase(getDatabase(), {
+    max: 4,
+    lockTimeoutMs: 2_000,
+    statementTimeoutMs: 5_000,
+  });
+  let closed: Promise<void> | undefined;
+  const close = () => {
+    closed ??= sql.end({ timeout: 1 });
+    void closed.catch(() => {});
+  };
+  signal.addEventListener('abort', close, { once: true });
   const active = new Map<NativeWebOwner, Promise<void>>();
   let sweeping: Promise<void> | undefined;
   let nextSweep = 0;
@@ -137,14 +154,20 @@ export async function reconcileNativeDeliveries(
         const current = AbortSignal.any([signal, revoked]);
         active.set(
           owner,
-          reconcileDeliveries(owner, ownerScope(location), storage, current)
+          reconcileDeliveries(
+            owner,
+            ownerScope(location),
+            storage,
+            current,
+            sql,
+          )
             .catch(() => {})
             .finally(() => active.delete(owner)),
         );
       }
       if (!sweeping && Date.now() >= nextSweep) {
         nextSweep = Date.now() + 60_000;
-        sweeping = sweepDEntryNativeDeliveryReservations(storage, signal)
+        sweeping = sweepDEntryNativeDeliveryReservations(storage, signal, sql)
           .catch(() => {})
           .finally(() => {
             sweeping = undefined;
@@ -155,7 +178,9 @@ export async function reconcileNativeDeliveries(
   } catch (error) {
     if (!signal.aborted) throw error;
   } finally {
-    await Promise.allSettled([...active.values(), sweeping]);
+    signal.removeEventListener('abort', close);
+    close();
+    await Promise.allSettled([...active.values(), sweeping, closed]);
   }
 }
 
