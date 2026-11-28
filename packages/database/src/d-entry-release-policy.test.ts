@@ -112,7 +112,7 @@ function fixture(
   data.createDedicatedDatabase.mockImplementation(
     ({ options }: { options: { onclose(): void } }) => {
       socketClosed = options.onclose;
-      return { reserve: async () => sql, end };
+      return Object.assign(sql, { reserve: async () => sql, end });
     },
   );
   return { end, seen, sql };
@@ -292,7 +292,11 @@ it('reads the foreground busy projection in a bounded read-only transaction', as
     await readPersonVmDiskPreparationForegroundBusy(person, signal()),
   ).toBe(true);
   expect(data.createDedicatedDatabase).toHaveBeenCalledWith({
-    options: { fetch_types: false, onclose: expect.any(Function) },
+    options: {
+      fetch_types: false,
+      max_lifetime: 0,
+      onclose: expect.any(Function),
+    },
   });
   expect(seen[0]?.query).toBe('begin read only');
   expect(seen[1]?.query).toBe("set local transaction_timeout = '5s'");

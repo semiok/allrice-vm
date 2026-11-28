@@ -266,6 +266,9 @@ async function readDiskPreparation<T>(
     options: {
       ...options,
       fetch_types: false,
+      // This connection is bounded by the preparation signal and must not
+      // rotate between its BEGIN and reservation.
+      max_lifetime: 0,
       onclose(id) {
         confirmSocketClosed();
         if (!closing) lost.abort(Error('DISK_PREPARATION_CONNECTION_CLOSED'));
@@ -296,17 +299,19 @@ async function readDiskPreparation<T>(
   active.addEventListener('abort', abort, { once: true });
   let result: T;
   try {
-    // Bind every statement to the original session. An idle disconnect
-    // between statements cannot resume the same transaction on a new socket.
+    // Start on the only connection before reserving it. postgres.js 3.4.9
+    // does not finish a cold reserve when type discovery is disabled.
+    await (mode === 'read only'
+      ? client`begin read only`
+      : client`begin isolation level repeatable read read only`);
+    active.throwIfAborted();
+    // A lost session may never continue this transaction on a new socket.
     const sql = new Proxy(await client.reserve(), {
       apply(target, receiver, args) {
         active.throwIfAborted();
         return Reflect.apply(target, receiver, args);
       },
     });
-    await (mode === 'read only'
-      ? sql`begin read only`
-      : sql`begin isolation level repeatable read read only`);
     await sql`set local transaction_timeout = '5s'`;
     active.throwIfAborted();
     result = await read(sql, active);
