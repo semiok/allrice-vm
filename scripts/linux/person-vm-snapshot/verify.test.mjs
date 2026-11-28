@@ -12,7 +12,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import { verifyTemplate, verifyTemplateInventory } from './verify.mjs';
 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -73,7 +73,7 @@ async function fixture(t) {
   const bytes = Buffer.from(JSON.stringify(manifest));
   const manifestSha256 = digest(bytes);
   const root = join(temporary, manifestSha256);
-  t.after(async () => {
+  t.onTestFinished(async () => {
     await chmod(root, 0o700);
     await chmod(join(root, 'disk'), 0o700);
     await rm(temporary, { recursive: true, force: true });

@@ -1,11 +1,20 @@
 /* global AbortController */
 
+import { spawn } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
+import { once } from 'node:events';
+import { chmod, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { sealTemplate } from './build.mjs';
+import { createCaptureFixture } from './capture.fixture.mjs';
+import { withGuestFreshnessHelper } from './guest-freshness.fixture.mjs';
 import { measureRestore } from './measure.mjs';
 import { createRestoreProbe } from './restore-probe.mjs';
+import { verifyTemplate } from './verify.mjs';
 
 const hash = 'a'.repeat(64);
 const seal = {
@@ -59,7 +68,7 @@ const manifest = {
     }))
     .concat({
       role: 'metadata',
-      path: 'checkpoint/snapshot.json',
+      path: 'template.msb',
       sizeBytes: 1,
       sha256: hash,
     }),
@@ -91,25 +100,31 @@ function setup(options = {}) {
   let attempt = options.offset ?? 0;
   let clock = 1000;
   let draw = 0;
+  const nextRandom =
+    options.random ??
+    ((size) =>
+      Buffer.alloc(size, options.sameChallenge ? (draw++ % 2) + 1 : ++draw));
   let previousReply;
   const native = {
     inspect: vi.fn(async () => dimensions.state ?? 'absent'),
-    restoreStrict: vi.fn(async ({ binding, dispatchCurrent, signal }) => {
-      const start = async () => {
-        calls.push('restore');
-        dimensions.state = 'running';
-        await options.afterDispatch?.(signal);
-        return {
-          binding,
-          templateDigest: hash,
-          memoryMode: 'cow',
-          computeIdentity: options.computeIdentity ?? computeIdentity,
-          ...options.nativeReceipt,
+    restoreStrict: vi.fn(
+      async ({ binding, template, dispatchCurrent, signal }) => {
+        const start = async () => {
+          calls.push('restore');
+          dimensions.state = 'running';
+          await options.afterDispatch?.(signal);
+          return {
+            binding,
+            templateDigest: template.seal.manifestSha256,
+            memoryMode: 'cow',
+            computeIdentity: options.computeIdentity ?? computeIdentity,
+            ...options.nativeReceipt,
+          };
         };
-      };
-      await options.beforeDispatch?.(dimensions);
-      return options.omitDispatch ? start() : dispatchCurrent(start);
-    }),
+        await options.beforeDispatch?.(dimensions);
+        return options.omitDispatch ? start() : dispatchCurrent(start);
+      },
+    ),
     stopAndJoin: vi.fn(async (binding, signal) => {
       signal.throwIfAborted();
       await options.stop?.();
@@ -202,7 +217,9 @@ function setup(options = {}) {
     }),
   };
   const probe = createRestoreProbe({
-    qualify: async (seal) => ({ seal, manifest: options.manifest ?? manifest }),
+    qualify:
+      options.qualify ??
+      (async (seal) => ({ seal, manifest: options.manifest ?? manifest })),
     gateTimeoutMs: options.gateTimeoutMs,
     reserve: async () => ({
       ...lease,
@@ -232,8 +249,7 @@ function setup(options = {}) {
       }),
     native,
     now: () => (clock += 7),
-    random: (size) =>
-      Buffer.alloc(size, options.sameChallenge ? (draw++ % 2) + 1 : ++draw),
+    random: nextRandom,
   });
   return {
     calls,
@@ -253,6 +269,172 @@ function setup(options = {}) {
     },
   };
 }
+
+describe('offline signed archive to restore probe', () => {
+  async function publish(after) {
+    const capture = await createCaptureFixture(after);
+    const { seal, manifest } = await sealTemplate(capture.options);
+    return {
+      seal,
+      manifest,
+      qualification: {
+        captureMode: 'fixture',
+        expected: capture.options.expected,
+        publisherUid: process.getuid(),
+        publicKey: capture.publicKey,
+      },
+    };
+  }
+
+  it('uses the sealed archive and joins the real C gate before committing seven synthetic spans', async ({
+    onTestFinished,
+  }) => {
+    const { seal, manifest, qualification } = await publish(onTestFinished);
+    const qualify = vi.fn((seal, signal) =>
+      verifyTemplate({ ...qualification, seal, signal }),
+    );
+    const random = vi.fn((size) => Buffer.alloc(size, 17));
+    random.mockImplementationOnce((size) => Buffer.alloc(size, 23));
+    const fixture = setup({
+      qualify,
+      random,
+    });
+    // Only the private-stream gate is real here. Kernel ioctls and the VM
+    // restore/CoW path belong to the independent Linux ARM64/KVM run.
+    await withGuestFreshnessHelper(async (binary) => {
+      let child;
+      let closed;
+      let transportFailure;
+      const connect = fixture.scope.connectGate.getMockImplementation();
+      fixture.scope.connectGate.mockImplementation(async (compute, signal) => {
+        const peer = await connect(compute, signal);
+        child = spawn(binary, [], {
+          stdio: ['ignore', 'ignore', 'ignore', 'pipe'],
+          signal,
+        });
+        // close also joins fd 3. Keep monitoring errors until that join.
+        closed = new Promise((resolve) => child.once('close', resolve));
+        child.on('error', (error) => {
+          transportFailure = error;
+        });
+        const channel = child.stdio[3];
+        channel.on('error', (error) => {
+          transportFailure = error;
+        });
+        const [ready] = await once(channel, 'data', { signal });
+        expect(ready).toEqual(Buffer.from([1]));
+        return {
+          ...peer,
+          waitingVersion: ready[0],
+          async exchange(frame) {
+            fixture.calls.push('c-gate');
+            const chunks = [];
+            channel.on('data', (chunk) => chunks.push(chunk));
+            channel.end(frame);
+            const code = await closed;
+            if (transportFailure) throw transportFailure;
+            expect(code).toBe(0);
+            return Buffer.concat(chunks);
+          },
+        };
+      });
+      try {
+        expect(await fixture.run({ seal })).toEqual({
+          evidence: 'synthetic',
+          failure: null,
+          resourcesReleased: true,
+          timeline: {
+            offsetsMs: {
+              accepted: 0,
+              epoch_reserved: 7,
+              host_disk_net_ready: 14,
+              restore_dispatch: 21,
+              fresh_gate_connected: 28,
+              freshness_confirmed: 35,
+              work_verified: 42,
+              native_editor_proof: 49,
+              ready_committed: 56,
+            },
+            stagesMs: {
+              admission: 7,
+              hostDiskAndNetwork: 7,
+              resumeToGate: 7,
+              freshness: 7,
+              workMount: 7,
+              nativeEditor: 7,
+              readyCommit: 7,
+            },
+            dispatchGapMs: 7,
+            totalMs: 56,
+          },
+        });
+      } finally {
+        if (child && child.exitCode === null) child.kill();
+        await closed;
+      }
+    });
+
+    const qualified = await qualify.mock.results[0].value;
+    expect(qualified).toEqual({ seal, manifest });
+    const [dispatch] = fixture.native.restoreStrict.mock.calls[0];
+    expect(dispatch.template).toEqual(qualified);
+    expect(dispatch.argv.slice(0, 3)).toEqual([
+      'snap',
+      'restore',
+      join(seal.templateDirectory, 'template.msb'),
+    ]);
+    expect(fixture.scope.probeSyntheticEditor.mock.calls[0][0]).toMatchObject({
+      templateDigest: seal.manifestSha256,
+      freshness: { controlChallengeConsumed: true },
+    });
+    expect(fixture.calls).toEqual([
+      'prepare',
+      'restore',
+      'c-gate',
+      'fence',
+      'stop',
+      'disk',
+      'lease',
+    ]);
+  });
+
+  it.for([
+    ['changed manifest bytes', 'manifest digest mismatch'],
+    ['wrong Ed25519 key', 'invalid signature'],
+  ])(
+    'rejects %s before any restore I/O',
+    async ([kind, error], { onTestFinished }) => {
+      const { seal, qualification } = await publish(onTestFinished);
+      if (kind === 'changed manifest bytes') {
+        const path = join(seal.templateDirectory, 'manifest.json');
+        const bytes = await readFile(path);
+        await chmod(path, 0o600);
+        // JSON still parses; only the signed bytes changed.
+        await writeFile(path, Buffer.concat([bytes, Buffer.from(' ')]));
+        await chmod(path, 0o444);
+      } else {
+        qualification.publicKey = generateKeyPairSync('ed25519').publicKey;
+      }
+      const qualify = vi.fn((seal, signal) =>
+        verifyTemplate({ ...qualification, seal, signal }),
+      );
+      const fixture = setup({ qualify });
+      expect(await fixture.run({ seal })).toMatchObject({
+        evidence: 'synthetic',
+        failure: { stage: 'admission', code: 'PROBE_STEP_FAILED' },
+        resourcesReleased: true,
+        timeline: { offsetsMs: { accepted: 0 }, totalMs: null },
+      });
+      await expect(qualify.mock.results[0].value).rejects.toThrow(error);
+      expect(fixture.native.inspect).not.toHaveBeenCalled();
+      expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
+      expect(fixture.scope.prepare).not.toHaveBeenCalled();
+      expect(fixture.scope.connectGate).not.toHaveBeenCalled();
+      expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
+      expect(fixture.calls).toEqual(['lease']);
+    },
+  );
+});
 
 describe('isolated Linux snapshot restore', () => {
   it('uses exact strict argv, proves the binding before the editor and measures seven spans', async () => {
@@ -280,7 +462,7 @@ describe('isolated Linux snapshot restore', () => {
     expect(argv).toEqual([
       'snap',
       'restore',
-      seal.templateDirectory + '/checkpoint',
+      seal.templateDirectory + '/template.msb',
       '--name',
       expect.stringMatching(/^probe-[a-f0-9]{64}$/),
       '--cow-mem',
@@ -374,26 +556,34 @@ describe('isolated Linux snapshot restore', () => {
     expect(fixture.scope.probeSyntheticEditor).toHaveBeenCalledTimes(1);
   });
 
-  it.each([false, true])(
-    'requires a unique signed native descriptor %#',
-    async (duplicate) => {
-      const files = duplicate
-        ? manifest.files.concat({
-            role: 'metadata',
-            path: 'other/snapshot.json',
-            sizeBytes: 1,
-            sha256: hash,
-          })
-        : manifest.files.filter(
-            ({ path }) => path !== 'checkpoint/snapshot.json',
-          );
-      const fixture = setup({ manifest: { ...manifest, files } });
-      expect((await fixture.run()).failure.code).toBe(
-        'SNAPSHOT_DESCRIPTOR_UNPROVED',
-      );
-      expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
-    },
-  );
+  it.for([
+    [],
+    [
+      {
+        role: 'metadata',
+        path: 'checkpoint/snapshot.json',
+        sizeBytes: 1,
+        sha256: hash,
+      },
+    ],
+    [
+      {
+        role: 'metadata',
+        path: 'other/template.msb',
+        sizeBytes: 1,
+        sha256: hash,
+      },
+    ],
+  ])('requires the exact signed archive %#', async (alternatives) => {
+    const files = manifest.files
+      .filter(({ path }) => path !== 'template.msb')
+      .concat(alternatives);
+    const fixture = setup({ manifest: { ...manifest, files } });
+    expect((await fixture.run()).failure.code).toBe(
+      'SNAPSHOT_ARCHIVE_UNPROVED',
+    );
+    expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
+  });
 
   it.each([
     { gatePeer: { endpoint: '/private/control-old.sock' } },

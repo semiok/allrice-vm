@@ -7,6 +7,7 @@ import {
   LinuxSnapshotConfigurationSchema,
   PersonVmTemplateManifestSchema,
 } from '../../../packages/person-vm/src/template-snapshot-contract.ts';
+import { templateArchiveName } from './capture-contract.mjs';
 import { measureRestore } from './measure.mjs';
 
 /** @typedef {import('../../../packages/person-vm/src/template-snapshot-contract.ts').PersonVmTemplatePort} PersonVmTemplatePort */
@@ -81,22 +82,25 @@ function inside(path, root) {
 }
 
 function strictRestoreArgs({ template, binding, disk, control }) {
-  const descriptors = template.manifest.files.filter(
-    ({ path }) => posix.basename(path) === 'snapshot.json',
+  const templateRoot = template.seal.templateDirectory;
+  requireProof(
+    template.manifest.files.some(
+      ({ path, role }) => path === templateArchiveName && role === 'metadata',
+    ),
+    'SNAPSHOT_ARCHIVE_UNPROVED',
   );
-  requireProof(descriptors.length === 1, 'SNAPSHOT_DESCRIPTOR_UNPROVED');
-  const snapshotPath = posix.dirname(
-    posix.join(template.seal.templateDirectory, descriptors[0].path),
-  );
+  // v0.7.16 accepts the portable archive the builder seals. The probe
+  // hands off that exact file without materializing a different checkpoint.
+  const snapshotPath = posix.join(templateRoot, templateArchiveName);
   requireProof(
     [snapshotPath, disk.workDirectory, control.socketPath].every(hostPath) &&
-      inside(snapshotPath, template.seal.templateDirectory) &&
-      !inside(disk.workDirectory, template.seal.templateDirectory) &&
-      !inside(template.seal.templateDirectory, disk.workDirectory) &&
+      inside(snapshotPath, templateRoot) &&
+      !inside(disk.workDirectory, templateRoot) &&
+      !inside(templateRoot, disk.workDirectory) &&
       !inside(control.socketPath, disk.workDirectory) &&
       !inside(disk.workDirectory, control.socketPath) &&
-      !inside(control.socketPath, template.seal.templateDirectory) &&
-      !inside(template.seal.templateDirectory, control.socketPath) &&
+      !inside(control.socketPath, templateRoot) &&
+      !inside(templateRoot, control.socketPath) &&
       Number.isInteger(control.port) &&
       control.port > 0 &&
       control.port <= 65535,

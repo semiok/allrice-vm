@@ -13,8 +13,10 @@ export function matches(pattern, value) {
   );
 }
 
+export const templateArchiveName = 'template.msb';
+
 export const payloads = Object.freeze({
-  'template.msb': 'metadata',
+  [templateArchiveName]: 'metadata',
   'execution.bin': 'state',
   'memory.json': 'memory',
   'root-disk.json': 'root-disk',

@@ -24,6 +24,7 @@ import {
   payloads,
   requireCapture,
   sha256,
+  templateArchiveName,
 } from './capture-contract.mjs';
 
 const exec = promisify(execFile);
@@ -644,7 +645,7 @@ export async function captureTemplate({
       );
       await rename(seeded, blank);
       dispatch = true;
-      const archive = join(capture, 'template.msb');
+      const archive = join(capture, templateArchiveName);
       await msb(
         captureCreateArgs({
           runtimeSizeMiB,
@@ -779,7 +780,7 @@ export async function captureTemplate({
         nativeCapture.topology,
         { mode: 0o444, flag: 'wx' },
       );
-      for (const path of ['device-topology.json', 'template.msb']) {
+      for (const path of ['device-topology.json', templateArchiveName]) {
         files.push({
           path,
           role: payloads[path],
@@ -811,7 +812,7 @@ export async function captureTemplate({
         mode: 0o444,
         flag: 'wx',
       });
-      await chmod(join(capture, 'template.msb'), 0o444);
+      await chmod(join(capture, templateArchiveName), 0o444);
       const directory = join(output, 'capture-' + captureSha256);
       signal.throwIfAborted();
       await rename(capture, directory);
