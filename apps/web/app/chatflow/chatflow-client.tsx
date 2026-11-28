@@ -3553,7 +3553,7 @@ export function ChatFlowClient({
                   onTemplate={viewWorkbenchTemplate}
                   onUse={useWorkbenchReference}
                   onPublish={
-                    workspace.viewerId
+                    workbenchEnabled && workspace.viewerId
                       ? (file) => openPublicationDialog({ kind: 'file', file })
                       : undefined
                   }
@@ -3655,7 +3655,7 @@ export function ChatFlowClient({
           onUseFileReference={useWorkbenchReference}
           onTemplateFile={viewWorkbenchTemplate}
           onPublishFile={
-            workspace.viewerId
+            workbenchEnabled && workspace.viewerId
               ? (file) => openPublicationDialog({ kind: 'file', file })
               : undefined
           }
