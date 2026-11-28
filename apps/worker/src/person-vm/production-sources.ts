@@ -193,7 +193,27 @@ export function createProductionPersonVmSources(
             ),
           }),
           runtime: {
-            async readiness(binding, signal) {
+            async readiness(binding, signal, context, editor) {
+              if (context && editor) {
+                if (routing.applies(binding)) {
+                  const proof = await startup.ensureVerifiedEditor(
+                    context,
+                    binding,
+                    editor.employee.employeeInstanceId,
+                    signal,
+                    editor.threadId,
+                  );
+                  signal.throwIfAborted();
+                  proof.throwIfAborted();
+                  return {
+                    binding,
+                    authenticated: true,
+                    editorReady: true,
+                    canSend: true,
+                  };
+                }
+                await startup.prepareForegroundEditor(binding, context, signal);
+              }
               const ready = await installed.readiness(binding, signal);
               const route = await routing.assertRootCurrent(binding, signal);
               route.throwIfAborted();

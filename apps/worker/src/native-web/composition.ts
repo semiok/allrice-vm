@@ -148,6 +148,7 @@ export function createAssignedNativeWebStartup(input: {
     PersonVmWebStartup,
     {
       selectedId?: string;
+      selectedThreadId?: string;
       runtimeLimit?: number;
       launches: readonly {
         endpoint: Endpoint;
@@ -555,9 +556,13 @@ export function createAssignedNativeWebStartup(input: {
         );
         current(binding, web);
         signal.throwIfAborted();
+        const selectedThreadId = model?.scoped ? web.editorThreadId : undefined;
         prepared.set(web, {
           launches,
-          selectedId: cold.selectedId,
+          selectedId: selectedThreadId
+            ? web.selectedEmployee?.employeeInstanceId
+            : cold.selectedId,
+          selectedThreadId,
           runtimeLimit: cold.runtimeLimit,
         });
         // The existing native bootstrap stages all files, initializes person
@@ -619,6 +624,7 @@ export function createAssignedNativeWebStartup(input: {
         running.set(binding.vmId, group);
         let attemptedOwnerOpen = false;
         let awaitingGroupSetup = true;
+        let selectedProof: AbortSignal | undefined;
         try {
           const prove = editorProof;
           group.stopArchive = await watchArchive(group);
@@ -656,7 +662,8 @@ export function createAssignedNativeWebStartup(input: {
             group.owners.set(employeeId, owner);
             group.startingEmployees.delete(employeeId);
             const context = web.context;
-            if (context && prove) {
+            const selected = employeeId === plan.selectedId;
+            if (context && prove && (!plan.selectedThreadId || selected)) {
               const proof = await owner.verifyStartingEditor(
                 scope,
                 signal,
@@ -667,6 +674,10 @@ export function createAssignedNativeWebStartup(input: {
                       endpoint,
                       context,
                       modelAdapterId,
+                      ...(selected &&
+                        plan.selectedThreadId && {
+                          threadId: plan.selectedThreadId,
+                        }),
                       profile,
                       readModels,
                     },
@@ -675,7 +686,8 @@ export function createAssignedNativeWebStartup(input: {
               );
               if (proof) {
                 proof.throwIfAborted();
-                group.verifiedEmployees.set(employeeId, proof);
+                if (selected && plan.selectedThreadId) selectedProof = proof;
+                else group.verifiedEmployees.set(employeeId, proof);
               }
             } else if (group.scheduledWake) {
               await owner.readScheduleCatalog(
@@ -690,12 +702,15 @@ export function createAssignedNativeWebStartup(input: {
           await scope.assertCurrent();
           signal.throwIfAborted();
           const provedSelected = plan.selectedId
-            ? group.verifiedEmployees.get(plan.selectedId)
+            ? (selectedProof ?? group.verifiedEmployees.get(plan.selectedId))
             : undefined;
           if (
             group.retiring ||
             editorProof !== prove ||
-            (prove && !group.scheduledWake && !group.verifiedEmployees.size) ||
+            (prove &&
+              !group.scheduledWake &&
+              !selectedProof &&
+              !group.verifiedEmployees.size) ||
             (prove &&
               plan.selectedId &&
               (!provedSelected || provedSelected.aborted)) ||

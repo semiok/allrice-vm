@@ -16,6 +16,7 @@ import {
   type PersonVmBinding,
   type PersonVmDiskPreparationPort,
   type PersonVmEmployeeSelection,
+  type PersonVmEditorSelection,
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
@@ -170,6 +171,7 @@ type FirstPrewarmDisk = Readonly<{
 }>;
 type SelectedStartup = Readonly<{
   employee: PersonVmEmployeeSelection;
+  editor?: PersonVmEditorSelection;
   firstDisk?: FirstPrewarmDisk;
 }>;
 type UpgradePrewarm = {
@@ -1005,6 +1007,7 @@ export class PersonVmService
     signal: AbortSignal,
     context?: RequestContext,
     scheduled = false,
+    editor?: PersonVmEditorSelection,
   ) {
     if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
     const binding = await this.pingRunning(row, signal);
@@ -1014,7 +1017,12 @@ export class PersonVmService
       return this.options.runtime.assertScheduledReady(binding, signal);
     }
     const result = context
-      ? await this.options.runtime.readiness(binding, signal, context)
+      ? await this.options.runtime.readiness(
+          binding,
+          signal,
+          context,
+          ...(editor ? [editor] : []),
+        )
       : await this.options.runtime.readiness(binding, signal);
     if (
       !result ||
@@ -1285,7 +1293,7 @@ export class PersonVmService
         );
         await lease.guard();
       }
-      await this.ready(row, signal, context);
+      await this.ready(row, signal, context, false, selectedStartup?.editor);
       if (roster && (await readRoster(signal))?.digest !== roster.digest)
         throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
       if (this.options.diskPool && assertAuthority)
@@ -1563,6 +1571,9 @@ export class PersonVmService
         web = Object.freeze({
           ...web,
           selectedEmployee,
+          ...(selectedStartup?.editor && {
+            editorThreadId: selectedStartup.editor.threadId,
+          }),
           ...(unusedEmployeeHomes && { unusedEmployeeHomes: true as const }),
         });
       }
@@ -1575,7 +1586,13 @@ export class PersonVmService
         web,
       });
       await assertStarting();
-      await this.ready(row, startingSignal, context, !!scheduled);
+      await this.ready(
+        row,
+        startingSignal,
+        context,
+        !!scheduled,
+        selectedStartup?.editor,
+      );
       await assertStarting();
       const publish = async (active: AbortSignal) => {
         await assertStartupAuthority(active);
@@ -1642,6 +1659,7 @@ export class PersonVmService
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
     prepareEditor = false,
+    editor?: PersonVmEditorSelection,
   ) {
     await this.assertNoPendingDisk(row, signal);
     if (target) await target.assertAuthority(signal);
@@ -1669,7 +1687,13 @@ export class PersonVmService
       )
         throw new PersonVmError('LEASE_LOST');
     }
-    await this.ready(row, signal, prepareEditor ? context : undefined);
+    await this.ready(
+      row,
+      signal,
+      prepareEditor ? context : undefined,
+      false,
+      editor,
+    );
     if (
       roster &&
       (await this.webRoster(context, signal))?.digest !== roster.digest
@@ -1730,6 +1754,7 @@ export class PersonVmService
         input.observer,
         input.selectedEmployee,
         input.trigger === 'open',
+        input.editorThreadId,
       );
     return this.options.diskPool
       ? this.options.diskPool.inForeground(work)
@@ -1742,6 +1767,7 @@ export class PersonVmService
     observer?: PersonVmPrewarmObserver,
     selectedEmployee?: PersonVmEmployeeSelection,
     foregroundOpen = false,
+    editorThreadId?: string,
   ): Promise<PersonVmView> {
     const identity = await this.identity(context, 'start', signal);
     if (
@@ -1752,6 +1778,10 @@ export class PersonVmService
           context.workspaceId !== selectedEmployee.workspaceId))
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    const editor =
+      selectedEmployee && editorThreadId
+        ? { employee: selectedEmployee, threadId: editorThreadId }
+        : undefined;
     const start = (
       nextTarget?: PersonVmPrewarmFence,
       firstDisk?: FirstPrewarmDisk,
@@ -1762,7 +1792,7 @@ export class PersonVmService
         signal,
         nextTarget,
         startupObserver,
-        selectedEmployee && { employee: selectedEmployee, firstDisk },
+        selectedEmployee && { employee: selectedEmployee, editor, firstDisk },
         foregroundOpen,
       );
     const row = await this.options.store.read(identity.personId);
@@ -1803,7 +1833,14 @@ export class PersonVmService
           !sameVmBinding(bindingOf(current), exact)
         )
           throw new PersonVmError('LEASE_LOST');
-        await this.confirmRunning(current, context, signal, joinedTarget, true);
+        await this.confirmRunning(
+          current,
+          context,
+          signal,
+          joinedTarget,
+          true,
+          editor,
+        );
         takeover.signal.throwIfAborted();
         (observer ?? target).observeVmStart?.(exact);
         return view(current, true);
@@ -1815,6 +1852,7 @@ export class PersonVmService
         observer,
         selectedEmployee,
         foregroundOpen,
+        editorThreadId,
       );
     }
     this.assertPrewarmTarget(row, target, true);
@@ -1859,7 +1897,7 @@ export class PersonVmService
     // the start directly so a no-op create does not acquire a separate lease.
     if (target?.orphanedStart) return start(target);
     if (row?.phase === 'running') {
-      await this.confirmRunning(row, context, signal, target, true);
+      await this.confirmRunning(row, context, signal, target, true, editor);
       return view(row, true);
     }
 

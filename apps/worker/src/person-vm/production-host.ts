@@ -737,16 +737,17 @@ export function createProductionPersonVmHost(input: {
         assertScheduledReady: async (binding, signal) => {
           requireStartup().assertAuthenticatedGroup(binding, signal);
         },
-        readiness: (binding, signal, context) =>
+        readiness: (binding, signal, context, editor) =>
           own(() =>
             currentWork(signal, async (active) => {
               const native = requireStartup();
               native.assertAuthenticatedGroup(binding, active);
-              if (context)
+              if (context && !editor)
                 await native.prepareForegroundEditor(binding, context, active);
               const readiness = await requireRuntime().readiness(
                 binding,
                 active,
+                ...(context && editor ? ([context, editor] as const) : []),
               );
               native.assertAuthenticatedGroup(binding, active);
               return readiness;

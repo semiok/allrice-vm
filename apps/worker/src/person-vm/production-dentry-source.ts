@@ -115,7 +115,7 @@ export function installProductionDEntrySource(input: {
   const pending = new Set<Promise<unknown>>();
   const owners = new WeakMap<
     ResolvedDEntryNativeOwner,
-    { context: RequestContext; identity: DEntryIdentity }
+    { context: RequestContext; identity: DEntryIdentity; proof: AbortSignal }
   >();
   let closing: Promise<void> | undefined;
 
@@ -389,7 +389,11 @@ export function installProductionDEntrySource(input: {
             !sameDEntryIdentity(previous.identity, expected))
         )
           denied();
-        owners.set(owner, { context: scope, identity: expected });
+        owners.set(owner, {
+          context: scope,
+          identity: expected,
+          proof: revoked,
+        });
         return {
           context: scope,
           binding,
@@ -486,11 +490,7 @@ export function installProductionDEntrySource(input: {
               .parse({ request });
             if (Object.keys(args.request).length) return denied();
             await owner.assertCurrent(found.context, active);
-            input.startup.assertVerifiedEditor(
-              owner.receipt.binding,
-              active,
-              found.identity.employeeInstanceId,
-            );
+            found.proof.throwIfAborted();
             return sameHost(owner, found.identity).createRootFor(
               found.context,
               args.request,

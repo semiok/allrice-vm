@@ -24,6 +24,7 @@ import { createProductionCodexRuntime } from './production-codex-runtime.js';
 const state = vi.hoisted(() => ({
   settings: vi.fn<typeof readPlatformModelSettings>(),
   statementTimeout: vi.fn(async () => []),
+  endSlotRead: vi.fn(async () => {}),
   subscription:
     vi.fn<
       (
@@ -34,7 +35,9 @@ const state = vi.hoisted(() => ({
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
-  getDatabase: () => ({
+  getDatabase: () => ({}),
+  createDedicatedDatabase: () => ({
+    end: state.endSlotRead,
     begin: (_mode: string, query: (tx: typeof state.subscription) => unknown) =>
       query(((parts: TemplateStringsArray, connectionId: string) =>
         parts[0]?.startsWith('set local statement_timeout')
@@ -276,6 +279,7 @@ it('proves both transports stopped while a timed database read is still settling
     );
     expect(proof).toContain('undici-owner-stopped:slot-query-fixture:auth:');
     expect(state.statementTimeout).toHaveBeenCalledOnce();
+    expect(state.endSlotRead).toHaveBeenCalledWith({ timeout: 0 });
     held.resolve([{ slot: 1, revision: '1' }]);
     await expect(reading).rejects.toMatchObject({ code: 'ADMISSION_CLOSED' });
     await closing;

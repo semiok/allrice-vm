@@ -100,6 +100,7 @@ export function createProductionCurrentPrewarm(input: {
           const { assertLockedUpgradeTicket, ...requestInput } = request;
           const prewarm = {
             ...requestInput,
+            ...(expected.threadId && { editorThreadId: expected.threadId }),
             selectedEmployee: Object.freeze({
               personId: expected.personId,
               organizationId: expected.organizationId,

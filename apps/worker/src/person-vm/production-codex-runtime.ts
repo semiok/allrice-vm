@@ -8,7 +8,11 @@ import {
   UpdatePlatformModelSettingsSchema,
   type PlatformModelConfiguration,
 } from '@allrice/contracts';
-import { getDatabase, readPlatformModelSettings } from '@allrice/database';
+import {
+  createDedicatedDatabase,
+  getDatabase,
+  readPlatformModelSettings,
+} from '@allrice/database';
 import {
   ModelGatewayError,
   createOwnedModelTransport,
@@ -31,11 +35,21 @@ async function readSelectedSubscription(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const [selected] = await getDatabase().begin('read only', async (tx) => {
-    signal.throwIfAborted();
-    await tx`set local statement_timeout = '3000ms'`;
-    signal.throwIfAborted();
-    return tx<{ slot: 1 | 2; revision: string }[]>`
+  // A stalled SQL lookup must not hold a revoked route or close another
+  // route's connection. This read owns its client through cancellation.
+  const active = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+  const sql = createDedicatedDatabase(getDatabase());
+  let closing: Promise<void> | undefined;
+  const close = () => (closing ??= sql.end({ timeout: 0 }));
+  const cancel = () => void close().catch(() => {});
+  active.addEventListener('abort', cancel, { once: true });
+  try {
+    active.throwIfAborted();
+    const [selected] = await sql.begin('read only', async (tx) => {
+      active.throwIfAborted();
+      await tx`set local statement_timeout = '3000ms'`;
+      active.throwIfAborted();
+      return tx<{ slot: 1 | 2; revision: string }[]>`
     select slot, extract(epoch from updated_at)::text as revision
     from allrice_codex_subscriptions
     where enabled and exists (
@@ -47,11 +61,18 @@ async function readSelectedSubscription(
         and c.status='ready' and p.enabled
         and p.provider_key in ('codex','openai-codex') and p.auth_mode='chatgpt_subscription'
     )
-    `;
-  });
-  signal.throwIfAborted();
-  if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
-  return selected;
+      `;
+    });
+    active.throwIfAborted();
+    if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+    return selected;
+  } catch (error) {
+    active.throwIfAborted();
+    throw error;
+  } finally {
+    active.removeEventListener('abort', cancel);
+    await close();
+  }
 }
 
 export function managedCodexModel(model: string) {
