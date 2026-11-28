@@ -31,6 +31,7 @@ const paths = {
   'managed/lazy-language.js': 'export const language = 1;',
   'managed/entry.js.map': '{"privateSource":true}',
   'native/index.html': '<div>Do not publish HTML</div>',
+  'native/assets/index-unused.js': 'export const unused = 1;',
   'native/assets/vendor-aaaaaaaa.css':
     "@font-face {src:url('./fonts/native-AbCd.woff2')}",
   'native/assets/fonts/native-AbCd.woff2': 'test font payload',
@@ -112,6 +113,9 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
     const directory = join(root, next, 'static/dsh-profile', first);
     expect(await readdir(directory)).toEqual(['bundles', 'managed', 'native']);
     expect(await readdir(join(directory, 'native'))).toEqual(['assets']);
+    expect(
+      await readFile(join(directory, 'native/assets/index-unused.js'), 'utf8'),
+    ).toBe(paths['native/assets/index-unused.js']);
     expect(
       await readFile(
         join(directory, 'native/assets/fonts/native-AbCd.woff2'),
