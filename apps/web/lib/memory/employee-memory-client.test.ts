@@ -199,6 +199,65 @@ describe('native memory across chat navigation', () => {
     ).toBeUndefined();
   });
 
+  it('keeps distinct employee bridges and fences writes from an inactive or retired frame', async () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const other = { ...employee, employeeInstanceId: id(42) };
+    const firstFrame = {} as Window;
+    const secondFrame = {} as Window;
+    let active = 'first';
+    const retire = bind(
+      host,
+      'first',
+      employee,
+      () => active === 'first',
+      () => firstFrame,
+    );
+    bind(
+      host,
+      'second',
+      other,
+      () => active === 'second',
+      () => secondFrame,
+    );
+    const first = readEmployeeMemoryPageWrites(
+      host,
+      'first',
+      employee,
+      firstFrame,
+    )!;
+    const second = readEmployeeMemoryPageWrites(
+      host,
+      'second',
+      other,
+      secondFrame,
+    )!;
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second', other, firstFrame),
+    ).toBeUndefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second', employee, secondFrame),
+    ).toBeUndefined();
+    active = 'second';
+    const fetcher = vi.fn(async () => ack());
+    vi.stubGlobal('fetch', fetcher);
+    const write = (bridge: typeof first) =>
+      bridge.mutate({ action: 'confirm', row: record }, () => {}, {});
+    await expect(write(first)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetcher).not.toHaveBeenCalled();
+    retire();
+    await write(second);
+    expect(fetcher).toHaveBeenCalledOnce();
+    bind(host, 'new-login', { ...other, personId: id(67) });
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second', other, secondFrame),
+    ).toBeUndefined();
+    await expect(write(second)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it('notifies a new same-employee document when a retired document commits', async () => {
     const host = {} as Window;
     const bind = createEmployeeMemoryPageWrites();

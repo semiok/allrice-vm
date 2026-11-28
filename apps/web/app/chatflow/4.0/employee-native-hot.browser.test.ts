@@ -185,7 +185,7 @@ suite('4.0 browser entry with a running employee', () => {
             };
             requests.push({ phase: 'document', start: performance.now() });
             return html(`<!doctype html><head><script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script></head>
-            <body data-thread-id="${threadId}"><div contenteditable="true" role="textbox" aria-label="消息"></div>
+            <body data-thread-id="${threadId}"><div contenteditable="true" role="textbox" aria-label="消息" style="min-height:1em"></div>
             <button id="create">新建对话</button><button id="previous">返回已有对话</button>
             <script>
               document.querySelector('#create').onclick = () => parent.postMessage(${JSON.stringify({ type: pageNavigate, scopeId, selection })}, location.origin);
@@ -389,6 +389,9 @@ suite('4.0 browser entry with a running employee', () => {
           const iframe = page.locator('iframe[title="员工工作区"]');
           const child = iframe.contentFrame();
           await child.getByRole('textbox').waitFor();
+          expect(
+            await iframe.evaluate((node) => getComputedStyle(node).visibility),
+          ).toBe('visible');
           await iframe.evaluate((node) => {
             (node as HTMLElement).dataset.qaRetained = '1';
           });

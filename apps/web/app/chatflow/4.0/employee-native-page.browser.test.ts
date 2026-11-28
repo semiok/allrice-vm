@@ -15,7 +15,6 @@ import { deferred } from '../../../../../packages/d-entry-principal/test/host-fi
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
 import {
   pageClosing,
-  pageCompletion,
   pageEditorMounted,
   pageNavigate,
 } from '../../../lib/d-entry/page-messages';
@@ -89,7 +88,7 @@ async function exerciseMultiEmployeeNavigation(
               },
             });
           } else if (packet.type === 'end') {
-            if (opens.length === 1) {
+            if (employee === b) {
               firstClose.resolve();
               await releaseClose.promise;
             }
@@ -102,18 +101,6 @@ async function exerciseMultiEmployeeNavigation(
     );
     const page = await context.newPage();
     page.setDefaultTimeout(10_000);
-    await page.addInitScript((completion) => {
-      if (window !== window.top) return;
-      addEventListener('message', (event) => {
-        if (event.origin === location.origin && event.data?.type === completion)
-          document.documentElement.dataset.fixtureOldDocumentClosed = 'yes';
-        if (
-          event.origin === location.origin &&
-          event.data?.fixtureLate === true
-        )
-          document.documentElement.dataset.fixtureLateDelivered = 'yes';
-      });
-    }, pageCompletion);
     await page.route('**/api/v1/d-entry/native-prewarm', async (route) => {
       const { selection } = route.request().postDataJSON();
       warmups.push(selection.employeeInstanceId);
@@ -237,53 +224,32 @@ async function exerciseMultiEmployeeNavigation(
           threadId: threads.get(a)!,
         }),
     );
-    const frame = page.frameLocator('iframe');
+    const frame = page.frameLocator('iframe:visible');
     const employeeButton = (index: number) =>
       frame.getByRole('treeitem').filter({ hasText: names[index]! }).first();
     const editor = frame.getByRole('textbox', { name: '消息' });
     await editor.waitFor();
     await editor.fill('甲的草稿');
-    await employeeButton(1).evaluate((button, latest) => {
-      if (!(button instanceof HTMLElement))
-        throw new Error('Expected an employee card');
-      button.click();
-      const card = document.querySelector('[aria-label="' + latest + '"]')!;
-      card.querySelector<HTMLElement>('[role=treeitem]')!.click();
-    }, names[2]!);
-    await firstClose.promise;
-    await page.locator('html[data-fixture-old-document-closed="yes"]').waitFor({
-      state: 'attached',
-    });
-    await frame.locator('#app').evaluate(
-      (container, late) => {
-        parent.postMessage(
-          {
-            type: late.type,
-            scopeId: (container as HTMLElement).dataset.scopeId,
-            selection: late.selection,
-            fixtureLate: true,
-          },
-          location.origin,
-        );
-      },
-      {
-        type: pageNavigate,
-        selection: { workspaceId: identity.workspaceId, employeeInstanceId: d },
-      },
-    );
-    await page.locator('html[data-fixture-late-delivered="yes"]').waitFor({
-      state: 'attached',
-    });
-    expect(warmups).toEqual([a]);
-    releaseClose.resolve();
-    await page
+    const currentEmployee = () =>
+      new URL(page.url()).searchParams.get('employeeInstanceId');
+    const choose = async (index: number, id: string) => {
+      await employeeButton(index).click();
+      await expect.poll(currentEmployee).toBe(id);
+      await frame.locator(`#app[data-employee-instance-id="${id}"]`).waitFor();
+      await editor.waitFor();
+    };
+    await employeeButton(2).click();
+    await frame
       .getByRole('alert')
       .getByText('可以点重试，或者返回员工页。')
       .waitFor();
+    expect(currentEmployee()).toBe(a);
     expect(warmups).toEqual([a, c]);
     expect(creates).toEqual([]);
-    await page.getByRole('button', { name: '重试', exact: true }).click();
-    const waiting = page.getByRole('status');
+    await frame.getByRole('button', { name: '重试', exact: true }).click();
+    const waiting = frame
+      .locator('[data-employee-transition]')
+      .getByRole('status');
     await waiting
       .getByRole('heading', { name: '正在等待工作台名额' })
       .waitFor();
@@ -291,16 +257,14 @@ async function exerciseMultiEmployeeNavigation(
       await waiting
         .getByText(
           '当前工作台的 3 个运行名额已占用。有空位会自动继续，也可以取消等待。',
-          {
-            exact: true,
-          },
+          { exact: true },
         )
         .isVisible(),
     ).toBe(true);
     expect(creates).toEqual([]);
-    await page.getByRole('button', { name: '取消等待', exact: true }).click();
+    await frame.getByRole('button', { name: '取消等待', exact: true }).click();
     await capacityCancellation.promise;
-    const continueButton = page.getByRole('button', {
+    const continueButton = frame.getByRole('button', {
       name: '继续',
       exact: true,
     });
@@ -310,50 +274,34 @@ async function exerciseMultiEmployeeNavigation(
     allowCapacityCancellation.resolve();
     await expect.poll(() => continueButton.isEnabled()).toBe(true);
     await continueButton.click();
+    await expect.poll(currentEmployee).toBe(c);
     await editor.waitFor();
     expect(warmups).toEqual([a, c, c, c]);
     expect(await editor.inputValue()).toBe('');
     expect(creates).toEqual([c]);
     await editor.fill('丙的草稿');
-    for (const [index, id] of [
-      [1, b],
-      [3, d],
-      [4, e],
-      [0, a],
-      [2, c],
-    ] as const) {
-      await employeeButton(index).click();
-      await expect
-        .poll(() => new URL(page.url()).searchParams.get('employeeInstanceId'))
-        .toBe(id);
-      await frame.locator(`#app[data-employee-instance-id="${id}"]`).waitFor();
-      await editor.waitFor();
-      expect(await editor.inputValue()).toBe(
-        id === a ? '甲的草稿' : id === c ? '丙的草稿' : '',
-      );
-    }
-    expect(opens).toEqual([a, c, b, d, e, a, c]);
-    expect(creates).toEqual([c]);
-    const historyLength = await page.evaluate(() => history.length);
-    const currentScope = await frame
-      .locator('#app')
-      .getAttribute('data-scope-id');
-    await employeeButton(3).evaluate((row, current) => {
-      if (!(row instanceof HTMLElement))
-        throw Error('Expected an employee card');
-      row.click();
-      document
-        .querySelector<HTMLElement>(
-          '[aria-label="' + current + '"] [role=treeitem]',
-        )!
-        .click();
-    }, names[2]!);
+
+    await choose(1, b);
+    await choose(0, a);
+    expect(await editor.inputValue()).toBe('甲的草稿');
+    await choose(2, c);
+    expect(await editor.inputValue()).toBe('丙的草稿');
+    expect(opens).toEqual([a, c, b]);
+
+    await employeeButton(3).click();
+    await firstClose.promise;
     await expect
-      .poll(() => frame.locator('#app').getAttribute('data-scope-id'))
-      .not.toBe(currentScope);
-    await editor.waitFor();
-    expect(opens).toEqual([a, c, b, d, e, a, c, c]);
-    expect(await page.evaluate(() => history.length)).toBe(historyLength);
+      .poll(() => frame.locator('[data-employee-transition]').count())
+      .toBe(1);
+    expect(currentEmployee()).toBe(c);
+    expect(opens).toEqual([a, c, b]);
+    expect(await page.locator('iframe').count()).toBe(3);
+    releaseClose.resolve();
+    await expect.poll(currentEmployee).toBe(d);
+    await choose(4, e);
+    await choose(2, c);
+    expect(opens).toEqual([a, c, b, d, e]);
+    expect(creates).toEqual([c]);
     await page.route('**/api/v1/employee-instances', (route) =>
       route.fulfill({ status: 401 }),
     );
@@ -415,9 +363,9 @@ suite('4.0 browser cold entry', () => {
                 {snapshot.error && <p role="alert">{snapshot.error}</p>}
                 <button onClick={() => setCreating(true)}>创建员工</button>
                 {creating && <EmployeeCreateDialog {...port.createEmployee} personal onClose={() => setCreating(false)}/>}
-                <label>消息<input value={draft} onChange={e => {
+                <div data-conversation-region="chat"><label>消息<input value={draft} onChange={e => {
                   setDraft(e.target.value); localStorage.setItem(storageKey, e.target.value);
-                }}/></label></>;
+                }}/></label></div></>;
             }
             installEmployeeProductOwner({ effect() {}, inject() {}, provide(name, port) {
               if (name !== 'allriceEmployeeSidebar') return;

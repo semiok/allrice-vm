@@ -7,6 +7,7 @@ import {
   initializeAccountLogin,
   isPlatformAdmin,
   login,
+  revokeSession,
 } from '@allrice/database';
 
 import {
@@ -32,6 +33,14 @@ import {
 } from '../../../../../lib/portal/session';
 
 export const runtime = 'nodejs';
+
+async function replaceBrowserSession() {
+  const store = await cookies();
+  const previous = store.get(sessionCookieName)?.value;
+  // Replacing a browser login must also fence live pages in its other tabs.
+  if (previous) await revokeSession(previous);
+  return store;
+}
 
 export async function POST(request: Request) {
   try {
@@ -80,7 +89,7 @@ export async function POST(request: Request) {
         organizationId: account.organization_id,
         workspaceId: account.workspace_id,
       });
-      const cookieStore = await cookies();
+      const cookieStore = await replaceBrowserSession();
       cookieStore.set(sessionCookieName, databaseSession.token, {
         ...sessionCookieOptions,
         sameSite: 'lax',
@@ -97,13 +106,17 @@ export async function POST(request: Request) {
       });
     }
     const result = await login(await request.json(), undefined, accountKind);
-    (await cookies()).set(sessionCookieName, result.session.token, {
-      ...sessionCookieOptions,
-      expires: new Date(result.session.expiresAt),
-    });
     const admin = await isPlatformAdmin({
       actor: { type: 'user', id: result.user.id },
     });
+    (await replaceBrowserSession()).set(
+      sessionCookieName,
+      result.session.token,
+      {
+        ...sessionCookieOptions,
+        expires: new Date(result.session.expiresAt),
+      },
+    );
     return Response.json({
       user: result.user,
       homePath: admin ? '/runtime-console' : '/chatflow',

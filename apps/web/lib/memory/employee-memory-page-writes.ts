@@ -31,6 +31,7 @@ type Host = Window & {
   __ALLRICE_EMPLOYEE_MEMORY_WRITES__?: (
     scopeId: string,
     employee: Employee,
+    caller?: Window,
   ) => EmployeeMemoryPageWrites | undefined;
 };
 
@@ -46,18 +47,45 @@ const employeeKey = (employee: Employee) =>
  * identity and the joined HTTP receipt, even if the initiating iframe leaves. */
 export function createEmployeeMemoryPageWrites() {
   let principal: string | undefined;
+  let owner: Host | undefined;
   const stores = new Map<string, PageState>();
-  return (host: Host, scopeId: string, employee: Employee) => {
+  const bindings = new Map<
+    string,
+    {
+      employee: string;
+      frame?: () => Window | null;
+      bridge: EmployeeMemoryPageWrites;
+    }
+  >();
+  const read = (scopeId: string, employee: Employee, caller?: Window) => {
+    const binding = bindings.get(scopeId);
+    if (binding?.employee !== employeeKey(employee)) return;
+    if (binding.frame && binding.frame() !== caller) return;
+    return binding.bridge;
+  };
+  return (
+    host: Host,
+    scopeId: string,
+    employee: Employee,
+    visible = () => true,
+    frame?: () => Window | null,
+  ) => {
     const actor = JSON.stringify([employee.organizationId, employee.personId]);
-    if (principal !== actor) {
+    if (principal !== actor || owner !== host) {
+      if (owner?.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ === read)
+        delete owner.__ALLRICE_EMPLOYEE_MEMORY_WRITES__;
+      bindings.clear();
       for (const state of stores.values()) {
         state.writes.clear();
         state.notify = undefined;
       }
       stores.clear();
       principal = actor;
+      owner = host;
     }
     const key = employeeKey(employee);
+    for (const [previousScope, binding] of bindings)
+      if (binding.employee === key) bindings.delete(previousScope);
     const state: PageState = stores.get(key) ?? { scopeId, writes: new Map() };
     stores.set(key, state);
     const target = {
@@ -72,11 +100,14 @@ export function createEmployeeMemoryPageWrites() {
     const listeners = new Set<Listener>();
     const notify = (source: object) =>
       listeners.forEach((listener) => listener(source));
+    const isCurrent = () =>
+      host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ === read &&
+      bindings.get(scopeId) === binding;
     const bridge: EmployeeMemoryPageWrites = {
       async mutate(intent, assertTab, source) {
         const client = employeeMemoryClient(target, state.writes, {
           assertCurrent() {
-            if (host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ !== read)
+            if (!isCurrent() || !visible())
               throw new DOMException('Employee page is closed', 'AbortError');
             assertTab();
           },
@@ -88,18 +119,19 @@ export function createEmployeeMemoryPageWrites() {
         return result;
       },
       subscribe(listener) {
-        if (host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ === read)
-          listeners.add(listener);
+        if (isCurrent()) listeners.add(listener);
         return () => listeners.delete(listener);
       },
     };
-    const read = (candidate: string, member: Employee) =>
-      candidate === scopeId && employeeKey(member) === key ? bridge : undefined;
+    const binding = { employee: key, bridge, frame };
+    bindings.set(scopeId, binding);
     host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ = read;
     state.notify = notify;
     return () => {
-      if (host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ === read)
-        delete host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__;
+      if (isCurrent()) {
+        bindings.delete(scopeId);
+        if (!bindings.size) delete host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__;
+      }
       if (state.notify === notify) state.notify = undefined;
       listeners.clear();
     };
@@ -110,6 +142,7 @@ export function readEmployeeMemoryPageWrites(
   host: Host,
   scopeId: string,
   employee: Employee,
+  caller?: Window,
 ) {
-  return host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__?.(scopeId, employee);
+  return host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__?.(scopeId, employee, caller);
 }

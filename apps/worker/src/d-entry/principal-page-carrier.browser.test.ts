@@ -50,6 +50,7 @@ it
     'cold-assets',
     'stall',
     'switch',
+    'cross-retain',
     'baseline',
     'attached',
     'unattached',
@@ -71,9 +72,11 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
+    const crossRetain = scenario === 'cross-retain';
     const warmRefresh = scenario === 'refresh';
     const usePublicFiles = coldAssets || warmRefresh;
-    const realShell = switching || nativeCreate || coldAssets || warmRefresh;
+    const realShell =
+      switching || nativeCreate || usePublicFiles || crossRetain;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -110,7 +113,15 @@ it
         ? f.registerThread(otherThread)
         : undefined;
     const cross =
-      scenario === 'switch' ? await f.registerOtherEmployee() : undefined;
+      scenario === 'switch' || crossRetain
+        ? await f.registerOtherEmployee()
+        : undefined;
+    const employees = cross ? [cross] : [];
+    if (crossRetain)
+      employees.push(
+        await f.registerOtherEmployee(),
+        await f.registerOtherEmployee(),
+      );
     const fromComposition = createRequire(
       new URL(
         '../../../../packages/dsh-web-composition/package.json',
@@ -288,6 +299,58 @@ it
       };
       f.host.catalog.allocateSessionId = () =>
         summary(expectedNativeId ?? randomUUID()).sessionId;
+    }
+    if (crossRetain) {
+      const root = f.host.catalog.items.find((row) => row.sessionId === 'root');
+      Object.assign(root!, { blank: false });
+      const events: Omit<SessionHistoryRecord['event'], 'seq' | 'time'>[] = [];
+      for (let turn = 1; turn <= 14; turn++) {
+        events.push(
+          { type: 'turn/start', data: { turn } },
+          {
+            type: 'user/message',
+            surfaceOp: 'append',
+            data: {
+              role: 'user',
+              id: randomUUID(),
+              source: { kind: 'user', rpcId: randomUUID() },
+              content: [
+                { type: 'text', text: '隔离回放的第' + turn + '个问题' },
+              ],
+            },
+          },
+          { type: 'step/start', data: { turn, step: 1 } },
+          {
+            type: 'assistant/message',
+            surfaceOp: 'append',
+            data: {
+              turn,
+              step: 1,
+              message: {
+                role: 'assistant',
+                id: randomUUID(),
+                source: {
+                  kind: 'model',
+                  provider: 'fixture',
+                  model: 'fixture',
+                },
+                content: [
+                  { type: 'text', text: '供滚动验收的第' + turn + '个回答' },
+                ],
+              },
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              stream: [],
+            },
+          },
+          { type: 'step/end', data: { turn, step: 1 } },
+          { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } },
+        );
+      }
+      const records: SessionHistoryRecord[] = events.map((event, index) => ({
+        type: 'event',
+        event: { ...event, seq: index + 1, time: Date.now() },
+      }));
+      f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
     }
     const nativeIdsByThread = new Map<string, string>();
     let registered = false;
@@ -639,6 +702,19 @@ it
           );
         }
         if (realShell) {
+          if (url.pathname === '/api/v1/auth/session') {
+            const token =
+              request.headers.cookie
+                ?.split('; ')
+                .find((part) => part.startsWith('allrice_session='))
+                ?.slice('allrice_session='.length) ?? '';
+            const current = await f.authenticate(token);
+            return await copy(
+              current
+                ? Response.json({ context: current })
+                : new Response(null, { status: 401 }),
+            );
+          }
           if (url.pathname === '/api/v1/d-entry/identity') {
             return await copy(
               Response.json({
@@ -987,7 +1063,7 @@ it
           viewerId: identity.personId,
           employees: [
             f.selection.employeeInstanceId,
-            ...(cross ? [cross.identity.employeeInstanceId] : []),
+            ...employees.map(({ identity }) => identity.employeeInstanceId),
           ].map((id) => ({
             id,
             employeeId: id,
@@ -995,19 +1071,21 @@ it
             currentVersion: version,
             versions: [version],
           })),
-          sessions: (switching || createAfterSwitch || outerCreated
+          sessions: (switching ||
+          createAfterSwitch ||
+          outerCreated ||
+          crossRetain
             ? [
                 f.selection.threadId,
-                otherThread,
-                ...(cross ? [cross.identity.threadId!] : []),
+                ...(crossRetain ? [] : [otherThread]),
+                ...employees.map(({ identity }) => identity.threadId!),
               ]
             : [selection.threadId]
           ).map((id) => ({
             id,
             employeeInstanceId:
-              id === cross?.identity.threadId
-                ? cross.identity.employeeInstanceId
-                : f.selection.employeeInstanceId,
+              employees.find(({ identity }) => identity.threadId === id)
+                ?.identity.employeeInstanceId ?? f.selection.employeeInstanceId,
             ownerId: identity.personId,
             updatedAt: '2026-01-01T00:00:00.000Z',
             createdAt: '2026-01-01T00:00:00.000Z',
@@ -1032,7 +1110,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          ${usePublicFiles ? nativeStyles : ''}
+          ${usePublicFiles || crossRetain ? nativeStyles : ''}
           <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
@@ -1142,6 +1220,8 @@ it
     }
     const streams = new Map<string, string>();
     let socketCount = 0;
+    const joinedScopes = new Set<string>();
+    const closedSockets = new Set<string>();
     let lastScopeId: string | undefined;
     const firstItems: string[] = [];
     const followed = new Set<string>();
@@ -1162,6 +1242,14 @@ it
     });
     page.on('websocket', (socket) => {
       socketCount++;
+      let attachedScope: string | undefined;
+      let acknowledged = false;
+      let joined = false;
+      socket.on('close', () => {
+        if (!attachedScope) return;
+        closedSockets.add(attachedScope);
+        if (joined) joinedScopes.add(attachedScope);
+      });
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
@@ -1178,13 +1266,18 @@ it
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'item' && frame.value.type === 'opened')
-          lastScopeId = frame.value.scopeReference.scopeId;
+          lastScopeId = attachedScope = frame.value.scopeReference.scopeId;
         if (frame.type === 'item' && frame.value.type === 'switched') {
           lastScopeId = frame.value.scopeId;
           for (const address of followAddresses.values()) {
             if (address.nativeId === frame.value.nativeSessionId)
               address.scopeId = frame.value.scopeId;
           }
+        }
+        if (streams.get(frame.streamId) === '$d-entry/page') {
+          if (frame.type === 'item' && frame.value.type === 'closed')
+            acknowledged = frame.value.scopeId === attachedScope;
+          if (frame.type === 'end' && acknowledged) joined = true;
         }
         if (
           frame.type === 'item' &&
@@ -1260,7 +1353,9 @@ it
       await context.close();
       return;
     }
-    const workbench = page.frameLocator('iframe');
+    const workbench = page.frameLocator(
+      crossRetain || scenario === 'switch' ? 'iframe:visible' : 'iframe',
+    );
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
@@ -1391,6 +1486,264 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (crossRetain) {
+      const [second, third, fourth] = employees;
+      const a = f.selection.employeeInstanceId;
+      const b = second!.identity.employeeInstanceId;
+      const c = third!.identity.employeeInstanceId;
+      const d = fourth!.identity.employeeInstanceId;
+      const app = workbench.locator('#app');
+      const borrow = (
+        scopeId: string,
+        identity: typeof f.identity,
+        token = sessionToken,
+      ) =>
+        f.invoke(scopeId, token, {
+          selection: {
+            workspaceId: identity.workspaceId,
+            employeeInstanceId: identity.employeeInstanceId,
+            threadId: identity.threadId,
+          },
+        });
+      const scope = async () => (await app.getAttribute('data-scope-id'))!;
+      const firstScope = await scope();
+      const scroll = workbench.locator('[data-conversation-scroll]');
+      await workbench.getByText('供滚动验收的第14个回答').waitFor();
+      const readingTop = await scroll.evaluate((node) => {
+        // Cap the synthetic host viewport. The native replay supplies the overflow.
+        Object.assign(node.style, {
+          maxHeight: '400px',
+          overflowY: 'auto',
+          scrollBehavior: 'auto',
+        });
+        node.scrollTop = 173;
+        return node.scrollTop;
+      });
+      expect(readingTop).toBe(173);
+      await app.evaluate((node) => {
+        node.dataset.testOriginalDocument = 'first';
+      });
+      await page.evaluate(() => {
+        const update = () => {
+          const root = document.documentElement;
+          root.dataset.testPeakFrames = String(
+            Math.max(
+              Number(root.dataset.testPeakFrames ?? 0),
+              document.querySelectorAll('iframe').length,
+            ),
+          );
+        };
+        new MutationObserver(update).observe(document.body, {
+          childList: true,
+          subtree: true,
+        });
+        update();
+      });
+      const choose = async (employeeInstanceId: string) => {
+        const row = workbench.locator(
+          '[data-row-key="workspace:' + employeeInstanceId + '"]',
+        );
+        await row.evaluate((node) => {
+          node.addEventListener(
+            'click',
+            () => parent.performance.mark('cross-employee-click'),
+            { capture: true, once: true },
+          );
+        });
+        await row.click();
+      };
+      const open = async (employeeInstanceId: string) => {
+        await choose(employeeInstanceId);
+        await page.waitForURL(
+          (url) =>
+            url.searchParams.get('employeeInstanceId') === employeeInstanceId,
+          { timeout: 8_000 },
+        );
+        await workbench
+          .locator(
+            '#app[data-employee-instance-id="' + employeeInstanceId + '"]',
+          )
+          .waitFor({ timeout: 8_000 });
+        expect(await editor.isEditable()).toBe(true);
+        return page.evaluate(
+          () =>
+            new Promise<number>((resolve) =>
+              requestAnimationFrame(() => {
+                const start = performance
+                  .getEntriesByName('cross-employee-click')
+                  .at(-1)!.startTime;
+                performance.clearMarks('cross-employee-click');
+                resolve(Math.round(performance.now() - start));
+              }),
+            ),
+        );
+      };
+      const bDocument = (url: URL) =>
+        url.pathname === '/chatflow/4.0/document' &&
+        url.searchParams.get('employeeInstanceId') === b;
+      const reachDocument = deferred<string>();
+      const resumeDocument = deferred<void>();
+      await page.route(
+        bDocument,
+        async (route) => {
+          reachDocument.resolve(
+            new URL(route.request().url()).searchParams.get('scopeId')!,
+          );
+          await resumeDocument.promise;
+          await route.abort().catch(() => {});
+        },
+        { times: 1 },
+      );
+      await choose(b);
+      const cancelledScope = await reachDocument.promise;
+      const pending = workbench.locator('[data-employee-transition]');
+      await pending.getByText('正在打开工作台', { exact: true }).waitFor();
+      expect(await workbench.locator('#chat-sidebar').isVisible()).toBe(true);
+      const header = await workbench
+        .locator('header:has(> [data-conversation-header-leading])')
+        .boundingBox();
+      const transition = await pending.boundingBox();
+      expect(header?.height).toBeGreaterThan(0);
+      expect(transition?.y).toBeGreaterThanOrEqual(
+        header!.y + header!.height - 0.5,
+      );
+      try {
+        await choose(a);
+        await pending.waitFor({ state: 'detached' });
+        await expect.poll(() => page.locator('iframe').count()).toBe(1);
+        await expect.poll(() => joinedScopes.has(cancelledScope)).toBe(true);
+      } finally {
+        resumeDocument.resolve();
+      }
+      expect((await borrow(cancelledScope, second!.identity)).status).toBe(404);
+      expect(await scope()).toBe(firstScope);
+
+      await open(b);
+      await editor.fill('第二位员工的独立草稿');
+      const secondScope = await scope();
+      expect(secondScope).not.toBe(firstScope);
+      const first = page
+        .frames()
+        .find((frame) => frame.url().includes(firstScope))!;
+      await first.locator('#app').evaluate(
+        (node, selection) => {
+          document.querySelector<HTMLElement>('[data-composer-input]')?.focus();
+          parent.postMessage(
+            {
+              type: 'allrice:d-entry:navigate',
+              scopeId: node.dataset.scopeId,
+              selection,
+            },
+            location.origin,
+          );
+        },
+        {
+          workspaceId: fourth!.identity.workspaceId,
+          employeeInstanceId: d,
+          threadId: fourth!.identity.threadId,
+        },
+      );
+      const activeAfterBackground = await page.evaluate(
+        () =>
+          new Promise<string>((resolve) =>
+            requestAnimationFrame(() => {
+              const frame = document.activeElement as HTMLIFrameElement | null;
+              resolve(
+                frame?.contentDocument?.querySelector<HTMLElement>('#app')
+                  ?.dataset.employeeInstanceId ?? '',
+              );
+            }),
+          ),
+      );
+      expect(activeAfterBackground).toBe(b);
+      expect(new URL(page.url()).searchParams.get('employeeInstanceId')).toBe(
+        b,
+      );
+
+      const network = { documentLoads, socketCount };
+      const samples = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        samples.push({ employee: 'A', elapsedMs: await open(a) });
+        expect(await app.getAttribute('data-test-original-document')).toBe(
+          'first',
+        );
+        expect(await scope()).toBe(firstScope);
+        expect(await editor.innerText()).toBe('未发送的原生草稿');
+        expect(await scroll.evaluate((node) => node.scrollTop)).toBe(
+          readingTop,
+        );
+        expect(
+          await editor.evaluate((node) => node === document.activeElement),
+        ).toBe(true);
+        samples.push({ employee: 'B', elapsedMs: await open(b) });
+        expect(await scope()).toBe(secondScope);
+        expect(await editor.innerText()).toBe('第二位员工的独立草稿');
+      }
+      expect(await pending.count()).toBe(0);
+      expect({ documentLoads, socketCount }).toEqual(network);
+      expect(closedSockets.has(firstScope)).toBe(false);
+      expect(closedSockets.has(secondScope)).toBe(false);
+      console.info(
+        'CROSS_EMPLOYEE_NATIVE_RETURN ' +
+          JSON.stringify({
+            browser: browser.version(),
+            samples,
+            documentLoads,
+            socketCount,
+          }),
+      );
+
+      await open(c);
+      const thirdScope = await scope();
+      await open(a);
+      await open(d);
+      const fourthScope = await scope();
+      expect(
+        page.frames().some((frame) => frame.url().includes(secondScope)),
+      ).toBe(false);
+      expect((await borrow(secondScope, second!.identity)).status).toBe(404);
+      expect(f.pageSignals.get(secondScope)?.aborted).toBe(true);
+      await expect.poll(() => joinedScopes.has(secondScope)).toBe(true);
+      expect(
+        await page.locator('html').getAttribute('data-test-peak-frames'),
+      ).toBe('3');
+
+      third!.revoked.abort();
+      await expect
+        .poll(() =>
+          page.frames().some((frame) => frame.url().includes(thirdScope)),
+        )
+        .toBe(false);
+      expect((await borrow(thirdScope, third!.identity)).status).toBe(404);
+      expect(await scope()).toBe(fourthScope);
+      expect(await editor.isEditable()).toBe(true);
+
+      await context.addCookies([
+        { name: 'allrice_session', value: otherToken, url: f.origin },
+      ]);
+      f.loginRevoked.abort();
+      await page.waitForURL(
+        (url) => url.pathname === '/chatflow/4.0' && !url.search,
+      );
+      await expect.poll(() => page.locator('iframe').count()).toBe(0);
+      expect(f.pageSignals.get(firstScope)?.aborted).toBe(true);
+      expect(f.pageSignals.get(fourthScope)?.aborted).toBe(true);
+      await expect
+        .poll(
+          () => closedSockets.has(firstScope) && closedSockets.has(fourthScope),
+        )
+        .toBe(true);
+      expect((await borrow(firstScope, f.identity)).status).toBe(401);
+      expect((await borrow(fourthScope, fourth!.identity)).status).toBe(401);
+      expect((await borrow(firstScope, f.identity, otherToken)).status).toBe(
+        404,
+      );
+      expect(
+        (await borrow(fourthScope, fourth!.identity, otherToken)).status,
+      ).toBe(404);
+      await context.close();
+      return;
+    }
     const dock = (nativeId: string) =>
       workbench.locator(
         '[data-sidebar-right-session="' +
@@ -1672,10 +2025,7 @@ it
         expect(await editor.innerText()).not.toContain('未发送的原生草稿');
         expect(documentLoads).toBe(before.documentLoads + 1);
         expect(socketCount).toBe(before.socketCount + 1);
-        expect((await f.invokeThread(original!, otherThread)).status).toBe(404);
-        console.info(
-          'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
-        );
+        expect((await f.invokeThread(original!, otherThread)).status).toBe(200);
         await page.goto(
           f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
         );

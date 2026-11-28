@@ -64,12 +64,17 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
-  const pageWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
-    organizationId,
-    personId: viewerId,
-    workspaceId: selection.workspaceId,
-    employeeInstanceId: selection.employeeInstanceId,
-  });
+  const pageWrites = readEmployeeMemoryPageWrites(
+    parent,
+    scopeId,
+    {
+      organizationId,
+      personId: viewerId,
+      workspaceId: selection.workspaceId,
+      employeeInstanceId: selection.employeeInstanceId,
+    },
+    window,
+  );
   let activeThreadId = threadId;
 
   const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);
@@ -109,6 +114,7 @@ export function installEmployeeProductOwner(ctx: Context) {
     employeeInstanceId: string,
     target?: string,
     reopen = false,
+    resumeEmployee = false,
   ) {
     signal!.throwIfAborted();
     parent.postMessage(
@@ -116,6 +122,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         type: pageNavigate,
         scopeId,
         ...(reopen && { reopen }),
+        ...(resumeEmployee && { resumeEmployee }),
         selection: {
           workspaceId: selection.workspaceId,
           employeeInstanceId,
@@ -458,13 +465,13 @@ export function installEmployeeProductOwner(ctx: Context) {
           onEmployeeNavigate(id) {
             if (!employeeChoice(workspace, id)) return;
             if (id === selection.employeeInstanceId) {
-              navigate(id, activeThreadId);
+              navigate(id, activeThreadId, false, true);
               return;
             }
             const session = sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
-            navigate(id, session?.id, !session);
+            navigate(id, session?.id, !session, true);
           },
           onNewSession(id) {
             if (!employeeChoice(workspace, id) || switchingScope) return;
