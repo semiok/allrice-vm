@@ -13,7 +13,6 @@ import {
   type PersonVmDiskPreparationTarget,
 } from '@allrice/person-vm';
 import { readContentPrincipal } from './content-maintenance.ts';
-import { joinCallerSave } from './business-runtime/caller-transaction.ts';
 import { createDedicatedDatabase, getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import {
@@ -238,38 +237,42 @@ export async function updateDEntryPersonRollout(
   });
 }
 
-/** Preparation reads stay off the request pool. Cancellation closes only
- * this owned connection and joins even a callback interrupted by disconnect. */
+/** Preparation reads stay off the request pool. The single owned connection
+ * can be ended without letting the driver's native transaction scope try to
+ * send a rollback on the socket that just disconnected. */
 async function readDiskPreparation<T>(
-  mode: string,
+  mode: 'read only' | 'isolation level repeatable read read only',
   signal: AbortSignal,
-  read: (sql: postgres.TransactionSql, active: AbortSignal) => Promise<T>,
+  read: (sql: postgres.Sql, active: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const active = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
   active.throwIfAborted();
-  const client = createDedicatedDatabase(getDatabase());
+  // postgres 3.4.9 can reject its internal type discovery outside the caller
+  // when the owned connection is ended mid-startup. These reads use scalar
+  // parameters and infer all built-in result types without that extra query.
+  const client = createDedicatedDatabase({
+    options: { ...getDatabase().options, fetch_types: false },
+  });
   let closing: Promise<void> | undefined;
-  let callback: Promise<{ value: T }> | undefined;
   const close = () => (closing ??= client.end({ timeout: 0 }));
   const abort = () => void close().catch(() => {});
   active.addEventListener('abort', abort, { once: true });
   try {
-    const result = await joinCallerSave(
-      client.begin(mode, (sql) => {
-        callback = (async () => {
-          active.throwIfAborted();
-          await sql`set local transaction_timeout = '5s'`;
-          active.throwIfAborted();
-          return { value: await read(sql, active) };
-        })();
-        return callback;
-      }),
-      () => callback,
-    );
+    await (mode === 'read only'
+      ? client`begin read only`
+      : client`begin isolation level repeatable read read only`);
     active.throwIfAborted();
-    return result.value;
+    await client`set local transaction_timeout = '5s'`;
+    active.throwIfAborted();
+    const result = await read(client, active);
+    active.throwIfAborted();
+    await client`commit`;
+    active.throwIfAborted();
+    return result;
   } finally {
     active.removeEventListener('abort', abort);
+    // If the query or commit failed, closing this read-only session is enough.
+    // Never issue more SQL on a connection whose state cannot be verified.
     await close();
   }
 }
@@ -316,7 +319,7 @@ export async function readPersonVmDiskPreparationForegroundBusy(
 /** Tenant and personal provenance must come from the exact version's creation
  * transaction. A missing platform mapping also describes old materializations. */
 async function hasDiskPreparationVersionProvenance(
-  sql: postgres.TransactionSql,
+  sql: postgres.Sql,
   identity: Pick<
     PersonVmDiskPreparationTarget,
     | 'organizationId'
@@ -419,7 +422,8 @@ export async function readPersonVmDiskPreparationTarget(
           join allrice_employee_assignments a on a.id=i.assignment_id
             and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
             and a.user_id=i.owner_id and a.active
-          where i.organization_id=any(${organizations}::uuid[]) and i.owner_id=${ownerId}
+          where i.organization_id=any(string_to_array(${organizations.join(',')}, ',')::uuid[])
+            and i.owner_id=${ownerId}
             and i.archived_at is null
           order by i.organization_id,i.id`;
       let eligible: PersonVmDiskPreparationTarget | null = null;

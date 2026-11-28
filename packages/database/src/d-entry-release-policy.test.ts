@@ -70,7 +70,12 @@ function fixture(
     async (strings: TemplateStringsArray, ...params: unknown[]) => {
       const query = strings.join('?');
       seen.push({ query, params });
-      if (query.includes('set local transaction_timeout')) return [];
+      if (
+        query.startsWith('begin ') ||
+        query.includes('set local transaction_timeout') ||
+        query === 'commit'
+      )
+        return [];
       if (query.includes('from allrice_settings')) {
         return [
           {
@@ -86,11 +91,11 @@ function fixture(
       if (query.includes('join allrice_audit_events audit'))
         return [{ verified: tenantVersionVerified }];
       if (query.includes('from allrice_employee_instances')) {
-        const [organizations, ownerId] = params as [string[], string];
+        const [organizations, ownerId] = params as [string, string];
         return instances
           .filter(
             (row) =>
-              organizations.includes(row.organization_id) &&
+              organizations.split(',').includes(row.organization_id) &&
               row.owner_id === ownerId,
           )
           .map((row) => ({
@@ -101,14 +106,10 @@ function fixture(
       throw Error('Unexpected fixture query');
     },
   );
-  const begin = vi.fn(
-    async (_mode: string, callback: (tx: typeof sql) => unknown) =>
-      callback(sql),
-  );
   const end = vi.fn(async () => {});
-  data.getDatabase.mockReturnValue({ trusted: true });
-  data.createDedicatedDatabase.mockReturnValue({ begin, end });
-  return { begin, end, seen, sql };
+  data.getDatabase.mockReturnValue({ options: { fetch_types: true } });
+  data.createDedicatedDatabase.mockReturnValue(Object.assign(sql, { end }));
+  return { end, seen, sql };
 }
 beforeEach(() => {
   vi.resetAllMocks();
@@ -171,7 +172,7 @@ it('fails closed on a published policy that defaults everyone to 4.0', async () 
 });
 
 it('resolves the released person’s employee from the same snapshot as policy, membership and version', async () => {
-  const { begin, seen, sql } = fixture([selection()]);
+  const { seen, sql } = fixture([selection()]);
   expect(await readPersonVmDiskPreparationTarget(person, signal())).toEqual({
     personId: person,
     organizationId: org,
@@ -182,8 +183,8 @@ it('resolves the released person’s employee from the same snapshot as policy, 
     platformRevisionId: null,
     policyRevision: 'revision-1',
   });
-  expect(begin.mock.calls[0]?.[0]).toBe(
-    'isolation level repeatable read read only',
+  expect(seen[0]?.query).toBe(
+    'begin isolation level repeatable read read only',
   );
   const candidates = seen.find(({ query }) =>
     query.includes('from allrice_employee_instances'),
@@ -280,16 +281,17 @@ it('propagates unexpected eligibility errors and rejects a cancelled scan', asyn
 });
 
 it('reads the foreground busy projection in a bounded read-only transaction', async () => {
-  const { begin, seen } = fixture([selection()], [{ busy: true }]);
+  const { seen } = fixture([selection()], [{ busy: true }]);
   expect(
     await readPersonVmDiskPreparationForegroundBusy(person, signal()),
   ).toBe(true);
-  expect(begin.mock.calls[0]?.[0]).toBe('read only');
-  expect(seen[0]?.query).toBe("set local transaction_timeout = '5s'");
-  expect(seen[1]?.query).toMatch(
+  expect(seen[0]?.query).toBe('begin read only');
+  expect(seen[1]?.query).toBe("set local transaction_timeout = '5s'");
+  expect(seen[2]?.query).toMatch(
     /lease_owner is not null or instance_id is not null\s+or holds/,
   );
-  expect(seen[1]?.params).toEqual([person]);
+  expect(seen[2]?.params).toEqual([person]);
+  expect(seen[3]?.query).toBe('commit');
 
   fixture([selection()]);
   expect(
