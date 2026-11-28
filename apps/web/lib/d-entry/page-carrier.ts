@@ -2,6 +2,7 @@ import { EmployeeEntryError } from './entry-client';
 import {
   DEntryPageClosedSchema,
   DEntryPageOpenedSchema,
+  DEntryPageRevokedSchema,
   DEntryPageSwitchResultSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
@@ -82,6 +83,7 @@ export function openNativePageCarrier(
     complete = false,
     dispatched = false,
     setupCancelled = false,
+    revoked = false,
     gotClosed = false,
     gotEnd = false;
   function send(value: object) {
@@ -101,7 +103,7 @@ export function openNativePageCarrier(
     if (complete) return;
     complete = true;
     closeMux();
-    onRevoked();
+    if (!revoked) onRevoked();
     ready.reject(reason);
     switching?.proof.abort(reason);
     switching?.result.reject(reason);
@@ -162,6 +164,20 @@ export function openNativePageCarrier(
       if (frame.type !== 'item' || gotClosed)
         throw Error('Unexpected native page terminal');
       if (scopeId) {
+        const withdrawal = DEntryPageRevokedSchema.safeParse(frame.value);
+        if (withdrawal.success) {
+          if (revoked || withdrawal.data.scopeId !== scopeId)
+            throw Error('Unexpected native page withdrawal');
+          revoked = true;
+          requested = true;
+          closeMux();
+          const reason = Error('Native page authority withdrawn');
+          switching?.proof.abort(reason);
+          switching?.result.reject(reason);
+          switching = undefined;
+          onRevoked();
+          return;
+        }
         if (switching) {
           const decoded = DEntryPageSwitchResultSchema.safeParse(frame.value);
           if (decoded.success) {

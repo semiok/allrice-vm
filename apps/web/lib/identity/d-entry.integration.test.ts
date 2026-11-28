@@ -1,3 +1,4 @@
+import type { DEntryPrincipalControlScope } from '@allrice/d-entry-principal/types';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { execFile } from 'node:child_process';
@@ -107,6 +108,7 @@ import {
   getDEntryPageNativeRoot,
   registerDEntryPageNativeRoot,
   ensureDEntryNativeRoot,
+  syncDEntryNativeRootTitle,
   requireDEntryNativeIdentity,
   readDEntryEmployeeDirectory,
   preparePersonNativeWebRoster,
@@ -556,6 +558,434 @@ suite(
         expect(runs!.n).toBe(0);
         expect(create).toHaveBeenCalledTimes(1);
       } finally {
+        await clearPublished();
+      }
+    });
+
+    it('runs sidebar rename, archive and restore through the current Worker and PG root', async () => {
+      const f = await enabledFour();
+      const active = new AbortController().signal;
+      const native = nativeEntryFixture({
+        context: f.context,
+        identity: f.identity,
+      });
+      const binding = native.binding;
+      const fact = creation(f, 'dsh-root');
+      fact.host.binding = { ...binding, organizationId: f.org };
+      await ensureDEntryNativeRoot(f.context, f.selection, f.identity, {
+        operationId: randomUUID(),
+        host: fact.host,
+        signal: active,
+        create: async () => fact,
+      });
+      await fixture.db`insert into person_virtual_machines
+        (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+        values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+          ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'sidebar-http' })})`;
+      const feed = createDEntryAuthorityFeed(
+        process.env.ALLRICE_TEST_DATABASE_URL!,
+      );
+      let archived = false;
+      let busy = true;
+      let title = f.thread.title;
+      const close = vi.fn(async () => {});
+      const followed = vi.fn(async () => {});
+      const invokePage = vi.fn<DEntryPrincipalControlScope['invokePage']>(
+        async ({
+          endpoint,
+          args,
+        }): ReturnType<DEntryPrincipalControlScope['invokePage']> => {
+          expect(args).toMatchObject({
+            request: { sessionId: fact.nativeSessionId },
+          });
+          const request = args.request as {
+            title?: string;
+            stopActivity?: boolean;
+          };
+          switch (endpoint) {
+            case 'session/rename':
+              title = request.title!;
+              return {
+                kind: 'page',
+                endpoint,
+                value: { title, seq: 1 },
+                attachments: [],
+              };
+            case 'session/projections':
+              return {
+                kind: 'page',
+                endpoint,
+                value: { kind: 'sequenced', asOfSeq: 1, values: { title } },
+                attachments: [],
+              };
+            case 'workspace/archiveSession':
+              if (busy && !request.stopActivity)
+                throw Object.assign(new Error('native session active'), {
+                  code: 'workspace/session-active',
+                  details: { activity: [{ kind: 'turn' }] },
+                });
+              archived = true;
+              busy = false;
+              break;
+            case 'workspace/unarchiveSession':
+              archived = false;
+              break;
+            default:
+              throw Error('Unexpected native endpoint');
+          }
+          return {
+            kind: 'page',
+            endpoint,
+            value: {
+              archivedSessionIds: archived ? [fact.nativeSessionId] : [],
+            },
+            attachments: [],
+          };
+        },
+      );
+      function temporary(
+        _context: Parameters<typeof native.owner.acquirePrincipal>[0],
+        input: Parameters<typeof native.owner.acquirePrincipal>[1],
+      ) {
+        return {
+          close,
+          run: async (): Promise<DEntryPrincipalControlScope> => ({
+            opened: {
+              type: 'opened',
+              scopeId: input.scopeId,
+              principal: {
+                kind: 'allrice-d-entry',
+                scopeId: input.scopeId,
+                identity: input.identity,
+              },
+              baseline: { type: 'baseline', owner: false, grants: [] },
+            },
+            revoked: active,
+            invoke: vi.fn(),
+            invokePage,
+            stream: vi.fn(),
+            streamPage: ({ endpoint, scopeId }) => ({
+              send: vi.fn(),
+              async *[Symbol.asyncIterator]() {
+                expect(endpoint).toBe('workspace/follow');
+                try {
+                  yield {
+                    type: 'page-item',
+                    scopeId,
+                    value: {
+                      type: 'baseline',
+                      value: {
+                        archivedSessionIds: archived
+                          ? [fact.nativeSessionId]
+                          : [],
+                      },
+                    },
+                  };
+                } finally {
+                  await followed();
+                }
+              },
+            }),
+            close,
+          }),
+        };
+      }
+      vi.mocked(native.owner.acquirePrincipal).mockImplementation(temporary);
+      const prepare = vi.fn(async () => ({
+        key: 'verified-retained-root',
+        target: {
+          vmId: binding.vmId,
+          instanceId: null,
+          leaseEpoch: binding.leaseEpoch,
+        },
+      }));
+      const warm = vi.fn(async () => {
+        await fixture.db`update person_virtual_machines set phase='running' where vm_id=${binding.vmId}`;
+      });
+      const server = await nativeEntryServer(native, {
+        ...dEntryHttpDefaults,
+        owners: native.deps.owners,
+        prewarm: { prepare, isCurrent: async () => true, prewarm: warm },
+        data: native.deps.data,
+        watch: (context, selection, identity, signal) =>
+          watchDEntryNativeAuthority(
+            context,
+            selection,
+            identity,
+            signal,
+            feed,
+          ),
+      });
+      const previous = process.env.ALLRICE_WORKER_INTERNAL_URL;
+      vi.stubEnv('ALLRICE_WORKER_INTERNAL_URL', server.origin);
+      cookie.token = f.login.token;
+      const patch = (
+        change: unknown,
+        employee = f.assignment,
+        origin = 'https://allrice.test',
+        requestSignal?: AbortSignal,
+      ) =>
+        PATCH(
+          new Request(
+            `https://allrice.test/api/v1/sessions/${f.thread.id}?entry=4.0&workspaceId=${f.workspace}&employeeInstanceId=${employee}`,
+            {
+              method: 'PATCH',
+              signal: requestSignal,
+              headers: {
+                origin,
+                host: 'allrice.test',
+                'content-type': 'application/json',
+                'x-allrice-organization-id': f.org,
+                'x-allrice-workspace-id': f.workspace,
+                'x-allrice-expected-viewer-id': f.user,
+              },
+              body: JSON.stringify(change),
+            },
+          ),
+          route(f.thread.id),
+        );
+      const stored = async () =>
+        (
+          await fixture.db`select title, archived_at, execution_generation
+        from allrice_chat_sessions where id=${f.thread.id}`
+        )[0]!;
+      try {
+        expect(
+          (await patch({ archived: true }, randomUUID())).status,
+        ).toBeGreaterThanOrEqual(400);
+        expect(
+          (
+            await patch(
+              { archived: true },
+              f.assignment,
+              'https://foreign.test',
+            )
+          ).status,
+        ).toBe(403);
+        expect(invokePage).not.toHaveBeenCalled();
+        const renamed = await patch({ title: '发票核对' });
+        expect(renamed.status, await renamed.clone().text()).toBe(200);
+        expect(await stored()).toMatchObject({
+          title: '发票核对',
+          archived_at: null,
+        });
+        const conflict = await patch({ archived: true });
+        expect(conflict.status).toBe(409);
+        expect(await conflict.json()).toMatchObject({
+          error: { code: 'SESSION_ACTIVE', activity: [{ kind: 'turn' }] },
+        });
+        expect((await stored()).archived_at).toBeNull();
+        const archivedReply = await patch({
+          archived: true,
+          stopActivity: true,
+        });
+        expect(archivedReply.status, await archivedReply.clone().text()).toBe(
+          200,
+        );
+        expect((await stored()).archived_at).toBeInstanceOf(Date);
+        await expect(
+          requireDEntryNativeIdentity(f.context, f.selection),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await fixture.db`update person_virtual_machines set phase='stopped' where vm_id=${binding.vmId}`;
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
+        prepare.mockResolvedValueOnce({
+          key: 'wrong-disk',
+          target: { vmId: randomUUID(), instanceId: null, leaseEpoch: 1 },
+        });
+        expect((await patch({ archived: false })).status).toBe(503);
+        expect(warm).not.toHaveBeenCalled();
+        expect((await stored()).archived_at).toBeInstanceOf(Date);
+        native.deps.owners.resolve.mockRejectedValueOnce(
+          new PersonVmError('LEASE_CONFLICT'),
+        );
+        const restored = await patch({ archived: false });
+        expect(warm).toHaveBeenCalledOnce();
+        expect(restored.status, await restored.clone().text()).toBe(200);
+        expect(await stored()).toMatchObject({
+          title: '发票核对',
+          archived_at: null,
+          execution_generation: '4.0',
+        });
+        expect(followed).toHaveBeenCalledTimes(2);
+        expect(close).toHaveBeenCalledTimes(4);
+
+        // An idempotent native unarchive ACK alone cannot prove a vanished root.
+        const invocations = invokePage.mock.calls.length;
+        vi.mocked(native.owner.readSessions).mockResolvedValueOnce({
+          ok: true,
+          value: { items: [] },
+        });
+        expect((await patch({ archived: false })).status).toBe(404);
+        expect(invokePage).toHaveBeenCalledTimes(invocations);
+
+        const baselineRead = deferred<void>();
+        const releaseProjection = deferred<void>();
+        followed.mockImplementationOnce(async () => {
+          baselineRead.resolve();
+          await releaseProjection.promise;
+        });
+        const disconnect = new AbortController();
+        const attempted = patch(
+          { archived: true },
+          f.assignment,
+          'https://allrice.test',
+          disconnect.signal,
+        );
+        try {
+          await baselineRead.promise;
+          disconnect.abort();
+          expect((await stored()).archived_at).toBeNull();
+        } finally {
+          releaseProjection.resolve();
+          await attempted;
+        }
+        await vi.waitFor(async () =>
+          expect((await stored()).archived_at).toBeInstanceOf(Date),
+        );
+      } finally {
+        await server.close();
+        await feed.close();
+        if (previous === undefined)
+          delete process.env.ALLRICE_WORKER_INTERNAL_URL;
+        else process.env.ALLRICE_WORKER_INTERNAL_URL = previous;
+        await clearPublished();
+      }
+    });
+
+    it('stores only the current native title for the registered 4.0 root and fences a delayed title', async () => {
+      const f = await enabledFour();
+      const fact = creation(f);
+      const binding = fact.host.binding;
+      const signal = new AbortController().signal;
+      const observed = deferred<void>();
+      const release = deferred<void>();
+      let pending: Promise<void> | undefined;
+      try {
+        const pin = await ensureDEntryNativeRoot(
+          f.context,
+          f.selection,
+          f.identity,
+          {
+            operationId: randomUUID(),
+            host: fact.host,
+            signal,
+            create: async () => fact,
+          },
+        );
+        await fixture.db`insert into person_virtual_machines
+          (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+          values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+            ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'synthetic-title' })})`;
+        const readStored = async () =>
+          (
+            await fixture.db`select title from allrice_chat_sessions where id=${f.thread.id}`
+          )[0]!.title;
+        const sync = (read: (signal: AbortSignal) => Promise<string>) =>
+          syncDEntryNativeRootTitle(f.context, pin, binding, read, signal);
+        await sync(async () => '自动生成标题');
+        expect(await readStored()).toBe('自动生成标题');
+
+        const delayed = vi
+          .fn<() => Promise<string>>()
+          .mockImplementationOnce(async () => {
+            observed.resolve();
+            await release.promise;
+            return '过时的自动标题';
+          })
+          // After the other page commits, re-read the authoritative title.
+          .mockResolvedValue('自动生成标题');
+        pending = sync(delayed);
+        void pending.catch(() => {});
+        await Promise.race([observed.promise, pending]);
+        await sync(async () => '自动生成标题'); // The user can rename back to the stored title.
+        release.resolve();
+        await pending;
+        expect(delayed).toHaveBeenCalledTimes(2);
+        expect(await readStored()).toBe('自动生成标题');
+
+        await sync(async () => '本人手动命名');
+        const misleadingTitle = vi.fn(async () => '串写标题');
+        for (const other of [
+          { ...pin, rootNativeSessionId: 'child' },
+          {
+            ...pin,
+            identity: { ...pin.identity, employeeInstanceId: randomUUID() },
+          },
+          {
+            ...pin,
+            identity: { ...pin.identity, organizationId: randomUUID() },
+          },
+        ])
+          await expect(
+            syncDEntryNativeRootTitle(
+              f.context,
+              other,
+              binding,
+              misleadingTitle,
+              signal,
+            ),
+          ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(misleadingTitle).not.toHaveBeenCalled();
+        await expect(
+          syncDEntryNativeRootTitle(
+            f.context,
+            pin,
+            { ...binding, leaseEpoch: binding.leaseEpoch + 1 },
+            misleadingTitle,
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        const locked = deferred<void>();
+        const unlock = deferred<void>();
+        const holder = fixture.db.begin(async (tx) => {
+          await tx`select id from allrice_chat_sessions where id=${f.thread.id} for no key update`;
+          locked.resolve();
+          await unlock.promise;
+        });
+        let writeFailure: unknown;
+        let blocked: Promise<void> | undefined;
+        try {
+          await Promise.race([locked.promise, holder]);
+          blocked = sync(async () => '遇到行锁的标题').catch(
+            (error: unknown) => {
+              writeFailure = error;
+            },
+          );
+          await vi.waitFor(
+            () =>
+              expect(writeFailure).toMatchObject({
+                message: 'employee_access_busy',
+              }),
+            { timeout: 7000 },
+          );
+          expect(await readStored()).toBe('本人手动命名');
+        } finally {
+          unlock.resolve();
+          await Promise.allSettled([holder, blocked]);
+        }
+
+        await fixture.db.begin(async (tx) => {
+          await tx`lock table allrice_chat_sessions in access exclusive mode`;
+          const readBlockedTitle = vi.fn(async () => '锁住时不读取原生标题');
+          await expect(sync(readBlockedTitle)).rejects.toMatchObject({
+            code: '55P03',
+          });
+          expect(readBlockedTitle).not.toHaveBeenCalled();
+        });
+
+        await expect(
+          sync(async () => {
+            await revokeSession(f.login.token);
+            return '失权后标题';
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(await readStored()).toBe('本人手动命名');
+      } finally {
+        release.resolve();
+        await Promise.allSettled([pending]);
         await clearPublished();
       }
     });

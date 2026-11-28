@@ -5,6 +5,7 @@ import type {
 
 export const pageClosing = 'allrice:d-entry:close';
 export const pageCompletion = 'allrice:d-entry:completion';
+export const pageEmployeeArchived = 'allrice:d-entry:employee-archived';
 export const pageNavigate = 'allrice:d-entry:navigate';
 export const pageRevoked = 'allrice:d-entry:revoked';
 export const pageStartupFailed = 'allrice:d-entry:startup-failed';

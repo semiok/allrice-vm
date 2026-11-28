@@ -796,16 +796,23 @@ export function listChatSessions(
 export function readDEntrySidebarSessionPage(
   context: RequestContext,
   workspaceId: string,
-  currentEmployeeIds: readonly string[],
+  currentEmployeeIds: readonly string[] | undefined,
   cursor: string | undefined,
   sql: TransactionSql,
+  options: Pick<
+    ChatSessionPageOptions,
+    | 'includeArchived'
+    | 'archivedOnly'
+    | 'includeEmployeeGroups'
+    | 'employeeInstanceId'
+  > = {},
 ) {
   return readChatSessionPage(
     context,
     workspaceId,
-    { cursor, limit: 50 },
+    { ...options, cursor, limit: 50 },
     sql,
-    currentEmployeeIds,
+    { employeeIds: currentEmployeeIds },
   );
 }
 
@@ -814,7 +821,7 @@ async function readChatSessionPage(
   workspaceIdInput: string,
   options: ChatSessionPageOptions,
   sql: ReturnType<typeof getDatabase> | TransactionSql,
-  dEntryEmployees?: readonly string[],
+  dEntry?: { employeeIds: readonly string[] | undefined },
 ) {
   const workspaceId = await resolveWorkspaceId(context, workspaceIdInput, sql);
   const cursor = decodeCursor(options.cursor);
@@ -825,6 +832,24 @@ async function readChatSessionPage(
     ? UuidSchema.parse(options.employeeInstanceId)
     : null;
   const limit = Math.min(Math.max(options.limit ?? 30, 1), 100);
+  const dEntryFilter = dEntry
+    ? sql`and s.owner_id=${requireUser(context)}
+      and s.execution_generation='4.0'
+      and s.d_entry_native_root->>'nativeSessionId' is not null
+      ${
+        dEntry.employeeIds
+          ? sql`and coalesce(s.employee_instance_id,s.employee_assignment_id)
+            = any(${sql.array([...dEntry.employeeIds])}::uuid[])`
+          : sql`and s.visibility='private'
+            and exists (
+              select 1 from allrice_employee_instances owned
+              where owned.id=coalesce(s.employee_instance_id,s.employee_assignment_id)
+                and owned.organization_id=s.organization_id
+                and owned.workspace_id=s.workspace_id
+                and owned.owner_id=s.owner_id
+            )`
+      }`
+    : sql``;
   // Bind cursor timestamps as text so postgres.js does not serialize them
   // through Date before PostgreSQL compares the full microsecond value.
   const rows = await sql<
@@ -832,8 +857,8 @@ async function readChatSessionPage(
   >`
     select *, to_char(updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as cursor_updated_at,
       coalesce(case when owner_id=${requireUser(context)} then
-        (select i.profile->>'name' from allrice_employee_instances i where i.id=coalesce(allrice_chat_sessions.employee_instance_id,allrice_chat_sessions.employee_assignment_id) and ${personalInstanceNameSql(sql)}) end,
-        (select v.name from allrice_employee_versions v where v.id=allrice_chat_sessions.employee_version_id)) as employee_name from allrice_chat_sessions
+        (select i.profile->>'name' from allrice_employee_instances i where i.id=coalesce(s.employee_instance_id,s.employee_assignment_id) and ${personalInstanceNameSql(sql)}) end,
+        (select v.name from allrice_employee_versions v where v.id=s.employee_version_id)) as employee_name from allrice_chat_sessions s
     where organization_id = ${context.organizationId}
       and workspace_id = ${workspaceId}
       and (${employeeAssignmentId}::uuid is null or employee_assignment_id = ${employeeAssignmentId}::uuid)
@@ -842,15 +867,7 @@ async function readChatSessionPage(
       and (not ${options.archivedOnly ?? false} or archived_at is not null)
       and (${options.query ?? ''} = '' or position(lower(${options.query ?? ''}) in lower(title)) > 0)
       and (owner_id = ${requireUser(context)} or visibility <> 'private')
-      ${
-        dEntryEmployees
-          ? sql`and owner_id=${requireUser(context)}
-             and execution_generation='4.0'
-             and d_entry_native_root->>'nativeSessionId' is not null
-             and coalesce(employee_instance_id,employee_assignment_id)
-               = any(${sql.array([...dEntryEmployees])}::uuid[])`
-          : sql``
-      }
+      ${dEntryFilter}
       and (
         ${cursor?.updatedAt ?? null}::text::timestamptz is null
         or (pinned_at is not null and archived_at is null, updated_at, id)
@@ -918,6 +935,7 @@ async function readChatSessionPage(
           and (not ${options.archivedOnly ?? false} or s.archived_at is not null)
           and (${options.query ?? ''} = '' or position(lower(${options.query ?? ''}) in lower(s.title)) > 0)
           and (s.owner_id = ${requireUser(context)} or s.visibility <> 'private')
+          ${dEntryFilter}
         group by s.employee_assignment_id,coalesce(s.employee_instance_id,s.employee_assignment_id)
       `
     : undefined;

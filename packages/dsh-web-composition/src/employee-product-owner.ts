@@ -15,6 +15,7 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import {
   pageNavigate,
+  pageEmployeeArchived,
   pageNativeThreadRegistered,
   pageNativeThreadSelected,
   type PageNativeThreadRegistration,
@@ -76,6 +77,8 @@ export function installEmployeeProductOwner(ctx: Context) {
   const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);
   let openRegisteredSession: ((thread: string) => boolean) | undefined;
   let startNativeSession: ((onError: () => void) => boolean) | undefined;
+  let reflectNativeTitle: (() => void) | undefined;
+  let beginNativeNavigation: (() => AbortSignal) | undefined;
   let activeNativeSession: string | undefined;
   let resourceScopeId = scopeId;
   let switchingScope = false;
@@ -105,6 +108,7 @@ export function installEmployeeProductOwner(ctx: Context) {
   const requestHeaders = {
     'x-allrice-workspace-id': selection.workspaceId,
     'x-allrice-organization-id': organizationId,
+    'x-allrice-expected-viewer-id': viewerId,
   };
   function navigate(
     employeeInstanceId: string,
@@ -112,6 +116,7 @@ export function installEmployeeProductOwner(ctx: Context) {
     reopen = false,
   ) {
     signal!.throwIfAborted();
+    beginNativeNavigation?.();
     parent.postMessage(
       {
         type: pageNavigate,
@@ -134,6 +139,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         ...previous,
         tree: { ...previous.tree, activeId: thread },
       });
+    reflectNativeTitle?.();
     const panel = panels.getSnapshot();
     const panelKey = resourceScopeId + '/' + thread;
     if (!panel || panel.scopeKey === panelKey) return;
@@ -192,6 +198,7 @@ export function installEmployeeProductOwner(ctx: Context) {
       const update = () => {
         activeNativeSession = native.sidebarRight.mounted.getSnapshot();
         followSelection();
+        reflectNativeTitle?.();
       };
       const unsubscribe = native.sidebarRight.mounted.subscribe(update);
       update();
@@ -212,6 +219,46 @@ export function installEmployeeProductOwner(ctx: Context) {
   ctx.inject(['uiWorkspace', 'sessions', 'workspaces', 'layout'], (native) => {
     native.effect(() => {
       const list = native.sessions.list;
+      const beginNavigation = () => native.layout.beginNavigation();
+      beginNativeNavigation = beginNavigation;
+      const reflect = () => {
+        if (signal.aborted || switchingScope) return;
+        const current = sidebar.getSnapshot();
+        if (!current?.tree) return;
+        const catalog = list.getSnapshot();
+        const titles = new Map<string, string>();
+        for (const nativeId of catalog.ids) {
+          const root = registered.get(nativeId);
+          const title = catalog.byId[nativeId]?.title;
+          if (root && title) titles.set(root.threadId, title);
+        }
+        if (!titles.size) return;
+        let changed = false;
+        const sessions = current.tree.sessions.map((session) => {
+          const title = titles.get(session.id);
+          if (
+            !title ||
+            title === session.title ||
+            sessionEmployeeKey(session) !== selection.employeeInstanceId ||
+            session.ownerId !== viewerId
+          )
+            return session;
+          changed = true;
+          return { ...session, title };
+        });
+        if (!changed) return;
+        sidebar.update({
+          ...current,
+          tree: {
+            ...current.tree,
+            sessions,
+            workspace: { ...current.tree.workspace, sessions },
+          },
+        });
+      };
+      reflectNativeTitle = reflect;
+      const unsubscribeTitle = list.subscribe(reflect);
+      reflect();
       const select = (thread: string) => {
         if (signal.aborted || switchingScope) return false;
         const session = list.getSnapshot().ids.find((candidate) => {
@@ -219,6 +266,7 @@ export function installEmployeeProductOwner(ctx: Context) {
           return root?.scopeId === resourceScopeId && root.threadId === thread;
         });
         if (session === undefined) return false;
+        beginNavigation();
         native.uiWorkspace.openSession(session);
         return true;
       };
@@ -228,28 +276,37 @@ export function installEmployeeProductOwner(ctx: Context) {
         const source = activeNativeSession;
         const sourceScope = resourceScopeId;
         if (signal.aborted || switchingScope || !source) return false;
-        if (registered.get(source)?.scopeId !== sourceScope) return false;
+        const sourceRoot = registered.get(source);
+        if (
+          sourceRoot?.scopeId !== sourceScope ||
+          sourceRoot.threadId !== activeThreadId
+        )
+          return false;
         const workspace = native.workspaces.list
           .getSnapshot()
           .items.find((item) => item.sessionIds.some((id) => id === source));
         if (!workspace) return false;
         if (creating) return true;
         creating = true;
+        const sourceThread = activeThreadId;
+        const navigation = beginNavigation();
         const current = () =>
           !disposed &&
           !signal.aborted &&
+          !navigation.aborted &&
           !switchingScope &&
-          activeNativeSession === source &&
+          activeThreadId === sourceThread &&
           resourceScopeId === sourceScope;
-        // Register through the native create RPC, then let the parent
-        // authorize the new thread before opening its conversation.
+        // rc.2 makes the created session addressable before resolving.
+        // Its business registration arrived on this same authenticated scope.
         void native.sessions
           .create({ workspaceId: workspace.workspaceId })
           .then((id) => {
             if (!current()) return;
             const root = registered.get(id);
             if (root?.scopeId !== sourceScope) return onError();
-            navigate(selection.employeeInstanceId, root.threadId);
+            if (!select(root.threadId))
+              navigate(selection.employeeInstanceId, root.threadId);
           })
           .catch(() => {
             if (current()) onError();
@@ -283,6 +340,10 @@ export function installEmployeeProductOwner(ctx: Context) {
         disposed = true;
         if (openRegisteredSession === select) openRegisteredSession = undefined;
         if (startNativeSession === start) startNativeSession = undefined;
+        if (reflectNativeTitle === reflect) reflectNativeTitle = undefined;
+        if (beginNativeNavigation === beginNavigation)
+          beginNativeNavigation = undefined;
+        unsubscribeTitle();
         unsubscribe();
       };
     }, 'AllRice employee native root');
@@ -337,6 +398,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         const onScope = (event: Event) => {
           if (signal.aborted) return;
           const next = (event as CustomEvent<PageThreadScope>).detail;
+          beginNativeNavigation?.();
           resourceScopeId = next.scopeId;
           registered.set(next.nativeSessionId, {
             threadId: next.threadId,
@@ -443,6 +505,7 @@ export function installEmployeeProductOwner(ctx: Context) {
           },
         });
         followSelection();
+        reflectNativeTitle?.();
       })
       .catch(() => {});
   }
@@ -469,18 +532,21 @@ export function installEmployeeProductOwner(ctx: Context) {
               navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
-            if (!employeeChoice(workspace, id)) return;
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || !employeeChoice(tree.workspace, id)) return;
             if (id === selection.employeeInstanceId) {
               navigate(id, activeThreadId);
               return;
             }
-            const session = sessions.find(
+            const session = tree.sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
             navigate(id, session?.id, !session);
           },
           onNewSession(id) {
-            if (!employeeChoice(workspace, id) || switchingScope) return;
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || !employeeChoice(tree.workspace, id) || switchingScope)
+              return;
             if (
               id === selection.employeeInstanceId &&
               startNativeSession?.(() => notice('暂时无法新建会话。'))
@@ -488,7 +554,6 @@ export function installEmployeeProductOwner(ctx: Context) {
               return;
             navigate(id);
           },
-          onDetails: () => notice('当前入口暂无法打开员工详情。'),
         },
       };
       function notice(error: string) {
@@ -497,6 +562,7 @@ export function installEmployeeProductOwner(ctx: Context) {
       }
       sidebar.update(initial);
       followSelection();
+      reflectNativeTitle?.();
       bindEmployeeSidebar(ctx, {
         getSnapshot: sidebar.getSnapshot,
         subscribe: sidebar.subscribe,
@@ -509,7 +575,167 @@ export function installEmployeeProductOwner(ctx: Context) {
           headers: requestHeaders,
           onCreated: (instance) => navigate(instance.id, undefined, true),
         },
-        openArchive: () => notice('当前入口暂无法打开归档。'),
+        management: {
+          scopeId: ownerKey,
+          headers: requestHeaders,
+          lifetime: signal,
+          onSessionChanged(session) {
+            const current = sidebar.getSnapshot();
+            if (!current || signal.aborted || session.ownerId !== viewerId)
+              return;
+            const sessions = current.tree.sessions.filter(
+              (row) => row.id !== session.id,
+            );
+            if (
+              !session.archivedAt &&
+              employeeChoice(
+                current.tree.workspace,
+                sessionEmployeeKey(session),
+              )
+            ) {
+              const previous = current.tree.sessions.find(
+                (row) => row.id === session.id,
+              );
+              sessions.push({ ...previous, ...session });
+              sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+            }
+            sidebar.update({
+              ...current,
+              tree: {
+                ...current.tree,
+                sessions,
+                workspace: { ...current.tree.workspace, sessions },
+              },
+            });
+            if (session.archivedAt && session.id === activeThreadId)
+              navigate(selection.employeeInstanceId, undefined, true);
+          },
+          async onEmployeeChanged(instance) {
+            const current = sidebar.getSnapshot();
+            if (
+              !current ||
+              signal.aborted ||
+              instance.ownerId !== viewerId ||
+              instance.workspaceId !== selection.workspaceId ||
+              instance.organizationId !== organizationId
+            )
+              return;
+            const workspace = current.tree.workspace;
+            if (
+              !instance.archivedAt &&
+              !employeeChoice(workspace, instance.id)
+            ) {
+              try {
+                const query = new URLSearchParams({
+                  ...selection,
+                  threadId: activeThreadId,
+                  entry: '4.0',
+                });
+                const response = await fetch('/api/v1/workspace?' + query, {
+                  headers: requestHeaders,
+                  signal,
+                  cache: 'no-store',
+                });
+                if (!response.ok) throw Error('Employee catalog unavailable');
+                const directory = (await response.json()) as Pick<
+                  Workspace,
+                  | 'viewerId'
+                  | 'workspaceId'
+                  | 'organizationId'
+                  | 'employees'
+                  | 'sessions'
+                >;
+                const latest = sidebar.getSnapshot();
+                if (signal.aborted || !latest) return;
+                if (
+                  directory.viewerId !== viewerId ||
+                  directory.organizationId !== organizationId ||
+                  directory.workspaceId !== selection.workspaceId
+                )
+                  throw Error('Employee catalog changed');
+                const choice = employeeChoice(
+                  {
+                    ...latest.tree.workspace,
+                    employees: directory.employees,
+                  },
+                  instance.id,
+                );
+                if (!choice) throw Error('Employee unavailable');
+                if (employeeChoice(latest.tree.workspace, instance.id)) return;
+                const employees = [...latest.tree.workspace.employees, choice];
+                const sessions = [
+                  ...latest.tree.sessions,
+                  ...directory.sessions.filter(
+                    (row) =>
+                      row.ownerId === viewerId &&
+                      !row.archivedAt &&
+                      sessionEmployeeKey(row) === instance.id,
+                  ),
+                ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+                sidebar.update({
+                  ...latest,
+                  tree: {
+                    ...latest.tree,
+                    sessions,
+                    workspace: {
+                      ...latest.tree.workspace,
+                      employees,
+                      sessions,
+                    },
+                  },
+                });
+              } catch {
+                notice('员工已恢复，暂时无法刷新员工列表。');
+              }
+              return;
+            }
+            if (
+              instance.archivedAt &&
+              instance.id === selection.employeeInstanceId
+            ) {
+              parent.postMessage(
+                { type: pageEmployeeArchived, scopeId },
+                location.origin,
+              );
+              return;
+            }
+            const employees = workspace.employees.flatMap((employee) => {
+              if (employee.instanceId !== instance.id) return [employee];
+              if (instance.archivedAt) return [];
+              const currentVersion = {
+                ...employee.currentVersion,
+                manifest: {
+                  ...employee.currentVersion.manifest,
+                  name:
+                    instance.profile.name ??
+                    employee.currentVersion.manifest.name,
+                  appearance: instance.profile.appearance,
+                },
+              };
+              return [
+                {
+                  ...employee,
+                  instances: [instance],
+                  currentVersion,
+                  versions: [currentVersion],
+                },
+              ];
+            });
+            const sessions = instance.archivedAt
+              ? current.tree.sessions.filter(
+                  (row) => sessionEmployeeKey(row) !== instance.id,
+                )
+              : current.tree.sessions;
+            sidebar.update({
+              ...current,
+              tree: {
+                ...current.tree,
+                sessions,
+                workspace: { ...workspace, employees, sessions },
+              },
+            });
+          },
+        },
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),
       });
     })

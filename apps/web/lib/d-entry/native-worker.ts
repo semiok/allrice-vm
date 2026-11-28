@@ -33,6 +33,7 @@ export async function requestDEntryWorker(
     | 'native-rpc'
     | 'native-rpc?carrier=page'
     | 'native-root'
+    | 'session-change'
     | 'native-prewarm',
   fields: Record<string, unknown> = {},
 ) {

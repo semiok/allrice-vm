@@ -446,8 +446,11 @@ export async function openNativeWebOwner(input: {
         });
     });
     ready = false;
-    principals.fence(new PersonVmError('LEASE_LOST'));
-    stale.abort(new PersonVmError('LEASE_LOST'));
+    // Both authority paths describe the same withdrawal. The page carrier
+    // can then match the admitted operation's terminal to this exact reason.
+    const reason = new PersonVmError('LEASE_LOST');
+    principals.fence(reason);
+    stale.abort(reason);
     return closing;
   }
   function retireExitedOwner() {
@@ -463,8 +466,9 @@ export async function openNativeWebOwner(input: {
       input.lifetime.removeEventListener('abort', aborted);
     });
     ready = false;
-    principals.fence(new PersonVmError('LEASE_LOST'));
-    stale.abort();
+    const reason = new PersonVmError('LEASE_LOST');
+    principals.fence(reason);
+    stale.abort(reason);
     carrier.abort();
     waitAbort.abort();
     return closing;

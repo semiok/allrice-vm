@@ -160,6 +160,7 @@ it.skipIf(!cli)(
           .object({
             type: z.literal('baseline'),
             value: z.object({
+              archivedSessionIds: z.array(z.string()),
               items: z.array(
                 z.object({
                   workspaceId: z.string(),
@@ -168,7 +169,7 @@ it.skipIf(!cli)(
               ),
             }),
           })
-          .parse(first.value?.value).value.items;
+          .parse(first.value?.value).value;
       } finally {
         await feed.return?.();
       }
@@ -176,13 +177,13 @@ it.skipIf(!cli)(
     try {
       const native = await create();
       expect(native).not.toBe(outer.value.sessionId);
-      const [original] = await baseline();
+      const [original] = (await baseline()).items;
       expect(original?.sessionIds).toEqual(
         expect.arrayContaining([outer.value.sessionId, native]),
       );
       await invoke('workspace/delete', { workspaceId: original!.workspaceId });
       const afterScoped = await create();
-      const [replacement] = await baseline();
+      const [replacement] = (await baseline()).items;
       expect(replacement?.workspaceId).not.toBe(original?.workspaceId);
       expect(replacement?.sessionIds).toContain(afterScoped);
 
@@ -190,9 +191,20 @@ it.skipIf(!cli)(
         workspaceId: replacement!.workspaceId,
       });
       const afterOuter = await f.owner.createRootFor(f.context, {}, signal);
-      const [next] = await baseline();
+      const [next] = (await baseline()).items;
       expect(next?.workspaceId).not.toBe(replacement?.workspaceId);
       expect(next?.sessionIds).toContain(afterOuter.value.sessionId);
+      const target = afterOuter.value.sessionId;
+      const archived = await invoke('workspace/archiveSession', {
+        sessionId: target,
+      });
+      expect(archived.value).toMatchObject({ archivedSessionIds: [target] });
+      expect((await baseline()).archivedSessionIds).toEqual([target]);
+      const restored = await invoke('workspace/unarchiveSession', {
+        sessionId: target,
+      });
+      expect(restored.value).toMatchObject({ archivedSessionIds: [] });
+      expect((await baseline()).archivedSessionIds).toEqual([]);
     } finally {
       await activity.close();
     }
@@ -2378,6 +2390,8 @@ it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
       // Normal stale abort rejects a real in-flight binding guard. It must not
       // enter lost and kill the carrier before the other page's close ACK.
       const closing = f.owner.close();
+      expect(f.owner.revoked.reason).toMatchObject({ code: 'LEASE_LOST' });
+      expect(secondScope.revoked.reason).toBe(f.owner.revoked.reason);
       await expect(reading).rejects.toBeDefined();
       await closing;
     } else {
