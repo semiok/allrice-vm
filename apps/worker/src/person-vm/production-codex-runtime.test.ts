@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { readPlatformModelSettings } from '@allrice/database';
 import { createDshGatewayProvider } from '@allrice/model-gateway';
+import Llm from '@deepseek-ai/dsh-llm';
 import {
   AttachmentId,
   ImageVariantId,
@@ -53,6 +54,45 @@ vi.mock('../codex-subscription-home.js', () => ({
   codexSubscriptionHome: () => state.home,
 }));
 const controller = () => new AbortController();
+
+it('does not report a failed model catalog lookup as unjoined cleanup on a zero-VM Host', async () => {
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'test-owner',
+  );
+  const failure = Error('synthetic catalog lookup failed');
+  const entered = deferred(),
+    release = deferred();
+  const lookup = vi
+    .spyOn(Llm.prototype, 'resolveModelInfo')
+    .mockRejectedValue(failure)
+    .mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      throw failure;
+    });
+  try {
+    const lookupResult = expect(
+      host.readCatalogModelMetadata(controller().signal),
+    ).rejects.toBe(failure);
+    await entered.promise;
+    const close = host.close(),
+      settled = vi.fn();
+    void close.then(settled, settled);
+    await new Promise<void>((done) => setImmediate(done));
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    await lookupResult;
+    await expect(close).resolves.toBeUndefined();
+    await expect(
+      host.confirmTransportStopped('test-owner', controller().signal),
+    ).resolves.toEqual(expect.any(String));
+  } finally {
+    release.resolve();
+    lookup.mockRestore();
+    await host.close().catch(() => {});
+  }
+});
 
 beforeEach(async () => {
   state.home = await mkdtemp(join(tmpdir(), 'allrice-codex-host-fixture-'));

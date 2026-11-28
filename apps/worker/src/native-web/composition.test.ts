@@ -2384,6 +2384,36 @@ function catalogOwner() {
     retireAfterNativeStop: vi.fn(async () => {}),
   };
 }
+
+it('joins Worker shutdown after the exact stopped VM resolves a prior unknown terminal close', async () => {
+  const f = fixture(),
+    owner = catalogOwner(),
+    sibling = catalogOwner(),
+    joined = latch();
+  owner.close.mockRejectedValue(Error('PRINCIPAL_JOIN_UNKNOWN'));
+  owner.retireAfterNativeStop.mockImplementation(() => joined.promise);
+  open.mockResolvedValueOnce(owner).mockResolvedValueOnce(sibling);
+  await f.service.memoryGuestPlan(f.binding, signal(), f.web);
+  await f.service.start(f.binding, signal(), f.scope, f.web);
+
+  f.lifetime.abort();
+  await expect(f.service.close()).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
+  const retire = f.service.retireAfterNativeStop(f.binding, signal());
+  try {
+    await expect(f.service.close()).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+  } finally {
+    joined.resolve();
+    await retire;
+  }
+  await expect(f.service.close()).resolves.toBeUndefined();
+  expect(owner.close).toHaveBeenCalledOnce();
+  expect(sibling.close).toHaveBeenCalledOnce();
+});
+
 it('完整启动才发布冻结原receipt/endpoint和私有ref；lookup无start/read/editor/send/history副作用', async () => {
   const f = fixture(),
     owners = [catalogOwner(), catalogOwner()];

@@ -773,6 +773,37 @@ suite(
     async function counts(personId: string) {
       return db`select disposition,count(*)::int as count from person_vm_admission_permits where person_id=${personId} group by disposition order by disposition`;
     }
+
+    it('joins a stopped Gateway permit whose finish committed before the VM row was removed', async () => {
+      const lost = Error('fixture lost the finish commit acknowledgement');
+      let loseFinish = false;
+      const source = factory('finish-purged', async () => {
+        if (loseFinish) {
+          loseFinish = false;
+          throw lost;
+        }
+      });
+      const h = await setup(source.open);
+      const item = await permit(h, 'gateway');
+      loseFinish = true;
+      await expect(h.host.finish(item)).rejects.toBe(lost);
+      expect(await counts(h.binding.personId)).toEqual([]);
+      h.states.set(h.binding.vmId, 'stopped'); // Synthetic provider stop readback.
+      await h.service.stop(h.rc, signal());
+      const removed = await db`delete from person_virtual_machines
+        where person_id=${h.binding.personId} and instance_id=${h.binding.instanceId}
+          and lease_epoch=${h.binding.leaseEpoch} and phase='stopped' returning vm_id`;
+      expect(removed).toEqual([{ vm_id: h.binding.vmId }]);
+      await expect(
+        h.peer.recoverStoppedGatewayPermit(item, signal()),
+      ).rejects.toMatchObject({
+        code: 'LEASE_LOST',
+      });
+      await expect(
+        h.host.recoverStoppedGatewayPermit(item, signal()),
+      ).resolves.toBeUndefined();
+    });
+
     async function idleInputs(
       h: Awaited<ReturnType<typeof setup>>,
       mono: number,

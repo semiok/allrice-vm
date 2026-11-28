@@ -1024,7 +1024,16 @@ export class PersonVmAdmissionHost
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     await owned.finish.catch(() => {});
     if (owned.pending.size) throw new PersonVmError('CLEANUP_INCOMPLETE');
-    await this.releasePermit(permit, owned, signal);
+    try {
+      await this.releasePermit(permit, owned, signal);
+    } catch (error) {
+      // This exact Gateway has already joined. The permit's foreign key
+      // prevents the VM row from being removed while its permit still exists.
+      // A lost finish acknowledgement can outlive both committed deletions.
+      if (!(error instanceof PersonVmError) || error.code !== 'NOT_FOUND')
+        throw error;
+      signal.throwIfAborted();
+    }
   }
   async waitUntilReady(
     context: RequestContext,

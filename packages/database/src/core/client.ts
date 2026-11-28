@@ -1,4 +1,5 @@
 import postgres from 'postgres';
+import { openPostgresNotifications } from './notification-client.ts';
 
 let client: ReturnType<typeof postgres> | undefined;
 let diagnostics: ReturnType<typeof postgres> | undefined;
@@ -25,6 +26,76 @@ export function getDatabase() {
   });
 
   return client;
+}
+
+export function openDatabaseNotifications(
+  database: ReturnType<typeof postgres>,
+  channels: readonly string[],
+  receive: (channel: string, payload: string) => void,
+  options: { onListen?(): void } = {},
+) {
+  if (database !== client)
+    throw Error('Notification connection must use the process database');
+  const parsed = database.options;
+  const { host, port, ssl, target_session_attrs, keep_alive, connection } =
+    parsed;
+  const password: unknown = Reflect.get(parsed, 'pass');
+  if (
+    host.length !== 1 ||
+    !host[0] ||
+    !port[0] ||
+    ssl ||
+    target_session_attrs ||
+    (!connection.options && process.env.PGOPTIONS) ||
+    process.env.PGREPLICATION ||
+    typeof password !== 'string' ||
+    Object.keys(connection).some(
+      (key) => key !== 'application_name' && key !== 'options',
+    )
+  ) {
+    // Keep the existing process pool as the physical owner for specialized
+    // connection settings. This close only fences the subscription callback.
+    let closed = false;
+    const ready = (async () => {
+      for (const channel of channels) {
+        if (closed) return;
+        await database.listen(
+          channel,
+          (payload) => {
+            if (!closed) receive(channel, payload);
+          },
+          () => {
+            if (!closed) options.onListen?.();
+          },
+        );
+      }
+    })();
+    return {
+      ready,
+      close() {
+        closed = true;
+        return Promise.resolve();
+      },
+    };
+  }
+  return openPostgresNotifications(
+    {
+      host: host[0],
+      port: port[0],
+      database: parsed.database,
+      user: parsed.user,
+      password: () => password,
+      ssl: false,
+      sslnegotiation: 'postgres',
+      options: connection.options ? String(connection.options) : undefined,
+      application_name: connection.application_name,
+      keepAlive: Boolean(keep_alive),
+      keepAliveInitialDelayMillis: (keep_alive ?? 0) * 1000,
+    },
+    channels,
+    receive,
+    options.onListen,
+  );
 }
 
 /** A caller-owned client from the trusted client's entire public configuration.
