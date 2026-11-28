@@ -27,6 +27,7 @@ import {
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
+import { controlTitleTargets, snapshotTitleTarget } from './native-title.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -468,6 +469,13 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
+          if (frame.endpoint === 'session/control') {
+            for (const nativeId of controlTitleTargets(item.value))
+              page.requestNativeTitle(nativeId);
+          } else if (frame.endpoint === 'session/follow') {
+            const nativeId = snapshotTitleTarget(item.value);
+            if (nativeId) page.requestNativeTitle(nativeId);
+          }
         }
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
