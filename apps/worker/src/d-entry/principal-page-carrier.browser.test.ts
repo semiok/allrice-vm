@@ -248,12 +248,15 @@ it
     const createdNativeId = 'native-created';
     const outerNativeId = 'native-outer-created';
     let expectedNativeId: string | undefined;
-    if (outerCreate) {
+    let finishSkillTurn: (() => void) | undefined;
+    let ongoingSkillPromptCount = 0;
+    if (outerCreate || skillsRefresh) {
       let records: readonly SessionHistoryRecord[] = [];
       f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
       f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
         expect(sessionId).toBe('root');
         expect(content).toEqual([{ type: 'text', text: '你好' }]);
+        if (skillsRefresh) ongoingSkillPromptCount++;
         const message = {
           role: 'user',
           id: randomUUID(),
@@ -287,10 +290,16 @@ it
             data: { turn: 1, reason: { kind: 'completed' } },
           },
         ];
-        records = events.map((event, index) => ({
+        const answer = events.map((event, index): SessionHistoryRecord => ({
           type: 'event',
           event: { ...event, seq: index + 1, time: Date.now() },
         }));
+        if (skillsRefresh) {
+          records = answer.slice(0, 3);
+          finishSkillTurn = () => {
+            records = answer;
+          };
+        } else records = answer;
       };
       f.host.catalog.allocateSessionId = () =>
         summary(expectedNativeId ?? randomUUID()).sessionId;
@@ -1221,11 +1230,26 @@ it
         (method) => method === 'skills/list',
       ).length;
       expect(originalReads).toBeGreaterThan(0);
+      await editor.press('Escape');
+      await editor.fill('你好');
+      await editor.press('Enter');
+      await expect.poll(() => ongoingSkillPromptCount).toBe(1);
+      expect(finishSkillTurn).toBeDefined();
       const priorSubscriptions = f.host.catalog.follows.length;
+      // The same Host's outstanding turn completes during the page transport
+      // reattachment. Let the real rc.2 follow snapshot recover its answer.
+      f.host.catalog.beforeFollow = async () => {
+        finishSkillTurn?.();
+        finishSkillTurn = undefined;
+      };
       f.setFixtureSkills([]);
       await expect
         .poll(() => f.host.catalog.follows.length, { timeout: 12_000 })
         .toBeGreaterThan(priorSubscriptions);
+      await workbench
+        .getByText('隔离会话的首条回复', { exact: true })
+        .waitFor();
+      expect(ongoingSkillPromptCount).toBe(1);
       await editor.waitFor();
       await editor.press('Escape');
       await editor.fill('');
