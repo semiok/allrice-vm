@@ -1936,6 +1936,17 @@ suite(
         signal(),
       );
       expect(selected.selection.revisionId).toBe(published.revisionId);
+      expect(selected.excerpt).toBeUndefined();
+      const withExcerpt = await p.client.selectMaterial(
+        {
+          workspaceId: p.selection.workspaceId,
+          revisionId: published.revisionId,
+          includeExcerpt: true,
+        },
+        signal(),
+      );
+      expect(withExcerpt.excerpt).toEqual({ text, truncated: false });
+
       const downloaded = await p.client.downloadMaterial(
         {
           workspaceId: p.selection.workspaceId,
@@ -1974,6 +1985,7 @@ suite(
           {
             workspaceId: p.selection.workspaceId,
             revisionId: published.revisionId,
+            includeExcerpt: true,
           },
           signal(),
         ),

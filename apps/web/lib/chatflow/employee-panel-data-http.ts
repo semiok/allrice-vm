@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   ApiErrorSchema,
+  ChecksumSchema,
   DEntrySelectionInputSchema,
   DeliverableFavoriteResultProjectionSchema,
   DeliverableUploadResultProjectionSchema,
@@ -86,7 +87,10 @@ const page = {
   offset: z.number().int().positive().optional(),
 };
 const queryInput = workspace.extend({ query: ReferencePublicationQuerySchema });
-const materialPreview = material.extend(page);
+const materialPreview = material.extend({
+  ...page,
+  checksum: ChecksumSchema.optional(),
+});
 const catalog = ReferencePublicationQueryResultSchema.extend({
   viewerId: UuidSchema,
   options: ReferenceLibraryOptionsSchema,
@@ -184,7 +188,7 @@ export function createEmployeePanelsHttpClient(
     value: z.infer<typeof material> | z.infer<typeof file>,
     path: string,
     signal: AbortSignal,
-    options: { source?: boolean; offset?: number },
+    options: { source?: boolean; offset?: number; checksum?: string },
   ) =>
     parseArtifactPreview(
       await call(path, signal, value, {
@@ -192,6 +196,7 @@ export function createEmployeePanelsHttpClient(
           source:
             options.source === undefined ? undefined : options.source ? 1 : 0,
           offset: options.offset,
+          checksum: options.checksum,
         },
       }),
     );
@@ -226,14 +231,23 @@ export function createEmployeePanelsHttpClient(
         })
         .parse(await call('/materials/options', signal, value));
     },
-    async selectMaterial(input: z.input<typeof material>, signal: AbortSignal) {
+    async selectMaterial(
+      {
+        includeExcerpt,
+        ...input
+      }: z.input<typeof material> & { includeExcerpt?: true },
+      signal: AbortSignal,
+    ) {
       const value = material.parse(input);
       return ReferenceInputSelectionResultSchema.parse(
         await call(
           `/materials/revisions/${value.revisionId}/selection`,
           signal,
           value,
-          { revisions: [value.revisionId] },
+          {
+            revisions: [value.revisionId],
+            query: { excerpt: includeExcerpt ? 1 : undefined },
+          },
         ),
       );
     },
@@ -340,13 +354,21 @@ export function createEmployeePanelsHttpClient(
       );
     },
     async listDeliverables(
-      input: z.input<typeof WorkbenchDeliverablesFilterSchema>,
+      {
+        mention,
+        ...input
+      }: z.input<typeof WorkbenchDeliverablesFilterSchema> & { mention?: true },
       signal: AbortSignal,
     ) {
       const value = WorkbenchDeliverablesFilterSchema.parse(input);
       const { workspaceId, ...query } = value;
       return WorkbenchDeliverablesActionsCatalogSchema.parse(
-        await call('/deliverables', signal, { workspaceId }, { query }),
+        await call(
+          '/deliverables',
+          signal,
+          { workspaceId },
+          { query: { ...query, mention: mention ? 1 : undefined } },
+        ),
       );
     },
     async captureReference(
@@ -399,10 +421,17 @@ export function createEmployeePanelsHttpClient(
         fileName: string;
         source?: boolean;
         offset?: number;
+        checksum?: string;
       },
       signal: AbortSignal,
     ) {
-      const value = file.extend({ ...page, fileName: z.string() }).parse(input);
+      const value = file
+        .extend({
+          ...page,
+          fileName: z.string(),
+          checksum: ChecksumSchema.optional(),
+        })
+        .parse(input);
       return preview(
         value,
         `/deliverables/${value.objectId}/preview`,

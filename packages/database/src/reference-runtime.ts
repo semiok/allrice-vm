@@ -358,6 +358,7 @@ export async function readReferenceInputSelection(
   context: ContentIdentity,
   workspaceId: string,
   revisionId: string,
+  includeExcerpt?: true,
 ) {
   UuidSchema.parse(workspaceId);
   UuidSchema.parse(revisionId);
@@ -372,12 +373,26 @@ export async function readReferenceInputSelection(
       tx,
     );
     const current = await readReferenceSelection(context, revisionId, tx, true);
+    const [excerpt] =
+      includeExcerpt && current.readCapabilities.text
+        ? await tx<{ text: string; truncated: boolean }[]>`
+        select left(full_text, 4000) as text, length(full_text)>4000 as truncated
+        from allrice_knowledge_documents
+        where knowledge_revision_id=${revisionId}
+          and organization_id=${current.organizationId}
+          and workspace_id=${current.workspaceId}
+          and source_ref=${'file:' + current.objectId}
+          and checksum=${current.selection.checksum} and active
+          and length(full_text)>0 and full_text_locations is not null
+          and full_text_metadata is not null`
+        : [];
     return {
       viewerId: context.actor.id,
       workspaceId,
       selection: selection!,
       canReference: true,
       readCapabilities: current.readCapabilities,
+      ...(excerpt && { excerpt }),
     };
   });
 }

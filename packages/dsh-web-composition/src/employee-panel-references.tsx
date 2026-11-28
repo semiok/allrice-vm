@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
-import type {} from '@deepseek-ai/dsh-client-ui-input-trigger/client';
+import type { InputTriggerCandidate } from '@deepseek-ai/dsh-client-ui-input-trigger/client';
+import type {} from '@deepseek-ai/dsh-session-reference/remote';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type {
@@ -8,6 +9,19 @@ import type {
   SessionIdOf,
 } from '@deepseek-ai/dsh-client-ui-slots';
 import { ReferenceSelectionSchema } from '@allrice/contracts';
+import {
+  conversationCandidate,
+  conversationPick,
+  filesSection,
+  materialFolder,
+  materialPath,
+  materialPin as pin,
+  materialTarget,
+  mentionOccurrence,
+  nativeReferenceSource,
+  readMention,
+  type MentionTarget,
+} from './employee-mention-source';
 import { useEffect } from 'react';
 import { z } from 'zod';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
@@ -18,15 +32,6 @@ import type {
 } from './employee-panels-port';
 
 const source = 'allrice-panel-reference';
-const pin = ReferenceSelectionSchema.pick({
-  sourceId: true,
-  revisionId: true,
-  revision: true,
-  checksum: true,
-  fileName: true,
-})
-  .strip()
-  .extend({ digest: ReferenceSelectionSchema.shape.digest.optional() });
 const selectionPin = pin.extend({
   manifestDigest: ReferenceSelectionSchema.shape.digest.optional(),
 });
@@ -143,6 +148,23 @@ export function apply(ctx: Context) {
     listeners.clear();
   });
 
+  let lookupConversations:
+    Context['remote']['sessionReferenceResolver']['candidates'] | undefined;
+  ctx.inject(['remote', 'remote.sessionReferenceResolver'], (native) => {
+    const resolver = native.remote?.sessionReferenceResolver;
+    if (!resolver) return;
+    const lookup: NonNullable<typeof lookupConversations> = (
+      id,
+      query,
+      signal,
+    ) => resolver.candidates(id, query, signal);
+    native.effect(() => {
+      lookupConversations = lookup;
+      return () => {
+        if (lookupConversations === lookup) lookupConversations = undefined;
+      };
+    });
+  });
   ctx.inject(
     ['slots', 'sessions', 'conversation', 'sidebarRight', 'inputTriggers'],
     (native) => {
@@ -172,7 +194,9 @@ export function apply(ctx: Context) {
           : undefined;
       };
       const parse = (raw: string) => {
-        const value = occurrence.parse(JSON.parse(raw));
+        const decoded: unknown = JSON.parse(raw);
+        const menu = mentionOccurrence.safeParse(decoded);
+        const value = menu.success ? menu.data : occurrence.parse(decoded);
         if (value.sessionId !== native.sidebarRight.mounted.getSnapshot())
           throw unavailable();
         return value;
@@ -189,15 +213,205 @@ export function apply(ctx: Context) {
           : undefined;
       };
 
+      const dataClient = (threadId: string) =>
+        createEmployeePanelsHttpClient(
+          { ...selection, threadId },
+          { expectedViewerId: viewerId, lifetimeSignal: lifetime },
+        );
+      const sameOwner = (
+        id: SessionIdOf,
+        target: NonNullable<ReturnType<typeof currentPanelOwner>>,
+      ) => {
+        const live = currentPanelOwner(id);
+        return (
+          live?.bound === target.bound &&
+          live.snapshot.scopeKey === target.snapshot.scopeKey &&
+          live.snapshot.publicationManagement ===
+            target.snapshot.publicationManagement
+        );
+      };
+      const rootCrumb = 'root';
+      const folderCrumb = 'materials';
       native.effect(() =>
         native.inputTriggers.registerSource({
           trigger: '@',
           name: source,
           showGroupTitle: false,
-          candidates: async () => [],
-          onPick: () => undefined,
+          header: (_, { query }) =>
+            query.startsWith(materialPath)
+              ? [
+                  { label: filesSection, value: rootCrumb },
+                  { label: materialFolder, value: folderCrumb, current: true },
+                ]
+              : undefined,
+          async candidates(session, { query, quoted, signal }) {
+            const id = session.sessionId;
+            const binding = current(id);
+            if (!binding) return [];
+            const target = currentPanelOwner(id);
+            const threadId = target?.snapshot.publicationManagement?.threadId;
+            const inFolder = query.startsWith(materialPath);
+            const candidates: InputTriggerCandidate[] = [];
+            const attempt = AbortSignal.any(
+              target ? [signal, active, target.bound.signal] : [signal, active],
+            );
+            const catalog =
+              target && threadId ? dataClient(threadId) : undefined;
+            const encode = (value: MentionTarget) =>
+              JSON.stringify({
+                version: 2,
+                target: value,
+                sessionId: id,
+                documentId,
+                ownerEpoch: target?.bound.epoch,
+              });
+            if (inFolder) {
+              if (!catalog || !target) return [];
+              const result = await catalog.queryMaterials(
+                {
+                  workspaceId,
+                  query: {
+                    category: 'all',
+                    query: query.slice(
+                      materialPath.length,
+                      materialPath.length + 200,
+                    ),
+                    limit: 50,
+                  },
+                },
+                attempt,
+              );
+              if (
+                attempt.aborted ||
+                current(id) !== binding ||
+                !sameOwner(id, target) ||
+                result.viewerId !== viewerId ||
+                result.options.workspaceId !== workspaceId
+              )
+                return [];
+              return result.references
+                .filter(
+                  (row) =>
+                    row.status === 'active' &&
+                    row.canReference === true &&
+                    (row.fullTextReady || row.readCapabilities?.text),
+                )
+                .map((row) => ({
+                  name: row.fileName,
+                  icon: 'file',
+                  value: encode(materialTarget(row)),
+                }));
+            }
+            const [files, sessions] = await Promise.allSettled([
+              catalog?.listDeliverables(
+                {
+                  workspaceId,
+                  category: 'artifact',
+                  mention: true,
+                  query: query.slice(0, 200),
+                },
+                attempt,
+              ),
+              quoted ? undefined : lookupConversations?.(id, query, attempt),
+            ]);
+            if (attempt.aborted || current(id) !== binding) return [];
+            if (target && sameOwner(id, target)) {
+              if (!query || materialFolder.includes(query))
+                candidates.push({
+                  name: materialFolder,
+                  icon: 'folder',
+                  section: filesSection,
+                  drill: true,
+                  value: folderCrumb,
+                });
+              if (
+                files.status === 'fulfilled' &&
+                files.value?.viewerId === viewerId
+              ) {
+                const quotable = new Set(files.value.quotableFileIds);
+                for (const file of files.value.files) {
+                  if (
+                    !file.ownedByMe ||
+                    file.origin !== 'business-deliverable' ||
+                    !quotable.has(file.objectId)
+                  )
+                    continue;
+                  candidates.push({
+                    name: file.fileName,
+                    icon: 'file',
+                    section: filesSection,
+                    value: encode({
+                      kind: 'deliverable',
+                      fileName: file.fileName,
+                      objectId: file.objectId,
+                      checksum: file.checksum,
+                      requestId: crypto.randomUUID(),
+                    }),
+                  });
+                }
+              }
+            }
+            if (sessions.status === 'fulfilled' && sessions.value?.ok) {
+              const listed = native.sessions.list.getSnapshot().byId;
+              candidates.push(
+                ...sessions.value.value.map((row) =>
+                  conversationCandidate(row, listed[row.sessionId]?.title),
+                ),
+              );
+            }
+            return candidates;
+          },
+          onPick({ session, candidate }) {
+            if (!current(session.sessionId) || !candidate.value) return;
+            if (candidate.value === rootCrumb)
+              return { text: '@', continue: true };
+            if (candidate.value === folderCrumb) {
+              if (currentPanelOwner(session.sessionId))
+                return { text: '@' + materialPath, continue: true };
+              return;
+            }
+            const value: unknown = JSON.parse(candidate.value);
+            const conversation = conversationPick.safeParse(value);
+            if (conversation.success)
+              return {
+                insert: {
+                  source: nativeReferenceSource,
+                  ref: conversation.data.mention,
+                  appearance: 'session',
+                  label: candidate.name,
+                  clipboardText: conversation.data.mention,
+                },
+              };
+            const menu = mentionOccurrence.safeParse(value);
+            const target = currentPanelOwner(session.sessionId);
+            if (
+              !target ||
+              !menu.success ||
+              menu.data.sessionId !== session.sessionId ||
+              menu.data.ownerEpoch !== target.bound.epoch ||
+              menu.data.documentId !== documentId
+            )
+              return;
+            return {
+              insert: {
+                source,
+                ref: candidate.value,
+                appearance: 'file',
+                label: menu.data.target.fileName,
+                clipboardText: '@' + menu.data.target.fileName,
+              },
+            };
+          },
           codec: {
-            clipboardText: (raw) => `@${parse(raw).fileName}`,
+            clipboardText: (raw) => {
+              const selected = parse(raw);
+              return (
+                '@' +
+                (selected.version === 2
+                  ? selected.target.fileName
+                  : selected.fileName)
+              );
+            },
             async serialize(raw, signal) {
               const selected = parse(raw);
               const id = native.sidebarRight.mounted.getSnapshot();
@@ -220,10 +434,24 @@ export function apply(ctx: Context) {
               const { bound, snapshot } = target;
               const attempt = AbortSignal.any([signal, active, bound.signal]);
               attempt.throwIfAborted();
-              const data = createEmployeePanelsHttpClient(
-                { ...selection, threadId },
-                { expectedViewerId: viewerId, lifetimeSignal: lifetime },
-              );
+              const data = dataClient(threadId);
+              if (selected.version === 2) {
+                const content = await readMention(
+                  data,
+                  workspaceId,
+                  viewerId,
+                  selected.target,
+                  attempt,
+                );
+                attempt.throwIfAborted();
+                if (current(id) !== binding || !sameOwner(id, target))
+                  throw unavailable();
+                return `\n引用文件 ${JSON.stringify({
+                  fileName: selected.target.fileName,
+                  checksum: selected.target.checksum,
+                  ...content,
+                })}\n`;
+              }
               const result = await data.selectMaterial(
                 {
                   workspaceId,
@@ -270,6 +498,21 @@ export function apply(ctx: Context) {
                 fileName,
               })}\n`;
             },
+          },
+        }),
+      );
+      // Keep serialization for restored native chips. The profile no longer
+      // registers the native source that discovers arbitrary guest files.
+      native.effect(() =>
+        native.inputTriggers.registerSource({
+          trigger: '@',
+          name: nativeReferenceSource,
+          showGroupTitle: false,
+          candidates: async () => [],
+          onPick: () => undefined,
+          codec: {
+            clipboardText: (ref) => ref,
+            serialize: async (ref) => ref,
           },
         }),
       );

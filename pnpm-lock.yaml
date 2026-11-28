@@ -962,6 +962,9 @@ importers:
       '@deepseek-ai/dsh-client-web':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)(@types/react@19.2.18)(node-addon-require-builtin@0.1.9)
+      '@deepseek-ai/dsh-session-reference':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(a2f1efffe5952430d76fddc46856f267)
       '@deepseek-ai/dsh-subagent':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(35798409003075a790d2e345ef752118)
