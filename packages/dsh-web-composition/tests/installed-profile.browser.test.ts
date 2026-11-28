@@ -14,6 +14,8 @@ declare global {
   interface Window {
     __allriceCompositionTest?: {
       openSession: (id: string) => void;
+      startSession: () => void;
+      selectFixtureEmployee: (id: 'gold' | 'orange') => void;
       setTheme: (mode: 'light' | 'dark') => void;
     };
   }
@@ -249,16 +251,7 @@ suite('installed AllRice native Web composition', () => {
         name: /^请?选择模型/,
       });
       await model.waitFor();
-      await page
-        .getByRole('button', { name: '访问模式，当前：完全权限', exact: true })
-        .click();
-      await page
-        .getByRole('menuitem', { name: '仅可查看', exact: true })
-        .click();
-      await page
-        .getByRole('button', { name: '访问模式，当前：仅可查看', exact: true })
-        .and(page.locator('button:enabled'))
-        .waitFor();
+      expect(await permission.count()).toBe(0);
       await model.click();
       await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
       await page.getByRole('button', { name: /当前 Fixture Nova/ }).waitFor();
@@ -268,7 +261,7 @@ suite('installed AllRice native Web composition', () => {
         .first();
       await composer.fill('请读取当前工作区的测试文件。');
       await composer.press('Enter');
-      const running = page.getByText(/深度求索中.*用时/);
+      const running = page.getByText(/思考中.*用时/);
       await running.waitFor();
       await writeFile(join(host.root, 'fixture-plugin', 'issue-tool'), '');
       await page
@@ -279,10 +272,12 @@ suite('installed AllRice native Web composition', () => {
         .waitFor();
       expect(await running.isVisible()).toBe(true);
       const capture = async (name: string) => {
-        if (!process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) return;
-        const target = resolve(
-          process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
-        );
+        const evidence = process.env.ALLRICE_RUN_BRAND_EVIDENCE;
+        const directory = process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR;
+        if (!directory && !evidence) return;
+        const target = directory
+          ? resolve(directory)
+          : resolve(process.env.HOME!, '..', 'evidence', evidence!);
         await mkdir(target, { recursive: true });
         await page.screenshot({
           path: join(target, `controls-${name}.png`),
@@ -290,7 +285,52 @@ suite('installed AllRice native Web composition', () => {
           animations: 'disabled',
         });
       };
-      await capture('running');
+      const status = page.locator('[data-chat-running]');
+      expect(await status.getByRole('status').textContent()).toBe('思考中');
+      expect(await status.locator('svg:visible').count()).toBe(0);
+      for (const width of [1440, 390])
+        for (const mode of ['light', 'dark'] as const) {
+          await page.setViewportSize({ width, height: 1000 });
+          let previousBackground: string | undefined;
+          for (const employee of ['gold', 'orange'] as const) {
+            await page.evaluate(
+              ({ employee, mode }) => {
+                const fixture = window.__allriceCompositionTest!;
+                fixture.setTheme(mode);
+                fixture.selectFixtureEmployee(employee);
+              },
+              { employee, mode },
+            );
+            const accent = employee === 'gold' ? '#EAB308' : '#F97316';
+            const stop = page.getByRole('button', {
+              name: '停止生成',
+              exact: true,
+            });
+            await stop.waitFor();
+            const button = await stop.evaluate((element) => {
+              const css = getComputedStyle(element);
+              return {
+                token: css
+                  .getPropertyValue('--dsw-alias-button-info-fill')
+                  .trim(),
+                background: css.backgroundColor,
+              };
+            });
+            expect(button.token.toLowerCase()).toContain(accent.toLowerCase());
+            expect(button.background).not.toBe(previousBackground);
+            previousBackground = button.background;
+            expect(
+              (
+                await status.evaluate((element) =>
+                  getComputedStyle(element).getPropertyValue(
+                    '--dsw-alias-label-deep-diving-shimmer',
+                  ),
+                )
+              ).toLowerCase(),
+            ).toContain(accent.toLowerCase());
+            await capture(`running-${width}-${mode}-${employee}`);
+          }
+        }
       await writeFile(join(host.root, 'fixture-plugin', 'finish-turn'), '');
       await page
         .getByText('R2 浏览器收到原生回合结果。', { exact: true })
@@ -308,7 +348,7 @@ suite('installed AllRice native Web composition', () => {
             (mode) => window.__allriceCompositionTest!.setTheme(mode),
             theme,
           );
-          await permission.waitFor();
+          expect(await permission.count()).toBe(0);
           await model.waitFor();
           await activity.waitFor();
           await usage.waitFor();
@@ -326,4 +366,56 @@ suite('installed AllRice native Web composition', () => {
       throw error;
     }
   }, 60_000);
+  it('renders AllRice on an actual new native conversation without the two workspace controls', async () => {
+    await page.evaluate(() => window.__allriceCompositionTest!.startSession());
+    const hero = page.locator('[data-allrice-hero-brand]');
+    await hero.waitFor();
+    expect(await hero.innerText()).toContain('AllRice');
+    expect(await hero.innerText()).toContain('Do it right. Make it nice.');
+    expect(await hero.getByText('预览版').isVisible()).toBe(true);
+    expect(
+      await hero
+        .locator('img')
+        .evaluate(
+          (image: HTMLImageElement) => image.complete && image.naturalWidth > 0,
+        ),
+    ).toBe(true);
+    expect(await page.getByText('探索未至之境').isVisible()).toBe(false);
+    expect(
+      await page.getByRole('button', { name: /选择工作区|标准模式/ }).count(),
+    ).toBe(0);
+    const composer = page
+      .locator('[data-composer-input][contenteditable="true"]')
+      .first();
+    await composer.fill('验证原生编辑器');
+    const send = page.getByRole('button', { name: '发送消息', exact: true });
+    await send.waitFor();
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      for (const mode of ['light', 'dark'] as const) {
+        await page.evaluate(
+          (mode) => window.__allriceCompositionTest!.setTheme(mode),
+          mode,
+        );
+        const target = process.env.ALLRICE_RUN_BRAND_EVIDENCE;
+        if (target) {
+          const directory = resolve(
+            process.env.HOME!,
+            '..',
+            'evidence',
+            target,
+          );
+          await mkdir(directory, { recursive: true });
+          await page.screenshot({
+            path: join(directory, `hero-${width}-${mode}.png`),
+            animations: 'disabled',
+          });
+        }
+        expect(
+          await page.evaluate(() => document.documentElement.scrollWidth),
+        ).toBeLessThanOrEqual(width);
+      }
+    }
+    expect(errors).toEqual([]);
+  }, 45_000);
 });

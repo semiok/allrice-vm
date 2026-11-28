@@ -111,6 +111,9 @@ export function sensitivePageCapability(
     return 'provider-configuration';
   }
 
+  if (namespace === 'agentPresets' && method === 'select')
+    return 'platform-settings';
+
   if (namespace === 'settings' && method === 'openSettingsDocument') {
     return 'platform-settings';
   }
@@ -120,7 +123,10 @@ export function sensitivePageCapability(
   if (namespace === 'settings' && /^(?:mutate|replace|update)/u.test(method)) {
     if (!configuration) return 'provider-configuration';
     const ns = configuration.args.ns;
-    if (typeof ns === 'string' && configuration.pluginSettings?.has(ns)) {
+    if (
+      ns === 'agent-preset-registry' ||
+      (typeof ns === 'string' && configuration.pluginSettings?.has(ns))
+    ) {
       return 'platform-settings';
     }
     if (

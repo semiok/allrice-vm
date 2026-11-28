@@ -28,6 +28,16 @@
 - id: ui-settings-models
   disabled: true
 # These six disabled settings UI entries have native no-op Host halves.
+# The employee profile selects Standard on the Host. The native Agent and
+# permission services stay mounted; only the two selector plugins are absent.
+- id: ui-agent-preset
+  disabled: true
+- id: ui-permission
+  disabled: true
+- id: agent-preset-registry
+  config:
+    default: standard
+    selectedDefault: standard
 - id: ui-settings-agent-loop
   disabled: true
 - id: ui-settings-plugins

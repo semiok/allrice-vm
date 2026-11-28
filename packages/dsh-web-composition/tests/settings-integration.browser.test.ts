@@ -561,10 +561,11 @@ suite('production settings owner in the installed rc.2 workbench', () => {
           .getByRole('button', { name: '通用设置', exact: true })
           .count(),
       ).toBe(1);
-      for (const name of ['我的电脑', '工作方式', '已链接应用'])
+      for (const name of ['我的电脑', '工作方式', '已链接应用', 'Agent 预设'])
         expect(
           await native.getByRole('button', { name, exact: true }).count(),
         ).toBe(0);
+      expect(await native.getByText(/当前版本|0\.2\.1-rc\.2/).count()).toBe(0);
       await page.keyboard.press('Escape');
       await native.waitFor({ state: 'hidden' });
       await capture(390);

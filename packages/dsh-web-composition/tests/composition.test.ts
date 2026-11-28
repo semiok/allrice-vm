@@ -180,7 +180,7 @@ it('assembles the independent profile with native question/document/catalog and 
   expect(entry('locale')?.config).toMatchObject({ preference: 'zh' });
   expect(entry('ui-chat')).toBeDefined();
   expect(entry('ui-chat')?.config ?? {}).not.toHaveProperty('performanceUsage');
-  for (const id of ['ui-model-selection', 'ui-permission', 'session-stats']) {
+  for (const id of ['ui-model-selection', 'session-stats']) {
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
@@ -188,6 +188,12 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
+  for (const id of ['ui-agent-preset', 'ui-permission'])
+    expect(entry(id)?.disabled, id).toBe(true);
+  expect(entry('agent-preset-registry')?.config).toMatchObject({
+    default: 'standard',
+    selectedDefault: 'standard',
+  });
   for (const id of [
     'agent-preset-registry',
     'permission',
