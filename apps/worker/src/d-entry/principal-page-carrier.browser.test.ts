@@ -319,7 +319,7 @@ it
       },
       fileName: '第四季度销售口径说明.pdf',
       purpose: '核对销售统计口径',
-      checksum: 'a'.repeat(64),
+      checksum: 'sha256:' + 'a'.repeat(64),
     };
     const reference = ReferenceRevisionSchema.parse({
       ...materialPin,
