@@ -75,6 +75,7 @@ type ThreadHandoff = {
 type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
+  stopAssetDownloads(): void;
   readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
   progress: {
     current?: EmployeePrewarmProgress;
@@ -91,6 +92,7 @@ function startEntryWarmup(
   foregroundOpen?: boolean,
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
+  const assets = new AbortController();
   let lookup:
     | {
         read: ReturnType<typeof readEmployeeEntryIdentity>;
@@ -105,7 +107,10 @@ function startEntryWarmup(
       lookup?.cancel.abort();
       lookup = undefined;
       progress.ticket = accepted;
-      void warmPublicProfileAssets(startupAssetUrls, lifetime.signal);
+      void warmPublicProfileAssets(
+        startupAssetUrls,
+        AbortSignal.any([lifetime.signal, assets.signal]),
+      );
     },
     progress(state) {
       progress.current = state;
@@ -122,7 +127,13 @@ function startEntryWarmup(
     void read.catch(() => {}); // hot ready can retry an earlier miss.
     lookup = { read, cancel };
   }
-  return { lifetime, result, progress, readIdentity: () => lookup?.read };
+  return {
+    lifetime,
+    result,
+    progress,
+    stopAssetDownloads: () => assets.abort(),
+    readIdentity: () => lookup?.read,
+  };
 }
 
 async function waitForVisibleEntry(signal: AbortSignal) {
@@ -283,6 +294,7 @@ export function EmployeeNativePage({
     }
     function retire() {
       if (replacing) return replacing;
+      warmup?.stopAssetDownloads();
       if (prepare) {
         closingNotice = window.setTimeout(
           () => setStatus('closing'),

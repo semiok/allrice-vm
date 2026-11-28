@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { gzipSync } from 'node:zlib';
-import { stageDshProfileAssets } from '../../../../scripts/dev-release/stage-dsh-profile-assets.mjs';
 import { pathToFileURL } from 'node:url';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
@@ -299,6 +298,15 @@ it
       await cp(release.directory, join(root, 'apps/worker/dist/d-entry-web'), {
         recursive: true,
       });
+      const stageModule = new URL(
+        '../../../../scripts/dev-release/stage-dsh-profile-assets.mjs',
+        import.meta.url,
+      );
+      const {
+        stageDshProfileAssets,
+      }: {
+        stageDshProfileAssets(root: string, sourceSha: string): Promise<void>;
+      } = await import(stageModule.href);
       await stageDshProfileAssets(root, manifest.source.head);
       const index: { paths: string[]; startup: string[] } = JSON.parse(
         await readFile(
