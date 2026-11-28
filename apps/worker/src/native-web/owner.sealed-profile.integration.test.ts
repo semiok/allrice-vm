@@ -303,7 +303,7 @@ it(
                 const session = agent.session;
                 const restored = effective(session);
                 const invoke = args => agent.ctx.tools.execute({
-                  name: 'bash', arguments: args, agent,
+                  name: 'bash', arguments: { description: 'Check managed workspace permissions', ...args }, agent,
                   callId: randomUUID(), signal: AbortSignal.timeout(10_000),
                 });
                 session.append('turn/start', { turn: 1 });
