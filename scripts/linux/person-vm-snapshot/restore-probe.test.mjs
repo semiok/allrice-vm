@@ -77,30 +77,36 @@ function setup(options = {}) {
   const caller = new AbortController();
   const transport = new AbortController();
   const lease = {
-    assertCurrent: vi.fn(async (signal) => signal.throwIfAborted()),
+    assertCurrent: vi.fn(async (signal) => {
+      signal.throwIfAborted();
+      if (dimensions.revoked) throw Error('LEASE_LOST');
+    }),
     release: vi.fn(async () => {
       calls.push('lease');
       return true;
     }),
   };
-  let attempt = 0;
+  let attempt = options.offset ?? 0;
   let clock = 1000;
   let draw = 0;
   let previousReply;
   const native = {
     inspect: vi.fn(async () => dimensions.state ?? 'absent'),
-    restoreStrict: vi.fn(async ({ binding, onNativeDispatch, signal }) => {
-      if (!options.omitDispatch) onNativeDispatch();
-      calls.push('restore');
-      dimensions.state = 'running';
-      await options.afterDispatch?.(signal);
-      return {
-        binding,
-        templateDigest: hash,
-        memoryMode: 'cow',
-        computeIdentity,
-        ...options.nativeReceipt,
+    restoreStrict: vi.fn(async ({ binding, dispatchCurrent, signal }) => {
+      const start = async () => {
+        calls.push('restore');
+        dimensions.state = 'running';
+        await options.afterDispatch?.(signal);
+        return {
+          binding,
+          templateDigest: hash,
+          memoryMode: 'cow',
+          computeIdentity,
+          ...options.nativeReceipt,
+        };
       };
+      await options.beforeDispatch?.(dimensions);
+      return options.omitDispatch ? start() : dispatchCurrent(start);
     }),
     stopAndJoin: vi.fn(async (binding, signal) => {
       signal.throwIfAborted();
@@ -118,8 +124,22 @@ function setup(options = {}) {
     readOwnedReceipts: vi.fn(async () => ({
       disk: scope.disk,
       egress: scope.egress,
+      control: scope.control,
+      isolationId: scope.isolationId,
       networkFenced: scope.networkFenced,
     })),
+    withCurrentAuthority: vi.fn(async (expected, signal, start) => {
+      await options.beforeAuthority?.(dimensions);
+      signal.throwIfAborted();
+      if (
+        dimensions.revoked ||
+        expected.binding !== scope.disk.binding ||
+        expected.disk.mountId !== scope.disk.mountId ||
+        expected.egress.bindingId !== scope.egress.bindingId
+      )
+        throw Error('AUTHORITY_LOST');
+      return start();
+    }),
     connectGate: vi.fn(async (compute, signal) => ({
       binding: lease.binding,
       compute,
@@ -426,6 +446,38 @@ describe('isolated Linux snapshot restore', () => {
     },
   );
 
+  it('rejects A’s exact peer while A still owns compute and disk and stops only B', async () => {
+    const aStopping = Promise.withResolvers();
+    const permitAStop = Promise.withResolvers();
+    const a = setup({
+      stop: async () => {
+        aStopping.resolve();
+        await permitAStop.promise;
+      },
+    });
+    const aRun = a.run();
+    try {
+      await aStopping.promise;
+      const aPeer = await a.scope.connectGate.mock.results[0].value;
+      const b = setup({ offset: 1 });
+      b.scope.connectGate.mockResolvedValue(aPeer);
+      expect(await b.run()).toMatchObject({
+        failure: { code: 'GATE_PEER_UNVERIFIED' },
+        resourcesReleased: true,
+      });
+      expect(b.calls).not.toContain('reseed');
+      expect(b.native.stopAndJoin).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ vmId: 'vm-2', leaseEpoch: 2 }),
+        expect.anything(),
+      );
+      expect(a.dimensions.state).toBe('running');
+      expect(a.scope.release).not.toHaveBeenCalled();
+    } finally {
+      permitAStop.resolve();
+      expect((await aRun).resourcesReleased).toBe(true);
+    }
+  });
+
   it('expires a silent peer, joins it and only then stops and releases', async () => {
     let joined = false;
     const fixture = setup({
@@ -508,6 +560,64 @@ describe('isolated Linux snapshot restore', () => {
     });
     expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
   });
+
+  it('rejects lease revocation while re-reading disk and egress before dispatch', async () => {
+    const fixture = setup();
+    const read = fixture.scope.readOwnedReceipts.getMockImplementation();
+    fixture.scope.readOwnedReceipts.mockImplementation(async () => {
+      const result = await read();
+      if (fixture.scope.readOwnedReceipts.mock.calls.length === 2)
+        fixture.dimensions.revoked = true;
+      return result;
+    });
+    expect(await fixture.run()).toMatchObject({
+      failure: { stage: 'restore' },
+      resourcesReleased: true,
+    });
+    expect(fixture.native.restoreStrict).not.toHaveBeenCalled();
+  });
+
+  it.each(['beforeDispatch', 'beforeAuthority'])(
+    'prevents a late revocation at %s from reaching spawn',
+    async (boundary) => {
+      const fixture = setup({
+        [boundary]: (dimensions) => {
+          dimensions.revoked = true;
+        },
+      });
+      expect(await fixture.run()).toMatchObject({
+        failure: { stage: 'restore' },
+        resourcesReleased: true,
+      });
+      expect(fixture.native.restoreStrict).toHaveBeenCalledTimes(1);
+      expect(fixture.calls).not.toContain('restore');
+      expect(fixture.scope.connectGate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['control', 'isolation'])(
+    'rejects %s rotation after proof instead of handing out an unproved identity',
+    async (kind) => {
+      const fixture = setup();
+      const verifiedMount =
+        fixture.scope.verifyMountedWork.getMockImplementation();
+      fixture.scope.verifyMountedWork.mockImplementation(async (compute) => {
+        const mount = await verifiedMount(compute);
+        if (kind === 'control')
+          fixture.scope.control = {
+            ...fixture.scope.control,
+            socketPath: '/private/replaced.sock',
+          };
+        else fixture.scope.isolationId = 'replacement-net';
+        return mount;
+      });
+      expect(await fixture.run()).toMatchObject({
+        failure: { code: 'OWNED_RESOURCES_CHANGED' },
+        resourcesReleased: true,
+      });
+      expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
+    },
+  );
 
   it('keeps exact disk and lease pinned if a broken driver omits its dispatch receipt', async () => {
     const fixture = setup({ omitDispatch: true });

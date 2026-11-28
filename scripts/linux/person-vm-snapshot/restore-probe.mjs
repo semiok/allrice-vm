@@ -132,6 +132,8 @@ async function confirmFreshness({
   binding,
   compute,
   egress,
+  control,
+  isolationId,
   signal,
   seen,
   random,
@@ -143,7 +145,7 @@ async function confirmFreshness({
     stream.waitingVersion === 1 &&
       sameBinding(binding, stream.binding) &&
       sameCompute(compute, stream.compute) &&
-      stream.endpoint === scope.control.socketPath,
+      stream.endpoint === control.socketPath,
     'GATE_PEER_UNVERIFIED',
   );
   timeline.mark('fresh_gate_connected');
@@ -191,8 +193,8 @@ async function confirmFreshness({
   requireProof(
     sameBinding(binding, identity?.binding) &&
       sameCompute(compute, identity.compute) &&
-      identity.endpoint === scope.control.socketPath &&
-      identity.isolationId === scope.isolationId &&
+      identity.endpoint === control.socketPath &&
+      identity.isolationId === isolationId &&
       identity.egressBindingId === egress.bindingId &&
       identity.blockedBusinessRoutes === true &&
       identity.priorNetworkStateGone === true &&
@@ -208,7 +210,9 @@ async function confirmFreshness({
 /**
  * The synthetic native driver joins each call. It owns the paused gate, and
  * verifies a new private endpoint/peer, namespace and cgroup against the exact
- * compute. It must report even partial resource ownership to the pre-existing
+ * compute. The driver must spawn synchronously within dispatchCurrent's callback.
+ * The authority fence must exclude rollover of the lease and both receipts
+ * through that invocation. The driver reports partial ownership to the same
  * scope. There is no default runner, production owner or credential issuer.
  *
  * @returns {PersonVmTemplatePort}
@@ -221,7 +225,9 @@ function scopedTemplatePort(
   qualify,
   timeline,
   gateTimeoutMs,
+  resources,
 ) {
+  const { control, isolationId } = resources;
   return {
     qualify,
     inspect: (binding, signal) => native.inspect(binding, signal),
@@ -239,17 +245,30 @@ function scopedTemplatePort(
         template,
         binding,
         disk,
-        control: scope.control,
+        control,
       });
       await assertCurrent(signal);
       const receipt = await native.restoreStrict({
         binding,
         argv,
-        onNativeDispatch,
         signal,
         template,
         disk,
         egress,
+        async dispatchCurrent(start) {
+          await assertCurrent(signal);
+          // The scope validates the current lease and both pinned receipts as
+          // one authority and invokes start under that authority.
+          return scope.withCurrentAuthority(
+            { binding, ...resources },
+            signal,
+            () => {
+              signal.throwIfAborted();
+              onNativeDispatch();
+              return start();
+            },
+          );
+        },
       });
       signal.throwIfAborted();
       requireProof(
@@ -270,6 +289,8 @@ function scopedTemplatePort(
           binding,
           compute,
           egress,
+          control,
+          isolationId,
           seen,
           random,
           timeline,
@@ -294,7 +315,7 @@ function scopedTemplatePort(
         binding,
         templateDigest: template.seal.manifestSha256,
         computeIdentity: compute,
-        controlEndpoint: scope.control.socketPath,
+        controlEndpoint: control.socketPath,
         mountIdentity: disk,
         guestWorkMount: {
           path: '/work',
@@ -302,7 +323,7 @@ function scopedTemplatePort(
           verifiedAgainstOwnedDisk: true,
         },
         networkIdentity: {
-          isolationId: scope.isolationId,
+          isolationId,
           egressBindingId: egress.bindingId,
         },
         freshness: {
@@ -433,9 +454,13 @@ export function createRestoreProbe({
               current.egress.bindingId === resources.egress.bindingId &&
               Array.isArray(current.egress.gatewayPorts) &&
               current.egress.gatewayPorts.length === 0 &&
+              current.control?.socketPath === resources.control.socketPath &&
+              current.control.port === resources.control.port &&
+              current.isolationId === resources.isolationId &&
               current.networkFenced === true,
             'OWNED_RESOURCES_CHANGED',
           );
+          await lease.assertCurrent(currentSignal);
         }
         currentSignal.throwIfAborted();
       };
@@ -464,7 +489,7 @@ export function createRestoreProbe({
       // openScope only establishes ownership; prepare owns every I/O it starts.
       scope = openScope(binding);
       await scope.prepare(template, runSignal);
-      const { disk, egress, networkFenced } =
+      const { disk, egress, control, isolationId, networkFenced } =
         await scope.readOwnedReceipts(runSignal);
       requireProof(
         sameBinding(binding, disk?.binding) &&
@@ -479,8 +504,9 @@ export function createRestoreProbe({
           egress.bindingId.length > 0 &&
           Array.isArray(egress.gatewayPorts) &&
           egress.gatewayPorts.length === 0 &&
-          typeof scope.isolationId === 'string' &&
-          scope.isolationId.length > 0 &&
+          control &&
+          typeof isolationId === 'string' &&
+          isolationId.length > 0 &&
           networkFenced === true,
         'OWNED_RESOURCES_UNPROVED',
       );
@@ -495,6 +521,8 @@ export function createRestoreProbe({
           binding,
           gatewayPorts: Object.freeze([]),
         }),
+        control: Object.freeze({ ...control }),
+        isolationId,
       };
       timeline.mark('host_disk_net_ready');
 
@@ -517,21 +545,27 @@ export function createRestoreProbe({
         qualify,
         timeline,
         gateTimeoutMs,
+        resources,
       );
       const restored = await port.restore({
         template,
         binding,
-        ...resources,
+        disk: resources.disk,
+        egress: resources.egress,
         assertCurrent,
         signal: runSignal,
         onNativeDispatch() {
           requireProof(!dispatched, 'RESTORE_ALREADY_DISPATCHED');
           addOnce(
             seen.controls,
-            scope.control.socketPath,
+            resources.control.socketPath,
             'CONTROL_ENDPOINT_REUSED',
           );
-          addOnce(seen.isolation, scope.isolationId, 'NETWORK_IDENTITY_REUSED');
+          addOnce(
+            seen.isolation,
+            resources.isolationId,
+            'NETWORK_IDENTITY_REUSED',
+          );
           runSignal.throwIfAborted();
           timeline.mark('restore_dispatch');
           dispatched = true;
@@ -539,7 +573,14 @@ export function createRestoreProbe({
       });
       stage = 'editor';
       await assertCurrent(runSignal);
-      const editor = await scope.probeSyntheticEditor(restored, runSignal);
+      const editor = await scope.withCurrentAuthority(
+        { binding, ...resources },
+        runSignal,
+        () => {
+          runSignal.throwIfAborted();
+          return scope.probeSyntheticEditor(restored, runSignal);
+        },
+      );
       requireProof(
         sameBinding(binding, editor?.binding) && editor.editorReady === true,
         'EDITOR_PROOF_UNAVAILABLE',
@@ -548,7 +589,14 @@ export function createRestoreProbe({
       stage = 'ready';
       await assertCurrent(runSignal);
       requireProof(
-        (await scope.confirmSyntheticReady(restored, runSignal)) === true,
+        (await scope.withCurrentAuthority(
+          { binding, ...resources },
+          runSignal,
+          () => {
+            runSignal.throwIfAborted();
+            return scope.confirmSyntheticReady(restored, runSignal);
+          },
+        )) === true,
         'READY_UNCONFIRMED',
       );
       await assertCurrent(runSignal);
