@@ -1,7 +1,10 @@
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
 import { expect, it } from 'vitest';
 import { z } from 'zod';
-import { pageSettingsNamespaces } from '../src/page-capability-policy.js';
+import {
+  pageSettingsNamespaces,
+  projectEmployeePageCatalog,
+} from '../src/page-capability-policy.js';
 import {
   encodePageNativeResult,
   requirePageNativeMethod,
@@ -42,10 +45,49 @@ it('uses a live DSH descriptor for new native methods and requires the matching 
       {},
       new Set(),
     ),
-  ).toThrow('DSH method unavailable');
+  ).toThrow('此操作暂不可用');
   expect(() =>
     requirePageNativeMethod(registry, 'session/other', 'unary', {}, new Set()),
-  ).toThrow('DSH method unavailable');
+  ).toThrow('此操作暂不可用');
+});
+
+it('keeps Standard managed while allowing the native preset and language reads', () => {
+  const require = (endpoint: string, args = {}) => {
+    const [ns, method] = endpoint.split('/') as [string, string];
+    return requirePageNativeMethod(
+      { get: () => descriptor(ns, method) },
+      endpoint,
+      'unary',
+      args,
+      new Set(),
+    );
+  };
+  expect(() => require('agentPresets/select')).toThrow('此操作由平台管理');
+  expect(() =>
+    require('settings/update', { ns: 'agent-preset-registry' }),
+  ).toThrow('此操作由平台管理');
+  expect(require('agentPresets/list').method).toBe('list');
+  expect(require('settings/update', { ns: 'locale' }).method).toBe('update');
+});
+
+it('limits the employee menu and native execution to the approved commands', () => {
+  const commands = ['file', 'plan', 'goal', 'compact', 'model'];
+  const removed = ['permission', 'export', 'feedback', 'other-command'];
+  const list = [...commands, ...removed].map((name) => ({ name }));
+  expect(projectEmployeePageCatalog('commands/list', list)).toEqual(
+    commands.map((name) => ({ name })),
+  );
+  const invoke = (name: string) =>
+    requirePageNativeMethod(
+      { get: () => descriptor('commands', 'execute') },
+      'commands/execute',
+      'unary',
+      { line: `/${name} details` },
+      new Set(),
+    );
+  for (const name of commands) expect(invoke(name).method).toBe('execute');
+  for (const name of removed)
+    expect(() => invoke(name)).toThrow('此操作由平台管理');
 });
 
 it('admits native terminal methods with their ordinary stream uplink descriptor', () => {
@@ -93,7 +135,7 @@ it('excludes the private AllRice registry and refuses managed operations before 
       {},
       new Set(),
     ),
-  ).toThrow('DSH method unavailable');
+  ).toThrow('此操作暂不可用');
   expect(() =>
     requirePageNativeMethod(
       { get: () => activate },
@@ -102,7 +144,7 @@ it('excludes the private AllRice registry and refuses managed operations before 
       {},
       new Set(),
     ),
-  ).toThrow('DSH method is platform managed');
+  ).toThrow('此操作由平台管理');
 });
 
 it('allows inventories and ordinary settings through the same native boundary', () => {
@@ -140,7 +182,7 @@ it('keeps sensitive Host effects and file preview unavailable even when register
       new Set(),
       new Set(['the-profile-market-entry']),
     ),
-  ).toThrow('DSH method is platform managed');
+  ).toThrow('此操作由平台管理');
   for (const [namespace, method, mode] of [
     ['account', 'watch', 'stream'],
     ['remoteAccess', 'pair', 'unary'],
@@ -168,7 +210,7 @@ it('keeps sensitive Host effects and file preview unavailable even when register
         { ns: 'provider' },
         new Set(['provider']),
       ),
-    ).toThrow('DSH method');
+    ).toThrow(/此操作(?:由平台管理|暂不可用)/);
   }
 });
 
@@ -207,7 +249,7 @@ it('protects the loaded default model entry under its profile ID while leaving o
           providerSettings,
           pluginSettings,
         ),
-      ).toThrow('DSH method is platform managed');
+      ).toThrow('此操作由平台管理');
     }
     expect(
       requirePageNativeMethod(

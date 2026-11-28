@@ -23,7 +23,10 @@ import {
   type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
-import { nativeSearchToolPatches } from './search-tools.js';
+import {
+  nativeEmployeeSkillPatches,
+  nativeSearchToolPatches,
+} from './search-tools.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -213,6 +216,11 @@ export async function prepareNativeWebLaunch(
         'utf8',
       )
     : undefined;
+  const modelPatches = modelAdapter
+    ? modelAdapter.scoped
+      ? nativeScopedModelPatches(modelAdapter.scoped)
+      : nativeSearchToolPatches(modelAdapter.webSearchEnabled === true)
+    : [];
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
@@ -310,15 +318,12 @@ export function apply(ctx, config) {
               ]
             : []),
           ...(commandMemory ?? []),
+          ...modelPatches,
+          ...nativeEmployeeSkillPatches(modelPatches),
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
-                ...(modelAdapter.scoped
-                  ? nativeScopedModelPatches(modelAdapter.scoped)
-                  : nativeSearchToolPatches(
-                      modelAdapter.webSearchEnabled === true,
-                    )),
                 {
                   id: 'agent-default-model',
                   config: {

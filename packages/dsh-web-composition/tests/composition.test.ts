@@ -132,7 +132,7 @@ it('keeps native conversation controls and hides only the employee header entrie
   remove();
 });
 
-it('assembles the independent profile with native question/document/catalog and Host log export intact', async () => {
+it('assembles the independent profile with native question, document and catalog intact', async () => {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), 'allrice-composition-profile-')),
   );
@@ -169,7 +169,6 @@ it('assembles the independent profile with native question/document/catalog and 
     'ui-user-questions',
     'ui-sidebar-documentpreview',
     'ui-subagent',
-    'session-log-download',
     'ui-deliverables',
     'ui-conversation',
     'ui-sidebar-right',
@@ -177,10 +176,10 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
-  expect(entry('locale')?.config).toMatchObject({ preference: 'zh' });
+  expect(entry('locale')?.config).toMatchObject({ preference: 'zh-x-allrice' });
   expect(entry('ui-chat')).toBeDefined();
   expect(entry('ui-chat')?.config ?? {}).not.toHaveProperty('performanceUsage');
-  for (const id of ['ui-model-selection', 'ui-permission', 'session-stats']) {
+  for (const id of ['ui-model-selection', 'session-stats']) {
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
@@ -188,6 +187,19 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
+  for (const id of [
+    'ui-agent-preset',
+    'ui-permission',
+    'session-log-download',
+    'command-feedback',
+    'message-feedback',
+    'ui-message-feedback',
+  ])
+    expect(entry(id)?.disabled, id).toBe(true);
+  expect(entry('agent-preset-registry')?.config).toMatchObject({
+    default: 'standard',
+    selectedDefault: 'standard',
+  });
   for (const id of [
     'agent-preset-registry',
     'permission',

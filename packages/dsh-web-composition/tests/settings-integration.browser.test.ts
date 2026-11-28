@@ -1,6 +1,6 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import {
   afterAll,
@@ -561,10 +561,35 @@ suite('production settings owner in the installed rc.2 workbench', () => {
           .getByRole('button', { name: '通用设置', exact: true })
           .count(),
       ).toBe(1);
-      for (const name of ['我的电脑', '工作方式', '已链接应用'])
+      for (const name of ['我的电脑', '工作方式', '已链接应用', 'Agent 预设'])
         expect(
           await native.getByRole('button', { name, exact: true }).count(),
         ).toBe(0);
+      expect(await native.getByText(/当前版本|0\.2\.1-rc\.2/).count()).toBe(0);
+      const evidence = process.env.ALLRICE_RUN_BRAND_EVIDENCE;
+      if (evidence) {
+        const target = resolve(process.env.HOME!, '..', 'evidence', evidence);
+        await mkdir(target, { recursive: true });
+        for (const width of [1440, 390])
+          for (const mode of ['light', 'dark'] as const) {
+            await page.setViewportSize({
+              width,
+              height: width === 1440 ? 1000 : 844,
+            });
+            await workbench.locator('body').evaluate((body, mode) => {
+              const fixture = body.ownerDocument.defaultView as unknown as {
+                __allriceSettingsWorkbench: { setTheme(theme: string): void };
+              };
+              fixture.__allriceSettingsWorkbench.setTheme(mode);
+            }, mode);
+            await native.waitFor({ state: 'visible' });
+            await page.screenshot({
+              path: join(target, `general-${width}-${mode}.png`),
+              animations: 'disabled',
+            });
+          }
+      }
+
       await page.keyboard.press('Escape');
       await native.waitFor({ state: 'hidden' });
       await capture(390);

@@ -28,6 +28,16 @@
 - id: ui-settings-models
   disabled: true
 # These six disabled settings UI entries have native no-op Host halves.
+# The employee profile selects Standard on the Host. The native Agent and
+# permission services stay mounted; only the two selector plugins are absent.
+- id: ui-agent-preset
+  disabled: true
+- id: ui-permission
+  disabled: true
+- id: agent-preset-registry
+  config:
+    default: standard
+    selectedDefault: standard
 - id: ui-settings-agent-loop
   disabled: true
 - id: ui-settings-plugins
@@ -44,6 +54,15 @@
   disabled: true
 - id: ui-plugin-manager
   disabled: true
+# Disable both the native feedback and export actions, including their Hosts.
+- id: session-log-download
+  disabled: true
+- id: command-feedback
+  disabled: true
+- id: message-feedback
+  disabled: true
+- id: ui-message-feedback
+  disabled: true
 - id: ui-trajectory
   disabled: true
 - id: open-in-app
@@ -52,7 +71,7 @@
   disabled: true
 - id: locale
   config:
-    preference: zh
+    preference: zh-x-allrice
 # The installed employee profile publishes a single immutable release graph.
 - id: client-hmr
   disabled: true

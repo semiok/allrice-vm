@@ -22,6 +22,7 @@ export * as panels from './src/employee-panels.tsx';
 export * as topbar from './src/employee-topbar.tsx';
 export * as references from './src/employee-panel-references.tsx';
 export * as childPane from './src/child-pane.cjs';
+export * as brand from './src/employee-brand.tsx';
 export * as product from './src/employee-product-owner.ts';`,
     resolveDir: new URL('.', import.meta.url).pathname,
     sourcefile: 'allrice-employee-contributions.ts',
@@ -65,7 +66,7 @@ const artifact = `window.__ModuleLoader__.load({
   factory: (require) => {
     const exports = {};
 ${source}
-    const { sidebar, settings, panels, topbar, references, childPane, product } = (() => {
+    const { sidebar, settings, panels, topbar, references, childPane, brand, product } = (() => {
       const module = { exports: {} };
       const exports = module.exports;
 ${js}
@@ -82,6 +83,7 @@ ${js}
         return () => style.remove();
       });
       sidebar.apply(ctx);
+      brand.apply(ctx);
       references.apply(ctx);
       const workbench = product.installEmployeeProductOwner(ctx);
       settings.apply(ctx, {

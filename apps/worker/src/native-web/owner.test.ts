@@ -24,6 +24,7 @@ import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 import { nativeScopedModelPatches } from './model-task-presets.js';
 import {
+  nativeEmployeeSkillPatches,
   nativeSearchToolPatches,
   nativeWebBundlePatches,
 } from './search-tools.js';
@@ -271,6 +272,33 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
         profile,
       ),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('turns off filesystem Skill discovery in every preset while retaining tools and earlier overlays', () => {
+  const scoped = nativeScopedModelPatches({
+    compaction: { provider: 'openai', model: 'compact-model' },
+  });
+  const base = [...nativeWebBundlePatches(), scoped];
+  const before = composeEntries(base);
+  const after = composeEntries([...base, nativeEmployeeSkillPatches(scoped)]);
+  const known = ['preset-standard', 'preset-ptc', 'preset-cordis'];
+  for (const id of known) {
+    const original = before.find((entry) => entry.id === id)?.config;
+    expect(after.find((entry) => entry.id === id)?.config).toEqual({
+      ...original,
+      plugins: original.plugins.map((plugin: { id: string }) =>
+        plugin.id === 'skill-filesystem'
+          ? { ...plugin, disabled: true }
+          : plugin,
+      ),
+    });
+    expect(original.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'skill-filesystem' }),
+        expect.objectContaining({ id: 'tool-skill' }),
+      ]),
+    );
+  }
 });
 
 it.each([false, true])(

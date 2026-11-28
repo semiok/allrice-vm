@@ -61,7 +61,10 @@ import {
   encodePageNativeResult,
   requirePageNativeMethod,
 } from './page-native-method.js';
-import { pageSettingsNamespaces } from './page-capability-policy.js';
+import {
+  pageSettingsNamespaces,
+  projectEmployeePageCatalog,
+} from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
 const terminalId = z.string().min(1).max(128);
@@ -1203,21 +1206,24 @@ class PrincipalService extends TypertRemoteService {
           'unary',
         );
         let nativeArgs = args;
-        const workspace = this.graphObserver?.defaultWorkspace();
-        if (endpoint === 'session/create' && workspace) {
+        if (endpoint === 'session/create') {
           const { request } = Native.methods[endpoint]
             .input({ strict: true })
             .create()
             .parse(args);
+          const create = { ...request, agentPreset: 'standard' };
+          nativeArgs = { request: create };
+          const workspace = this.graphObserver?.defaultWorkspace();
           if (
-            request.workspaceId === undefined &&
-            (request.cwd === undefined || request.cwd === workspace.path)
+            workspace &&
+            create.workspaceId === undefined &&
+            (create.cwd === undefined || create.cwd === workspace.path)
           ) {
             const workspaceId = await workspace.ensure();
             active.throwIfAborted();
-            const create = { ...request, workspaceId };
-            delete create.cwd;
-            nativeArgs = { request: create };
+            const owned = { ...create, workspaceId };
+            delete owned.cwd;
+            nativeArgs = { request: owned };
           }
         }
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
@@ -1292,7 +1298,7 @@ class PrincipalService extends TypertRemoteService {
         const visible =
           endpoint === 'settings/describe'
             ? { ...object.parse(value), hasDocument: false }
-            : value;
+            : projectEmployeePageCatalog(endpoint, value);
         return {
           kind: 'page',
           endpoint,

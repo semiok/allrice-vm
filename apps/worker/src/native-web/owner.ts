@@ -890,6 +890,7 @@ export async function openNativeWebOwner(input: {
                 request: {
                   ...request,
                   workspaceId: WorkspaceId(workspace.workspaceId),
+                  agentPreset: 'standard',
                 },
               });
             // rc.2 create has no native cancellation slot. Let a dispatched
