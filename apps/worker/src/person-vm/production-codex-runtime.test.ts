@@ -37,7 +37,7 @@ vi.mock('@allrice/database', () => ({
   getDatabase: () => ({
     begin: (_mode: string, query: (tx: typeof state.subscription) => unknown) =>
       query(((parts: TemplateStringsArray, connectionId: string) =>
-          parts[0]?.startsWith('set local statement_timeout')
+        parts[0]?.startsWith('set local statement_timeout')
           ? state.statementTimeout()
           : state.subscription(
               parts,
