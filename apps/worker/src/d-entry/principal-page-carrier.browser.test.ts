@@ -59,6 +59,7 @@ it
     'unattached',
     'native-create',
     'outer-create',
+    'sidebar-create-after-switch',
     'native-title',
     'native-title-reopen',
     ...(process.platform === 'darwin'
@@ -73,8 +74,11 @@ it
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
     const outerCreate = scenario === 'outer-create';
-    const nativeCreate = outerCreate || scenario.startsWith('native-create');
+    const sidebarCreate = scenario === 'sidebar-create-after-switch';
+    const nativeCreate =
+      outerCreate || sidebarCreate || scenario.startsWith('native-create');
     const createAfterSwitch =
+      sidebarCreate ||
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const realShell = switching || nativeCreate || coldAssets;
@@ -1921,6 +1925,20 @@ it
           (url) => url.searchParams.get('threadId') === otherThread,
         );
         await editor.fill('切换后保留的草稿', { timeout: 15_000 });
+        if (sidebarCreate) {
+          expect(
+            await workbench
+              .locator(`[data-row-key="session:${otherThread}"]`)
+              .getAttribute('aria-selected'),
+          ).toBe('true');
+          expect(
+            await editor.evaluate((node) =>
+              node
+                .closest('[data-conversation-session]')
+                ?.getAttribute('data-conversation-session'),
+            ),
+          ).toBe('root-' + otherThread);
+        }
       }
       const platform = await editor.evaluate(
         (node) => node.ownerDocument.defaultView!.navigator.platform,
@@ -1933,7 +1951,7 @@ it
           ? 'Control+Alt+N'
           : 'Control+Shift+Period';
       try {
-        if (createAfterSwitch) {
+        if (createAfterSwitch && !sidebarCreate) {
           await workbench.locator('#app').evaluate((node) => {
             window.addEventListener('message', (event) => {
               if (
@@ -1945,8 +1963,15 @@ it
           });
           holdCreatedResponse = true;
         }
-        await editor.press(chord, { timeout: 10_000 });
-        if (createAfterSwitch) {
+        if (sidebarCreate)
+          await workbench
+            .getByRole('button', {
+              name: '和 Fixture employee 开新会话',
+              exact: true,
+            })
+            .click();
+        else await editor.press(chord, { timeout: 10_000 });
+        if (createAfterSwitch && !sidebarCreate) {
           try {
             await createdResponse.promise;
             const before = switchProofRequests;
@@ -2003,6 +2028,8 @@ it
         '[data-row-key="session:' + createdThread + '"]',
       );
       await row.waitFor({ timeout: 15_000 });
+      if (sidebarCreate)
+        await row.and(workbench.locator('[aria-selected="true"]')).waitFor();
       await expect
         .poll(
           () =>
