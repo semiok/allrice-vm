@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type postgres from 'postgres';
 import { z } from 'zod';
 import {
@@ -13,7 +14,6 @@ import {
   type PersonVmDiskPreparationTarget,
 } from '@allrice/person-vm';
 import { readContentPrincipal } from './content-maintenance.ts';
-import { joinCallerSave } from './business-runtime/caller-transaction.ts';
 import { createDedicatedDatabase, getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import {
@@ -238,40 +238,96 @@ export async function updateDEntryPersonRollout(
   });
 }
 
-/** Preparation reads stay off the request pool. Cancellation closes only
- * this owned connection and joins even a callback interrupted by disconnect. */
+/** Preparation reads stay off the request pool. The single owned connection
+ * can be ended without letting the driver's native transaction scope try to
+ * send a rollback on the socket that just disconnected. */
 async function readDiskPreparation<T>(
-  mode: string,
+  mode: 'read only' | 'isolation level repeatable read read only',
   signal: AbortSignal,
-  read: (sql: postgres.TransactionSql, active: AbortSignal) => Promise<T>,
+  read: (sql: postgres.Sql, active: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  const active = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
+  const lost = new AbortController();
+  const active = AbortSignal.any([
+    signal,
+    lost.signal,
+    AbortSignal.timeout(8_000),
+  ]);
   active.throwIfAborted();
-  const client = createDedicatedDatabase(getDatabase());
+  // postgres 3.4.9 can reject its internal type discovery outside the caller
+  // when the owned connection is ended mid-startup. These reads use scalar
+  // parameters and infer all built-in result types without that extra query.
+  const options = getDatabase().options;
+  let confirmSocketClosed!: () => void;
+  const socketClosed = new Promise<void>((resolve) => {
+    confirmSocketClosed = resolve;
+  });
   let closing: Promise<void> | undefined;
-  let callback: Promise<{ value: T }> | undefined;
-  const close = () => (closing ??= client.end({ timeout: 0 }));
+  const client = createDedicatedDatabase({
+    options: {
+      ...options,
+      fetch_types: false,
+      // This connection is bounded by the preparation signal and must not
+      // rotate between its BEGIN and reservation.
+      max_lifetime: 0,
+      onclose(id) {
+        confirmSocketClosed();
+        if (!closing) lost.abort(Error('DISK_PREPARATION_CONNECTION_CLOSED'));
+        options.onclose?.(id);
+      },
+    },
+  });
+  const close = () =>
+    (closing ??= Promise.resolve().then(async () => {
+      await client.end({ timeout: 0 });
+      // The end timeout can initiate a half-close. Join the driver's actual
+      // socket-close event before the scanner may finish or replace its feed.
+      const deadline = new AbortController();
+      try {
+        await Promise.race([
+          socketClosed,
+          sleep(6_000, undefined, { signal: deadline.signal, ref: false }).then(
+            () => {
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            },
+          ),
+        ]);
+      } finally {
+        deadline.abort();
+      }
+    }));
   const abort = () => void close().catch(() => {});
   active.addEventListener('abort', abort, { once: true });
+  let result: T;
   try {
-    const result = await joinCallerSave(
-      client.begin(mode, (sql) => {
-        callback = (async () => {
-          active.throwIfAborted();
-          await sql`set local transaction_timeout = '5s'`;
-          active.throwIfAborted();
-          return { value: await read(sql, active) };
-        })();
-        return callback;
-      }),
-      () => callback,
-    );
+    // Start on the only connection before reserving it. postgres.js 3.4.9
+    // does not finish a cold reserve when type discovery is disabled.
+    const begin =
+      mode === 'read only'
+        ? client`begin read only`
+        : client`begin isolation level repeatable read read only`;
+    // Enqueue the initial operation before an abort in this same turn can
+    // end the otherwise unused pool and leave no socket event to join.
+    await begin.execute();
     active.throwIfAborted();
-    return result.value;
+    // A lost session may never continue this transaction on a new socket.
+    const sql = new Proxy(await client.reserve(), {
+      apply(target, receiver, args) {
+        active.throwIfAborted();
+        return Reflect.apply(target, receiver, args);
+      },
+    });
+    await sql`set local transaction_timeout = '5s'`;
+    active.throwIfAborted();
+    result = await read(sql, active);
+    await sql`commit`;
   } finally {
     active.removeEventListener('abort', abort);
+    // If the query or commit failed, closing this read-only session is enough.
+    // Never issue more SQL on a connection whose state cannot be verified.
     await close();
   }
+  active.throwIfAborted();
+  return result;
 }
 
 /** One committed roster per sweep. Pages are scheduling hints only. */
@@ -316,7 +372,7 @@ export async function readPersonVmDiskPreparationForegroundBusy(
 /** Tenant and personal provenance must come from the exact version's creation
  * transaction. A missing platform mapping also describes old materializations. */
 async function hasDiskPreparationVersionProvenance(
-  sql: postgres.TransactionSql,
+  sql: postgres.Sql,
   identity: Pick<
     PersonVmDiskPreparationTarget,
     | 'organizationId'
@@ -419,7 +475,8 @@ export async function readPersonVmDiskPreparationTarget(
           join allrice_employee_assignments a on a.id=i.assignment_id
             and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
             and a.user_id=i.owner_id and a.active
-          where i.organization_id=any(${organizations}::uuid[]) and i.owner_id=${ownerId}
+          where i.organization_id=any(string_to_array(${organizations.join(',')}, ',')::uuid[])
+            and i.owner_id=${ownerId}
             and i.archived_at is null
           order by i.organization_id,i.id`;
       let eligible: PersonVmDiskPreparationTarget | null = null;

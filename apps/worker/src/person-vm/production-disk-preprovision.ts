@@ -108,6 +108,7 @@ export function startProductionDiskPreprovision(input: {
     let attempt: { personId: string; recheck(): void } | undefined;
     let hinted = false;
     let nextSweep = 0;
+    let qualificationCleanupFailure: PersonVmError | undefined;
     const startup = AbortSignal.any([signal, AbortSignal.timeout(6_000)]);
     startup.throwIfAborted();
     // pg can leave connect() pending after an early end(). On abort let
@@ -143,8 +144,17 @@ export function startProductionDiskPreprovision(input: {
       try {
         return await read();
       } catch (error) {
-        if (!active.aborted && !vmError(error, 'ORGANIZATION_CONFLICT'))
+        if (vmError(error, 'CLEANUP_INCOMPLETE')) {
+          // A recheck can still be joining its SQL connection after the
+          // feed or caller aborts. That abort cannot certify socket closure.
+          qualificationCleanupFailure ??= error;
           disconnected.abort(error);
+        } else if (
+          !active.aborted &&
+          !vmError(error, 'ORGANIZATION_CONFLICT')
+        ) {
+          disconnected.abort(error);
+        }
         throw error;
       }
     }
@@ -302,6 +312,8 @@ export function startProductionDiskPreprovision(input: {
         }
       }
       signal.throwIfAborted();
+    } catch (error) {
+      throw qualificationCleanupFailure ?? error;
     } finally {
       unsubscribe();
     }

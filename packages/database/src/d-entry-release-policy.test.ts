@@ -66,49 +66,58 @@ function fixture(
   instances = [instance()],
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
-  const sql = vi.fn(
-    async (strings: TemplateStringsArray, ...params: unknown[]) => {
-      const query = strings.join('?');
-      seen.push({ query, params });
-      if (query.includes('set local transaction_timeout')) return [];
-      if (query.includes('from allrice_settings')) {
-        return [
-          {
-            value: JSON.stringify({
-              revision: 'revision-1',
-              defaultGeneration,
-              selections,
-            }),
-          },
-        ];
-      }
-      if (query.includes('from person_virtual_machines')) return vm;
-      if (query.includes('join allrice_audit_events audit'))
-        return [{ verified: tenantVersionVerified }];
-      if (query.includes('from allrice_employee_instances')) {
-        const [organizations, ownerId] = params as [string[], string];
-        return instances
-          .filter(
-            (row) =>
-              organizations.includes(row.organization_id) &&
-              row.owner_id === ownerId,
-          )
-          .map((row) => ({
-            ...row,
-            platform_version: platformVersion,
-          }));
-      }
-      throw Error('Unexpected fixture query');
+  const query = async (strings: TemplateStringsArray, ...params: unknown[]) => {
+    const query = strings.join('?');
+    seen.push({ query, params });
+    if (
+      query.startsWith('begin ') ||
+      query.includes('set local transaction_timeout') ||
+      query === 'commit'
+    )
+      return [];
+    if (query.includes('from allrice_settings')) {
+      return [
+        {
+          value: JSON.stringify({
+            revision: 'revision-1',
+            defaultGeneration,
+            selections,
+          }),
+        },
+      ];
+    }
+    if (query.includes('from person_virtual_machines')) return vm;
+    if (query.includes('join allrice_audit_events audit'))
+      return [{ verified: tenantVersionVerified }];
+    if (query.includes('from allrice_employee_instances')) {
+      const [organizations, ownerId] = params as [string, string];
+      return instances
+        .filter(
+          (row) =>
+            organizations.split(',').includes(row.organization_id) &&
+            row.owner_id === ownerId,
+        )
+        .map((row) => ({
+          ...row,
+          platform_version: platformVersion,
+        }));
+    }
+    throw Error('Unexpected fixture query');
+  };
+  const sql = vi.fn((...args: Parameters<typeof query>) => {
+    const result = query(...args);
+    return Object.assign(result, { execute: () => result });
+  });
+  let socketClosed!: () => void;
+  const end = vi.fn(async () => socketClosed());
+  data.getDatabase.mockReturnValue({ options: { fetch_types: true } });
+  data.createDedicatedDatabase.mockImplementation(
+    ({ options }: { options: { onclose(): void } }) => {
+      socketClosed = options.onclose;
+      return Object.assign(sql, { reserve: async () => sql, end });
     },
   );
-  const begin = vi.fn(
-    async (_mode: string, callback: (tx: typeof sql) => unknown) =>
-      callback(sql),
-  );
-  const end = vi.fn(async () => {});
-  data.getDatabase.mockReturnValue({ trusted: true });
-  data.createDedicatedDatabase.mockReturnValue({ begin, end });
-  return { begin, end, seen, sql };
+  return { end, seen, sql };
 }
 beforeEach(() => {
   vi.resetAllMocks();
@@ -171,7 +180,7 @@ it('fails closed on a published policy that defaults everyone to 4.0', async () 
 });
 
 it('resolves the released person’s employee from the same snapshot as policy, membership and version', async () => {
-  const { begin, seen, sql } = fixture([selection()]);
+  const { seen, sql } = fixture([selection()]);
   expect(await readPersonVmDiskPreparationTarget(person, signal())).toEqual({
     personId: person,
     organizationId: org,
@@ -182,13 +191,13 @@ it('resolves the released person’s employee from the same snapshot as policy, 
     platformRevisionId: null,
     policyRevision: 'revision-1',
   });
-  expect(begin.mock.calls[0]?.[0]).toBe(
-    'isolation level repeatable read read only',
+  expect(seen[0]?.query).toBe(
+    'begin isolation level repeatable read read only',
   );
   const candidates = seen.find(({ query }) =>
     query.includes('from allrice_employee_instances'),
   );
-  expect(candidates?.params).toEqual([[org], person]);
+  expect(candidates?.params).toEqual([org, person]);
   expect(candidates?.query).toContain('a.user_id=i.owner_id and a.active');
   expect(candidates?.query).toContain('i.archived_at is null');
   expect(candidates?.query).toContain('order by i.organization_id,i.id');
@@ -197,8 +206,10 @@ it('resolves the released person’s employee from the same snapshot as policy, 
     organizationId: org,
     workspaceId: workspace,
   };
-  expect(data.principal).toHaveBeenCalledExactlyOnceWith(subject, sql);
-  expect(data.employee).toHaveBeenCalledExactlyOnceWith(subject, first, sql);
+  const scope = data.principal.mock.calls[0]?.[1] as typeof sql;
+  expect(scope.mock).toBe(sql.mock);
+  expect(data.principal).toHaveBeenCalledExactlyOnceWith(subject, scope);
+  expect(data.employee).toHaveBeenCalledExactlyOnceWith(subject, first, scope);
 });
 
 it('requires a writable current membership and a live assignment', async () => {
@@ -280,16 +291,24 @@ it('propagates unexpected eligibility errors and rejects a cancelled scan', asyn
 });
 
 it('reads the foreground busy projection in a bounded read-only transaction', async () => {
-  const { begin, seen } = fixture([selection()], [{ busy: true }]);
+  const { seen } = fixture([selection()], [{ busy: true }]);
   expect(
     await readPersonVmDiskPreparationForegroundBusy(person, signal()),
   ).toBe(true);
-  expect(begin.mock.calls[0]?.[0]).toBe('read only');
-  expect(seen[0]?.query).toBe("set local transaction_timeout = '5s'");
-  expect(seen[1]?.query).toMatch(
+  expect(data.createDedicatedDatabase).toHaveBeenCalledWith({
+    options: {
+      fetch_types: false,
+      max_lifetime: 0,
+      onclose: expect.any(Function),
+    },
+  });
+  expect(seen[0]?.query).toBe('begin read only');
+  expect(seen[1]?.query).toBe("set local transaction_timeout = '5s'");
+  expect(seen[2]?.query).toMatch(
     /lease_owner is not null or instance_id is not null\s+or holds/,
   );
-  expect(seen[1]?.params).toEqual([person]);
+  expect(seen[2]?.params).toEqual([person]);
+  expect(seen[3]?.query).toBe('commit');
 
   fixture([selection()]);
   expect(
@@ -327,8 +346,10 @@ it('requires an exact, still published platform source without rejecting tenant-
       employeeId: assignedEmployee,
       versionId: version,
     },
-    sql,
+    data.principal.mock.calls[0]?.[1],
   );
+  const scope = data.publication.mock.calls[0]?.[1] as typeof sql;
+  expect(scope.mock).toBe(sql.mock);
 
   data.publication.mockClear();
   data.employee.mockResolvedValueOnce({
