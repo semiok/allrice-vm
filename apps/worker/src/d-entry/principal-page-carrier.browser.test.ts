@@ -220,6 +220,7 @@ it
               import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
               createRoot(document.getElementById('root')).render(
                 <EmployeeNativePage prepare query={location.search.slice(1)}
+                  warmIdentity={JSON.parse(document.getElementById('warm-identity')?.textContent ?? 'null') ?? undefined}
                   startupAssetUrls={JSON.parse(document.getElementById('startup-assets')?.textContent ?? '[]')} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
@@ -711,6 +712,11 @@ it
               .writeHead(200, { 'content-type': 'text/html' })
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
+                  (warmRefresh
+                    ? '<script id="warm-identity" type="application/json">' +
+                      JSON.stringify(f.identity) +
+                      '</script>'
+                    : '') +
                   (coldAssets && bench !== 'progress'
                     ? '<script id="startup-assets" type="application/json">' +
                       JSON.stringify(coldPaths) +
@@ -2220,6 +2226,11 @@ it
           workbench: await workbench.locator('#app').evaluate(timings),
         }),
     );
+    if (warmRefresh) {
+      expect(
+        (await page.evaluate(timings)).reads.map(([path]) => path),
+      ).not.toContain('/api/v1/d-entry/native-prewarm');
+    }
     console.info(
       'SEALED_PROFILE_REFRESH ' +
         JSON.stringify({
@@ -2321,7 +2332,12 @@ it.skipIf(!browserExecutable)(
         .invoke(receipt.opened.scopeReference.scopeId)
         .then((value) => value.status),
     ).toBe(404);
-    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(2);
+    expect(
+      vi
+        .mocked(f.owner.acquirePrincipal)
+        .mock.calls.map(([, issue]) => issue.identity.threadId),
+    ).toEqual(expect.arrayContaining([null, f.selection.threadId]));
     await context.close();
   },
 );

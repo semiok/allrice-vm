@@ -121,6 +121,7 @@ type OwnedPage = {
 // Session follow and every other stream stay with the currently issued page.
 const employeeStreams = new Set([
   '$events',
+  'remoteAccess/follow',
   'session/control',
   'workspace/follow',
 ]);

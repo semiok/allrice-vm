@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   DEntrySelectionInputSchema,
+  type DEntryIdentity,
   type DEntryNativePrewarmTicket,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
@@ -149,11 +150,13 @@ export function EmployeeNativePage({
   prepare = false,
   initialUnavailable = false,
   startupAssetUrls = noStartupAssets,
+  warmIdentity,
 }: {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
   startupAssetUrls?: readonly string[];
+  warmIdentity?: DEntryIdentity;
 }) {
   const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
@@ -173,7 +176,8 @@ export function EmployeeNativePage({
     warmup?: EntryWarmup;
     retainFrame?: boolean;
     ticket?: DEntryNativePrewarmTicket;
-  }>({ query });
+    warmIdentity?: DEntryIdentity;
+  }>({ query, warmIdentity });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
     undefined,
@@ -816,49 +820,38 @@ export function EmployeeNativePage({
             : state,
       );
     };
-    const prewarming = prepare
-      ? parsedEntry.then(async ({ selection }) => {
-          await waitForVisibleEntry(lifetime.signal);
-          lifetime.signal.throwIfAborted();
-          warmup ??= startEntryWarmup(
-            selection,
-            lifetime,
-            assetUrls.current,
-            ticket,
-            activation.foregroundOpen,
-          );
-          warmup.progress.show = showPrewarm;
-          const progress = warmup.progress.current;
-          if (progress) showPrewarm(progress.state, progress.activeLimit);
-          await warmup.result;
-        })
-      : undefined;
+    const startPrewarming = () =>
+      prepare
+        ? parsedEntry.then(async ({ selection }) => {
+            await waitForVisibleEntry(lifetime.signal);
+            lifetime.signal.throwIfAborted();
+            warmup ??= startEntryWarmup(
+              selection,
+              lifetime,
+              assetUrls.current,
+              ticket,
+              activation.foregroundOpen,
+            );
+            warmup.progress.show = showPrewarm;
+            const progress = warmup.progress.current;
+            if (progress) showPrewarm(progress.state, progress.activeLimit);
+            await warmup.result;
+          })
+        : undefined;
+    let prewarming = activation.warmIdentity ? undefined : startPrewarming();
     void prewarming?.catch(() => {}); // setup reports the same rejection.
-    const setup = async () => {
-      const entry = await parsedEntry;
-      const selection = prepare
-        ? await prepareEmployeeEntry(
-            entry,
-            lifetime.signal,
-            () => {
-              ticket = undefined;
-              if (warmup) warmup.progress.ticket = undefined;
-              setStatus('opening');
-              timer = window.setTimeout(() => finish('failed'), entryWaitMs);
-            },
-            prewarming,
-          )
-        : entry.selection;
-      const { params } = entry;
-      if (selection.threadId && !entry.selection.threadId)
-        params.set('threadId', selection.threadId);
-      if (prepare && selection.threadId) selectedQuery = params.toString();
-      const warmIdentity = warmup?.readIdentity();
-      const identity =
-        warmIdentity ??
-        (await readEmployeeEntryIdentity(selection, lifetime.signal));
-      lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(identity, selection, () => {
+    const opening = () => {
+      ticket = undefined;
+      if (warmup) warmup.progress.ticket = undefined;
+      setStatus('opening');
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+    };
+    const connect = (
+      identity: DEntryIdentity,
+      selection: DEntrySelectionInput,
+    ) =>
+      openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         unbindMemoryWrites?.();
         send(pageRevoked);
@@ -887,7 +880,61 @@ export function EmployeeNativePage({
             })
             .catch(() => {});
       });
-      const issued = (await carrier.ready).scopeReference;
+    const setup = async () => {
+      const entry = await parsedEntry;
+      let selection = entry.selection;
+      let identity: DEntryIdentity | undefined;
+      let opened: Awaited<ReturnType<typeof connect>['ready']> | undefined;
+      const warm = activation.warmIdentity;
+      if (
+        prepare &&
+        !entry.operationId &&
+        warm &&
+        selection.threadId &&
+        warm.threadId === selection.threadId &&
+        warm.workspaceId === selection.workspaceId &&
+        warm.employeeInstanceId === selection.employeeInstanceId
+      ) {
+        await waitForVisibleEntry(lifetime.signal);
+        opening();
+        const attempt = (carrier = connect(warm, selection));
+        try {
+          opened = await attempt.ready;
+          identity = warm;
+        } catch (error) {
+          lifetime.signal.throwIfAborted();
+          // Before the page command it is safe to fall back to the cold path.
+          // A dispatched attempt must retain its normal failure and close.
+          if (attempt.dispatched) throw error;
+          await attempt.close();
+          carrier = undefined;
+          remoteRevoked = false;
+          window.clearTimeout(timer);
+          setStatus('warming');
+        }
+      }
+      if (!opened || !identity) {
+        prewarming ??= startPrewarming();
+        selection = prepare
+          ? await prepareEmployeeEntry(
+              entry,
+              lifetime.signal,
+              opening,
+              prewarming,
+            )
+          : entry.selection;
+        identity =
+          warmup?.readIdentity() ??
+          (await readEmployeeEntryIdentity(selection, lifetime.signal));
+        lifetime.signal.throwIfAborted();
+        carrier = connect(identity, selection);
+        opened = await carrier.ready;
+      }
+      const { params } = entry;
+      if (selection.threadId && !entry.selection.threadId)
+        params.set('threadId', selection.threadId);
+      if (prepare && selection.threadId) selectedQuery = params.toString();
+      const issued = opened.scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
       if (navigating) return;

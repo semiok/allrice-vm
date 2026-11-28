@@ -218,6 +218,7 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
 
 it('replaces the borrowed root while keeping native employee events on the same channel', async () => {
   const f = await fixture();
+  const previousRevocation = f.registerThread(f.selection.threadId);
   const target = randomUUID();
   const revoked = f.registerThread(target);
   const { peer, scopeId, receive } = await open(f, true);
@@ -271,6 +272,8 @@ it('replaces the borrowed root while keeping native employee events on the same 
   expect((await f.invokeThread(nextScope, f.selection.threadId)).status).toBe(
     404,
   );
+  previousRevocation.abort();
+  expect((await f.invokeThread(nextScope, target)).status).toBe(200);
   const targetClosed = once(peer, 'close');
   revoked.abort();
   expect(await receive('life')).toMatchObject({ type: 'error' });

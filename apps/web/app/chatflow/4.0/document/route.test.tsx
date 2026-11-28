@@ -22,6 +22,9 @@ import {
 import { deferred } from '../../../../../../packages/d-entry-principal/test/host-fixture';
 
 const authenticated = vi.hoisted(() => vi.fn());
+const entryContext = vi.hoisted(() => vi.fn());
+const entryRoot = vi.hoisted(() => vi.fn());
+const entryDiscovery = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
 const directory = vi.hoisted(() => vi.fn());
@@ -30,8 +33,10 @@ const cookie = vi.hoisted(() => ({ value: '' }));
 vi.mock('@allrice/database', async (load) => ({
   ...(await load<typeof Database>()),
   readDEntryEmployeeDirectory: directory,
+  getDEntryNativeRootPin: entryRoot,
 }));
 vi.mock('next/headers', () => ({
+  headers: async () => new Headers(),
   cookies: async () => ({
     get: () => cookie,
   }),
@@ -39,10 +44,12 @@ vi.mock('next/headers', () => ({
 vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
   ...(await importOriginal<typeof NativeWorker>()),
   requestDEntryProfile: profileRequest,
+  requestDEntryWorker: entryDiscovery,
 }));
 vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
   ...(await importOriginal<typeof SessionIdentity>()),
   requireRequestContext: authenticated,
+  getRequestContext: entryContext,
 }));
 vi.mock('../../../../lib/d-entry/released-profile-assets', () => ({
   readLocalProfileAssets: releasedAssets,
@@ -72,12 +79,44 @@ const request = (suffix = query) =>
   });
 beforeEach(() => {
   authenticated.mockReset();
+  entryContext.mockReset();
+  entryRoot.mockReset();
+  entryDiscovery.mockReset();
   historyIdentity.mockReset();
   profileRequest.mockReset();
   directory.mockReset();
   releasedAssets.mockReset();
   cookie.value = 'unit-test-original-session-cookie';
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
+});
+
+it('issues a read-only warm startup hint for the exact current rooted selection', async () => {
+  const f = await fixture();
+  entryContext.mockResolvedValue(f.context);
+  historyIdentity.mockResolvedValue(f.identity);
+  entryRoot.mockImplementation(() => f.root());
+  entryDiscovery.mockImplementation(() =>
+    Response.json({
+      identity: f.identity,
+      controlReady: true,
+      bindingRef: f.owner.bindingRef,
+    }),
+  );
+  const render = () =>
+    EntryPage({ searchParams: Promise.resolve(f.selection) });
+  expect((await render()).props.warmIdentity).toEqual(f.identity);
+  expect(entryDiscovery).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ context: f.context, selection: f.selection }),
+    'native-owner',
+  );
+  entryDiscovery.mockImplementationOnce(() =>
+    Response.json({
+      identity: f.identity,
+      controlReady: false,
+      bindingRef: f.owner.bindingRef,
+    }),
+  );
+  expect((await render()).props.warmIdentity).toBeUndefined();
 });
 
 it('the Next product page preserves selection before the client opens its long-lived owner', async () => {

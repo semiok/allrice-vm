@@ -1,16 +1,68 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { IdentityError, preparePersonNativeWebRoster } from '@allrice/database';
+import {
+  DEntryNativeDiscoverySchema,
+  DEntrySelectionInputSchema,
+  sameDEntryIdentity,
+} from '@allrice/contracts';
+import {
+  getDEntryNativeRootPin,
+  IdentityError,
+  preparePersonNativeWebRoster,
+} from '@allrice/database';
 import {
   findDEntryCreationWorkspace,
   findDEntryEmployee,
 } from '../../../lib/d-entry/entry-threads';
 import { readStartupProfileAssetUrls } from '../../../lib/d-entry/released-profile-assets';
+import { currentNativeRequest } from '../../../lib/d-entry/native-request';
+import {
+  readDEntryWorkerJson,
+  requestDEntryWorker,
+} from '../../../lib/d-entry/native-worker';
 import { getRequestContext } from '../../../lib/identity/session';
 import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
+
+async function readWarmEntry(query: URLSearchParams) {
+  const selection = DEntrySelectionInputSchema.safeParse(
+    Object.fromEntries(query),
+  );
+  if (
+    !selection.success ||
+    !selection.data.threadId ||
+    [...query.keys()].some((key) => query.getAll(key).length !== 1)
+  )
+    return;
+  try {
+    const request = new Request('http://localhost/chatflow/4.0', {
+      headers: await headers(),
+      signal: AbortSignal.timeout(1_500),
+    });
+    const context = await getRequestContext(request);
+    if (!context) return;
+    const input = await currentNativeRequest(request, selection.data, context);
+    const [root, discovery] = await Promise.all([
+      getDEntryNativeRootPin(context, selection.data),
+      requestDEntryWorker(input, 'native-owner').then((response) =>
+        readDEntryWorkerJson(response, (value) =>
+          DEntryNativeDiscoverySchema.strip().parse(value),
+        ),
+      ),
+    ]);
+    // Discovery is read-only. The socket must still own and admit the page.
+    if (
+      discovery.controlReady &&
+      sameDEntryIdentity(discovery.identity, input.identity) &&
+      sameDEntryIdentity(root.identity, input.identity)
+    )
+      return input.identity;
+  } catch {
+    // Cold or unavailable: start through the regular browser prewarm path.
+  }
+}
 
 export default async function EmployeeNativeEntryPage({
   searchParams,
@@ -92,10 +144,15 @@ export default async function EmployeeNativeEntryPage({
       return <EmployeeNativePage query="" initialUnavailable prepare />;
     }
   }
+  const [startupAssetUrls, warmIdentity] = await Promise.all([
+    readStartupProfileAssetUrls(),
+    readWarmEntry(query),
+  ]);
   return (
     <EmployeeNativePage
       query={query.toString()}
-      startupAssetUrls={await readStartupProfileAssetUrls()}
+      startupAssetUrls={startupAssetUrls}
+      warmIdentity={warmIdentity}
       prepare
     />
   );
