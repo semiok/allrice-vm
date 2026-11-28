@@ -2,7 +2,10 @@ import { expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
+import { selectScopedModel } from '@allrice/model-gateway';
 import {
+  managedModelRequest,
+  managedModelPrompt,
   nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
@@ -684,4 +687,64 @@ it('denies an unobserved direct root input and a same-ID direct child input', ()
     1,
   );
   expect(f.searchOrigin('child')).toBeNull();
+});
+
+it('routes through the DSH agent/request payload with an opaque scoped receiver before selecting adapter controls', async () => {
+  const lifetime = new globalThis.AbortController();
+  const root = { provider: 'openai-codex', model: 'root-fixture' };
+  const child = { provider: 'deepseek', model: 'child-fixture' };
+  const next = () => Promise.resolve({ ...root, reasoningEffort: 'high' });
+  const waterfall = managedModelRequest(
+    selectScopedModel,
+    [{ ...child, parentSessionId: 'parent', scope: 'subagent' }],
+    root,
+    lifetime.signal,
+  );
+  const payload = {
+    agent: {
+      session: {
+        id: 'child',
+        header: { origin: 'subagent', parentSession: 'parent' },
+      },
+    },
+    signal: lifetime.signal,
+  };
+  const scopeCarrier = Object.freeze({});
+  await expect(waterfall.call(scopeCarrier, payload, next)).resolves.toEqual(
+    child,
+  );
+  payload.agent.session.header.parentSession = 'other';
+  await expect(waterfall.call(scopeCarrier, payload, next)).resolves.toEqual(
+    await next(),
+  );
+  lifetime.abort();
+  await expect(
+    waterfall.call(scopeCarrier, payload, next),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+});
+
+it('uses the current scoped model in the native prompt without mutating the retained session', async () => {
+  const lifetime = new globalThis.AbortController();
+  const route = { provider: 'openai', model: 'vision-fixture' };
+  const prior = { provider: 'deepseek', model: 'old-text-fixture' };
+  const context = { agent: { session: { id: 'retained', header: {} } } };
+  const native = Object.freeze({
+    variables: Object.freeze({ ...prior, name: 'fixture' }),
+  });
+  const next = async () => native;
+  const prompt = managedModelPrompt(
+    selectScopedModel,
+    [],
+    route,
+    lifetime.signal,
+  );
+  await expect(prompt(null, context, next)).resolves.toEqual({
+    variables: { ...route, name: 'fixture' },
+  });
+  expect(native.variables).toEqual({ ...prior, name: 'fixture' });
+  await expect(prompt(null, {}, next)).resolves.toBe(native);
+  lifetime.abort();
+  await expect(prompt(null, context, next)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
 });

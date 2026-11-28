@@ -49,6 +49,7 @@ export type PersonVmWebStartup = Readonly<
   {
     receipt: PersonVmWebEndpointReceipt;
     selectedEmployee?: PersonVmEmployeeSelection;
+    editorThreadId?: string;
     /** Proven on this start lease before guest profile staging. */
     unusedEmployeeHomes?: true;
     recordNativeFailure?(

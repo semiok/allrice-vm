@@ -5,13 +5,19 @@ import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
   PlatformModelConfigurationSchema,
+  UpdatePlatformModelSettingsSchema,
   type PlatformModelConfiguration,
 } from '@allrice/contracts';
-import { getDatabase, readPlatformModelSettings } from '@allrice/database';
+import {
+  createDedicatedDatabase,
+  getDatabase,
+  readPlatformModelSettings,
+} from '@allrice/database';
 import {
   ModelGatewayError,
   createOwnedModelTransport,
   withGatewayAuthTransaction,
+  type DshGatewayRoute,
   type GatewayFetchClassification,
 } from '@allrice/model-gateway';
 import {
@@ -22,9 +28,28 @@ import { codexSubscriptionHome } from '../codex-subscription-home.js';
 
 const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
+const oauthEndpoint = 'https://auth.openai.com/oauth/token';
 
-async function readSelectedSubscription(connectionId: string) {
-  const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
+async function readSelectedSubscription(
+  connectionId: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  // A stalled SQL lookup must not hold a revoked route or close another
+  // route's connection. This read owns its client through cancellation.
+  const active = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+  const sql = createDedicatedDatabase(getDatabase());
+  let closing: Promise<void> | undefined;
+  const close = () => (closing ??= sql.end({ timeout: 0 }));
+  const cancel = () => void close().catch(() => {});
+  active.addEventListener('abort', cancel, { once: true });
+  try {
+    active.throwIfAborted();
+    const [selected] = await sql.begin('read only', async (tx) => {
+      active.throwIfAborted();
+      await tx`set local statement_timeout = '3000ms'`;
+      active.throwIfAborted();
+      return tx<{ slot: 1 | 2; revision: string }[]>`
     select slot, extract(epoch from updated_at)::text as revision
     from allrice_codex_subscriptions
     where enabled and exists (
@@ -36,9 +61,18 @@ async function readSelectedSubscription(connectionId: string) {
         and c.status='ready' and p.enabled
         and p.provider_key in ('codex','openai-codex') and p.auth_mode='chatgpt_subscription'
     )
-  `;
-  if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
-  return selected;
+      `;
+    });
+    active.throwIfAborted();
+    if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+    return selected;
+  } catch (error) {
+    active.throwIfAborted();
+    throw error;
+  } finally {
+    active.removeEventListener('abort', cancel);
+    await close();
+  }
 }
 
 export function managedCodexModel(model: string) {
@@ -60,17 +94,6 @@ export function managedCodexModel(model: string) {
   };
 }
 
-class MeteredCodexCredentials extends LocalCredentials {
-  override modifyRecord(
-    ...args: Parameters<LocalCredentials['modifyRecord']>
-  ): ReturnType<LocalCredentials['modifyRecord']> {
-    if (args[0] !== credential)
-      return Promise.reject(new ModelGatewayError('AUTHORIZATION_DENIED'));
-    // Join the original DSH operation, including writer lock and persistence.
-    return withGatewayAuthTransaction(() => super.modifyRecord(...args));
-  }
-}
-
 function classify(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -82,7 +105,7 @@ function classify(
     return null;
   if (url.href === 'https://chatgpt.com/backend-api/codex/responses')
     return { kind: 'model', protocol: 'openai-responses' };
-  if (url.href === 'https://auth.openai.com/oauth/token')
+  if (url.href === oauthEndpoint)
     return { kind: 'auth-refresh', protocol: 'opaque' };
   return null;
 }
@@ -96,6 +119,7 @@ async function openCodexGeneration(
   model: string,
   reasoning: PlatformModelConfiguration['reasoningEffort'],
   images: ReturnType<typeof createProductionModelImages> | undefined,
+  trackAuth: <T>(work: Promise<T>) => Promise<T>,
 ) {
   lifetime.throwIfAborted();
   const historicalIds =
@@ -118,6 +142,22 @@ async function openCodexGeneration(
       release();
     };
   }
+  class MeteredCodexCredentials extends LocalCredentials {
+    override modifyRecord(
+      ...args: Parameters<LocalCredentials['modifyRecord']>
+    ): ReturnType<LocalCredentials['modifyRecord']> {
+      if (args[0] !== credential)
+        return Promise.reject(new ModelGatewayError('AUTHORIZATION_DENIED'));
+      // Join the original DSH operation, including writer lock and persistence.
+      const release = retain();
+      return trackAuth(
+        withGatewayAuthTransaction(() => super.modifyRecord(...args)).finally(
+          release,
+        ),
+      );
+    }
+  }
+
   let closing: Promise<void> | undefined;
   function close() {
     if (closing) return closing;
@@ -128,7 +168,7 @@ async function openCodexGeneration(
     const active = AbortSignal.any([signal, revoked]);
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
-    const current = await readSelectedSubscription(connectionId);
+    const current = await readSelectedSubscription(connectionId, active);
     active.throwIfAborted();
     if (
       !record.configured ||
@@ -188,17 +228,26 @@ export async function createProductionCodexRuntime(
   lifetime: AbortSignal,
   ownerId: string,
   readModelImage?: ReadProductionModelImage,
+  approvedModel?: string,
 ) {
   lifetime.throwIfAborted();
-  // A Host and its existing guests share one pinned route. Activate the
-  // audited platform selection when constructing the next Host generation.
+  // Keep the audited platform connection and default. A scoped Codex rule
+  // may pin a model that the same platform adapter supports.
   const {
-    configuration: { connectionId, workModel: model, reasoningEffort },
+    configuration: { connectionId, workModel, reasoningEffort },
   } = await readPlatformModelSettings();
   lifetime.throwIfAborted();
+  const configured =
+    approvedModel === undefined
+      ? { success: true as const, data: workModel }
+      : UpdatePlatformModelSettingsSchema.shape.configuration.shape.workModel.safeParse(
+          approvedModel,
+        );
+  if (!configured.success) throw new ModelGatewayError('BINDING_INVALID');
+  const model = configured.data;
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
-  const route = Object.freeze({
+  const route: DshGatewayRoute = Object.freeze({
     provider,
     model,
     transport: 'sse' as const,
@@ -208,6 +257,16 @@ export async function createProductionCodexRuntime(
     ? createProductionModelImages(readModelImage)
     : undefined;
   const transport = createOwnedModelTransport(ownerId);
+  // A route may stop its model sockets without interrupting a rotating OAuth
+  // grant that another route sharing this slot will subsequently need.
+  const oauth = createOwnedModelTransport(ownerId + ':auth');
+  const authTransactions = new Set<Promise<unknown>>();
+  function trackAuth<T>(work: Promise<T>) {
+    authTransactions.add(work);
+    const release = () => authTransactions.delete(work);
+    void work.then(release, release);
+    return work;
+  }
   let generation: Awaited<ReturnType<typeof openCodexGeneration>> | undefined;
   let operations = Promise.resolve();
   const retiring = new Set<Promise<void>>();
@@ -236,7 +295,7 @@ export async function createProductionCodexRuntime(
           await generation.assertCurrent(active);
           return generation;
         }
-        const selection = await readSelectedSubscription(connectionId);
+        const selection = await readSelectedSubscription(connectionId, active);
         active.throwIfAborted();
         generation = await openCodexGeneration(
           revoked,
@@ -245,6 +304,7 @@ export async function createProductionCodexRuntime(
           model,
           reasoningEffort,
           images,
+          trackAuth,
         );
         active.throwIfAborted();
         return generation;
@@ -265,6 +325,45 @@ export async function createProductionCodexRuntime(
       () => {},
     );
     return task;
+  }
+  let catalog:
+    | Promise<Awaited<ReturnType<typeof openCodexGeneration>>['modelMetadata']>
+    | undefined;
+  function readCatalogModelMetadata(signal: AbortSignal) {
+    signal.throwIfAborted();
+    return (catalog ??= (async () => {
+      const host = new Context();
+      try {
+        await host.plugin(Llm).await();
+        await host
+          .plugin(PiAi, {
+            providers: {
+              [provider]: {
+                transport: 'sse',
+                models: [
+                  ...PlatformModelConfigurationSchema.shape.workModel.options,
+                ].map(managedCodexModel),
+                reasoning: reasoningEffort,
+              },
+            },
+          })
+          .await();
+        const all = await Promise.all(
+          PlatformModelConfigurationSchema.shape.workModel.options.map((id) =>
+            host.llm.resolveModelInfo(provider, id, lifetime),
+          ),
+        );
+        return {
+          modelInfo: all.find(({ id }) => id === model)!,
+          historicalModels: all.filter(({ id }) => id !== model),
+        };
+      } finally {
+        await host.fiber.dispose();
+      }
+    })()).then((info) => {
+      signal.throwIfAborted();
+      return info;
+    });
   }
   const llm: Pick<LlmRuntime, 'prepareCall'> = {
     async prepareCall(config, signal) {
@@ -298,9 +397,51 @@ export async function createProductionCodexRuntime(
       };
     },
   };
+  let oauthStopped: Promise<void> | undefined;
+  async function stoppedEvidence(candidate: string, signal: AbortSignal) {
+    signal.throwIfAborted();
+    if (candidate !== ownerId || !oauthStopped)
+      throw new ModelGatewayError('AUTHORIZATION_DENIED');
+    const [modelEvidence, oauthEvidence] = await Promise.all([
+      transport.stoppedEvidence(candidate, signal),
+      oauthStopped.then(() =>
+        oauth.stoppedEvidence(candidate + ':auth', signal),
+      ),
+    ]);
+    signal.throwIfAborted();
+    return modelEvidence + '|' + oauthEvidence;
+  }
+  function close() {
+    if (closing) return closing;
+    stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
+    oauthStopped = Promise.allSettled([...authTransactions]).then(() =>
+      oauth.close(),
+    );
+    return (closing = Promise.allSettled([
+      transport.close(),
+      oauthStopped,
+      catalog,
+      operations.then(async () => {
+        if (generation) retire(generation);
+        await Promise.allSettled([...retiring]);
+        if (retirementFailures.length)
+          throw new AggregateError(
+            retirementFailures,
+            'CODEX_GENERATION_CLOSE_UNKNOWN',
+          );
+      }),
+    ]).then((results) => {
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length)
+        throw new AggregateError(failures, 'CODEX_RUNTIME_CLOSE_UNKNOWN');
+    }));
+  }
   return Object.freeze({
     llm,
     route,
+    readCatalogModelMetadata,
     async readModelMetadata(signal: AbortSignal) {
       return (await current(signal)).modelMetadata;
     },
@@ -314,33 +455,16 @@ export async function createProductionCodexRuntime(
     },
     transport: {
       ...transport,
+      close,
+      stoppedEvidence,
+      fetchOwned: (...args: Parameters<typeof transport.fetchOwned>) =>
+        (args[1].url === oauthEndpoint ? oauth : transport).fetchOwned(...args),
       async beforeDispatch(signal: AbortSignal) {
         await current(signal);
         signal.throwIfAborted();
       },
     },
-    confirmTransportStopped: transport.stoppedEvidence,
-    close() {
-      if (closing) return closing;
-      stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
-      return (closing = Promise.allSettled([
-        transport.close(),
-        operations.then(async () => {
-          if (generation) retire(generation);
-          await Promise.allSettled([...retiring]);
-          if (retirementFailures.length)
-            throw new AggregateError(
-              retirementFailures,
-              'CODEX_GENERATION_CLOSE_UNKNOWN',
-            );
-        }),
-      ]).then((results) => {
-        const failures = results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        );
-        if (failures.length)
-          throw new AggregateError(failures, 'CODEX_RUNTIME_CLOSE_UNKNOWN');
-      }));
-    },
+    confirmTransportStopped: stoppedEvidence,
+    close,
   });
 }

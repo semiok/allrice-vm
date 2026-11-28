@@ -200,7 +200,7 @@ function nativeFacts() {
   };
 }
 
-async function setup(withWebSearch = false) {
+async function setup(withWebSearch = false, scopedRouting = false) {
   const lifetime = new AbortController();
   let observed!: Observer;
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
@@ -256,6 +256,7 @@ async function setup(withWebSearch = false) {
       assertRouteCurrent: async () => lifetime.signal,
       route: { provider: 'openai-codex', model },
       bindReference,
+      ...(scopedRouting && { scoped: { applies: () => true } }),
       ...(withWebSearch && {
         webSearch: { provider: { search: vi.fn() }, bind: bindWebSearch },
       }),
@@ -324,6 +325,26 @@ async function setup(withWebSearch = false) {
     },
   };
 }
+
+it('keeps standalone R2 Search closed for a scoped VM even when the Host configured its provider', async () => {
+  const f = await setup(true, true);
+  try {
+    const resolve = f.resolveSearch;
+    if (!resolve) throw Error('Native Search service unavailable');
+    await expect(
+      resolve(
+        {} as IncomingMessage,
+        f.profile.receipt.binding,
+        new AbortController().signal,
+        vi.fn(),
+      ),
+    ).rejects.toMatchObject({ code: 'DENIED' });
+    expect(f.observeNativeSearchCallFor).not.toHaveBeenCalled();
+    expect(f.bindWebSearch).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
+});
 
 it('binds Search to the exact root occurrence when a child shares its request ID', async () => {
   const f = await setup(true);

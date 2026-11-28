@@ -92,6 +92,14 @@ export function createOwnedModelTransport(ownerId: string) {
         evidence = `undici-owner-stopped:${ownerId}:${randomUUID()}`;
       }));
     },
+    async confirmClosed() {
+      const join = closing;
+      if (!join) return false;
+      return join.then(
+        () => evidence !== undefined,
+        () => false,
+      );
+    },
     async stoppedEvidence(candidate: string, signal: AbortSignal) {
       signal.throwIfAborted();
       if (candidate !== ownerId || !closing)
