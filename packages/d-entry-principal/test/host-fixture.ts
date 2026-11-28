@@ -289,7 +289,8 @@ class Catalog extends TypertRemoteService {
       yield {
         type: 'snapshot',
         header: { version: 1, id: sessionId, createdAt: 1, isSeeded: false },
-        cursor: 0,
+        // rc.2 defines the tail of an empty Session journal as -1.
+        cursor: -1,
         records: [],
         hasMore: false,
         projections: { asOfSeq: 0, values: {} },
