@@ -25,12 +25,14 @@ async function personalEmployeeCapacityMessage(response: Response) {
       .catch(() => null);
   if (body?.error?.code !== 'QUOTA_EXCEEDED') return;
   const message = body.error.message;
+  // r1-exempt(own-text): 只显示系统容量门卫随 409 QUOTA_EXCEEDED 返回的名额数。
   const limit =
     typeof message === 'string'
       ? /^每人最多 ([1-9][0-9]*) 个员工$/.exec(message)?.[1]
       : undefined;
   if (limit)
     return `员工名额已满，最多可以有 ${limit} 个员工。可以关闭此窗口，继续使用已有员工。`;
+  // r1-exempt(own-text): 只显示系统容量门卫随 409 QUOTA_EXCEEDED 返回的固定停机提示。
   if (message === '当前工作台还没确认停机，停机后可以创建更多员工。')
     return message;
   return '暂时无法创建更多员工。可以关闭此窗口，继续使用已有员工。';
