@@ -149,6 +149,10 @@ export async function fixture(
     }
   });
   const profileObserved = vi.fn<(part: 'item' | 'terminal') => void>();
+  const skillListeners = new Set<() => void>();
+  let fixtureSkills:
+    | { name: string; description: string; modelInvocable: boolean }[]
+    | undefined;
   vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) => {
     const activity = control.acquire(input, active);
     return {
@@ -157,6 +161,22 @@ export async function fixture(
         const scope = await activity.run(signal);
         return {
           ...scope,
+          subscribeSkillChanges(listener: () => void) {
+            skillListeners.add(listener);
+            return () => skillListeners.delete(listener);
+          },
+          invokePage(call, active) {
+            if (fixtureSkills && call.endpoint === 'skills/list') {
+              active.throwIfAborted();
+              return Promise.resolve({
+                kind: 'page' as const,
+                endpoint: call.endpoint,
+                value: { skills: fixtureSkills },
+                attachments: [],
+              });
+            }
+            return scope.invokePage(call, active);
+          },
           stream(call, caller, observer) {
             return scope.stream(
               call,
@@ -615,6 +635,10 @@ export async function fixture(
     invokeThread,
     profileBorrows,
     profileObserved,
+    setFixtureSkills(entries: NonNullable<typeof fixtureSkills>) {
+      fixtureSkills = entries;
+      for (const listener of skillListeners) listener();
+    },
     profileFailures,
     profileSource,
     profileUrl,

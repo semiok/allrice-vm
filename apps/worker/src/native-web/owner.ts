@@ -70,6 +70,7 @@ import {
   type PublishNativeMemoryCall,
 } from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
+import { nativeWebSkillSource } from './skill-source.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
 
 export class NativeRootJoinUnknown extends Error {
@@ -1060,6 +1061,7 @@ export async function openNativeWebOwner(input: {
               },
             };
           },
+          context && nativeWebSkillSource(context, issue, binding, input.vm),
         );
       },
       readSessions(requestSignal: AbortSignal) {

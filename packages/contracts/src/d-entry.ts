@@ -152,6 +152,10 @@ export const DEntryPageRevokedSchema = z.strictObject({
 export const DEntryPageClosedSchema = z
   .object({ type: z.literal('closed'), scopeId: UuidSchema })
   .strict();
+export const DEntryPageSkillRefreshSchema = z.strictObject({
+  type: z.enum(['skills-changed', 'refresh-skills', 'skills-refreshed']),
+  scopeId: UuidSchema,
+});
 export const DEntryPageSwitchSchema = z.strictObject({
   type: z.literal('switch'),
   requestId: UuidSchema,

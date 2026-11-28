@@ -21,6 +21,7 @@ import {
   type PageNativeThreadRegistration,
   pageSwitchReady,
   pageThreadScope,
+  pageSkillsRefreshed,
   pageThreadSelected,
   type PageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
@@ -412,7 +413,11 @@ export function installEmployeeProductOwner(ctx: Context) {
           };
           connection.reconnect();
         };
+        const onSkills = () => {
+          if (!signal.aborted) connection.reconnect();
+        };
         document.addEventListener(pageThreadScope, onScope);
+        document.addEventListener(pageSkillsRefreshed, onSkills);
         const cleanup = [
           connection.generation.subscribe(update),
           native.sessions.list.subscribe(update),
@@ -421,6 +426,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
         return () => {
           document.removeEventListener(pageThreadScope, onScope);
+          document.removeEventListener(pageSkillsRefreshed, onSkills);
           cleanup.forEach((unsubscribe) => unsubscribe());
         };
       }, 'AllRice authorized thread selection');

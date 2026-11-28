@@ -1696,7 +1696,9 @@ it('uses actual DSH replies for create and fork registration on a page without a
     decodeDEntryRegisteredThread(create.headers.get('x-allrice-d-entry-thread'))
       ?.id,
   ).toBe((await f.registerRoot.mock.results[0]?.value)?.identity.threadId);
-  expect(f.host.catalog.creationRequests).toEqual([{}]);
+  expect(f.host.catalog.creationRequests).toEqual([
+    { agentPreset: 'standard' },
+  ]);
   expect(f.prepareEditorRoot).not.toHaveBeenCalled();
   expect(f.registerRoot).toHaveBeenNthCalledWith(
     1,

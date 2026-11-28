@@ -175,6 +175,13 @@ tags:
       && pnpm -r --workspace-concurrency=1 --filter @allrice/worker... --if-present run build
       && node apps/worker/scripts/prepare-native-artifact.mjs --root=.
       && NATIVE_MEMORY_POSTGRES=1 ALLRICE_RUN_DB_INTEGRATION=1 ALLRICE_NATIVE_WEB_TEST_CLI="$NATIVE_WEB_TEST_CLI" pnpm exec vitest run {file} --maxWorkers=1
+  manual:NATIVE_SKILL_POSTGRES:
+    reason: Pinned public rc.2 Web profile and isolated PostgreSQL for the authenticated native Skill owner duplex and committed binding withdrawal.
+    command: >-
+      test -f "$NATIVE_WEB_TEST_CLI"
+      && test -n "$ALLRICE_TEST_DATABASE_URL"
+      && pnpm build:test-sources
+      && ALLRICE_RUN_DB_INTEGRATION=1 ALLRICE_NATIVE_WEB_TEST_CLI="$NATIVE_WEB_TEST_CLI" pnpm exec vitest run {file} --maxWorkers=1
   manual:WORKDAY_FIXTURE_SOURCE:
     reason: Exact allrice-vm checkout with nativeEntryServer/nativeEntryFixture, pinned by full Git SHA in FIXTURE_CONFIG and validated by workday/run.py. FIXTURE_OUTPUT must be a new output directory. Synthetic consumer HTTP only, no real Host, VM, database, model or Dev acceptance.
     command: test "{file}" = scripts/acceptance/workday/native-entry.fixture.test.ts && (fixture_rc=0; python3 scripts/acceptance/workday/run.py --mode fixture --config "$FIXTURE_CONFIG" --output "$FIXTURE_OUTPUT" || fixture_rc=$?; test "$fixture_rc" -eq 2 && test -f "$FIXTURE_OUTPUT/native-source.json")

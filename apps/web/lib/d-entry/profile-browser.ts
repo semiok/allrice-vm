@@ -30,6 +30,7 @@ import {
 } from './page-carrier';
 import {
   pageNativeThreadRegistered,
+  pageSkillsRefreshed,
   pageThreadScope,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
@@ -211,6 +212,7 @@ export function nativeProfileDocument(
   earlyBundles?: EarlyProfileBundles,
   onThreadScope?: (scope: PageThreadScope) => void,
   onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+  onSkillsRefreshed?: () => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -262,6 +264,18 @@ export function nativeProfileDocument(
     if (data.type === pageRevoked && !lifetime.signal.aborted) {
       lifetime.abort();
       onRevoked();
+    }
+    if (
+      data.type === pageSkillsRefreshed &&
+      onSkillsRefreshed &&
+      !lifetime.signal.aborted &&
+      authority.scopeId === data.resourceScopeId &&
+      container.dataset.sharedMux === '1'
+    ) {
+      const old = peer;
+      peer = undefined;
+      old?.close();
+      onSkillsRefreshed();
     }
     if (data.type === pageCompletion) {
       if (data.state === 'closed') done.resolve();

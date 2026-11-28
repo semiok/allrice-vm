@@ -1,4 +1,8 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import {
+  PrincipalSkillClient,
+  installPrincipalSkillProvider,
+} from './skill-provider.js';
 import { pageDownlink, pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
@@ -43,6 +47,7 @@ import {
 } from './policy.js';
 import type {
   CloseCommand,
+  PrincipalScopeCommand,
   DEntryPageInput,
   DEntryPrincipal,
   DEntryScopeIssue,
@@ -135,10 +140,16 @@ function signalGate(signal: AbortSignal) {
     detach: () => signal.removeEventListener('abort', stop),
   };
 }
-async function commands(input: AsyncIterator<CloseCommand>, stop: () => void) {
-  const next = await input.next();
-  if (!next.done && next.value !== 'close')
-    throw Error('PRINCIPAL_CLOSE_INVALID');
+async function commands(
+  input: AsyncIterator<PrincipalScopeCommand>,
+  stop: () => void,
+  skills: PrincipalSkillClient,
+) {
+  for (;;) {
+    const next = await input.next();
+    if (next.done || next.value === 'close') break;
+    skills.receive(next.value);
+  }
   stop();
 }
 type ReadCompletion = { ok: true } | { ok: false; error: unknown };
@@ -260,7 +271,11 @@ class Scope implements Projection {
   }>();
   private followTimer?: ReturnType<typeof setTimeout>;
   private followRead?: Promise<void>;
-  private readonly followWithdrawals = new Set<string>();
+  private readonly notices: Exclude<
+    ScopeFrame,
+    { type: 'closed' | 'opened' | 'revoked' }
+  >[] = [];
+  readonly skills: PrincipalSkillClient;
   private wakeFollowWithdrawal?: () => void;
   constructor(
     readonly host: PrincipalService,
@@ -268,6 +283,12 @@ class Scope implements Projection {
     readonly parent: PeerScope,
     readonly issue: DEntryScopeIssue,
   ) {
+    this.skills = new PrincipalSkillClient(
+      issue.scopeId,
+      this.abort.signal,
+      (notice) => this.notice(notice),
+      () => host.skills.invalidate(),
+    );
     // Public Host services use the constructor's owning Context. The Peer
     // Context below continues to own every scope registration and its join.
     // Registration precedes any async setup. Child Peer belongs to the exact
@@ -426,18 +447,22 @@ class Scope implements Projection {
       ),
     );
     if (followId && !this.abort.signal.aborted) {
-      this.followWithdrawals.add(followId);
-      this.wakeFollowWithdrawal?.();
+      this.notice({
+        type: 'follow-revoked',
+        scopeId: this.issue.scopeId,
+        followId,
+      });
     }
   }
-  async nextFollowWithdrawal(signal: AbortSignal) {
+  private notice(notice: (typeof this.notices)[number]) {
+    this.notices.push(notice);
+    this.wakeFollowWithdrawal?.();
+  }
+  async nextNotice(signal: AbortSignal) {
     while (true) {
       signal.throwIfAborted();
-      const id = this.followWithdrawals.values().next().value;
-      if (id !== undefined) {
-        this.followWithdrawals.delete(id);
-        return id;
-      }
+      const notice = this.notices.shift();
+      if (notice) return notice;
       try {
         await waitForRead(
           new Promise((resolve) => {
@@ -603,7 +628,7 @@ class Scope implements Projection {
     this.bindings = [];
     this.eventBindings = [];
     this.eventSessions.clear();
-    this.followWithdrawals.clear();
+    this.notices.length = 0;
     if (this.followTimer) clearTimeout(this.followTimer);
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
@@ -624,6 +649,7 @@ class PrincipalService extends TypertRemoteService {
     'sessionController',
   ];
   readonly scopes = new Map<string, Scope>();
+  readonly skills: ReturnType<typeof installPrincipalSkillProvider>;
   private readonly terminalOwners = new Map<string, Scope>();
   private readonly terminalStop = new AbortController();
   private readonly scopeControls = new Set<Promise<void>>();
@@ -642,6 +668,7 @@ class PrincipalService extends TypertRemoteService {
     },
   ) {
     super(hostContext, 'allricePrincipal');
+    this.skills = installPrincipalSkillProvider(hostContext, this.scopes);
     hostContext.remoteAccess.registerPolicy(
       'allrice-d-entry',
       principalPolicy(this.scopes),
@@ -849,7 +876,7 @@ class PrincipalService extends TypertRemoteService {
   async *openScope(
     issue: DEntryScopeIssue,
     signal: AbortSignal,
-  ): RemoteStream<ScopeFrame, CloseCommand> {
+  ): RemoteStream<ScopeFrame, PrincipalScopeCommand> {
     const { args, invocation } = this.raw('allricePrincipal/openScope');
     issue = issueSchema.parse(args.issue);
     const { profile, binding } = this.config;
@@ -900,8 +927,9 @@ class PrincipalService extends TypertRemoteService {
     };
     scope.abort.signal.addEventListener('abort', withdraw, { once: true });
     if (scope.abort.signal.aborted) withdraw();
-    const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
-    const pump = commands(input, gate.stop).catch((error) => {
+    const uplink = invocation.uplink<PrincipalScopeCommand>();
+    const input = uplink[Symbol.asyncIterator]();
+    const pump = commands(input, gate.stop, scope.skills).catch((error) => {
       gate.stop();
       throw error;
     });
@@ -959,15 +987,14 @@ class PrincipalService extends TypertRemoteService {
         };
       }
       while (!gate.abort.signal.aborted) {
-        let followId: string;
+        let notice: Awaited<ReturnType<Scope['nextNotice']>>;
         try {
-          followId = await scope.nextFollowWithdrawal(gate.abort.signal);
+          notice = await scope.nextNotice(gate.abort.signal);
         } catch (error) {
           if (!gate.abort.signal.aborted) throw error;
           break;
         }
-        if (!gate.abort.signal.aborted)
-          yield { type: 'follow-revoked', scopeId: issue.scopeId, followId };
+        if (!gate.abort.signal.aborted) yield notice;
       }
       if (opened && withdrawn && !signal.aborted)
         yield { type: 'revoked', scopeId: issue.scopeId };
@@ -1099,7 +1126,14 @@ class PrincipalService extends TypertRemoteService {
       // rc.2 filters the catalog through RemoteAccess for this non-owner peer.
       const value = await (key === 'session/list'
         ? scope.readCatalog(dispatch, active)
-        : this.native(scope, key, args, dispatch));
+        : this.native(
+            scope,
+            key,
+            args,
+            key === 'skills/list'
+              ? () => this.skills.run(scope, active, dispatch)
+              : dispatch,
+          ));
       active.throwIfAborted();
       // Literal branches retain the source descriptor/result relationship.
       switch (key) {
@@ -1271,9 +1305,11 @@ class PrincipalService extends TypertRemoteService {
               signal: active,
             });
           // The registry call above can overlap a catalog refresh.
-          value = await (nativeArgs === args
-            ? dispatch()
-            : scope.current(dispatch, active));
+          value = await (endpoint === 'skills/list'
+            ? this.skills.run(scope, active, dispatch, true)
+            : nativeArgs === args
+              ? dispatch()
+              : scope.current(dispatch, active));
           if (terminal) terminal.possiblyAllocated = true;
         } catch (error) {
           // These rc.2 failures occur before any allocation. A success or

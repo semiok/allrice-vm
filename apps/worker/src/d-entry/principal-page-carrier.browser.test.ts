@@ -161,6 +161,7 @@ it
     'cold-assets',
     'stall',
     'switch',
+    'skills-refresh',
     'baseline',
     'attached',
     'unattached',
@@ -193,7 +194,9 @@ it
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
     const wallet = scenario.startsWith('wallet-');
-    const realShell = switching || nativeCreate || coldAssets || wallet;
+    const skillsRefresh = scenario === 'skills-refresh';
+    const realShell =
+      switching || nativeCreate || coldAssets || wallet || skillsRefresh;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -314,6 +317,14 @@ it
         sync.mockRestore();
       });
     }
+    if (skillsRefresh)
+      f.setFixtureSkills([
+        {
+          name: 'bound-qa-skill',
+          description: 'QA only',
+          modelInvocable: true,
+        },
+      ]);
     let otherThread = randomUUID();
     let outerCreated = false;
     const revokeOther =
@@ -460,11 +471,16 @@ it
       f.host.catalog.items = f.host.catalog.items.map((item) =>
         item.sessionId === 'root' ? { ...item, cwd: '/work/team' } : item,
       );
+    }
+    let finishSkillTurn: (() => void) | undefined;
+    let ongoingSkillPromptCount = 0;
+    if (outerCreate || skillsRefresh) {
       let records: readonly SessionHistoryRecord[] = [];
       f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
       f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
         expect(sessionId).toBe('root');
         expect(content).toEqual([{ type: 'text', text: '你好' }]);
+        if (skillsRefresh) ongoingSkillPromptCount++;
         const message = {
           role: 'user',
           id: randomUUID(),
@@ -482,24 +498,6 @@ it
           { type: 'user/message', data: message, surfaceOp: 'append' },
           { type: 'step/start', data: { turn: 1, step: 1 } },
           {
-            type: 'tool/call',
-            data: {
-              turn: 1,
-              step: 1,
-              callId: 'present-file-fixture',
-              name: 'present',
-              arguments: { files: [{ path: deliveryPath }] },
-            },
-          },
-          {
-            type: 'deliverables/presented',
-            data: {
-              turn: 1,
-              callId: 'present-file-fixture',
-              files: [{ path: deliveryPath }, { path: '/private/foreign.md' }],
-            },
-          },
-          {
             type: 'assistant/message',
             data: {
               turn: 1,
@@ -516,11 +514,45 @@ it
             data: { turn: 1, reason: { kind: 'completed' } },
           },
         ];
-        records = events.map((event, index) => ({
+        if (outerCreate)
+          events.splice(
+            3,
+            0,
+            {
+              type: 'tool/call',
+              data: {
+                turn: 1,
+                step: 1,
+                callId: 'present-file-fixture',
+                name: 'present',
+                arguments: { files: [{ path: deliveryPath }] },
+              },
+            },
+            {
+              type: 'deliverables/presented',
+              data: {
+                turn: 1,
+                callId: 'present-file-fixture',
+                files: [
+                  { path: deliveryPath },
+                  { path: '/private/foreign.md' },
+                ],
+              },
+            },
+          );
+        const answer = events.map((event, index): SessionHistoryRecord => ({
           type: 'event',
           event: { ...event, seq: index + 1, time: Date.now() },
         }));
-        f.host.catalog.pageRecords = records;
+        if (skillsRefresh) {
+          records = answer.slice(0, 3);
+          finishSkillTurn = () => {
+            records = answer;
+          };
+        } else {
+          records = answer;
+          f.host.catalog.pageRecords = records;
+        }
       };
       f.host.catalog.allocateSessionId = () =>
         summary(expectedNativeId ?? randomUUID()).sessionId;
@@ -1561,6 +1593,62 @@ it
           { cause },
         );
       }
+      await context.close();
+      return;
+    }
+    if (skillsRefresh) {
+      await editor.waitFor({ timeout: 15_000 });
+      const originalCarrier = socketCount;
+      const originalDocument = documentLoads;
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((element, id) => {
+        element.dataset.fixtureDocument = id;
+      }, mark);
+      await editor.click();
+      await editor.press('/');
+      await workbench
+        .getByText('bound-qa-skill', { exact: false })
+        .first()
+        .waitFor();
+      const originalReads = unary.filter(
+        (method) => method === 'skills/list',
+      ).length;
+      expect(originalReads).toBeGreaterThan(0);
+      await editor.press('Escape');
+      await editor.fill('你好');
+      await editor.press('Enter');
+      await expect.poll(() => ongoingSkillPromptCount).toBe(1);
+      expect(finishSkillTurn).toBeDefined();
+      const priorSubscriptions = f.host.catalog.follows.length;
+      // The same Host's outstanding turn completes during the page transport
+      // reattachment. Let the real rc.2 follow snapshot recover its answer.
+      f.host.catalog.beforeFollow = async () => {
+        finishSkillTurn?.();
+        finishSkillTurn = undefined;
+      };
+      f.setFixtureSkills([]);
+      await expect
+        .poll(() => f.host.catalog.follows.length, { timeout: 12_000 })
+        .toBeGreaterThan(priorSubscriptions);
+      await workbench
+        .getByText('隔离会话的首条回复', { exact: true })
+        .waitFor();
+      expect(ongoingSkillPromptCount).toBe(1);
+      await editor.waitFor();
+      await editor.press('Escape');
+      await editor.fill('');
+      await editor.press('/');
+      await expect
+        .poll(() => unary.filter((method) => method === 'skills/list').length)
+        .toBeGreaterThan(originalReads);
+      expect(
+        await workbench.getByText('bound-qa-skill', { exact: false }).count(),
+      ).toBe(0);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+      expect(documentLoads).toBe(originalDocument);
+      expect(socketCount).toBe(originalCarrier);
       await context.close();
       return;
     }

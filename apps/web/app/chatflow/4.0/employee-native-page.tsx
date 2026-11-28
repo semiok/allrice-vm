@@ -21,6 +21,7 @@ import {
   pageEmployeeArchived,
   pageSwitchReady,
   pageThreadScope,
+  pageSkillsRefreshed,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
   pageThreadSwitchPrepared,
@@ -892,87 +893,111 @@ export function EmployeeNativePage({
         speculative ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(identity, selection, () => {
-        const mayReopenSelection = !navigating && !superseded;
-        const target = selectedEmployee;
-        remoteRevoked = true;
-        unbindMemoryWrites?.();
-        send(pageRevoked);
-        if (!prepare && !lifetime.signal.aborted) setFailed(true);
-        // Before issuance, ready's rejection is handled by setting below.
-        if (prepare && mounted) finish('failed');
-        // Password changes and logout can revoke this carrier before their
-        // responses reach the iframe. Only the current cookie decides where
-        // the outer page goes.
-        if (mounted)
-          void retire()
-            .then(async (closed) => {
-              if (!closed || detached || replace.current !== applyQuery) return;
-              const response = await fetch('/api/v1/auth/session', {
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: lifetime.signal,
-              });
-              // The unqualified entry checks the cookie again on navigation.
-              const stillCurrent = () =>
-                !detached &&
-                !superseded &&
-                nextQuery.current === displayedQuery.current &&
-                replace.current === applyQuery;
-              if (!stillCurrent()) return;
-              if (response.status === 401) {
-                location.replace('/chatflow/4.0');
-                return;
-              }
-              if (!mayReopenSelection || !prepare || !response.ok || !target)
-                return;
-              // Committed metadata can revoke the old document before the
-              // initiating dialog receives its HTTP reply.
-              const { threadId, ...employee } = target;
-              const readCurrent = (selection: typeof target) =>
-                readEmployeeEntryIdentity(
-                  selection,
-                  lifetime.signal,
-                  'execute',
-                ).catch((error: unknown) => {
-                  if (
-                    error instanceof EmployeeEntryError &&
-                    [403, 404, 409].includes(error.status) &&
-                    !error.reason
-                  )
-                    return null;
-                  throw error;
+      carrier = openNativePageCarrier(
+        identity,
+        selection,
+        () => {
+          const mayReopenSelection = !navigating && !superseded;
+          const target = selectedEmployee;
+          remoteRevoked = true;
+          unbindMemoryWrites?.();
+          send(pageRevoked);
+          if (!prepare && !lifetime.signal.aborted) setFailed(true);
+          // Before issuance, ready's rejection is handled by setting below.
+          if (prepare && mounted) finish('failed');
+          // Password changes and logout can revoke this carrier before their
+          // responses reach the iframe. Only the current cookie decides where
+          // the outer page goes.
+          if (mounted)
+            void retire()
+              .then(async (closed) => {
+                if (!closed || detached || replace.current !== applyQuery)
+                  return;
+                const response = await fetch('/api/v1/auth/session', {
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: lifetime.signal,
                 });
-              const next = await readCurrent(employee);
-              if (!stillCurrent() || target !== selectedEmployee) return;
-              if (!next) {
-                location.replace(
-                  '/chatflow/4.0?' +
-                    new URLSearchParams({
-                      workspaceId: employee.workspaceId,
-                    }),
-                );
-                return;
-              }
-              if (
-                next.organizationId !== identity.organizationId ||
-                next.personId !== identity.personId
-              )
-                return;
-              const thread = threadId ? await readCurrent(target) : next;
-              if (!stillCurrent() || target !== selectedEmployee) return;
-              if (
-                !thread ||
-                next.employeeRevision !== identity.employeeRevision ||
-                next.employeeVersionId !== identity.employeeVersionId
-              )
-                location.replace(
-                  '/chatflow/4.0?' +
-                    new URLSearchParams(thread ? target : employee),
-                );
-            })
-            .catch(() => {});
-      });
+                // The unqualified entry checks the cookie again on navigation.
+                const stillCurrent = () =>
+                  !detached &&
+                  !superseded &&
+                  nextQuery.current === displayedQuery.current &&
+                  replace.current === applyQuery;
+                if (!stillCurrent()) return;
+                if (response.status === 401) {
+                  location.replace('/chatflow/4.0');
+                  return;
+                }
+                if (!mayReopenSelection || !prepare || !response.ok || !target)
+                  return;
+                // Committed metadata can revoke the old document before the
+                // initiating dialog receives its HTTP reply.
+                const { threadId, ...employee } = target;
+                const readCurrent = (selection: typeof target) =>
+                  readEmployeeEntryIdentity(
+                    selection,
+                    lifetime.signal,
+                    'execute',
+                  ).catch((error: unknown) => {
+                    if (
+                      error instanceof EmployeeEntryError &&
+                      [403, 404, 409].includes(error.status) &&
+                      !error.reason
+                    )
+                      return null;
+                    throw error;
+                  });
+                const next = await readCurrent(employee);
+                if (!stillCurrent() || target !== selectedEmployee) return;
+                if (!next) {
+                  location.replace(
+                    '/chatflow/4.0?' +
+                      new URLSearchParams({
+                        workspaceId: employee.workspaceId,
+                      }),
+                  );
+                  return;
+                }
+                if (
+                  next.organizationId !== identity.organizationId ||
+                  next.personId !== identity.personId
+                )
+                  return;
+                const thread = threadId ? await readCurrent(target) : next;
+                if (!stillCurrent() || target !== selectedEmployee) return;
+                if (
+                  !thread ||
+                  next.employeeRevision !== identity.employeeRevision ||
+                  next.employeeVersionId !== identity.employeeVersionId
+                )
+                  location.replace(
+                    '/chatflow/4.0?' +
+                      new URLSearchParams(thread ? target : employee),
+                  );
+              })
+              .catch(() => {});
+        },
+        (refreshedScopeId) => {
+          if (
+            !mounted ||
+            navigating ||
+            detached ||
+            remoteRevoked ||
+            (refreshedScopeId !== resourceScopeId &&
+              refreshedScopeId !== switching?.scopeId)
+          )
+            return;
+          frame.current?.contentWindow?.postMessage(
+            {
+              type: pageSkillsRefreshed,
+              scopeId,
+              resourceScopeId: refreshedScopeId,
+            },
+            location.origin,
+          );
+        },
+      );
       const issued = (await carrier.ready).scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();

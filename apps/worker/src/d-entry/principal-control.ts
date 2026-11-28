@@ -12,6 +12,7 @@ import {
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   DEntryScopeIssueSchema,
+  PRINCIPAL_SKILL_BODY_MAX_LENGTH,
   type DEntryPageInput,
   type DEntryPageNativeCall,
   type DEntryPageNativeEnd,
@@ -25,6 +26,8 @@ import {
   type DEntryScopedUnaryCall,
   type InputOf,
   type ScopeFrame,
+  type PrincipalSkillRead,
+  type PrincipalSkillResult,
 } from '@allrice/d-entry-principal/types';
 
 type StreamFrame =
@@ -43,6 +46,39 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 const unknown = (cause?: unknown) => Error('PRINCIPAL_JOIN_UNKNOWN', { cause });
+
+function boundedSkillResult(
+  read: PrincipalSkillRead,
+  result: PrincipalSkillResult,
+): PrincipalSkillResult {
+  // Leave room for the rc.2 logical stream envelope and other owner commands.
+  const frameBytes = 112 * 1024;
+  const unavailable = { kind: 'unavailable' } as const;
+  if (result.kind !== 'body' || read.kind !== 'body')
+    return Buffer.byteLength(JSON.stringify(result)) <= frameBytes
+      ? result
+      : unavailable;
+  const { content } = result;
+  const offset = read.offset ?? 0;
+  if (
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset >= content.length ||
+    content.length > PRINCIPAL_SKILL_BODY_MAX_LENGTH
+  )
+    return unavailable;
+  let end = Math.min(content.length, offset + frameBytes);
+  let part = content.slice(offset, end);
+  while (Buffer.byteLength(JSON.stringify(part)) > frameBytes - 1_024) {
+    end = offset + Math.floor((end - offset) / 2);
+    part = content.slice(offset, end);
+  }
+  return {
+    kind: 'body',
+    content: part,
+    ...(end < content.length && { next: end }),
+  };
+}
 
 export type PrincipalInvocationObservation = Readonly<{
   undispatched(): Promise<void>;
@@ -135,7 +171,8 @@ class Relay<T extends ScopeFrame | StreamFrame> {
   private failure: unknown;
   readonly done: Promise<void>;
   constructor(
-    private readonly handle: RemoteStreamHandle<T, 'close'>,
+    private readonly handle: AsyncIterable<T> &
+      Pick<RemoteStreamHandle<T, 'close'>, 'send' | 'end' | 'dispose'>,
     private readonly scopeId: string,
     private readonly timeoutMs: number,
     parser: TypertSchema<T>,
@@ -293,6 +330,20 @@ export function createDEntryPrincipalControl(
         call: PrincipalInvocationCall,
         signal: AbortSignal,
       ) => Promise<PrincipalInvocationObservation | undefined>,
+      skillSource?: {
+        read(
+          read: PrincipalSkillRead,
+          signal: AbortSignal,
+        ): Promise<PrincipalSkillResult>;
+        watch(
+          signal: AbortSignal,
+          changed: () => void,
+          lost: (error: unknown) => void,
+        ): Promise<{
+          close(): void;
+          throughCommit(signal: AbortSignal): Promise<void>;
+        }>;
+      },
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -306,6 +357,9 @@ export function createDEntryPrincipalControl(
       const children = new Set<Relay<StreamFrame>>();
       const operations = new Set<Promise<unknown>>();
       const follows = new Map<string, AbortController>();
+      const skillReads = new Map<string, AbortController>();
+      const skillListeners = new Set<() => void>();
+      let detachSkills: (() => void) | undefined;
       let detachRun = () => {};
       let published = false;
       let terminalDispatched = false;
@@ -335,6 +389,68 @@ export function createDEntryPrincipalControl(
             const handle = TYPERT_REMOTE.methods[
               'allricePrincipal/openScope'
             ].invoke(root.remote, { issue }, input.carrier);
+            let skillWatch:
+              ReturnType<NonNullable<typeof skillSource>['watch']> | undefined;
+            let catalog: string | undefined;
+            let skillGeneration = 0;
+            let feedLost = false;
+            const pageCatalog = (result?: PrincipalSkillResult) =>
+              JSON.stringify(
+                result?.kind === 'catalog'
+                  ? result.entries.filter(({ userInvocable }) => userInvocable)
+                  : [],
+              );
+            const trackSkill = (task: Promise<void>) => {
+              operations.add(task);
+              void task.then(
+                () => operations.delete(task),
+                (error) => {
+                  operations.delete(task);
+                  if (!business.aborted) revoked.abort(error);
+                },
+              );
+            };
+            const skillChanged = () => {
+              if (business.aborted) return;
+              const generation = ++skillGeneration;
+              try {
+                handle.send({ type: 'skills-changed' });
+              } catch (error) {
+                revoked.abort(error);
+                return;
+              }
+              if (!skillSource || catalog === undefined || !skillListeners.size)
+                return;
+              trackSkill(
+                (async () => {
+                  let next;
+                  try {
+                    next = feedLost
+                      ? undefined
+                      : await skillSource.read({ kind: 'list' }, business);
+                  } catch {
+                    // A failed recheck cannot leave a previously granted catalog visible.
+                  }
+                  if (business.aborted || generation !== skillGeneration)
+                    return;
+                  const digest = pageCatalog(next);
+                  if (catalog === digest) return;
+                  catalog = digest;
+                  for (const listener of skillListeners) listener();
+                })(),
+              );
+            };
+            const watchSkills = (source: NonNullable<typeof skillSource>) =>
+              (skillWatch ??= source
+                .watch(business, skillChanged, () => {
+                  feedLost = true;
+                  skillChanged();
+                })
+                .then((observation) => {
+                  if (business.aborted) observation.close();
+                  else detachSkills = observation.close;
+                  return observation;
+                }));
             relay = new Relay(
               handle,
               issue.scopeId,
@@ -343,6 +459,68 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'skill-cancel') {
+                  skillReads.get(frame.id)?.abort();
+                  return false;
+                }
+                if (frame.type === 'skill-read') {
+                  if (!published || skillReads.has(frame.id)) throw unknown();
+                  if (business.aborted) return false;
+                  const stop = new AbortController();
+                  const active = AbortSignal.any([business, stop.signal]);
+                  const { id, read } = frame;
+                  skillReads.set(id, stop);
+                  const task = Promise.resolve()
+                    .then(async () => {
+                      let result: PrincipalSkillResult = {
+                        kind: 'unavailable',
+                      };
+                      try {
+                        if (skillSource) {
+                          const watch = await watchSkills(skillSource);
+                          if (read.kind === 'list' && read.page)
+                            catalog ??= '[]';
+                          // A same-VM notification need not change this page's
+                          // catalog. Give the picker one fresh cut before rc.2
+                          // caches an empty result for this connection.
+                          const attempts =
+                            read.kind === 'list' && read.page ? 2 : 1;
+                          for (
+                            let attempt = 0;
+                            attempt < attempts && !feedLost;
+                            attempt++
+                          ) {
+                            const generation = skillGeneration;
+                            const readResult = await skillSource.read(
+                              read,
+                              active,
+                            );
+                            // This listener cut joins commits during the SQL
+                            // reads, before a catalog or body can escape.
+                            await watch.throughCommit(active);
+                            if (!feedLost && generation === skillGeneration) {
+                              result = boundedSkillResult(read, readResult);
+                              break;
+                            }
+                          }
+                        }
+                      } catch {
+                        // Only the fixed unavailable result crosses the owner wire.
+                      }
+                      if (!active.aborted) {
+                        if (
+                          read.kind === 'list' &&
+                          read.page &&
+                          result.kind === 'catalog'
+                        )
+                          catalog = pageCatalog(result);
+                        handle.send({ type: 'skill-result', id, result });
+                      }
+                    })
+                    .finally(() => skillReads.delete(id));
+                  trackSkill(task);
+                  return false;
+                }
                 if (frame.type === 'follow-revoked' && published) {
                   follows.get(frame.followId)?.abort(
                     new RemoteError(
@@ -624,6 +802,10 @@ export function createDEntryPrincipalControl(
                   },
                 };
               },
+              subscribeSkillChanges(listener: () => void) {
+                skillListeners.add(listener);
+                return () => skillListeners.delete(listener);
+              },
               close: activity.close,
             } satisfies DEntryPrincipalControlScope;
           });
@@ -646,6 +828,8 @@ export function createDEntryPrincipalControl(
               return;
             }
             if (!relay) throw unknown();
+            detachSkills?.();
+            skillListeners.clear();
             const results = await Promise.allSettled(
               [...children]
                 .map((child) => child.close())

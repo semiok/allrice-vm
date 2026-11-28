@@ -35,6 +35,8 @@ export type PageNativeThreadRegistration = {
   thread: ReturnType<typeof ChatSessionSchema.parse>;
 };
 
+export const pageSkillsRefreshed = 'allrice:d-entry:skills-refreshed';
+
 export function readPageMessage(
   event: MessageEvent,
   peer: Window | null | undefined,
