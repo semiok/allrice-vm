@@ -24,7 +24,8 @@ const mocks = vi.hoisted(() => ({
   watch: vi.fn(),
   query: vi.fn(),
 }));
-vi.mock('@allrice/database', () => ({
+vi.mock('@allrice/database', async (original) => ({
+  ...(await original<typeof import('@allrice/database')>()),
   getDEntryNativeRootPin: mocks.pin,
   getDatabase: () =>
     Object.assign(mocks.query, { json: (value: unknown) => value }),
