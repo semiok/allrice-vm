@@ -374,7 +374,9 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
     ['bootstrap', { scopeId }, 'document'],
   ]);
-  profileRequest.mockResolvedValueOnce(new Response(null, { status: 404 }));
+  profileRequest.mockResolvedValueOnce(
+    Response.json({ ...claims, bindingRef: 'stale-profile' }),
+  );
   expect((await call('api/present.host')).status).toBe(404);
   expect((await call('api/present.open', 'POST')).status).toBe(404);
 });
