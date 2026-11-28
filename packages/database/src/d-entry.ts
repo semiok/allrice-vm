@@ -15,7 +15,6 @@ import {
   readDEntrySidebarSessionPage,
 } from './workspace/service.ts';
 import {
-  EmployeeInstanceError,
   getEmployeeInstance,
   getEmployeeInstanceForHistory,
   listEmployeeInstances,
@@ -129,55 +128,68 @@ export async function readDEntryEmployeeDirectory(
       const policy = await readDEntryReleasePolicy(sql);
       if (!hasDEntryPersonRelease(policy, identity))
         throw new DataAccessError('authorization_denied');
-      const employees = [];
-      for (const { id: employeeId } of await listEmployeeInstances(
+      const instances = await listEmployeeInstances(
         scope,
         identity.workspaceId,
         sql,
-      )) {
-        signal.throwIfAborted();
-        try {
-          const instance = await getEmployeeInstance(scope, employeeId, sql);
-          const [version] = await sql<
-            { employee_id: string; name: string; is_default: boolean }[]
-          >`
-            select v.employee_id,v.name,a.is_default
-            from allrice_employee_assignments a
-            join allrice_employee_versions v
-              on v.id=${instance.source.employeeVersionId}
-              and v.organization_id=a.organization_id and v.workspace_id=a.workspace_id
-            where a.id=${instance.assignmentId}
-              and a.organization_id=${identity.organizationId}
-              and a.workspace_id=${identity.workspaceId} and a.user_id=${identity.personId}`;
-          if (!version) continue;
-          const currentVersion = {
-            id: instance.source.employeeVersionId,
-            manifest: {
-              name: instance.profile.name ?? version.name,
-              description: instance.profile.description,
-              appearance: instance.profile.appearance,
-            },
-          };
-          employees.push({
+      );
+      if (!instances.some(({ id }) => id === identity.employeeInstanceId))
+        throw new DataAccessError('authorization_denied');
+      signal.throwIfAborted();
+      // The inventory already checked the owned live instances in this cut.
+      // Qualify the current assignments together using the same owner,
+      // employee, release and version predicates as the individual reads.
+      const versions = await sql<
+        {
+          assignment_id: string;
+          employee_version_id: string;
+          employee_id: string;
+          name: string;
+          is_default: boolean;
+        }[]
+      >`
+        select a.id assignment_id,a.employee_version_id,v.employee_id,v.name,a.is_default
+        from allrice_employee_assignments a
+        join allrice_employees e on e.id=a.employee_id
+          and e.organization_id=a.organization_id and e.workspace_id=a.workspace_id
+        join allrice_employee_versions v on v.id=a.employee_version_id
+          and v.organization_id=a.organization_id and v.workspace_id=a.workspace_id
+        where a.id in ${sql([...new Set(instances.map((row) => row.assignmentId))])}
+          and a.organization_id=${identity.organizationId}
+          and a.workspace_id=${identity.workspaceId} and a.user_id=${identity.personId}
+          and a.active and e.status='active'
+          and not exists(select 1 from allrice_platform_employee_tenant_assignments d
+            where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id
+              and d.tenant_employee_id=a.employee_id and not d.active)`;
+      const assignments = new Map(
+        versions.map((row) => [row.assignment_id, row]),
+      );
+      const employees = instances.flatMap((instance) => {
+        const version = assignments.get(instance.assignmentId);
+        if (
+          !version ||
+          version.employee_version_id !== instance.source.employeeVersionId
+        )
+          return [];
+        const currentVersion = {
+          id: instance.source.employeeVersionId,
+          manifest: {
+            name: instance.profile.name ?? version.name,
+            description: instance.profile.description,
+            appearance: instance.profile.appearance,
+          },
+        };
+        return [
+          {
             id: instance.assignmentId,
             instanceId: instance.id,
             employeeId: version.employee_id,
             isDefault: version.is_default && instance.kind === 'general',
             currentVersion,
             versions: [currentVersion],
-          });
-        } catch (error) {
-          if (
-            (error instanceof DataAccessError &&
-              (error.code === 'not_found' ||
-                error.code === 'authorization_denied')) ||
-            (error instanceof EmployeeInstanceError &&
-              error.code === 'instance_archived')
-          )
-            continue;
-          throw error;
-        }
-      }
+          },
+        ];
+      });
       const employeeIds = employees.map(({ instanceId }) => instanceId);
       if (!employeeIds.includes(identity.employeeInstanceId))
         throw new DataAccessError('authorization_denied');

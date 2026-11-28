@@ -31,6 +31,7 @@ import {
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
 import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
+import { publicProfileModules } from '../../../web/lib/d-entry/public-profile-warmup.js';
 import { recordRefreshWaterfall } from './refresh-waterfall.fixture.js';
 import {
   fixture,
@@ -420,6 +421,7 @@ it
       )
       .join('');
     let coldPaths: string[] = [];
+    let managedPreloads = '';
     let stagedPaths: Set<string> | undefined;
     if (independentlyInstalled) {
       const root = await realpath(
@@ -450,6 +452,13 @@ it
           ),
         );
       publicIndex = publicProfileBundles.parse(index.bundles);
+      managedPreloads = publicProfileModules(
+        index.startup
+          .filter((path) => index.paths.includes(path))
+          .map((path) => publicRoot + path),
+      )
+        .map((url) => `<link rel="modulepreload" href="${url}">`)
+        .join('');
       if (coldAssets && bench !== 'baseline')
         coldPaths = index.startup.map((path) => publicRoot + path);
       stagedPaths = new Set(index.paths);
@@ -723,7 +732,8 @@ it
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
                   (warmRefresh
-                    ? '<script id="warm-identity" type="application/json">' +
+                    ? managedPreloads +
+                      '<script id="warm-identity" type="application/json">' +
                       JSON.stringify(f.identity) +
                       '</script>'
                     : '') +
@@ -1049,6 +1059,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
+          ${usePublicFiles ? managedPreloads : ''}
           ${usePublicFiles ? nativeStyles : ''}
           <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>

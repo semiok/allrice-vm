@@ -1,7 +1,30 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { warmPublicProfileAssets } from './public-profile-warmup';
+import {
+  publicProfileModules,
+  warmPublicProfileAssets,
+} from './public-profile-warmup';
 
 afterEach(() => vi.unstubAllGlobals());
+
+it('only hints at deduplicated sealed managed modules', () => {
+  const root = '/_next/static/dsh-profile/' + 'a'.repeat(64) + '/';
+  const entry = root + 'managed/employee-web-entry.js';
+  const chunk = root + 'managed/chunk-ab12.js';
+  expect(
+    publicProfileModules([
+      entry,
+      chunk,
+      entry,
+      entry + '?scopeId=x',
+      entry + '\n',
+      root + 'managed/employee-web-entry.css',
+      root + 'bundles/' + 'b'.repeat(64) + '.js',
+      root + 'managed/../managed/chunk-ab12.js',
+      'https://other.test' + entry,
+      '/api/v1/d-entry/profile/bootstrap',
+    ]),
+  ).toEqual([entry, chunk]);
+});
 
 it('warms only exact immutable URLs, once and without credentials or redirects', async () => {
   const body = vi.fn();

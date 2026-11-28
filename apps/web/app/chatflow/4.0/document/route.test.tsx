@@ -96,7 +96,13 @@ it('offers the warm path only on a document load with an exact owned root', asyn
   entryRoot.mockImplementation(() => f.root());
   const render = () =>
     EntryPage({ searchParams: Promise.resolve(f.selection) });
-  expect((await render()).props.warmIdentity).toEqual(f.identity);
+  const warm = await render();
+  expect(warm.props.children[1].props.warmIdentity).toEqual(f.identity);
+  expect(renderToStaticMarkup(warm)).toContain(
+    'rel="modulepreload" href="/_next/static/dsh-profile/' +
+      'a'.repeat(64) +
+      '/managed/employee-web-entry.js"',
+  );
   expect(entryRoot).toHaveBeenCalledExactlyOnceWith(f.context, f.selection, {
     runningSnapshot: true,
   });
@@ -294,6 +300,7 @@ it('requires the issued scope in the document address and leaves the two exact n
       'native/assets/index-BxpfOGf3.css',
       'managed/employee-web-entry.js',
     ]),
+    startup: ['managed/employee-web-entry.js', 'managed/unpublished.js'],
     bundles: [
       {
         reference: bundle,
@@ -320,6 +327,10 @@ it('requires the issued scope in the document address and leaves the two exact n
     'data-login-session-id="00000000-0000-4000-8000-000000000006"',
   );
   expect(html).not.toContain(cookie.value);
+  expect(html).toContain(
+    'rel="modulepreload" href="' + assetRoot + 'managed/employee-web-entry.js"',
+  );
+  expect(html).not.toContain('managed/unpublished.js');
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
   expect(releasedAssets).toHaveBeenCalledExactlyOnceWith();
   expect(html).toContain(

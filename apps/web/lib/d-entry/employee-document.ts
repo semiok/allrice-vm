@@ -10,6 +10,7 @@ import {
 import { readDEntryWorkerJson, requestDEntryProfile } from './native-worker';
 import { profileAddress, profileDirectory, type profileInput } from './profile';
 import { readLocalProfileAssets } from './released-profile-assets';
+import { publicProfileModules } from './public-profile-warmup';
 
 const escapeAttribute = (value: string) =>
   value
@@ -84,6 +85,15 @@ export async function renderEmployeeDocument(
   const earlyAttribute = earlyBundles.length
     ? ` data-public-startup-bundles="${escapeAttribute(JSON.stringify(earlyBundles))}"`
     : '';
+  const modulePreloads = released
+    ? publicProfileModules(
+        released.startup
+          .filter((path) => released.paths.has(path))
+          .map((path) => released.root + path),
+      )
+        .map((url) => `<link rel="modulepreload" href="${url}">`)
+        .join('')
+    : '';
   const staticAsset = (path: string, fallback: string) =>
     released?.paths.has(path) ? released.root + path : fallback;
   const directoryJson = safeJson(directory);
@@ -109,7 +119,7 @@ export async function renderEmployeeDocument(
     .map(([key, value]) => `data-${key}="${escapeAttribute(value!)}"`)
     .join(' ');
   // The upstream viewport rule targets #root. This document mounts at #app.
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><script data-scope-id="${escapeAttribute(scopeId)}"${earlyAttribute}>${initialDocumentLifecycle}</script><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/index-BxpfOGf3.css', native + 'assets/index-BxpfOGf3.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/vendor-DV2921Zo.css', native + 'assets/vendor-DV2921Zo.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('managed/employee-web-entry.css', assets + '/managed/employee-web-entry.css')}"></head><body><div id="app" style="height:100%" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script>${bootstrapScript}<script type="module" data-allrice-document-asset="entry" src="${staticAsset('managed/employee-web-entry.js', assets + '/managed/employee-web-entry.js')}"></script></body></html>`;
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><script data-scope-id="${escapeAttribute(scopeId)}"${earlyAttribute}>${initialDocumentLifecycle}</script>${modulePreloads}<link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/index-BxpfOGf3.css', native + 'assets/index-BxpfOGf3.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('native/assets/vendor-DV2921Zo.css', native + 'assets/vendor-DV2921Zo.css')}"><link rel="stylesheet" data-allrice-document-asset="style" href="${staticAsset('managed/employee-web-entry.css', assets + '/managed/employee-web-entry.css')}"></head><body><div id="app" style="height:100%" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script>${bootstrapScript}<script type="module" data-allrice-document-asset="entry" src="${staticAsset('managed/employee-web-entry.js', assets + '/managed/employee-web-entry.js')}"></script></body></html>`;
   request.signal.throwIfAborted();
   return new Response(html, {
     headers: {
