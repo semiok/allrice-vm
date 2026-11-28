@@ -969,10 +969,12 @@ it
         workspaceId: f.identity.workspaceId,
         viewerId: f.identity.personId,
       };
-      await expect.poll(() => materialReads.slice(before)).toEqual([
-        { kind: 'catalog', ...expectedScope },
-        { kind: 'selection', ...expectedScope },
-      ]);
+      await expect
+        .poll(() => materialReads.slice(before))
+        .toEqual([
+          { kind: 'catalog', ...expectedScope },
+          { kind: 'selection', ...expectedScope },
+        ]);
       const chip = editor.locator(
         '[data-composer-chip="allrice-panel-reference"]',
       );
@@ -981,7 +983,8 @@ it
       } catch (cause) {
         const alerts = await right.getByRole('alert').allTextContents();
         throw Error(
-          'Native reference insertion did not render: ' + JSON.stringify(alerts),
+          'Native reference insertion did not render: ' +
+            JSON.stringify(alerts),
           { cause },
         );
       }
