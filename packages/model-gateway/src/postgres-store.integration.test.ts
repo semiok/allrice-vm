@@ -200,7 +200,9 @@ integration(
           };
         },
       }) as postgres.Sql;
-      const store = createPostgresModelGatewayStore(observed);
+      const store = createPostgresModelGatewayStore(firstDb, (notify, ready) =>
+        observed.listen('allrice_model_gateway_capacity', notify, ready),
+      );
       const person = randomUUID();
       const signal = new AbortController().signal;
       const watch = await store.watchCapacity(person, signal);
@@ -233,6 +235,11 @@ integration(
       >`select count(*)::int as count
         from pg_stat_activity where application_name=${applicationName}`;
       expect(remaining?.count).toBe(0);
+      // Host maintenance must still be able to reconcile the ledger after
+      // the dedicated capacity socket (including its reconnect) has closed.
+      await expect(
+        store.reconcileOwner(randomUUID(), 'fixture-stop'),
+      ).resolves.toBe(0);
     });
 
     it('真实初次连接失败后同一LISTEN owner恢复；取消等待者不新注册driver callback', async () => {

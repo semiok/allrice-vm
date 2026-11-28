@@ -330,7 +330,10 @@ export async function createProductionCodexRuntime(
   let catalog:
     | Promise<Awaited<ReturnType<typeof openCodexGeneration>>['modelMetadata']>
     | undefined;
+  let catalogDisposal: Promise<unknown> | undefined;
+  let closingCatalog = false;
   function readCatalogModelMetadata(signal: AbortSignal) {
+    lifetime.throwIfAborted();
     signal.throwIfAborted();
     return (catalog ??= (async () => {
       const host = new Context();
@@ -349,17 +352,22 @@ export async function createProductionCodexRuntime(
             },
           })
           .await();
-        const all = await Promise.all(
+        const results = await Promise.allSettled(
           PlatformModelConfigurationSchema.shape.workModel.options.map((id) =>
             host.llm.resolveModelInfo(provider, id, lifetime),
           ),
         );
+        const all = results.map((result) => {
+          if (result.status === 'rejected') throw result.reason;
+          return result.value;
+        });
         return {
           modelInfo: all.find(({ id }) => id === model)!,
           historicalModels: all.filter(({ id }) => id !== model),
         };
       } finally {
-        await host.fiber.dispose();
+        catalogDisposal = Promise.resolve().then(() => host.fiber.dispose());
+        await catalogDisposal;
       }
     })()).then((info) => {
       signal.throwIfAborted();
@@ -413,25 +421,35 @@ export async function createProductionCodexRuntime(
     return modelEvidence + '|' + oauthEvidence;
   }
   function close() {
-    if (closing) return closing;
-    stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
-    oauthStopped = Promise.allSettled([...authTransactions]).then(() =>
-      oauth.close(),
-    );
-    return (closing = Promise.allSettled([
-      transport.close(),
-      oauthStopped,
-      catalog,
-      operations.then(async () => {
-        if (generation) retire(generation);
-        await Promise.allSettled([...retiring]);
-        if (retirementFailures.length)
-          throw new AggregateError(
-            retirementFailures,
-            'CODEX_GENERATION_CLOSE_UNKNOWN',
-          );
-      }),
-    ]).then((results) => {
+    if (closing && (!catalog || closingCatalog)) return closing;
+    const tasks: Promise<unknown>[] = [];
+    if (closing) tasks.push(closing);
+    else {
+      stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
+      oauthStopped = Promise.allSettled([...authTransactions]).then(() =>
+        oauth.close(),
+      );
+      tasks.push(
+        transport.close(),
+        oauthStopped,
+        operations.then(async () => {
+          if (generation) retire(generation);
+          await Promise.allSettled([...retiring]);
+          if (retirementFailures.length)
+            throw new AggregateError(
+              retirementFailures,
+              'CODEX_GENERATION_CLOSE_UNKNOWN',
+            );
+        }),
+      );
+    }
+    if (catalog) {
+      // Retiring an individual route preserves its static metadata for other
+      // routes. A later full Host close joins any lookup started since then.
+      closingCatalog = true;
+      tasks.push(Promise.allSettled([catalog]).then(() => catalogDisposal));
+    }
+    return (closing = Promise.allSettled(tasks).then((results) => {
       const failures = results.flatMap((result) =>
         result.status === 'rejected' ? [result.reason] : [],
       );

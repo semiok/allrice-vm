@@ -509,7 +509,7 @@ export async function recoverProductionPersonVmModelOwner(
         if (endpoint) await (await endpoint).close();
         if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
         await closeDatabase();
-        process.exitCode = 0;
+        process.exit(0);
       } catch {
         shutdownStatus = receipt;
         if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
@@ -1211,6 +1211,14 @@ const stopWorker = (signal: string) => {
           error instanceof WorkerShutdownError
             ? error.failures.map(({ name }) => name)
             : ['shutdown_setup'],
+        databaseRetainedForMaintenance:
+          error instanceof WorkerShutdownError &&
+          error.failures.some(
+            ({ name, error }) =>
+              name === 'database' &&
+              error instanceof Error &&
+              error.message === 'WORKER_SHUTDOWN_MAINTENANCE_RETAINED',
+          ),
       });
       process.exitCode = 1;
       const result = await personVmHost;

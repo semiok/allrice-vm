@@ -14,29 +14,35 @@ type CapacityHub = {
   subscribers: Map<string, Set<(error?: unknown) => void>>;
   ready: boolean;
 };
-const capacityHubs = new WeakMap<postgres.Sql, CapacityHub>();
+type ListenCapacity = (
+  notify: (person: string) => void,
+  ready: () => void,
+) => Promise<unknown>;
+const capacityHubs = new WeakMap<postgres.Sql | ListenCapacity, CapacityHub>();
 
-function capacityHub(db: postgres.Sql): CapacityHub {
-  const existing = capacityHubs.get(db);
+function capacityHub(
+  db: postgres.Sql,
+  listen: ListenCapacity | undefined,
+): CapacityHub {
+  const key = listen ?? db;
+  const existing = capacityHubs.get(key);
   if (existing) return existing;
   const hub: CapacityHub = { subscribers: new Map(), ready: false };
-  capacityHubs.set(db, hub);
-  // One long-lived listener belongs to the caller-owned pool, including its
-  // reconnect lifecycle. postgres 3.4.9 rebuilds listener identities on reconnect;
-  // per-waiter unlisten handles cannot safely remove those rebuilt listeners.
-  // Waiters own only these local subscriptions, never driver listener handles.
-  void db
-    .listen(
-      CHANNEL,
-      (person) => {
+  capacityHubs.set(key, hub);
+  // Waiters own only local subscriptions. The injected listener or the
+  // caller's pool owns the transport and reconnect.
+  void Promise.resolve()
+    .then(() => {
+      const notify = (person: string) => {
         for (const pulse of hub.subscribers.get(person) ?? []) pulse();
-      },
-      () => {
+      };
+      const ready = () => {
         hub.ready = true;
         for (const subscribers of hub.subscribers.values())
           for (const pulse of subscribers) pulse();
-      },
-    )
+      };
+      return listen ? listen(notify, ready) : db.listen(CHANNEL, notify, ready);
+    })
     .catch((error: unknown) => {
       if (hub.ready) return; // A newer onlisten already recovered this owner.
       // postgres retains this callback even when the first LISTEN rejects,
@@ -93,10 +99,11 @@ export function nativeCallKey(binding: ModelCallBinding): string {
     .digest('hex');
 }
 
-/** Caller owns the pool and its lifecycle. All SQL touches only this owner's
+/** Caller owns both clients and their lifecycles. All SQL touches only this owner's
  * three tables; no joins into identity, employee, Run or billing internals. */
 export function createPostgresModelGatewayStore(
   db: postgres.Sql,
+  listenCapacity?: ListenCapacity,
 ): ModelGatewayStore {
   const json = (value: unknown) =>
     db.json(JSON.parse(JSON.stringify(value)) as postgres.JSONValue);
@@ -144,7 +151,7 @@ export function createPostgresModelGatewayStore(
     },
     async watchCapacity(personId, signal) {
       signal.throwIfAborted();
-      const hub = capacityHub(db);
+      const hub = capacityHub(db, listenCapacity);
       let notified = false;
       let closed = false;
       let listenFailure: unknown;

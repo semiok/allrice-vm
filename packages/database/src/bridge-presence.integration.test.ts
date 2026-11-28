@@ -5,6 +5,9 @@ import {
 } from './bridge-settings.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createConnection, createServer, type Socket } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
@@ -18,6 +21,8 @@ import {
   completeBridgeWorkspaceSelection,
 } from './bridge.ts';
 import type * as Client from './core/client.ts';
+import { createBridgeConnectionAuthority } from './bridge-connections.ts';
+import { openPostgresNotifications } from './core/notification-client.ts';
 import {
   resolveWorkbenchTerminalTarget,
   revalidateBridgeTerminalTarget,
@@ -162,6 +167,158 @@ suite(
         await admin.end();
       }
     });
+
+    it.each(['after reconnect', 'during backoff'] as const)(
+      'closes the Bridge LISTEN socket %s without closing the Web business pool',
+      async (timing) => {
+        const applicationName = 'bridge-close-' + randomUUID();
+        const client = await vi.importActual<typeof Client>('./core/client.ts');
+        const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+        url.searchParams.set('application_name', applicationName);
+        url.searchParams.set('ssl', 'false');
+        vi.stubEnv('DATABASE_URL', url.toString());
+        const previous = database;
+        const web = (database = client.getDatabase());
+        const notify = vi.fn();
+        const channel = 'allrice_bridge_workspace_selection';
+        const subscriptionPids = () => admin<{ pid: number }[]>`
+        select pid from pg_stat_activity
+        where application_name = ${applicationName}
+          and lower(query) = ${`listen "${channel}"`}
+      `;
+        let close: (() => Promise<void>) | undefined;
+        try {
+          const [business] = await web<
+            { pid: number }[]
+          >`select pg_backend_pid() as pid`;
+          close = await createBridgeConnectionAuthority().subscribe(notify);
+          const [first] = await subscriptionPids();
+          expect(first).toBeDefined();
+          const device = randomUUID();
+          await web.notify(channel, device);
+          await vi.waitFor(() =>
+            expect(notify).toHaveBeenCalledWith(device, 'work'),
+          );
+          await admin`select pg_terminate_backend(${first!.pid})`;
+          await vi.waitFor(
+            async () => {
+              const connections = await subscriptionPids();
+              expect(connections.map(({ pid }) => pid)).not.toContain(
+                first!.pid,
+              );
+              if (timing === 'after reconnect')
+                expect(connections).toHaveLength(1);
+              else expect(connections).toHaveLength(0);
+            },
+            { timeout: 5000, interval: 10 },
+          );
+          await close();
+          // Cross a full retry interval; a reconnect scheduled before close
+          // must not authenticate a second backend.
+          await delay(400);
+          await vi.waitFor(async () => {
+            expect(
+              await admin`
+              select pid from pg_stat_activity where application_name=${applicationName}
+            `,
+            ).toEqual([{ pid: business!.pid }]);
+          });
+          await expect(web`select 1 as healthy`).resolves.toMatchObject([
+            { healthy: 1 },
+          ]);
+        } finally {
+          try {
+            await close?.();
+          } finally {
+            database = previous;
+            vi.unstubAllEnvs();
+            await client.closeDatabase();
+          }
+        }
+      },
+      10000,
+    );
+
+    it.each([
+      'target session',
+      'inherited options',
+      'inherited replication',
+    ] as const)(
+      'leaves the %s notification socket with its original pool until database close',
+      async (setting) => {
+        const client = await vi.importActual<typeof Client>('./core/client.ts');
+        const applicationName = 'bridge-target-' + randomUUID();
+        const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+        url.searchParams.set('application_name', applicationName);
+        if (setting === 'target session')
+          url.searchParams.set('target_session_attrs', 'read-write');
+        if (setting === 'inherited options')
+          vi.stubEnv('PGOPTIONS', '-c role=nonexistent_test_role');
+        if (setting === 'inherited replication')
+          vi.stubEnv('PGREPLICATION', 'database');
+        vi.stubEnv('DATABASE_URL', url.toString());
+        const previous = database;
+        database = client.getDatabase();
+        const pids = () =>
+          admin`select pid from pg_stat_activity where application_name=${applicationName}`;
+        try {
+          const close = await createBridgeConnectionAuthority().subscribe(
+            () => {},
+          );
+          const subscribed = await pids();
+          expect(subscribed).toHaveLength(1);
+          await close();
+          expect(await pids()).toEqual(subscribed);
+          await client.closeDatabase();
+          await vi.waitFor(async () => expect(await pids()).toEqual([]));
+        } finally {
+          database = previous;
+          vi.unstubAllEnvs();
+          await client.closeDatabase();
+        }
+      },
+    );
+
+    it('joins the capacity LISTEN socket even when its proxy keeps the TCP peer open', async () => {
+      const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
+      const sockets: Socket[] = [];
+      const proxy = createServer({ allowHalfOpen: true }, (incoming) => {
+        const upstream = createConnection({
+          host: url.hostname,
+          port: Number(url.port),
+        });
+        sockets.push(incoming, upstream);
+        incoming.on('error', () => upstream.destroy());
+        upstream.on('error', () => incoming.destroy());
+        incoming.pipe(upstream);
+        // The database may close normally, but the proxy withholds peer FIN.
+        upstream.pipe(incoming, { end: false });
+      });
+      proxy.listen(0, '127.0.0.1');
+      await once(proxy, 'listening');
+      const address = proxy.address();
+      if (!address || typeof address === 'string')
+        throw Error('fixture listener missing');
+      const routed = new URL(url);
+      routed.port = String(address.port);
+      const owner = openPostgresNotifications(
+        { connectionString: routed.toString() },
+        ['allrice_model_gateway_capacity'],
+        () => {},
+      );
+      try {
+        await owner.ready;
+        const joined = await Promise.race([
+          owner.close().then(() => true),
+          delay(3500, false, { ref: false }),
+        ]);
+        expect(joined).toBe(true);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await owner.close();
+        await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      }
+    }, 6000);
 
     it('human terminal authority binds the actual login, private chat and grant generation without mutating presence', async () => {
       const f = await terminalFixture();

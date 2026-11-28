@@ -69,7 +69,7 @@ export class EmployeePanelsWriteUnknownError extends Error {
     readonly originalInput: unknown,
     options: ErrorOptions,
   ) {
-    super('保存结果未知，请按原请求核对。', options);
+    super('操作未完成，请重试。', options);
     this.name = 'EmployeePanelsWriteUnknownError';
   }
 }

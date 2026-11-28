@@ -27,6 +27,7 @@ import {
   nativeEmployeeSkillPatches,
   nativeSearchToolPatches,
 } from './search-tools.js';
+import { nativeEmployeePersonaPatches } from './employee-instructions.js';
 import { productionNativeMemoryToolDefinitions } from '../person-vm/production-native-memory.js';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
@@ -41,6 +42,7 @@ export type NativeWebConfiguration = Readonly<{
   cliPath: string;
   startupTimeoutMs: number;
   terminalEnabled?: boolean;
+  employeeInstructions?: string;
   nativeMemoryEnabled?: boolean;
   principalProfile: Pick<
     DEntryIdentity,
@@ -234,11 +236,21 @@ export async function prepareNativeWebLaunch(
       ? nativeScopedModelPatches(modelAdapter.scoped)
       : nativeSearchToolPatches(modelAdapter.webSearchEnabled === true)
     : [];
+  const skillPatches = nativeEmployeeSkillPatches(modelPatches);
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
     files: Object.freeze([
       { path: plugin, contents: ownerSource, mode: 0o600 },
+      ...(config.employeeInstructions !== undefined
+        ? [
+            {
+              path: `${config.dshHome}/AGENTS.md`,
+              contents: config.employeeInstructions,
+              mode: 0o600,
+            },
+          ]
+        : []),
       {
         path: `${directory}/allrice-native-delivery-capture.mjs`,
         contents: deliverySource,
@@ -284,13 +296,22 @@ export function apply(ctx, config) {
       {
         path: patch,
         contents: JSON.stringify([
+          ...(config.employeeInstructions !== undefined
+            ? [
+                {
+                  id: 'system-prompt',
+                  config: { includeHarnessIdentity: false, personaPrefix: '' },
+                },
+                { id: 'harness-dev-context', disabled: true },
+              ]
+            : []),
           {
             id: 'web-runtime',
             // rc.2 replaces config as a whole; CLI webStartup values are not merged.
             config: {
               openBrowser: false,
               publicUrl: publicUrl.href,
-              surfaceContext: true,
+              surfaceContext: config.employeeInstructions === undefined,
               printUrl: false,
             },
           },
@@ -341,9 +362,6 @@ export function apply(ctx, config) {
             : []),
           ...(commandMemory ?? []),
           ...modelPatches,
-          // Compose filesystem Skill removal after model/search, before the
-          // employee persona consumes the full preset in the batch merge.
-          ...nativeEmployeeSkillPatches(modelPatches),
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },
@@ -356,6 +374,10 @@ export function apply(ctx, config) {
                   },
                 },
               ]
+            : []),
+          ...skillPatches,
+          ...(config.employeeInstructions !== undefined
+            ? nativeEmployeePersonaPatches([...modelPatches, ...skillPatches])
             : []),
         ]),
         mode: 0o600,

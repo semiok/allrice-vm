@@ -23,6 +23,7 @@ import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 import { nativeScopedModelPatches } from './model-task-presets.js';
+import { nativeEmployeePersonaPatches } from './employee-instructions.js';
 import {
   nativeEmployeeSkillPatches,
   nativeSearchToolPatches,
@@ -43,6 +44,47 @@ const binding = {
   organizationId: randomUUID(),
   leaseEpoch: 1,
 };
+it('keeps scoped native tools and enables employee instructions in every stock Web preset', () => {
+  const model = nativeScopedModelPatches({
+    compaction: { provider: 'openai', model: 'gpt-4.1-mini' },
+  });
+  const original = composeEntries([...nativeWebBundlePatches(), model]);
+  const entries = composeEntries([
+    ...nativeWebBundlePatches(),
+    model,
+    nativeEmployeePersonaPatches(model),
+  ]);
+  const presets = entries.filter(
+    ({ name }) => name === '@deepseek-ai/dsh-agent-preset',
+  );
+  expect(presets.map(({ id }) => id).sort()).toEqual([
+    'preset-cordis',
+    'preset-minimal',
+    'preset-ptc',
+    'preset-standard',
+  ]);
+  for (const { id, config } of presets) {
+    const plugins = config?.plugins as { name: string }[];
+    const isInstructionOrPersona = ({ name }: { name: string }) =>
+      name === '@deepseek-ai/dsh-persona' ||
+      name === '@deepseek-ai/dsh-agent-instructions';
+    expect(plugins.filter(isInstructionOrPersona)).toEqual([
+      expect.objectContaining({
+        name: '@deepseek-ai/dsh-persona',
+        config: expect.objectContaining({ prefix: '', complete: false }),
+      }),
+      expect.objectContaining({
+        name: '@deepseek-ai/dsh-agent-instructions',
+        config: expect.objectContaining({ maxBytes: 65536 }),
+      }),
+    ]);
+    const previous = original.find((entry) => entry.id === id)?.config
+      ?.plugins as typeof plugins;
+    expect(plugins.filter((entry) => !isInstructionOrPersona(entry))).toEqual(
+      previous.filter((entry) => !isInstructionOrPersona(entry)),
+    );
+  }
+});
 it('生产compiler收集全部native Web产品而不emit测试；typecheck仍收集完整测试', () => {
   const worker = fileURLToPath(new URL('../../', import.meta.url));
   function configuration(name: string) {
@@ -148,6 +190,90 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     ),
     '10.0.0.6' as PersonVmNativeWebGuestAddress,
   );
+  const modelRoute = { provider: 'openai', model: 'fixture-model' };
+  const modelInfo = {
+    provider: modelRoute.provider,
+    id: modelRoute.model,
+    name: modelRoute.model,
+    inputModalities: ['text'] as const,
+  };
+  const withPersona = await prepareNativeWebLaunch(
+    {
+      ...config,
+      employeeInstructions: '# Fixture employee instructions',
+      nativeMemoryEnabled: true,
+    },
+    binding,
+    profile,
+    undefined,
+    {
+      ...modelRoute,
+      origin: 'http://127.0.0.1:32180/',
+      capability: 'q'.repeat(43),
+      modelInfo,
+      scoped: {
+        rules: [],
+        title: modelRoute,
+        compaction: modelRoute,
+        models: [{ ...modelRoute, modelInfo }],
+      },
+    },
+  );
+  const layeredPatch = withPersona.files.find(({ path }) =>
+    path.endsWith('/owner.patch.json'),
+  );
+  if (!layeredPatch) throw Error('actual native owner patch missing');
+  const layered = composeEntries([
+    ...nativeWebBundlePatches(),
+    JSON.parse(layeredPatch.contents),
+  ]);
+  expect(
+    layered.find(({ id }) => id === 'allrice-native-web-owner')?.config,
+  ).toMatchObject({
+    modelAdapter: {
+      memoryTools: [
+        expect.objectContaining({ id: 'memory_read' }),
+        expect.objectContaining({ id: 'memory_remember' }),
+      ],
+    },
+  });
+  expect(
+    layered.find(({ id }) => id === 'agent-default-model')?.config,
+  ).toMatchObject(modelRoute);
+  expect(
+    layered.find(({ id }) => id === 'session-title-llm')?.config,
+  ).toMatchObject(modelRoute);
+  for (const id of ['preset-standard', 'preset-ptc', 'preset-cordis']) {
+    expect(layered.find((entry) => entry.id === id)?.config?.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'skill-filesystem', disabled: true }),
+        expect.objectContaining({ id: 'tool-skill' }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-tool-web',
+          config: expect.objectContaining({ search: false }),
+        }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-persona',
+          config: expect.objectContaining({ prefix: '', complete: false }),
+        }),
+        expect.objectContaining({
+          name: '@deepseek-ai/dsh-agent-instructions',
+        }),
+        expect.objectContaining({
+          id: 'compaction',
+          config: expect.arrayContaining([
+            expect.objectContaining({
+              name: '@deepseek-ai/dsh-compaction-basic',
+              config: expect.objectContaining({
+                summarizationProvider: modelRoute.provider,
+                summarizationModel: modelRoute.model,
+              }),
+            }),
+          ]),
+        }),
+      ]),
+    );
+  }
   expect(a.command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
   expect(a.command.args).toContain('--no-open');
   expect(a.command.args.slice(a.command.args.indexOf('--port'))).toEqual([

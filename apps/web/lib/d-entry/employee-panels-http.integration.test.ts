@@ -7,12 +7,7 @@ import { createProductionFileMentionContext } from '../../../worker/src/person-v
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import type {
-  Browser,
-  Locator,
-  Page,
-  Response as BrowserResponse,
-} from 'playwright-core';
+import type { Browser, Response as BrowserResponse } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
@@ -598,8 +593,6 @@ suite(
           const page = await context.newPage();
           const receiptPath = (requestId: string) =>
             '/write-receipts/' + requestId;
-          const receiptRoute = (requestId: string) =>
-            '**' + receiptPath(requestId) + '?*';
           const receiptResponse =
             (requestId: string) => (response: BrowserResponse) =>
               response.request().method() === 'GET' &&
@@ -636,71 +629,6 @@ suite(
                 releaseRequest();
               },
             };
-          }
-          async function retryReceiptWithKeyboard(
-            view: Page,
-            retry: Locator,
-            requestId: string,
-            nextControl: Locator,
-          ) {
-            await retry.waitFor();
-            const node = await retry.elementHandle();
-            if (!node) throw Error('Receipt retry control is missing');
-            const controlState = () =>
-              node.evaluate((element) => ({
-                focused: document.activeElement === element,
-                busy: element.getAttribute('aria-busy'),
-                disabled: element.getAttribute('aria-disabled'),
-                label: element.textContent?.trim(),
-              }));
-            await retry.focus();
-            const read = holdReceipt(requestId, 'beforeReply');
-            let response: BrowserResponse;
-            try {
-              [response] = await Promise.all([
-                view.waitForResponse(receiptResponse(requestId), {
-                  timeout: 5000,
-                }),
-                (async () => {
-                  try {
-                    await view.keyboard.press('Enter');
-                    await read.arrived();
-                    await expect.poll(controlState).toEqual({
-                      focused: true,
-                      busy: 'true',
-                      disabled: 'true',
-                      label: '正在核对…',
-                    });
-                    await view.keyboard.press('Enter');
-                  } finally {
-                    read.release();
-                  }
-                })(),
-              ]);
-              await read.assertFinished(response);
-            } finally {
-              read.close();
-            }
-            await expect.poll(controlState).toEqual({
-              focused: true,
-              busy: null,
-              disabled: 'true',
-              label: '核对结束',
-            });
-            await view.keyboard.press('Tab');
-            await expect
-              .poll(() =>
-                nextControl.evaluate(
-                  (element) =>
-                    document.activeElement === element &&
-                    element.getClientRects().length > 0,
-                ),
-              )
-              .toBe(true);
-            await view
-              .getByRole('button', { name: '核对结束', exact: true })
-              .waitFor({ state: 'detached' });
-            return response;
           }
           let deliverablesUnavailable = true;
           let gateUnreadPreflight: (() => Promise<void>) | undefined;
@@ -988,7 +916,7 @@ suite(
             }))
             .toMatchObject({ statuses: [200], dropped: true });
           await dialog
-            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .getByText('发布未完成，请重试。', { exact: true })
             .waitFor({ timeout: 5000 });
           const publishedId = publishWrites[0]!;
           // Chromium gives the new same-origin tab the opener's exact session
@@ -1012,24 +940,15 @@ suite(
             expect(await unavailableReceipt.finished()).toBeNull();
             expect(receiptReads).toEqual([]);
             expect(
-              await coldPage
-                .getByRole('button', {
-                  name: '核对原添加为企业资料 ' + original.objectId,
-                  exact: true,
-                })
-                .isVisible(),
-            ).toBe(false);
-            const confirmed = await retryReceiptWithKeyboard(
-              coldPage,
-              coldPage.getByRole('button', {
-                name: '重试核对',
-                exact: true,
-              }),
-              publishedId,
-              coldPage
-                .getByRole('region', { name: '交付成果' })
-                .getByRole('combobox', { name: '按员工筛选' }),
-            );
+              await coldPage.getByRole('button', { name: /核对/ }).count(),
+            ).toBe(0);
+            expect(
+              await coldPage.getByText(publishedId, { exact: false }).count(),
+            ).toBe(0);
+            const [confirmed] = await Promise.all([
+              coldPage.waitForResponse(receiptResponse(publishedId)),
+              coldPage.reload(),
+            ]);
             expect(confirmed.status()).toBe(200);
             expect(await confirmed.json()).toMatchObject({
               requestId: publishedId,
@@ -1037,44 +956,21 @@ suite(
               status: 'recorded',
               ready: true,
             });
-            await coldPage
-              .getByRole('status')
-              .filter({
-                hasText: '原添加为企业资料已完成。 ' + original.objectId,
-              })
-              .waitFor();
             expect(receiptReads).toEqual([publishedId]);
             expect(publishWrites).toEqual([publishedId]);
-            console.info('publication-receipt-fixture-ready-retry', {
-              requestId: publishedId,
-              unavailable: unavailableReceipt.status(),
-              confirmed: confirmed.status(),
-              readCount: receiptReads.length,
-              publishCount: publishWrites.length,
-            });
           } finally {
             unavailableOriginalReceipt = undefined;
             await coldPage.close();
           }
-          expect(browserPublicationAttempts).toEqual([publishedId]);
-          await dialog
-            .getByRole('button', { name: '取消', exact: true })
-            .click();
-          await openPublication();
-          await dialog
-            .getByText('原添加为企业资料已完成。', { exact: true })
-            .waitFor();
-          await dialog
-            .getByRole('button', { name: '取消', exact: true })
-            .click();
+          const [confirmedInForm] = await Promise.all([
+            page.waitForResponse(receiptResponse(publishedId)),
+            dialog.getByRole('button', { name: '确认', exact: true }).click(),
+          ]);
+          expect(confirmedInForm.status()).toBe(200);
           await dialog.waitFor({ state: 'hidden' });
           expect(receiptReads).toEqual([publishedId, publishedId]);
           expect(publishWrites).toEqual([publishedId]);
           expect(browserPublicationAttempts).toEqual([publishedId]);
-          console.info('publication-receipt-fixture-initial-posts', {
-            browserAttempts: browserPublicationAttempts.length,
-            confirmedWrites: publishWrites.length,
-          });
           const recorded = await p.client.readWriteReceipt(
             {
               workspaceId: p.selection.workspaceId,
@@ -1146,31 +1042,13 @@ suite(
           expect(incompleteReply?.writableFinished).toBe(false);
           incompleteReply?.destroy();
           await revoke
-            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .getByText('发布未完成，请重试。', { exact: true })
             .waitFor();
           expect(publicationActions).toHaveLength(1);
           const withdrawnId = publicationActions[0]!;
           expect(
             await f.db`select status from allrice_knowledge_sources where id=${sourceId}`,
           ).toEqual([{ status: 'archived' }]);
-          const retained = page.getByRole('button', {
-            name: '核对原撤销 ' + sourceId,
-          });
-          await page.addInitScript((sourceId) => {
-            const remove = Storage.prototype.removeItem;
-            Storage.prototype.removeItem = function (key) {
-              const prefix = 'allrice:publication-receipts:v2:';
-              if (
-                key.startsWith(prefix) &&
-                JSON.parse(key.slice(prefix.length)).at(-1) === sourceId
-              )
-                throw new DOMException(
-                  'Storage cleanup is unavailable',
-                  'QuotaExceededError',
-                );
-              remove.call(this, key);
-            };
-          }, sourceId);
           const previousReceipts = receiptReads.length;
           const ongoingReceipt = holdReceipt(withdrawnId, 'beforeReply');
           let allowUnread!: () => void;
@@ -1207,33 +1085,14 @@ suite(
             ongoingReceipt.close();
           }
           await sourceMenu.waitFor({ state: 'detached' });
-          await page
-            .getByRole('status')
-            .filter({ hasText: '原撤销已完成。 ' + sourceId })
-            .waitFor();
           expect(receiptReads.slice(previousReceipts)).toEqual([withdrawnId]);
           expect(publicationActions).toEqual([withdrawnId]);
-          expect(await retained.isVisible()).toBe(false);
+          expect(await page.getByRole('button', { name: /核对/ }).count()).toBe(
+            0,
+          );
           expect(
-            await page.evaluate(
-              (requestId) =>
-                Object.keys(sessionStorage).some(
-                  (key) =>
-                    key.startsWith('allrice:publication-receipts:v2:') &&
-                    (
-                      JSON.parse(sessionStorage.getItem(key)!) as {
-                        requestId: string;
-                        outcome: string;
-                      }[]
-                    ).some(
-                      (entry) =>
-                        entry.requestId === requestId &&
-                        entry.outcome === 'recorded',
-                    ),
-                ),
-              withdrawnId,
-            ),
-          ).toBe(true);
+            await page.getByText(withdrawnId, { exact: false }).count(),
+          ).toBe(0);
 
           const storage = runtimeFixtureStorage(f.db);
           const put = storage.put.bind(storage);
@@ -1248,598 +1107,305 @@ suite(
             ...employeePanelsDependencies,
             storage: () => storage,
           });
+          const nameA = '浏览器企业资料A.txt';
+          const contentA = '资料 A 的已写字节。';
+          const closeUpload = () =>
+            material.getByRole('button', { name: '取消', exact: true }).click();
+          const assertQuiet = async (...ids: string[]) => {
+            expect(
+              await page.getByRole('button', { name: /核对/ }).count(),
+            ).toBe(0);
+            expect(
+              await page
+                .getByText(/发布结果待核|未确认的资料|无法核对原发布/)
+                .count(),
+            ).toBe(0);
+            for (const id of ids)
+              expect(await page.getByText(id, { exact: false }).count()).toBe(
+                0,
+              );
+          };
           await openUpload();
-          await selectFile('浏览器企业资料A.txt', '资料 A 的已写字节。');
+          await selectFile(nameA, contentA);
           await publishMaterial();
           await material
-            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .getByText('上传中断，请重试。', { exact: true })
             .waitFor();
           const pendingId = publishWrites[1]!;
           expect(publishWrites).toHaveLength(2);
           expect(publicationStatuses[1]).toBe(500);
-          await page.reload();
-          await materials();
-          await openUpload();
-          await expect.poll(() => receiptReads.at(-1)).toBe(pendingId);
+          await assertQuiet(pendingId);
+          await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+          const policy = (revision: string, enabled: boolean) =>
+            updateDEntryReleasePolicy(p.context, {
+              revision,
+              defaultGeneration: '3.x',
+              selections: enabled
+                ? [
+                    {
+                      organizationId: p.context.organizationId,
+                      personId: p.context.actor.id,
+                    },
+                  ]
+                : [],
+            });
+          await policy('fixture-quiet-receipt-withdrawal', false);
+          const [denied] = await Promise.all([
+            page.waitForResponse(receiptResponse(pendingId)),
+            closeUpload(),
+          ]);
+          expect(denied.status()).toBe(403);
+          await material.waitFor({ state: 'hidden' });
+          await assertQuiet(pendingId);
+          expect(publishWrites).toHaveLength(2);
+          await policy('fixture-quiet-receipt-restored', true);
+
+          // A retained reservation remains internal while another upload can
+          // complete through its own request key.
+          const [stillPending] = await Promise.all([
+            page.waitForResponse(receiptResponse(pendingId)),
+            openUpload(),
+          ]);
+          expect(await stillPending.json()).toMatchObject({
+            requestId: pendingId,
+            status: 'recorded',
+            ready: false,
+          });
+          expect(await material.getByRole('alert').count()).toBe(0);
           await selectFile('浏览器企业资料B.txt', '与 A 无关的正式资料上传。');
-          await material
-            .getByRole('button', { name: '核对结果', exact: true })
-            .waitFor();
           await publishMaterial();
-          await page
-            .getByRole('status')
-            .filter({ hasText: '已发布' })
-            .waitFor();
+          await material.waitFor({ state: 'hidden' });
           expect(publishWrites).toHaveLength(3);
           expect(publishWrites[2]).not.toBe(pendingId);
-          const uploadedMaterial = await p.client.readWriteReceipt(
+          await page
+            .getByRole('button', { name: '‹ 企业资料', exact: true })
+            .click();
+
+          const [pendingAgain] = await Promise.all([
+            page.waitForResponse(receiptResponse(pendingId)),
+            openUpload(),
+          ]);
+          const storedA = await pendingAgain.json();
+          expect(storedA).toMatchObject({
+            requestId: pendingId,
+            status: 'recorded',
+            ready: false,
+          });
+          await selectFile(nameA, contentA);
+          const beforeRetry = browserPublicationAttempts.length;
+          const [pendingRetry] = await Promise.all([
+            page.waitForResponse(receiptResponse(pendingId)),
+            publishMaterial(),
+          ]);
+          expect(await pendingRetry.json()).toMatchObject({ ready: false });
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          expect(browserPublicationAttempts).toHaveLength(beforeRetry);
+
+          // Complete the original upload. The quiet panel refresh must not
+          // consume its intent, even before an entirely new form opens.
+          await completeReferenceUpload(
+            p.context,
+            p.selection.workspaceId,
+            storedA.result.revisionId,
+          );
+          const [readyInPanel] = await Promise.all([
+            page.waitForResponse(receiptResponse(pendingId)),
+            closeUpload(),
+          ]);
+          expect(await readyInPanel.json()).toMatchObject({ ready: true });
+          await page
+            .getByRole('button', { name: '资料选项 ' + nameA })
+            .waitFor();
+          await openUpload();
+          expect(await material.getByRole('alert').count()).toBe(0);
+          await selectFile(nameA, contentA);
+          await publishMaterial();
+          await material.waitFor({ state: 'hidden' });
+          expect(browserPublicationAttempts).toHaveLength(beforeRetry);
+          expect(publishWrites).toHaveLength(3);
+          await assertQuiet(publishedId, withdrawnId, pendingId);
+          await page
+            .getByRole('button', { name: '‹ 企业资料', exact: true })
+            .click();
+          const deletedName = '删除后再上传的资料.txt';
+          const deletedContent = '删除前后是同一个文件。';
+          await openUpload();
+          await selectFile(deletedName, deletedContent);
+          dropPublishReply = true;
+          await Promise.all([
+            page.waitForResponse(
+              (response) =>
+                response.request().method() === 'POST' &&
+                new URL(response.url()).pathname === publicationPath,
+            ),
+            publishMaterial(),
+          ]);
+          expect(incompleteReply?.writableFinished).toBe(false);
+          incompleteReply?.destroy();
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          const deletedRequest = publishWrites.at(-1)!;
+          await closeUpload();
+          const catalogBeforeDelete = await p.client.queryMaterials(
             {
               workspaceId: p.selection.workspaceId,
-              requestId: publishWrites[2]!,
+              query: { query: '' },
+            },
+            signal(),
+          );
+          const deleted = catalogBeforeDelete.references.find(
+            (reference) => reference.fileName === deletedName,
+          );
+          expect(deleted?.publication?.origin).toBe('upload');
+          const preDelete = holdReceipt(deletedRequest, 'beforeReply');
+          try {
+            await openUpload();
+            await preDelete.arrived();
+            await p.client.changePublication(
+              {
+                sourceId: deleted!.sourceId,
+                body: {
+                  workspaceId: p.selection.workspaceId,
+                  expectedRevision: deleted!.publication!.audienceRevision,
+                  requestId: randomUUID(),
+                  action: 'delete',
+                },
+              },
+              signal(),
+            );
+            // Keep the pre-delete reply held, but let the new receipt GET
+            // reach PostgreSQL after deletion.
+            receiptGate = undefined;
+            await selectFile(deletedName, deletedContent);
+            const [archivedReceipt] = await Promise.all([
+              page.waitForResponse(receiptResponse(deletedRequest)),
+              publishMaterial(),
+            ]);
+            expect(await archivedReceipt.json()).toMatchObject({
+              status: 'recorded',
+              archived: true,
+              result: { sourceId: deleted!.sourceId },
+            });
+            await material.waitFor({ state: 'hidden' });
+          } finally {
+            preDelete.close();
+          }
+          expect(publishWrites).toHaveLength(5);
+          expect(publishWrites.at(-1)).not.toBe(deletedRequest);
+          const replacement = await p.client.readWriteReceipt(
+            {
+              workspaceId: p.selection.workspaceId,
+              requestId: publishWrites.at(-1)!,
               operation: 'publish-upload',
             },
             signal(),
           );
-          expect(uploadedMaterial).toMatchObject({
-            status: 'recorded',
-            ready: true,
+          expect(replacement.ready).toBe(true);
+          expect(replacement.archived).toBeUndefined();
+          expect(replacement.result).not.toMatchObject({
+            sourceId: deleted!.sourceId,
           });
+          const beforeRejection = browserPublicationAttempts.length;
           await page
             .getByRole('button', { name: '‹ 企业资料', exact: true })
             .click();
           await openUpload();
-          await material
-            .getByRole('button', { name: '核对结果', exact: true })
-            .waitFor();
-          await expect.poll(() => receiptReads.at(-1)).toBe(pendingId);
-          expect(publishWrites).toHaveLength(3);
-          const storedA = await p.client.readWriteReceipt(
-            {
-              workspaceId: p.selection.workspaceId,
-              requestId: pendingId,
-              operation: 'publish-upload',
-            },
-            signal(),
-          );
-          expect(storedA).toMatchObject({ status: 'recorded', ready: false });
-          expect(referenceWrites).toBe(0);
-
-          const receiptFailure = (requestId: string) =>
-            page.waitForEvent('requestfailed', {
-              predicate: (request) =>
-                request.method() === 'GET' &&
-                new URL(request.url()).pathname.endsWith(
-                  receiptPath(requestId),
-                ),
-              timeout: 5000,
-            });
-          async function checkReceipt(button: Locator, requestId: string) {
-            const [response] = await Promise.all([
-              page.waitForResponse(receiptResponse(requestId)),
-              button.click(),
-            ]);
-            return response;
-          }
-          async function startUnknownUpload(fileName: string, content: string) {
-            await page.route(
-              '**/api/v1/d-entry/panels/*/materials/publications?*',
-              (route) => route.abort('failed'),
-              { times: 1 },
-            );
-            await selectFile(fileName, content);
-            const [unadmitted] = await Promise.all([
-              page.waitForRequest(
-                (request) =>
-                  request.method() === 'POST' &&
-                  new URL(request.url()).pathname.endsWith(
-                    '/materials/publications',
-                  ),
-              ),
-              publishMaterial(),
-            ]);
-            return (unadmitted.postDataJSON() as { requestId: string })
-              .requestId;
-          }
-          const independentId = await startUnknownUpload(
-            '浏览器企业资料C.txt',
-            '与 A 无关且回包未确认的资料。',
-          );
-          expect(independentId).not.toBe(pendingId);
-          expect(publishWrites).toHaveLength(3);
-          // The context event observes even the request stopped before the handler.
-          expect(browserPublicationAttempts.at(-1)).toBe(independentId);
-          console.info('publication-receipt-fixture-keys', {
-            A: pendingId,
-            C: independentId,
-          });
-          const postCheckpoint = browserPublicationAttempts.length;
-          const waiting = '发布结果待核，请按原请求核对。';
-          const formWaiting = material
-            .getByRole('alert')
-            .filter({ hasText: waiting });
-          await formWaiting.waitFor();
-          const checkAction = (requestId: string) =>
-            material.getByRole('button', {
-              name: '核对结果 ' + requestId.slice(0, 8),
-              exact: true,
-            });
-          await checkAction(independentId).waitFor();
-          const absentReceipt = await checkReceipt(
-            checkAction(independentId),
-            independentId,
-          );
-          expect(absentReceipt.status()).toBe(200);
-          expect(await absentReceipt.json()).toMatchObject({
-            requestId: independentId,
-            status: 'unknown',
-          });
-          await expect
-            .poll(() => checkAction(independentId).isEnabled())
-            .toBe(true);
-
-          const openDialog = await material.elementHandle();
-          await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
-          const withdraw = (revision: string) =>
-            updateDEntryReleasePolicy(p.context, {
-              revision,
-              defaultGeneration: '3.x',
-              selections: [],
-            });
-          const restore = (revision: string) =>
-            updateDEntryReleasePolicy(p.context, {
-              revision,
-              defaultGeneration: '3.x',
-              selections: [
-                {
-                  organizationId: p.context.organizationId,
-                  personId: p.context.actor.id,
-                },
-              ],
-            });
-          const cacheKey = (await page.evaluate(
-            (id) =>
-              Object.keys(sessionStorage).find(
-                (key) =>
-                  key.startsWith('allrice:publication-receipts:v2:') &&
-                  (
-                    JSON.parse(sessionStorage.getItem(key)!) as {
-                      requestId: string;
-                    }[]
-                  ).some((entry) => entry.requestId === id),
-              ),
-            pendingId,
-          ))!;
-          expect(cacheKey).toBeDefined();
-          const marker =
-            'allrice:publication-receipt-denials:v1:' +
-            cacheKey +
-            '/' +
-            pendingId;
-          const readCache = (key: string) =>
-            page.evaluate((key) => sessionStorage.getItem(key), key);
-          const originalCache = await readCache(cacheKey);
-          const failNextDenialWrite = () =>
-            page.evaluate((marker) => {
-              const set = Storage.prototype.setItem;
-              let failOnce = true;
-              Storage.prototype.setItem = function (key, value) {
-                if (key === marker && failOnce) {
-                  failOnce = false;
-                  throw new DOMException(
-                    'Denial write failed',
-                    'QuotaExceededError',
-                  );
-                }
-                set.call(this, key, value);
-              };
-            }, marker);
-          await failNextDenialWrite();
-          await withdraw('fixture-open-dialog-receipt-withdrawal');
-          const readsBeforeOpenDenial = receiptReads.length;
-          const deniedInDialog = await checkReceipt(
-            checkAction(pendingId),
-            pendingId,
-          );
-          expect(deniedInDialog.status()).toBe(403);
-          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
-            true,
-          );
-          await material
-            .getByRole('status')
-            .filter({ hasText: '当前无法核对原发布请求。' })
-            .waitFor({ timeout: 5000 });
-          expect(await material.isVisible()).toBe(true);
-          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
-            true,
-          );
-          expect(await material.getByText(pendingId.slice(0, 8)).count()).toBe(
-            0,
-          );
-          expect(receiptReads.slice(readsBeforeOpenDenial)).toEqual([
-            pendingId,
-          ]);
-          expect(await formWaiting.isVisible()).toBe(true);
-          expect(await readCache(marker)).toBeNull();
-          expect(publishWrites).toHaveLength(3);
-
-          const sideReceipt = (requestId: string) =>
-            page.getByRole('button', {
-              name: '核对原发布 ' + requestId,
-              exact: true,
-            });
-          const pendingPublication = sideReceipt(pendingId);
-          const independentPublication = sideReceipt(independentId);
-          const sideWaiting = page
-            .getByRole('status')
-            .filter({ hasText: waiting });
-          const onlyIndependentVisible = async () => {
-            expect(await pendingPublication.count()).toBe(0);
-            await independentPublication.waitFor({ timeout: 5000 });
-          };
-          const closeUpload = async () => {
-            await material
-              .getByRole('button', { name: '取消', exact: true })
-              .click();
-            await material.waitFor({ state: 'hidden' });
-          };
-          async function enterWithA(enter: () => Promise<void>) {
-            const [response] = await Promise.all([
-              page.waitForResponse(receiptResponse(pendingId), {
-                timeout: 5000,
-              }),
-              enter(),
-            ]);
-            return response;
-          }
-          async function enterWithAOnHold(
-            enter: () => Promise<void>,
-            whileHeld: () => Promise<void>,
-          ) {
-            const gate = holdReceipt(pendingId, 'beforeRead');
-            try {
-              const response = await enterWithA(async () => {
-                try {
-                  await enter();
-                  await gate.arrived();
-                  await whileHeld();
-                } finally {
-                  gate.release();
-                }
-              });
-              await gate.assertFinished(response);
-              return response;
-            } finally {
-              gate.close();
-            }
-          }
-          const beforeClose = receiptReads.length;
-          const deniedAfterClose = await enterWithAOnHold(
-            closeUpload,
-            async () => {
-              await onlyIndependentVisible();
-              await page.route(
-                receiptRoute(independentId),
-                (route) => route.abort('failed'),
-                { times: 1 },
-              );
-              const [failure] = await Promise.all([
-                receiptFailure(independentId),
-                independentPublication.click(),
-              ]);
-              expect(failure.failure()).not.toBeNull();
-              await sideWaiting.waitFor({ timeout: 5000 });
-              expect(receiptReads.slice(beforeClose)).toEqual([]);
-              await onlyIndependentVisible();
-            },
-          );
-          expect(deniedAfterClose.status()).toBe(403);
-          expect(receiptReads.slice(beforeClose)).toEqual([pendingId]);
-          await expect.poll(() => readCache(marker)).toBe('1');
-          expect(await readCache(cacheKey)).toBe(originalCache);
-          await onlyIndependentVisible();
-
-          async function returnToMaterials() {
-            await page
-              .getByRole('navigation', { name: '面板' })
-              .getByRole('button', { name: '交付成果' })
-              .click();
-            await materials();
-          }
-          await restore('fixture-receipt-before-hard-refresh');
-          expect((await enterWithA(returnToMaterials)).status()).toBe(200);
-          await pendingPublication.waitFor();
-          await expect.poll(() => readCache(marker)).toBeNull();
-          await failNextDenialWrite();
-          await withdraw('fixture-receipt-unpersisted-denial');
-          expect(
-            (await checkReceipt(pendingPublication, pendingId)).status(),
-          ).toBe(403);
-          await pendingPublication.waitFor({
-            state: 'detached',
-            timeout: 5000,
-          });
-          expect(await readCache(marker)).toBeNull();
-
-          // Reload from only the v2 records. Give C its own authorized response
-          // while A is held before its read, then withdraw and let A through.
-          await restore('fixture-receipt-fresh-heap-bootstrap');
-          await page.reload();
-          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
-          expect(await readCache(marker)).toBeNull();
-          const sidebarRetry = page.getByRole('button', {
-            name: '重试核对',
-            exact: true,
-          });
+          await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
           await page.route(
-            receiptRoute(independentId),
-            (route) => route.abort('failed'),
-            {
-              times: 1,
-            },
+            '**' + publicationPath + '?*',
+            (route) =>
+              route.fulfill({ status: 413, body: 'Payload Too Large' }),
+            { times: 1 },
           );
-          const beforeFreshRead = receiptReads.length;
-          const [freshC, deniedAfterReload, failedFreshRead] =
-            await Promise.all([
-              page.waitForResponse(receiptResponse(independentId), {
-                timeout: 5000,
-              }),
-              enterWithAOnHold(materials, async () => {
-                await sidebarRetry.waitFor();
-                expect(await pendingPublication.count()).toBe(0);
-                expect(await independentPublication.count()).toBe(0);
-                expect(receiptReads.slice(beforeFreshRead)).toEqual([]);
-                await sidebarRetry.click();
-                await onlyIndependentVisible();
-                expect(receiptReads.slice(beforeFreshRead)).toEqual([
-                  independentId,
-                ]);
-                await withdraw('fixture-receipt-fresh-heap-withdrawal');
-                await onlyIndependentVisible();
-              }),
-              receiptFailure(independentId),
-            ]);
-          expect(failedFreshRead.failure()).not.toBeNull();
-          expect(freshC.status()).toBe(200);
-          expect(await freshC.json()).toMatchObject({
-            requestId: independentId,
-            status: 'unknown',
-          });
-          expect(deniedAfterReload.status()).toBe(403);
-          await expect.poll(() => readCache(marker)).toBe('1');
-          await onlyIndependentVisible();
-          expect(await sidebarRetry.count()).toBe(0);
-
-          const deniedAfterSwitch = await enterWithA(returnToMaterials);
-          expect(deniedAfterSwitch.status()).toBe(403);
-          await onlyIndependentVisible();
-
-          await page.evaluate((marker) => {
-            const remove = Storage.prototype.removeItem;
-            let failOnce = true;
-            Storage.prototype.removeItem = function (key) {
-              if (key === marker && failOnce) {
-                failOnce = false;
-                throw new DOMException(
-                  'Denial removal failed',
-                  'QuotaExceededError',
-                );
-              }
-              remove.call(this, key);
-            };
-          }, marker);
-          await restore('fixture-open-dialog-receipt-restored');
-          const originalReceipt = await enterWithA(returnToMaterials);
-          expect(originalReceipt.status()).toBe(200);
-          expect(await originalReceipt.json()).toMatchObject({
-            requestId: pendingId,
-            status: 'recorded',
-            ready: false,
-          });
-          await pendingPublication.waitFor();
-          expect(await readCache(marker)).toBe('1');
-          const otherReceipt = await checkReceipt(
-            independentPublication,
-            independentId,
-          );
-          expect(otherReceipt.status()).toBe(200);
-          expect(await otherReceipt.json()).toMatchObject({
-            requestId: independentId,
-            status: 'unknown',
-          });
-          const readsBeforeUnknown = receiptReads.length;
-          const unknown = await checkReceipt(pendingPublication, pendingId);
-          expect(unknown.status()).toBe(200);
+          await publishMaterial();
+          await material
+            .getByText('服务器拒绝接收此文件，请换一个更小的文件重试。', {
+              exact: true,
+            })
+            .waitFor();
+          const unknownId = browserPublicationAttempts.at(-1)!;
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
+          expect(publishWrites).toHaveLength(5);
+          const [unknown] = await Promise.all([
+            page.waitForResponse(receiptResponse(unknownId)),
+            publishMaterial(),
+          ]);
           expect(await unknown.json()).toMatchObject({
-            requestId: pendingId,
-            status: 'recorded',
-            ready: false,
+            requestId: unknownId,
+            status: 'unknown',
+            result: null,
           });
-          await expect.poll(() => readCache(marker)).toBeNull();
-          expect(await readCache(cacheKey)).toBe(originalCache);
-          await expect.poll(() => sideWaiting.count()).toBe(2);
-          expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
-
-          const lateIndependent = holdReceipt(independentId, 'beforeReply');
-          try {
-            const [approvedBeforeWithdrawal] = await Promise.all([
-              page.waitForResponse(receiptResponse(independentId), {
-                timeout: 5000,
-              }),
-              (async () => {
-                try {
-                  await independentPublication.click();
-                  await lateIndependent.arrived();
-                  expect(receiptReads.at(-1)).toBe(independentId);
-                  await withdraw('fixture-browser-receipt-withdrawal');
-                  const readsBeforeDenial = receiptReads.length;
-                  const denied = await checkReceipt(
-                    pendingPublication,
-                    pendingId,
-                  );
-                  expect(denied.status()).toBe(403);
-                  await pendingPublication.waitFor({
-                    state: 'detached',
-                    timeout: 5000,
-                  });
-                  expect(receiptReads.slice(readsBeforeDenial)).toEqual([
-                    pendingId,
-                  ]);
-                  expect(await independentPublication.isVisible()).toBe(true);
-                  expect(await independentPublication.isDisabled()).toBe(true);
-                } finally {
-                  lateIndependent.release();
-                }
-              })(),
-            ]);
-            await lateIndependent.assertFinished(approvedBeforeWithdrawal);
-            expect(approvedBeforeWithdrawal.status()).toBe(200);
-            expect(await approvedBeforeWithdrawal.json()).toMatchObject({
-              requestId: independentId,
-              status: 'unknown',
-            });
-          } finally {
-            lateIndependent.close();
-          }
-          expect(
-            await page.getByText(pendingId, { exact: false }).count(),
-          ).toBe(0);
-          expect(await independentPublication.isVisible()).toBe(true);
-          await expect
-            .poll(() => independentPublication.isEnabled())
-            .toBe(true);
-          expect(await sideWaiting.count()).toBe(1);
-          expect(publishWrites).toHaveLength(3);
-          expect(browserPublicationAttempts.slice(postCheckpoint)).toEqual([]);
-
-          await restore('fixture-original-publication-completes');
-          expect((await enterWithA(returnToMaterials)).status()).toBe(200);
-          expect(
-            (
-              await checkReceipt(independentPublication, independentId)
-            ).status(),
-          ).toBe(200);
-          await expect.poll(() => sideWaiting.count()).toBe(2);
-          const originalReservation = storedA.result;
-          if (!originalReservation || !('revisionId' in originalReservation))
-            throw Error('Original upload reservation has no revision');
-          // The original reservation's immutable bytes were written before its
-          // provider acknowledgement was lost. Finish that reservation in PG.
-          await completeReferenceUpload(
-            p.context,
-            p.selection.workspaceId,
-            originalReservation.revisionId,
-          );
-          await openUpload();
           await material
-            .getByRole('status')
-            .filter({ hasText: '原发布已完成。' })
+            .getByText('上传中断，请重试。', { exact: true })
             .waitFor();
-          const currentFormId = await startUnknownUpload(
-            '浏览器企业资料D.txt',
-            '在当前弹窗里等待核对的独立上传。',
-          );
-          expect([pendingId, independentId]).not.toContain(currentFormId);
-          console.info('publication-receipt-fixture-current-form', {
-            D: currentFormId,
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
+          await assertQuiet(unknownId);
+          // Two independent background reads straddle a real release change.
+          // The earlier authorised reply cannot tell the UI what happened to
+          // the other request, whose read is denied under the current policy.
+          const lateRecorded = holdReceipt(withdrawnId, 'beforeReply');
+          let allowUnknown!: () => void;
+          const unknownHeld = new Promise<void>((resolve) => {
+            allowUnknown = resolve;
           });
-          await formWaiting.waitFor();
-          const currentDialog = await material.elementHandle();
-          await withdraw('fixture-current-form-receipt-withdrawal');
-          const deniedCurrentForm = await checkReceipt(
-            checkAction(currentFormId),
-            currentFormId,
-          );
-          expect(deniedCurrentForm.status()).toBe(403);
-          await formWaiting.waitFor({ state: 'detached', timeout: 5000 });
-          expect(
-            await currentDialog?.evaluate((node) => node.isConnected),
-          ).toBe(true);
-          const [lastDenial] = await Promise.all([
-            page.waitForResponse(receiptResponse(currentFormId), {
-              timeout: 5000,
-            }),
-            closeUpload(),
-          ]);
-          expect(lastDenial.status()).toBe(403);
-          await onlyIndependentVisible();
-          expect(await sideReceipt(currentFormId).count()).toBe(0);
-          expect(await sideWaiting.count()).toBe(1);
-
-          // A fresh unverified C can be retried in the original dialog too.
-          await restore('fixture-modal-unverified-retry');
-          await page.reload();
-          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
           await page.route(
-            receiptRoute(independentId),
-            (route) => route.abort('failed'),
-            {
-              times: 2,
+            '**' + receiptPath(unknownId) + '?*',
+            async (route) => {
+              await unknownHeld;
+              await route.continue();
             },
+            { times: 1 },
           );
-          const [, sideD] = await Promise.all([
-            receiptFailure(independentId),
-            page.waitForResponse(receiptResponse(currentFormId), {
-              timeout: 5000,
-            }),
-            materials(),
+          try {
+            const lateResponse = page.waitForResponse(
+              receiptResponse(withdrawnId),
+            );
+            const deniedResponse = page.waitForResponse(
+              receiptResponse(unknownId),
+            );
+            const replies = Promise.all([lateResponse, deniedResponse]);
+            void replies.catch(() => {});
+            await closeUpload();
+            await lateRecorded.arrived();
+            await policy('fixture-late-recorded-withdrawal', false);
+            allowUnknown();
+            expect((await deniedResponse).status()).toBe(403);
+            lateRecorded.release();
+            const [late] = await replies;
+            await lateRecorded.assertFinished(late);
+            expect(await late.json()).toMatchObject({
+              requestId: withdrawnId,
+              status: 'recorded',
+            });
+            await assertQuiet(withdrawnId, unknownId);
+            expect(browserPublicationAttempts).toHaveLength(
+              beforeRejection + 1,
+            );
+          } finally {
+            allowUnknown();
+            lateRecorded.close();
+          }
+          await policy('fixture-late-recorded-restored', true);
+          await page.reload();
+          await materials();
+          await openUpload();
+          await selectFile('代理拒绝的资料.txt', '这次 POST 未到达处理器。');
+          const [stillUnknown] = await Promise.all([
+            page.waitForResponse(receiptResponse(unknownId)),
+            publishMaterial(),
           ]);
-          expect(sideD.status()).toBe(200);
-          expect(await sideD.finished()).toBeNull();
-          await sideReceipt(currentFormId).waitFor();
-          await sidebarRetry.waitFor();
-          const [, dialogD] = await Promise.all([
-            receiptFailure(independentId),
-            page.waitForResponse(receiptResponse(currentFormId), {
-              timeout: 5000,
-            }),
-            openUpload(),
-          ]);
-          expect(dialogD.status()).toBe(200);
-          expect(await dialogD.finished()).toBeNull();
-          const modalRetry = material.getByRole('button', {
-            name: '重试核对',
-            exact: true,
-          });
-          await modalRetry.waitFor();
-          await checkAction(currentFormId).waitFor();
-          expect(
-            await material.getByText(independentId.slice(0, 8)).count(),
-          ).toBe(0);
-          const beforeModalRetry = receiptReads.length;
-          const modalRetryResult = await retryReceiptWithKeyboard(
-            page,
-            modalRetry,
-            independentId,
-            material.getByRole('button', { name: '关闭', exact: true }),
-          );
-          expect(modalRetryResult.status()).toBe(200);
-          expect(await modalRetryResult.json()).toMatchObject({
-            requestId: independentId,
+          expect(await stillUnknown.json()).toMatchObject({
             status: 'unknown',
           });
-          expect(receiptReads.slice(beforeModalRetry)).toEqual([independentId]);
-          expect(browserPublicationAttempts.slice(postCheckpoint)).toEqual([
-            currentFormId,
-          ]);
-          expect(publishWrites).toHaveLength(3);
+          await material
+            .getByText('上传中断，请重试。', { exact: true })
+            .waitFor();
+          expect(browserPublicationAttempts).toHaveLength(beforeRejection + 1);
+          expect(referenceWrites).toBe(0);
           await page.unrouteAll({ behavior: 'wait' });
-          console.info('publication-receipt-fixture-handoff', {
-            A: pendingId,
-            C: independentId,
-            afterClose: deniedAfterClose.status(),
-            afterReload: {
-              A: deniedAfterReload.status(),
-              C: freshC.status(),
-            },
-            heldOriginalReadsFinished: 3,
-            delayedReply: { A: 403, C: 200 },
-            unverifiedRetries: {
-              sidebar: freshC.status(),
-              dialog: modalRetryResult.status(),
-            },
-            originalRequestsRepeated: 0,
-            serverPublicationWrites: publishWrites.length,
-          });
           await context.close();
         } finally {
           await browser?.close();

@@ -470,6 +470,7 @@ export {
   createPostgresPersonVmScheduledWakeStore,
   PERSON_VM_WAKE_CLAIM_MS,
   readCompletePersonVmWakeRoster,
+  readPersonVmEmployeeInstructions,
   readPersonVmWakeRoster,
   withOwnedPersonVmAuthorityTransaction,
   type ScheduledWakeClaim,

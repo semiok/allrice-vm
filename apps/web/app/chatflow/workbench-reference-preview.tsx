@@ -26,6 +26,7 @@ export function ReferenceSnapshotPreview(props: {
   headers: Record<string, string>;
   active: boolean;
   dataClient?: EmployeePanelDataClient;
+  scopedDownload?: boolean;
   material?: {
     purpose: string;
     beforePreview?: ReactNode;
@@ -37,6 +38,7 @@ export function ReferenceSnapshotPreview(props: {
   const data = useEmployeePanelData(props);
   const scope = `${props.workspaceId}/${props.revisionId}`;
   const download = useEmployeePanelDownload(data, scope, props.active);
+  const useScopedDownload = !!props.dataClient || !!props.scopedDownload;
   const readPage = useCallback(
     (page: { source: true; offset?: number }, signal: AbortSignal) =>
       data.previewMaterial(
@@ -135,9 +137,9 @@ export function ReferenceSnapshotPreview(props: {
         delivery={!!props.material}
         description={props.material?.purpose}
         title={props.title}
-        downloadUrl={props.dataClient ? undefined : base + '/download' + query}
+        downloadUrl={useScopedDownload ? undefined : base + '/download' + query}
         onDownload={
-          props.dataClient
+          useScopedDownload
             ? () =>
                 void download.download(
                   (signal) =>
