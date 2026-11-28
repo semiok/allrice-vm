@@ -9,6 +9,7 @@ import {
 } from '@deepseek-ai/dsh-attachment';
 import {
   closeServer,
+  deferred,
   gatewayFixture,
   listen,
   modelBinding,
@@ -22,6 +23,8 @@ import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
 const state = vi.hoisted(() => ({
   settings: vi.fn<typeof readPlatformModelSettings>(),
+  statementTimeout: vi.fn(async () => []),
+  endSlotRead: vi.fn(async () => {}),
   subscription:
     vi.fn<
       (
@@ -32,7 +35,18 @@ const state = vi.hoisted(() => ({
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
-  getDatabase: () => state.subscription,
+  getDatabase: () => ({}),
+  createDedicatedDatabase: () => ({
+    end: state.endSlotRead,
+    begin: (_mode: string, query: (tx: typeof state.subscription) => unknown) =>
+      query(((parts: TemplateStringsArray, connectionId: string) =>
+        parts[0]?.startsWith('set local statement_timeout')
+          ? state.statementTimeout()
+          : state.subscription(
+              parts,
+              connectionId,
+            )) as typeof state.subscription),
+  }),
   readPlatformModelSettings: state.settings,
 }));
 vi.mock('../codex-subscription-home.js', () => ({
@@ -242,6 +256,39 @@ it('does not enable the route without a grant from the managed store', async () 
   }
 });
 
+it('proves both transports stopped while a timed database read is still settling', async () => {
+  await saveSyntheticGrant();
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'slot-query-fixture',
+  );
+  const entered = deferred();
+  const held = deferred<{ slot: 1; revision: string }[]>();
+  state.statementTimeout.mockClear();
+  state.subscription.mockImplementationOnce(() => {
+    entered.resolve();
+    return held.promise;
+  });
+  const reading = host.assertCurrent();
+  try {
+    await entered.promise;
+    const closing = host.close();
+    const proof = await host.confirmTransportStopped(
+      'slot-query-fixture',
+      AbortSignal.timeout(1500),
+    );
+    expect(proof).toContain('undici-owner-stopped:slot-query-fixture:auth:');
+    expect(state.statementTimeout).toHaveBeenCalledOnce();
+    expect(state.endSlotRead).toHaveBeenCalledWith({ timeout: 0 });
+    held.resolve([{ slot: 1, revision: '1' }]);
+    await expect(reading).rejects.toMatchObject({ code: 'ADMISSION_CLOSED' });
+    await closing;
+  } finally {
+    held.resolve([{ slot: 1, revision: '1' }]);
+    await Promise.allSettled([reading, host.close()]);
+  }
+});
+
 it('refreshes an expired managed Codex grant and meters an image-capable SSE request through the production runtime', async () => {
   await saveSyntheticGrant(0);
   const nativeFetch = globalThis.fetch;
@@ -411,4 +458,123 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
     await host.close();
     vi.unstubAllGlobals();
   }
+});
+
+it('joins OAuth rotation before closing its pool when a Codex route is withdrawn, retaining the grant for its peer', async () => {
+  await saveSyntheticGrant(0);
+  const refreshing = deferred();
+  const completeRefresh = deferred();
+  const access = [
+    'fixture',
+    Buffer.from(
+      JSON.stringify({
+        'https://api.openai.com/auth': {
+          chatgpt_account_id: 'fixture-account',
+        },
+      }),
+    ).toString('base64url'),
+    'fixture-signature',
+  ].join('.');
+  let refreshCount = 0;
+  const refresh = createServer(async (request, response) => {
+    for await (const part of request) void part;
+    refreshCount++;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.flushHeaders();
+    refreshing.resolve();
+    await completeRefresh.promise;
+    response.end(
+      JSON.stringify({
+        access_token: access,
+        refresh_token: 'fixture-rotated-refresh',
+        expires_in: 3600,
+      }),
+    );
+  });
+  const oauth = await listen(refresh);
+  const upstream = await responsesFixture({ codex: true });
+  const signal = controller().signal;
+  const first = await createProductionCodexRuntime(signal, 'codex-first');
+  const peer = await createProductionCodexRuntime(
+    signal,
+    'codex-peer',
+    undefined,
+    'gpt-6.1-sol',
+  );
+  const nativeFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!(input instanceof Request)) return nativeFetch(input, init);
+    const target = {
+      'https://auth.openai.com/oauth/token': oauth,
+      'https://chatgpt.com/backend-api/codex/responses': upstream.url,
+    }[input.url];
+    if (!target) {
+      if (new URL(input.url).hostname !== '127.0.0.1')
+        throw Error('non-local fixture');
+      return nativeFetch(input, init);
+    }
+    return nativeFetch(target, {
+      ...init,
+      method: input.method,
+      headers: input.headers,
+      signal: input.signal,
+    });
+  });
+  const start = (host: typeof first) =>
+    gatewayFixture({
+      binding: {
+        ...modelBinding(),
+        provider: host.route.provider,
+        model: host.route.model,
+      },
+      provider: createDshGatewayProvider(
+        host.llm,
+        host.route,
+        host.transport.fetchOwned,
+        host.transport.beforeDispatch,
+        host.scopeStream,
+        host.transport.confirmClosed,
+      ),
+    });
+  const a = await start(first);
+  const b = await start(peer);
+  const request = a.collect().catch(() => null);
+  try {
+    await refreshing.promise;
+    let joined = false;
+    const retirement = first.close().then(() => (joined = true));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(first.revoked.aborted).toBe(true);
+    expect(peer.revoked.aborted).toBe(false);
+    expect(joined).toBe(false);
+    completeRefresh.resolve();
+    await retirement;
+    await request;
+    expect(
+      [...a.store.rows.values()].map(({ kind, outcome }) => [kind, outcome]),
+    ).toEqual([['auth-refresh', 'closed']]);
+    expect(
+      await readFile(join(state.home, '.credentials.yaml'), 'utf8'),
+    ).toContain('fixture-rotated-refresh');
+    expect((await b.collect()).at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: 'stop' },
+    });
+    expect(refreshCount).toBe(1);
+  } finally {
+    completeRefresh.resolve();
+    await Promise.all([a.close(), b.close(), first.close(), peer.close()]);
+    await Promise.all([closeServer(refresh), upstream.close()]);
+  }
+}, 15_000);
+
+it('refuses to register retired Codex IDs as new scoped routes', async () => {
+  await expect(
+    createProductionCodexRuntime(
+      controller().signal,
+      'old-route',
+      undefined,
+      'gpt-5.4',
+    ),
+  ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
 });

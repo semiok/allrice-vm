@@ -100,6 +100,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       h.native.assertWebEndpoints = vi.fn(async () => {});
       h.runtime.retireAfterNativeStop = vi.fn(async () => {});
       const stage = vi.spyOn(h.runtime, 'memoryGuestPlan');
+      const readiness = vi.spyOn(h.runtime, 'readiness');
       const service = new PersonVmService({
         ...h.options,
         nativeWeb: {
@@ -114,11 +115,13 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       });
       const previous =
         state === 'previous disk' ? await service.create(rc, signal()) : null;
+      const editorThreadId = previous ? randomUUID() : undefined;
       const starting = service.prewarm(
         rc,
         {
           trigger: 'page',
           selectedEmployee,
+          editorThreadId,
           target: {
             vmId: previous?.vmId ?? null,
             instanceId: null,
@@ -140,6 +143,18 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       await expect(starting).resolves.toMatchObject({ ready: true });
       const startup = stage.mock.calls[0]?.[2];
       expect(startup?.selectedEmployee).toEqual(selectedEmployee);
+      expect(startup?.editorThreadId).toBe(editorThreadId);
+      if (editorThreadId)
+        expect(readiness).toHaveBeenCalledWith(
+          startup?.receipt.binding,
+          expect.any(AbortSignal),
+          rc,
+          {
+            employee: selectedEmployee,
+            threadId: editorThreadId,
+            starting: true,
+          },
+        );
       expect(startup?.unusedEmployeeHomes).toBe(
         state === 'fresh disk and attach' ? true : undefined,
       );

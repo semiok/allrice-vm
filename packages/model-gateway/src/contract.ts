@@ -19,32 +19,45 @@ export const MODEL_CALL_RECIPIENT_HEADER = 'x-allrice-model-call-recipient';
 export const isModelCallReference = (value: unknown): value is string =>
   typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 
+export type ModelRouteKey = Readonly<{ provider: string; model: string }>;
+
 /** HOST ONLY. Shapes do not authenticate. The authority must resolve every
  * field from its managed connection/current identity/native descriptor owner. */
-export type ModelCallBinding = Readonly<{
-  context: RequestContext;
-  vm: PersonVmBinding;
-  execution: Pick<ExecutionContext, 'runId' | 'executionId'>;
-  employeeInstanceId: string;
-  employeeRelease: string;
-  allriceThreadRef: string;
-  native: Readonly<{
-    instanceId: string;
-    profile: string;
-    sessionId: string;
-    rootSessionId: string;
-    parentSessionId: string | null;
-    callId: string;
-    attemptId?: string;
-    attemptKind?: 'assistant' | 'compaction' | 'session-title';
-    attemptTurn?: number | null;
-    attemptCursor?: number;
+export type ModelCallBinding = ModelRouteKey &
+  Readonly<{
+    context: RequestContext;
+    vm: PersonVmBinding;
+    execution: Pick<ExecutionContext, 'runId' | 'executionId'>;
+    employeeInstanceId: string;
+    employeeRelease: string;
+    allriceThreadRef: string;
+    native: Readonly<{
+      instanceId: string;
+      profile: string;
+      sessionId: string;
+      rootSessionId: string;
+      parentSessionId: string | null;
+      callId: string;
+      attemptId?: string;
+      attemptKind?: 'assistant' | 'compaction' | 'session-title';
+      attemptTurn?: number | null;
+      attemptCursor?: number;
+    }>;
+    executionGeneration: string;
+    gatewayRelease: string;
   }>;
-  executionGeneration: string;
-  gatewayRelease: string;
-  provider: string;
-  model: string;
-}>;
+
+/** Trusted routing input for issuance. A future resolver can apply a session
+ * or child-session policy here, then seal its result into ModelCallBinding.
+ * Never populate this context from a guest model hint. */
+export type ModelRouteScope = Pick<
+  ModelCallBinding,
+  'context' | 'vm' | 'employeeInstanceId' | 'employeeRelease' | 'native'
+>;
+export type ResolveModelRoute = (
+  scope: ModelRouteScope,
+  signal: AbortSignal,
+) => Promise<ModelRouteKey>;
 
 export interface ModelGatewayAuthority {
   /** Current membership, managed VM epoch, employee release, root/child tree,
@@ -104,7 +117,19 @@ export type GatewayFetchClassification = Readonly<{
   kind: 'model' | 'auth-refresh';
   protocol: 'openai-chat-completions' | 'openai-responses' | 'opaque';
 }>;
+export type DshGatewayRoute = ModelRouteKey &
+  Readonly<{
+    transport: 'sse';
+    classify: GatewayProvider['classify'];
+    /** Host approved for this exact route. Only for a supported provider/model capability. */
+    hostedWebSearch?: true;
+  }>;
 export interface GatewayProvider {
+  readonly hostedWebSearch?: ModelRouteKey;
+  /** Require a confirmed native transport close on every cancellation. */
+  readonly requireTransportProof?: true;
+  /** Exact owned dispatcher was destroyed and joined. False if still open. */
+  confirmTransportClosed?(): Promise<boolean>;
   /** Optional exact Host-owned transport. Only the gateway calls it after it
    * has committed the metered attempt. No Guest data selects the dispatcher. */
   assertDispatchCurrent?(signal: AbortSignal): Promise<void>;

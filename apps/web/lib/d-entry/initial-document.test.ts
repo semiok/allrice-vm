@@ -42,18 +42,14 @@ it('prepares only hinted application and exact bootstrap paths from the sealed g
   ).toEqual([]);
 });
 
-it('hands off each download once and waits for a cancelled body before publishing the close', async () => {
-  let releaseBody!: (value: ArrayBuffer) => void;
-  const content = new Promise<ArrayBuffer>((resolve) => {
-    releaseBody = resolve;
+it('hands off each download once and waits for an in-flight response to settle before publishing the close', async () => {
+  let releaseResponse!: (value: Response) => void;
+  const content = new Promise<Response>((resolve) => {
+    releaseResponse = resolve;
   });
-  const arrayBuffer = vi.fn(() => content);
-  const fetch = vi.fn<
-    (
-      url: string,
-      options: RequestInit,
-    ) => Promise<Pick<Response, 'ok' | 'arrayBuffer'>>
-  >(async () => ({ ok: true, arrayBuffer }));
+  const fetch = vi.fn<(url: string, options: RequestInit) => Promise<Response>>(
+    () => content,
+  );
   const postMessage = vi.fn();
   const sandbox = {
     AbortController,
@@ -67,6 +63,11 @@ it('hands off each download once and waits for a cancelled body before publishin
       },
     },
     fetch,
+    Response,
+    DOMException,
+    TransformStream,
+    clearTimeout,
+    setTimeout,
     location: { origin: 'https://allrice.test' },
     parent: { postMessage },
     window: { addEventListener() {}, removeEventListener() {} },
@@ -78,7 +79,7 @@ it('hands off each download once and waits for a cancelled body before publishin
         },
   };
   runInNewContext(initialDocumentLifecycle, sandbox);
-  await vi.waitFor(() => expect(arrayBuffer).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
   const owner = sandbox.__ALLRICE_EMPLOYEE_DOCUMENT__!;
   const bytes = owner.earlyBundles.take().get(url)!;
   expect(owner.earlyBundles.take().size).toBe(0);
@@ -95,7 +96,7 @@ it('hands off each download once and waits for a cancelled body before publishin
     expect.objectContaining({ type: pageCompletion }),
     expect.any(String),
   );
-  releaseBody(new ArrayBuffer(1));
+  releaseResponse(new Response(new Uint8Array(1)));
   await expect(bytes).rejects.toMatchObject({ name: 'AbortError' });
   await vi.waitFor(() =>
     expect(postMessage).toHaveBeenLastCalledWith(

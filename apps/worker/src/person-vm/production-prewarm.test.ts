@@ -71,6 +71,7 @@ it('carries the exact current selection through the real H1 scope to the shared 
     f.base.context,
     {
       trigger: 'page',
+      editorThreadId: f.base.identity.threadId,
       selectedEmployee: {
         personId: f.base.identity.personId,
         organizationId: f.base.identity.organizationId,
@@ -117,6 +118,7 @@ it('keeps the checked profile and original physical fence across the awaited gra
     employeeVersionId: initial.employeeVersionId,
   });
   expect(prewarm.selectedEmployee).not.toHaveProperty('threadId');
+  expect(prewarm.editorThreadId).toBe(f.base.identity.threadId);
 });
 
 it('rejects stale selection before any VM effect and preserves a later valid request', async () => {

@@ -14,15 +14,17 @@ import {
 import { NativeRootJoinUnknown } from '../native-web/owner.js';
 import { installProductionDEntrySource } from './production-dentry-source.js';
 
-const { current, policy, profile } = vi.hoisted(() => ({
+const { current, policy, profile, historyRoot } = vi.hoisted(() => ({
   current: vi.fn(),
   policy: vi.fn(),
   profile: vi.fn(),
+  historyRoot: vi.fn<typeof Database.getDEntryHistoryRootPin>(),
 }));
 vi.mock('@allrice/database', async (original) => ({
   ...(await original<typeof Database>()),
   requireDEntryNativeIdentity: current,
   readDEntryReleasePolicy: policy,
+  getDEntryHistoryRootPin: historyRoot,
 }));
 vi.mock('../d-entry/released-profile.js', () => ({
   holdReleasedProfile: profile,
@@ -189,13 +191,14 @@ function fixture(holdAdmission = false) {
   });
   cleanup.push(source.close);
   const verificationOwner = {};
-  async function prove(modelAdapterId?: string) {
+  async function prove(modelAdapterId?: string, threadId?: string) {
     verified = await proof(
       {
         binding,
         endpoint,
         context,
         ...(modelAdapterId && { modelAdapterId }),
+        ...(threadId && { threadId }),
         readModels,
         profile: {
           revoked: signal,
@@ -307,6 +310,33 @@ it('requires the live physical proof even with the current employee already veri
   } finally {
     uninstall();
   }
+});
+
+it('authorizes a retained route from the current database root for the exact VM and thread', async () => {
+  const f = fixture();
+  const identity = { ...f.identity, threadId: randomUUID() };
+  current.mockResolvedValue(identity);
+  const pin = {
+    identity,
+    rootNativeSessionId: 'trusted-native-root',
+    rootOriginDigest: 'provenance',
+    rootBindingRef: 'reference',
+    vmId: f.binding.vmId,
+  };
+  historyRoot.mockResolvedValue(pin);
+  await expect(f.prove('adapter', identity.threadId)).resolves.toBe(
+    f.route.revoked,
+  );
+  expect(f.resolveSendRoute).toHaveBeenCalledWith(
+    expect.objectContaining({ rootNativeSessionId: pin.rootNativeSessionId }),
+    expect.any(AbortSignal),
+  );
+  f.resolveSendRoute.mockClear();
+  historyRoot.mockResolvedValue({ ...pin, vmId: randomUUID() });
+  await expect(f.prove('adapter', identity.threadId)).rejects.toBeInstanceOf(
+    DataAccessError,
+  );
+  expect(f.resolveSendRoute).not.toHaveBeenCalled();
 });
 
 it('ties the selected prewarm proof to the revocation of the authenticated Host group', async () => {

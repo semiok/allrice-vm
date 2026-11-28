@@ -37,7 +37,10 @@ import {
   readEmployeeEntryIdentity,
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
+import { warmPublicProfileAssets } from '../../../lib/d-entry/public-profile-warmup';
 import styles from './employee-native-page.module.css';
+
+const noStartupAssets: readonly string[] = [];
 
 type Status =
   | 'warming'
@@ -75,6 +78,7 @@ type EntryWarmup = {
   selection: DEntrySelectionInput;
   lifetime: AbortController;
   result: Promise<void>;
+  stopAssetDownloads(): void;
   readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
   progress: {
     current?: { state: EmployeePrewarmProgress; activeLimit?: number };
@@ -86,10 +90,12 @@ type EntryWarmup = {
 function startEntryWarmup(
   selection: DEntrySelectionInput,
   lifetime: AbortController,
+  startupAssetUrls: readonly string[],
   ticket?: DEntryNativePrewarmTicket,
   foregroundOpen?: boolean,
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
+  const assets = new AbortController();
   let lookup:
     | {
         read: ReturnType<typeof readEmployeeEntryIdentity>;
@@ -104,6 +110,10 @@ function startEntryWarmup(
       lookup?.cancel.abort();
       lookup = undefined;
       progress.ticket = accepted;
+      void warmPublicProfileAssets(
+        startupAssetUrls,
+        AbortSignal.any([lifetime.signal, assets.signal]),
+      );
     },
     progress(state, activeLimit) {
       progress.current = { state, activeLimit };
@@ -125,6 +135,7 @@ function startEntryWarmup(
     lifetime,
     result,
     progress,
+    stopAssetDownloads: () => assets.abort(),
     readIdentity: () => lookup?.read,
   };
 }
@@ -149,11 +160,14 @@ export function EmployeeNativePage({
   query,
   prepare = false,
   initialUnavailable = false,
+  startupAssetUrls = noStartupAssets,
 }: {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
+  startupAssetUrls?: readonly string[];
 }) {
+  const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
   const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
@@ -188,6 +202,10 @@ export function EmployeeNativePage({
     lastPropQuery.current = query;
     nextQuery.current = query;
   }
+
+  useEffect(() => {
+    assetUrls.current = startupAssetUrls;
+  }, [startupAssetUrls]);
 
   useEffect(() => {
     const discardPending = () => pendingWarmup.current?.lifetime.abort();
@@ -284,6 +302,7 @@ export function EmployeeNativePage({
     }
     function retire() {
       if (replacing) return replacing;
+      warmup?.stopAssetDownloads();
       if (prepare) {
         closingNotice = window.setTimeout(
           () => setStatus('closing'),
@@ -518,7 +537,11 @@ export function EmployeeNativePage({
         selectedEmployee?.workspaceId === selection.workspaceId &&
         selectedEmployee.employeeInstanceId === selection.employeeInstanceId;
       if (sameEmployee && !document.hidden) {
-        nextWarmup = startEntryWarmup(selection, new AbortController());
+        nextWarmup = startEntryWarmup(
+          selection,
+          new AbortController(),
+          assetUrls.current,
+        );
       }
       void retire().then((closed) => {
         if (replace.current !== applyQuery || detached) return;
@@ -810,6 +833,7 @@ export function EmployeeNativePage({
           warmup ??= startEntryWarmup(
             selection,
             lifetime,
+            assetUrls.current,
             ticket,
             activation.foregroundOpen,
           );

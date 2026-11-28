@@ -22,6 +22,7 @@ import {
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
+import { nativeScopedModelPatches } from './model-task-presets.js';
 import {
   nativeSearchToolPatches,
   nativeWebBundlePatches,
@@ -67,6 +68,43 @@ it('生产compiler收集全部native Web产品而不emit测试；typecheck仍收
   expect(build.options.rootDir).toBe(join(worker, 'src'));
   expect(build.options.paths).toEqual({});
 });
+it('applies both maintenance task routes before preparation, preserving the native Search and Fetch preset boundaries', () => {
+  const title = { provider: 'deepseek', model: 'deepseek-flash' };
+  const compaction = { provider: 'openai', model: 'gpt-4.1-mini' };
+  const entries = composeEntries([
+    ...nativeWebBundlePatches(),
+    nativeScopedModelPatches({ title, compaction }),
+  ]);
+  expect(entries.find(({ id }) => id === 'session-title-llm')).toMatchObject({
+    config: { ...title, maxInputBytes: 4096, timeoutMs: 60000 },
+  });
+  const presets = entries.filter(
+    ({ name }) => name === '@deepseek-ai/dsh-agent-preset',
+  );
+  expect(presets.length).toBeGreaterThan(0);
+  const standard = presets.find(({ id }) => id === 'preset-standard');
+  expect(standard?.config?.plugins).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        name: '@deepseek-ai/dsh-tool-web',
+        config: expect.objectContaining({ search: false }),
+      }),
+      expect.objectContaining({
+        id: 'compaction',
+        config: expect.arrayContaining([
+          expect.objectContaining({
+            name: '@deepseek-ai/dsh-compaction-basic',
+            config: {
+              summarizationProvider: compaction.provider,
+              summarizationModel: compaction.model,
+            },
+          }),
+        ]),
+      }),
+    ]),
+  );
+});
+
 it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI；不写token或端口池', async () => {
   const config = {
     origin: 'http://127.0.0.1:32179/',

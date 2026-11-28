@@ -218,7 +218,7 @@ export function createModelGateway(options: {
   ownerId: string;
   authority: ModelGatewayAuthority;
   store: ModelGatewayStore;
-  provider: GatewayProvider;
+  provider: GatewayProvider | ((binding: ModelCallBinding) => GatewayProvider);
   admission: ModelGatewayAdmission;
   confirmTransportStopped?(
     ownerId: string,
@@ -405,9 +405,14 @@ export function createModelGateway(options: {
                 createHash('sha256')
                   .update(JSON.stringify(input))
                   .digest('hex');
+              const provider =
+                typeof options.provider === 'function'
+                  ? options.provider(binding)
+                  : options.provider;
               const callId = await options.store.claimCall(binding, digest);
               transport = createMeteredTransport({
                 ...options,
+                provider,
                 binding,
                 callId,
                 signal,
@@ -415,7 +420,7 @@ export function createModelGateway(options: {
                 activate,
               });
               iterator = transport.run(() => {
-                const source = options.provider.stream(binding, input, signal);
+                const source = provider.stream(binding, input, signal);
                 return source[Symbol.asyncIterator]();
               });
               response.writeHead(200, {

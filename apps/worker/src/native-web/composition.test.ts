@@ -29,7 +29,8 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from './composition.js';
-import { dEntryNativePublicUrl } from './launch.js';
+import * as NativeLaunch from './launch.js';
+const { dEntryNativePublicUrl } = NativeLaunch;
 const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
@@ -280,6 +281,132 @@ it.each(['proved', 'unproved'] as const)(
     }
   },
 );
+it.each([false, true])(
+  'proves the exact scoped thread during starting without using running-only or threadless proof (with schedules=%s)',
+  async (withSchedules) => {
+    const f = withSchedules
+      ? capacityFixture(createProductionEmployeeRuntime({}, 20)!)
+      : fixture();
+    const [selected, sibling] = f.web.receipt.endpoints;
+    const employee = { ...selected!, ...f.binding };
+    const editor = { employee, threadId: randomUUID() };
+    const dispatch: PersonVmGuestLaunchDispatch = (active, work) =>
+      work(active);
+    const web = {
+      ...f.web,
+      selectedEmployee: employee,
+      editorThreadId: editor.threadId,
+      ...(withSchedules && {
+        scheduledEmployeeIds: [
+          employee.employeeInstanceId,
+          sibling!.employeeInstanceId,
+        ],
+        dispatchScheduledLaunch: dispatch,
+      }),
+    };
+    const proof = new AbortController();
+    const model = {
+      provider: 'openai-codex',
+      model: 'gpt-6.2-sol',
+      modelInfo: {
+        provider: 'openai-codex',
+        id: 'gpt-6.2-sol',
+        name: 'Fixture',
+      },
+    };
+    f.service.installModelAdapter(async () => ({
+      ...model,
+      origin: 'http://192.0.2.5:34100',
+      capability: 'synthetic-model-capability',
+      scoped: { rules: [], models: [model] },
+    }));
+    const verify = vi.fn(async () => proof.signal);
+    f.service.installStartingEditorProof(verify);
+    const prepareLaunch = NativeLaunch.prepareNativeWebLaunch;
+    // This test exercises startup evidence. Leave production artifact
+    // construction to the build gates, which have the compiled Worker files.
+    const stage = vi
+      .spyOn(NativeLaunch, 'prepareNativeWebLaunch')
+      .mockImplementation((config, binding, profile, memory) =>
+        prepareLaunch(config, binding, profile, memory),
+      );
+    const owner = {
+      ...catalogOwner(),
+      readScheduleCatalog: vi.fn(async () => []),
+      verifyStartingEditor: vi.fn<NativeWebOwner['verifyStartingEditor']>(
+        async (_scope, active, check) =>
+          check(
+            {
+              revoked: active,
+              readImmutableGraph: vi.fn(),
+              readImmutableBundle: vi.fn(),
+            },
+            vi.fn(),
+            active,
+          ),
+      ),
+      verifyRunningEditor: vi.fn(),
+    };
+    const siblingOwner = {
+      ...catalogOwner(),
+      readScheduleCatalog: vi.fn(async () => []),
+      verifyStartingEditor: vi.fn(),
+    };
+    open.mockResolvedValueOnce(owner).mockResolvedValueOnce(siblingOwner);
+    try {
+      await f.service.memoryGuestPlan(f.binding, signal(), web);
+      expect(stage.mock.calls[0]?.[4]).toMatchObject({ scoped: { rules: [] } });
+      await f.service.start(f.binding, signal(), f.scope, web);
+      expect(verify).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          context: web.context,
+          endpoint: selected,
+          threadId: editor.threadId,
+        }),
+        expect.any(AbortSignal),
+      );
+      expect(siblingOwner.verifyStartingEditor).not.toHaveBeenCalled();
+      if (withSchedules) {
+        expect(open.mock.calls[0]![0]).toMatchObject({
+          context: web.context,
+          dispatchLaunch: dispatch,
+        });
+        expect(open.mock.calls[1]![0].context).toBeUndefined();
+        expect(open.mock.calls[1]![0].dispatchLaunch).toBe(dispatch);
+        expect(owner.readScheduleCatalog).toHaveBeenCalledOnce();
+        expect(siblingOwner.readScheduleCatalog).toHaveBeenCalledOnce();
+      }
+      f.startup.abort();
+      vi.mocked(f.scope.assertCurrent).mockRejectedValue(
+        new Error('closed bootstrap scope'),
+      );
+      expect(
+        f.service.assertStartingEditor(
+          f.binding,
+          web.context,
+          editor,
+          signal(),
+        ),
+      ).toBe(proof.signal);
+      expect(owner.verifyRunningEditor).not.toHaveBeenCalled();
+      expect(() =>
+        f.service.assertVerifiedEditor(f.binding, signal()),
+      ).toThrow();
+      expect(() =>
+        f.service.assertStartingEditor(
+          f.binding,
+          web.context,
+          { ...editor, threadId: randomUUID() },
+          signal(),
+        ),
+      ).toThrow(expect.objectContaining({ code: 'RUNTIME_NOT_READY' }));
+    } finally {
+      stage.mockRestore();
+      await f.service.close();
+    }
+  },
+);
+
 it.each([5, 20])(
   'a retained %i-employee roster opens only the exact requested profile, then hot-opens a sibling on the same VM',
   async (count) => {

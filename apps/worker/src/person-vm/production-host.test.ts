@@ -56,7 +56,11 @@ const io = vi.hoisted(() => ({
         options: Parameters<typeof Model.createModelGateway>[0],
       ) => Pick<
         Model.ModelGatewayPort,
-        'handle' | 'revoke' | 'reconcileOwner' | 'close'
+        | 'handle'
+        | 'revoke'
+        | 'reconcileOwner'
+        | 'reconcileClosedOwner'
+        | 'close'
       >
     >(),
   authority: vi.fn<() => PersonVmAuthority | undefined>(),
@@ -243,6 +247,8 @@ function fixture() {
         throw Error('no model recovery in this fixture');
       },
     ),
+    reconcileClosedOwner:
+      vi.fn<NonNullable<Model.ModelGatewayPort['reconcileClosedOwner']>>(),
     close: vi.fn(async () => {}),
   };
   io.model.mockReturnValue(model);
@@ -1602,6 +1608,28 @@ it('close fences the native ports and joins source work; repeated close has one 
     released.release();
     await outcome;
   }
+});
+
+it('joins all scoped transport owners before asking for the combined ledger recovery proof', async () => {
+  const value = fixture();
+  const secondPool = gate();
+  const entered = gate();
+  value.bound.model.closeTransport = vi.fn(async () => {
+    entered.release();
+    await secondPool.promise;
+  });
+  value.model.reconcileClosedOwner.mockResolvedValue(0);
+  const { host } = await open(value);
+  const closing = host.close();
+  try {
+    await entered.promise;
+    expect(value.model.reconcileClosedOwner).not.toHaveBeenCalled();
+  } finally {
+    secondPool.release();
+    await closing;
+  }
+  expect(value.model.reconcileClosedOwner).toHaveBeenCalledOnce();
+  expect(host.modelOwnerMaintenancePending()).toBe(false);
 });
 
 it('retains the provider owner when the model gateway cannot prove its join', async () => {

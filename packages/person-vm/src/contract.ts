@@ -82,6 +82,13 @@ export type PersonVmEmployeeSelection = Readonly<
   >
 >;
 
+/** Host-only conversation target for editor readiness. Disk preparation uses
+ * only the employee profile and never receives the thread. */
+export type PersonVmEditorSelection = Readonly<{
+  employee: PersonVmEmployeeSelection;
+  threadId: string;
+}>;
+
 /** Host-derived storage target only. A rollout revision is not a user session
  * or permission to start a VM. */
 export type PersonVmDiskPreparationTarget = PersonVmEmployeeSelection &
@@ -153,6 +160,7 @@ export interface PersonVmRuntimePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     context?: RequestContext,
+    editor?: PersonVmEditorSelection & Readonly<{ starting: boolean }>,
   ): Promise<{
     binding: PersonVmBinding;
     authenticated: boolean;
@@ -251,6 +259,7 @@ export type PersonVmPrewarmInput = {
   target?: PersonVmPrewarmFence;
   observer?: PersonVmPrewarmObserver;
   selectedEmployee?: PersonVmEmployeeSelection;
+  editorThreadId?: string;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
