@@ -6,6 +6,7 @@ import type {
   RequestContext,
 } from '@allrice/contracts';
 import {
+  createProductionNativeMemorySource,
   selectNativeMemoryConfiguration,
   type ProductionNativeMemorySource,
 } from './production-native-memory.js';
@@ -936,7 +937,9 @@ export function createProductionPersonVmHost(input: {
       });
       personVm = vm;
       const { native, web } = providers.configuration;
-      const memory = web.nativeMemoryEnabled ? configuredMemory : undefined;
+      const memory = web.nativeMemoryEnabled
+        ? (configuredMemory ?? createProductionNativeMemorySource())
+        : undefined;
       if (
         web.nativeMemoryEnabled &&
         (!memory?.tools || !memory.publication.dispatchRoot)

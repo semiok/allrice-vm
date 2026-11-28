@@ -667,7 +667,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               argumentsFromTool.value,
               active,
             );
-            await prompt.assertObserved(active);
+            prompt.assertObservedNow();
             active.throwIfAborted();
             return { text };
           },

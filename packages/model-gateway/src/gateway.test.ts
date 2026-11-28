@@ -82,6 +82,8 @@ it.each([
     const native = await nativeProviderFixture(upstream.url);
     cleanup.push(() => native.close());
     const store = new FixtureStore();
+    const routeEntered = deferred();
+    const routeReleased = deferred();
     let archived = false;
     store.beforeStart = async () => {
       if (gate === 'capacity') archived = true;
@@ -91,7 +93,10 @@ it.each([
       provider: {
         ...native.provider,
         async assertDispatchCurrent() {
-          if (gate === 'route') archived = true;
+          if (gate === 'route') {
+            routeEntered.resolve();
+            await routeReleased.promise;
+          }
         },
       },
       store,
@@ -106,7 +111,16 @@ it.each([
       },
     });
     cleanup.push(() => f.close());
-    await f.collect();
+    const result = f.collect();
+    if (gate === 'route') {
+      try {
+        await routeEntered.promise;
+        archived = true;
+      } finally {
+        routeReleased.resolve();
+      }
+    }
+    await result;
     expect(phases).toEqual(['seal', 'dispatch']);
     expect(store.calls.size).toBe(1);
     expect(upstream.requests).toHaveLength(0);

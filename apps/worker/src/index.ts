@@ -1,5 +1,4 @@
 import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
-import { createProductionNativeMemorySource } from './person-vm/production-native-memory.js';
 import { createProductionPersonVmSources } from './person-vm/production-sources.js';
 import { createProductionPersonVmDeleteHttp } from './person-vm/production-delete-http.js';
 import {
@@ -456,7 +455,6 @@ const httpAborter = new AbortController();
 let personVmRecovery: () => string = () => 'pending';
 const personVmHost = createProductionPersonVmHost({
   lifetime: httpAborter.signal,
-  nativeMemory: createProductionNativeMemorySource(),
   sources: createProductionPersonVmSources(
     createProductionNativeModelExecution(),
   ),
