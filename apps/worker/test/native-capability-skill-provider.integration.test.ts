@@ -87,8 +87,15 @@ suite(
     let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
     let host: Awaited<ReturnType<typeof setup>>;
     const contexts: Context[] = [];
-    async function setup() {
+    async function setup(
+      prepare?: (
+        publication: Awaited<
+          ReturnType<typeof createEmployeeAdministrationFixture>
+        >,
+      ) => Promise<void>,
+    ) {
       const publication = await createEmployeeAdministrationFixture(f.db);
+      await prepare?.(publication);
       // Existing synthetic publication fixture; no provider/model/VM invocation.
       await publication.preview();
       expect((await publication.publish()).valid).toBe(true);
@@ -217,8 +224,7 @@ suite(
       };
     }
 
-    async function prepareProduction() {
-      const { context } = host;
+    async function enableNative(context: RequestContext) {
       await f.db`insert into allrice_settings(scope_type,key,value)
         values ('system','d_entry_rollout_policy',${f.db.json({
           revision: randomUUID(),
@@ -231,6 +237,11 @@ suite(
           ],
         })})
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    }
+
+    async function prepareProduction() {
+      const { context } = host;
+      await enableNative(context);
       const instance = await createEmployeeInstance(context, {
         workspaceId: host.scope.workspaceId,
         expectedOwnerId: context.actor.id,
@@ -248,6 +259,71 @@ suite(
       const installed = await install(true);
       return { context, identity, otherIdentity, installed };
     }
+
+    it('requires the reviewed file pin as well as a real published employee binding', async () => {
+      const signal = AbortSignal.timeout(20_000);
+      const builtin = createBuiltinSkillSourcesPort();
+      const { sources } = await builtin.listSources(signal);
+      const descriptor = sources.find(
+        ({ name }) => name === 'employee-customization',
+      )!;
+      const { content } = await builtin.readPackage(
+        descriptor.selector,
+        signal,
+      );
+      async function publish(id: string, name: string) {
+        const { context, scope } = await setup(
+          async ({ definition, revisionId }) => {
+            const source = descriptor;
+            await f.db`insert into allrice_platform_dsh_skills
+            (id,name,description,content,checksum,source_ref,version,license,review_status,
+             reviewed_by_label,reviewed_at,model_invocable,user_invocable)
+            values(${id},${name},${source.description},${content},${source.selector.contentChecksum},
+             ${source.sourceRef},${source.selector.version},${source.license},'reviewed',
+             ${source.reviewedByLabel},clock_timestamp(),${source.modelInvocable},${source.userInvocable})`;
+            definition.capabilities.nativeSkillIds = [id];
+            await f.db`update allrice_platform_employee_revisions
+            set definition=${f.db.json(definition)},checksum=${hash(JSON.stringify(definition))}
+            where id=${revisionId}`;
+          },
+        );
+        await enableNative(context);
+        const identity = await requireDEntryNativeIdentity(context, {
+          workspaceId: scope.workspaceId,
+          employeeInstanceId: scope.instanceId,
+        });
+        return nativeWebSkillSource(
+          context,
+          { scopeId: randomUUID(), identity, access: 'page' },
+          {
+            organizationId: identity.organizationId,
+            personId: identity.personId,
+            vmId: randomUUID(),
+            instanceId: randomUUID(),
+            leaseEpoch: 1,
+          },
+          { assertCurrentBinding: async () => {} },
+        )!;
+      }
+      const current = await publish(descriptor.selector.id, descriptor.name);
+      const result = await current.read({ kind: 'list' }, signal);
+      expect(result).toMatchObject({
+        kind: 'catalog',
+        entries: [{ name: descriptor.name }],
+      });
+      if (result.kind !== 'catalog') throw Error('Missing reviewed Skill');
+      const { name, revision } = result.entries[0]!;
+      expect(
+        await current.read({ kind: 'body', name, revision }, signal),
+      ).toEqual({ kind: 'body', content });
+      // Sync does not delete unmanaged rows. An enabled row with the same
+      // source bytes and a real grant remains invisible without its file pin.
+      const unlisted = await publish(randomUUID(), 'retired-fixture-skill');
+      expect(await unlisted.read({ kind: 'list' }, signal)).toEqual({
+        kind: 'catalog',
+        entries: [],
+      });
+    }, 30_000);
 
     it('rechecks production Skill reads against the exact login, employee, organization and VM lease', async () => {
       const { context, identity, otherIdentity, installed } =

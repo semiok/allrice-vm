@@ -51,7 +51,7 @@ export type CloseCommand = 'close';
  * principal never receives a locator, body or capability credential. */
 export type PrincipalSkillRead =
   | Readonly<{ kind: 'list'; page?: true }>
-  | Readonly<{ kind: 'body'; name: string; revision: string }>;
+  | Readonly<{ kind: 'body'; name: string; revision: string; offset?: number }>;
 export type PrincipalSkillSummary = Readonly<{
   name: string;
   description: string;
@@ -61,8 +61,9 @@ export type PrincipalSkillSummary = Readonly<{
 }>;
 export type PrincipalSkillResult =
   | Readonly<{ kind: 'catalog'; entries: readonly PrincipalSkillSummary[] }>
-  | Readonly<{ kind: 'body'; content: string }>
+  | Readonly<{ kind: 'body'; content: string; next?: number }>
   | Readonly<{ kind: 'unavailable' }>;
+export const PRINCIPAL_SKILL_BODY_MAX_LENGTH = 500_000;
 export type PrincipalScopeCommand =
   | CloseCommand
   | Readonly<{ type: 'skill-result'; id: string; result: PrincipalSkillResult }>

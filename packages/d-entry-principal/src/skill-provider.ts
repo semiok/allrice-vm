@@ -7,12 +7,13 @@ import {
   BUNDLED_SKILL_RANK,
   type SkillProviderControl,
 } from '@deepseek-ai/dsh-skill';
-import type {
-  DEntryScopeIssue,
-  PrincipalScopeCommand,
-  PrincipalSkillRead,
-  PrincipalSkillResult,
-  ScopeFrame,
+import {
+  PRINCIPAL_SKILL_BODY_MAX_LENGTH,
+  type DEntryScopeIssue,
+  type PrincipalScopeCommand,
+  type PrincipalSkillRead,
+  type PrincipalSkillResult,
+  type ScopeFrame,
 } from './types.js';
 
 type SkillNotice = Extract<ScopeFrame, { type: 'skill-read' | 'skill-cancel' }>;
@@ -59,6 +60,23 @@ export class PrincipalSkillClient {
         read: command,
       });
     });
+  }
+
+  async readBody(name: string, revision: string, signal: AbortSignal) {
+    const parts: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const part = await this.read(
+        { kind: 'body', name, revision, offset },
+        signal,
+      );
+      if (part.kind !== 'body' || !part.content.length) return;
+      parts.push(part.content);
+      offset += part.content.length;
+      if (offset > PRINCIPAL_SKILL_BODY_MAX_LENGTH) return;
+      if (part.next === undefined) return parts.join('');
+      if (part.next !== offset) return;
+    }
   }
 
   receive(command: Exclude<PrincipalScopeCommand, 'close'>) {
@@ -169,23 +187,26 @@ export function installPrincipalSkillProvider(
             };
           },
           async get(candidate, { signal }) {
-            if (typeof candidate.locator !== 'string') return;
-            const result = await read(
-              {
-                kind: 'body',
-                name: candidate.name,
-                revision: candidate.locator,
-              },
-              signal,
+            const claim = current.getStore();
+            if (
+              !claim ||
+              !bound(claim.scope) ||
+              typeof candidate.locator !== 'string'
+            )
+              return;
+            const content = await claim.scope.skills.readBody(
+              candidate.name,
+              candidate.locator,
+              signal ? AbortSignal.any([claim.signal, signal]) : claim.signal,
             );
-            if (result?.kind === 'body') {
+            if (content !== undefined) {
               const { name, description, invocation } = candidate;
               return {
                 name,
                 description,
                 invocation,
                 ...source,
-                content: result.content,
+                content,
               };
             }
           },

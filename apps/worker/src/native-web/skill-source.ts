@@ -1,5 +1,6 @@
 import { sameDEntryIdentity, type RequestContext } from '@allrice/contracts';
 import {
+  createBuiltinSkillSourcesPort,
   createPostgresPersonalSkillPackageSource,
   getDatabase,
   requireCurrentWorkspaceWriteAuthority,
@@ -68,6 +69,8 @@ export function nativeWebSkillSource(
         binding_id: string;
         platform_id: string;
         source_version: string;
+        source_ref: string;
+        bundle_checksum: string | null;
         updated_at: string;
         name: string;
         description: string;
@@ -77,7 +80,8 @@ export function nativeWebSkillSource(
         model_invocable: boolean;
       }[]
     >`
-      select b.id binding_id,p.id platform_id,p.version source_version,
+      select b.id binding_id,p.id platform_id,p.version source_version,p.source_ref,
+             p.bundle->>'checksum' bundle_checksum,
              s.updated_at::text updated_at,s.name,s.description,
              s.content,s.checksum,s.user_invocable,s.model_invocable
       from allrice_employee_instances i
@@ -108,6 +112,7 @@ export function nativeWebSkillSource(
             and (published #>> '{invocation,userInvocable}')::boolean=s.user_invocable
             and (published #>> '{invocation,modelInvocable}')::boolean=s.model_invocable
             and published->'requiredToolRefs'='[]'::jsonb
+            and published #>> '{bundle,checksum}' is not distinct from p.bundle->>'checksum'
             and coalesce(jsonb_array_length(published #> '{bundle,resources}'),0)=0)
         and (${name ?? null}::text is null or s.name=${name ?? null})
       order by s.name,s.id limit 65`;
@@ -118,20 +123,40 @@ export function nativeWebSkillSource(
       const rows = await read;
       signal.throwIfAborted();
       if (rows.length > 64) throw denied();
-      return rows.flatMap((row): Skill[] =>
-        row.checksum === skillBytesChecksum(row.content)
-          ? [
-              {
-                name: row.name,
-                description: row.description,
-                revision: skillBytesChecksum(JSON.stringify(row)),
-                userInvocable: row.user_invocable,
-                modelInvocable: row.model_invocable,
-                content: row.content,
-              },
-            ]
-          : [],
-      );
+      if (!rows.length) return [];
+      // A materialized row can outlive its reviewed repository source. Treat
+      // the file catalog as an additional pin check, never a grant.
+      const builtin = createBuiltinSkillSourcesPort();
+      const { sources } = await builtin.listSources(signal);
+      return rows.flatMap((row): Skill[] => {
+        const source = sources.find(
+          ({ selector }) => selector.id === row.platform_id,
+        );
+        if (
+          !source?.sourceEnabled ||
+          source.name !== row.name ||
+          source.sourceRef !== row.source_ref ||
+          source.selector.version !== row.source_version ||
+          source.selector.contentChecksum !== row.checksum ||
+          source.selector.bundleChecksum !== row.bundle_checksum ||
+          source.declaredToolRefs.length ||
+          source.resources.length ||
+          source.userInvocable !== row.user_invocable ||
+          source.modelInvocable !== row.model_invocable ||
+          row.checksum !== skillBytesChecksum(row.content)
+        )
+          return [];
+        return [
+          {
+            name: row.name,
+            description: source.description,
+            revision: skillBytesChecksum(JSON.stringify(row)),
+            userInvocable: row.user_invocable,
+            modelInvocable: row.model_invocable,
+            content: row.content,
+          },
+        ];
+      });
     } finally {
       signal.removeEventListener('abort', cancel);
     }

@@ -12,6 +12,7 @@ import {
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   DEntryScopeIssueSchema,
+  PRINCIPAL_SKILL_BODY_MAX_LENGTH,
   type DEntryPageInput,
   type DEntryPageNativeCall,
   type DEntryPageNativeEnd,
@@ -45,6 +46,39 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 const unknown = (cause?: unknown) => Error('PRINCIPAL_JOIN_UNKNOWN', { cause });
+
+function boundedSkillResult(
+  read: PrincipalSkillRead,
+  result: PrincipalSkillResult,
+): PrincipalSkillResult {
+  // Leave room for the rc.2 logical stream envelope and other owner commands.
+  const frameBytes = 112 * 1024;
+  const unavailable = { kind: 'unavailable' } as const;
+  if (result.kind !== 'body' || read.kind !== 'body')
+    return Buffer.byteLength(JSON.stringify(result)) <= frameBytes
+      ? result
+      : unavailable;
+  const { content } = result;
+  const offset = read.offset ?? 0;
+  if (
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset >= content.length ||
+    content.length > PRINCIPAL_SKILL_BODY_MAX_LENGTH
+  )
+    return unavailable;
+  let end = Math.min(content.length, offset + frameBytes);
+  let part = content.slice(offset, end);
+  while (Buffer.byteLength(JSON.stringify(part)) > frameBytes - 1_024) {
+    end = offset + Math.floor((end - offset) / 2);
+    part = content.slice(offset, end);
+  }
+  return {
+    kind: 'body',
+    content: part,
+    ...(end < content.length && { next: end }),
+  };
+}
 
 export type PrincipalInvocationObservation = Readonly<{
   undispatched(): Promise<void>;
@@ -360,6 +394,12 @@ export function createDEntryPrincipalControl(
             let catalog: string | undefined;
             let skillGeneration = 0;
             let feedLost = false;
+            const pageCatalog = (result?: PrincipalSkillResult) =>
+              JSON.stringify(
+                result?.kind === 'catalog'
+                  ? result.entries.filter(({ userInvocable }) => userInvocable)
+                  : [],
+              );
             const trackSkill = (task: Promise<void>) => {
               operations.add(task);
               void task.then(
@@ -393,10 +433,7 @@ export function createDEntryPrincipalControl(
                   }
                   if (business.aborted || generation !== skillGeneration)
                     return;
-                  const digest =
-                    next?.kind === 'catalog'
-                      ? JSON.stringify(next.entries)
-                      : '[]';
+                  const digest = pageCatalog(next);
                   if (catalog === digest) return;
                   catalog = digest;
                   for (const listener of skillListeners) listener();
@@ -453,7 +490,7 @@ export function createDEntryPrincipalControl(
                             // reads, before a catalog or body can escape.
                             await watch.throughCommit(active);
                             if (!feedLost && generation === skillGeneration)
-                              result = readResult;
+                              result = boundedSkillResult(read, readResult);
                           }
                         }
                       } catch {
@@ -465,7 +502,7 @@ export function createDEntryPrincipalControl(
                           read.page &&
                           result.kind === 'catalog'
                         )
-                          catalog = JSON.stringify(result.entries);
+                          catalog = pageCatalog(result);
                         handle.send({ type: 'skill-result', id, result });
                       }
                     })
