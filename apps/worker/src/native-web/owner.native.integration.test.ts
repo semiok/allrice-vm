@@ -1135,6 +1135,11 @@ it.skipIf(!cli)(
     expect(JSON.stringify(assistantInputs[1]!.messages)).toContain('整理交付');
     for (const { system, messages, tools } of assistantInputs) {
       const modelContext = JSON.stringify({ system, messages });
+      expect(modelContext).toContain('你是 AllRice 平台上的数字员工');
+      expect(modelContext).toContain('自然介绍自己的 AllRice 员工姓名和职责');
+      expect(modelContext).toContain(
+        '不得自称 DeepSeek、DeepSeek Harness、DeepSeek API、ChatGPT',
+      );
       expect(modelContext).not.toContain(
         'AI agent powered by DeepSeek Harness',
       );

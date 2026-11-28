@@ -31,7 +31,6 @@ import {
 } from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import { readNativeScheduleObservations } from '../native-schedule-observation.js';
-import { earliestNativeScheduleTarget } from '../person-vm/scheduled-wake.js';
 import {
   nativeWebLaunchOnGuest,
   prepareNativeWebLaunch,
@@ -1153,12 +1152,13 @@ export function createAssignedNativeWebStartup(input: {
                 signal,
               );
               await scope.assertCurrent();
-              const next = earliestNativeScheduleTarget([schedule]);
               if (
                 !activity.complete ||
                 activity.work.size ||
                 revision !== existing.nativeActivityRevision() ||
-                (next !== null && next <= Date.now() + input.cleanupTimeoutMs)
+                // A running VM with no employee owner has no wake handoff.
+                // Keep this scheduler live even if its next reminder is far away.
+                schedule.items.some(({ status }) => status === 'active')
               )
                 throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
             };

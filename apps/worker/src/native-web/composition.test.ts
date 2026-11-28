@@ -260,23 +260,23 @@ it('replaces only the idle employee owner after a committed profile revision', a
   const revised = { ...first!, employeeRevision: first!.employeeRevision + 1 };
   const draining = latch(),
     joined = latch();
+  let holdRetire = false;
+  const schedule = {
+    id: ScheduleId('persona-schedule'),
+    sessionId: SessionId('original'),
+    title: 'Fixture schedule',
+    prompt: 'Fixture reminder',
+    kind: 'every' as const,
+    everySeconds: 60,
+    status: 'active' as const,
+    scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+  };
   const previous = {
     ...catalogOwner(),
     nativeActivityRevision: vi.fn(() => 0),
     joinStaleProfilePrincipals: vi.fn(async () => {}),
     readScheduleCatalog: vi.fn<NativeWebOwner['readScheduleCatalog']>(
-      async () => [
-        {
-          id: ScheduleId('persona-schedule'),
-          sessionId: SessionId('original'),
-          title: 'Fixture schedule',
-          prompt: 'Fixture reminder',
-          kind: 'every',
-          everySeconds: 60,
-          status: 'active',
-          scheduledAt: new Date(Date.now() + 60_000).toISOString(),
-        },
-      ],
+      async () => [],
     ),
     readNativeActivity: vi.fn(async () => ({
       complete: true,
@@ -284,7 +284,7 @@ it('replaces only the idle employee owner after a committed profile revision', a
     })),
     close: vi.fn(async () => {
       draining.resolve();
-      await joined.promise;
+      if (holdRetire) await joined.promise;
     }),
   };
   const other = {
@@ -306,6 +306,8 @@ it('replaces only the idle employee owner after a committed profile revision', a
     ...f.web,
     selectedEmployee: { ...first!, ...f.binding, threadId: null },
     scheduledEmployeeIds: [sibling!.employeeInstanceId],
+    dispatchScheduledLaunch: ((active, work) =>
+      work(active)) satisfies PersonVmGuestLaunchDispatch,
   };
   const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
   expect(plan.files).toEqual(
@@ -319,13 +321,7 @@ it('replaces only the idle employee owner after a committed profile revision', a
   );
   await f.service.start(f.binding, signal(), f.scope, web);
   try {
-    const [schedule] = await previous.readScheduleCatalog(
-      async () => {},
-      signal(),
-    );
-    previous.readScheduleCatalog.mockResolvedValueOnce([
-      { ...schedule!, scheduledAt: new Date(Date.now() + 1000).toISOString() },
-    ]);
+    previous.readScheduleCatalog.mockResolvedValueOnce([schedule]);
     await expect(f.enroll(revised)).rejects.toMatchObject({
       code: 'WEB_ENDPOINTS_PREPARING',
     });
@@ -340,17 +336,13 @@ it('replaces only the idle employee owner after a committed profile revision', a
     });
     expect(previous.close).not.toHaveBeenCalled();
     previous.joinStaleProfilePrincipals.mockImplementationOnce(async () => {
-      previous.readScheduleCatalog.mockResolvedValueOnce([
-        {
-          ...schedule!,
-          scheduledAt: new Date(Date.now() + 1000).toISOString(),
-        },
-      ]);
+      previous.readScheduleCatalog.mockResolvedValueOnce([schedule]);
     });
     await expect(f.enroll(revised)).rejects.toMatchObject({
       code: 'WEB_ENDPOINTS_PREPARING',
     });
     expect(previous.close).not.toHaveBeenCalled();
+    holdRetire = true;
     const change = f.enroll(revised);
     try {
       await Promise.race([draining.promise, change]);
