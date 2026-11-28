@@ -433,11 +433,22 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
       binding: {
         device_id: 'work',
         role: 'external_bind',
-        source_sandbox: 'allrice-public-template',
       },
       id: 'virtio:26:work',
-      kind: 'fs',
+      kind: 'virtiofs',
       treatment: 'reconnect',
+    },
+    {
+      binding: {
+        agent_version: '0.7.16',
+        bulk_port: 'agent-bulk',
+        bulk_profile: 'dual-port-v1',
+        protocol_generation: '8',
+        workload_transport_barrier_version: 1,
+      },
+      id: 'guest:agentd',
+      kind: 'agent',
+      treatment: 'serialize',
     },
   ];
   const topology = {
@@ -456,6 +467,38 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
     inputs,
     deviceTopologySha256: sha256(JSON.stringify(topology)),
   };
+  const rawResources = (attempt) => [
+    resources[0],
+    {
+      ...resources[1],
+      binding: {
+        ...resources[1].binding,
+        source_binding_token: 'fresh-grant-' + attempt,
+        source_sandbox: 'allrice-public-template',
+      },
+    },
+    {
+      ...resources[2],
+      binding: {
+        agent_version: '0.7.16',
+        attempt_id: 'capture-' + attempt,
+        protocol_generation: '8',
+        ready_time_ns: String(attempt * 10),
+        transport_guest_bulk_bytes: String(attempt * 15),
+        ready: JSON.stringify({
+          boot_time_ns: attempt,
+          init_time_ns: attempt * 2,
+          ready_time_ns: attempt * 10,
+          workload_transport_barrier_version: 1,
+          bulk_transport: {
+            profile: 'dual-port-v1',
+            port: 'agent-bulk',
+            connection_id: Array(16).fill(attempt),
+          },
+        }),
+      },
+    },
+  ];
   const checkpoint = {
     schema: 'microsandbox.checkpoint/1',
     architecture: 'aarch64',
@@ -465,16 +508,7 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
     memory: ram.id,
     disks: [disk.id, runtime.id],
     geometry,
-    resources: [
-      resources[0],
-      {
-        ...resources[1],
-        binding: {
-          ...resources[1].binding,
-          source_binding_token: 'fresh-grant',
-        },
-      },
-    ],
+    resources: rawResources(1),
     devices,
   };
   const descriptor = {
@@ -501,6 +535,10 @@ test('reads the pinned checkpoint generations and rejects native capture ABI and
   assert.equal(verified.execution, state.path);
   assert.equal(verified.memoryPath, ram.path);
   assert.equal(verified.rootDisk, disk.path);
+  await save({ resources: rawResources(2) });
+  const next = await readNativeCheckpoint(root, expected, signal());
+  assert.deepEqual(next.topology, verified.topology);
+  assert.notEqual(next.checkpointRoot, verified.checkpointRoot);
   for (const change of [
     { architecture: 'x86_64' },
     { owned_volumes: [{}] },

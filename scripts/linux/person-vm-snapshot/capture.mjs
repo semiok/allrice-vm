@@ -64,6 +64,55 @@ function canonical(value) {
   return value;
 }
 
+const deviceBindings = {
+  block: [
+    'device_id',
+    'managed_disk',
+    'guest_path',
+    'mount_options',
+    'fstype',
+    'lifecycle_owned',
+  ],
+  virtiofs: ['device_id', 'role', 'guest_tag', 'guest_mount', 'filename'],
+  network: ['device_id'],
+  rng: ['device_id'],
+  vsock: ['device_id'],
+  virtio: ['device_id'],
+};
+
+function stableResource({ id, kind, treatment, binding }) {
+  if (id === 'guest:agentd' && kind === 'agent') {
+    const ready = JSON.parse(binding.ready);
+    return {
+      id,
+      kind,
+      treatment,
+      binding: {
+        agent_version: binding.agent_version,
+        protocol_generation: binding.protocol_generation,
+        workload_transport_barrier_version:
+          ready.workload_transport_barrier_version,
+        bulk_profile: ready.bulk_transport?.profile,
+        bulk_port: ready.bulk_transport?.port,
+      },
+    };
+  }
+  requireCapture(
+    Object.hasOwn(deviceBindings, kind),
+    'unknown checkpoint resource kind',
+  );
+  return {
+    id,
+    kind,
+    treatment,
+    binding: Object.fromEntries(
+      deviceBindings[kind]
+        .filter((key) => Object.hasOwn(binding, key))
+        .map((key) => [key, binding[key]]),
+    ),
+  };
+}
+
 export function cpuAbi(cpuinfo) {
   const groups = cpuinfo
     .trim()
@@ -157,14 +206,21 @@ async function sealedInput(path, digest, signal) {
   await exactPath(path);
   requireCapture(matches(hashPattern, digest), 'expected pinned input digest');
   const info = await lstat(path);
-  const parent = await lstat(dirname(path));
+  const allowedOwners = [0, process.getuid()];
+  for (let parent = dirname(path); parent !== '/'; parent = dirname(parent)) {
+    const ancestor = await lstat(parent);
+    requireCapture(
+      ancestor.isDirectory() &&
+        allowedOwners.includes(ancestor.uid) &&
+        (ancestor.mode & 0o7022) === 0,
+      'unprotected capture input ancestor',
+    );
+  }
   requireCapture(
     info.isFile() &&
       (info.mode & 0o7222) === 0 &&
       info.nlink === 1 &&
-      [0, process.getuid()].includes(info.uid) &&
-      (parent.mode & 0o7022) === 0 &&
-      [0, process.getuid()].includes(parent.uid),
+      allowedOwners.includes(info.uid),
     'unprotected capture input',
   );
   requireCapture(
@@ -213,6 +269,9 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
       Array.isArray(checkpoint.devices) &&
       checkpoint.devices.length > 0 &&
       Array.isArray(checkpoint.resources) &&
+      checkpoint.resources.filter(
+        ({ id, kind }) => id === 'guest:agentd' && kind === 'agent',
+      ).length === 1 &&
       checkpoint.resources.every((resource) => resource.treatment !== 'reject'),
     'native checkpoint ABI or resource closure mismatch',
   );
@@ -223,21 +282,9 @@ export async function readNativeCheckpoint(artifact, expected, signal) {
           device_id,
           device_type,
         })),
-        // Per-boot grants and network identities stay bound by the raw
-        // checkpoint hash. Only stable device layout enters the profile pin.
-        resources: checkpoint.resources.map(({ binding, ...resource }) => ({
-          ...resource,
-          binding: Object.fromEntries(
-            Object.entries(binding).filter(
-              ([key]) =>
-                ![
-                  'source_binding_token',
-                  'guest_network',
-                  'gateway_mac',
-                ].includes(key),
-            ),
-          ),
-        })),
+        // Full resource state stays bound by the checkpoint hash. This
+        // separate pin includes only the device and negotiated ABI layout.
+        resources: checkpoint.resources.map(stableResource),
         geometry,
       }),
     ),
@@ -759,12 +806,14 @@ export async function captureTemplate({
       checkCaptureReceipt(receipt, { mode: 'linux', expected });
       const bytes = Buffer.from(JSON.stringify(receipt));
       const captureSha256 = sha256(bytes);
+      signal.throwIfAborted();
       await writeFile(join(capture, 'capture.json'), bytes, {
         mode: 0o444,
         flag: 'wx',
       });
       await chmod(join(capture, 'template.msb'), 0o444);
       const directory = join(output, 'capture-' + captureSha256);
+      signal.throwIfAborted();
       await rename(capture, directory);
       return { directory, captureSha256 };
     } catch (error) {
