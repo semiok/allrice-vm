@@ -1139,31 +1139,35 @@ export function createAssignedNativeWebStartup(input: {
               throw new PersonVmError(
                 sameRevision ? 'RUNTIME_NOT_READY' : 'WEB_ENDPOINTS_PREPARING',
               );
-            // A committed revision prevents new admissions on the old owner.
-            // Sample its existing work and native schedule before joining it.
-            const revision = existing.nativeActivityRevision();
-            const schedule = await readNativeScheduleObservations(
-              {
-                catalog: () =>
-                  existing.readScheduleCatalog(scope.assertCurrent, signal),
-              },
-              signal,
-            );
-            const activity = await existing.readNativeActivity(
-              scope.assertCurrent,
-              signal,
-            );
-            await scope.assertCurrent();
-            const next = earliestNativeScheduleTarget([schedule]);
-            if (
-              !activity.complete ||
-              activity.work.size ||
-              revision !== existing.nativeActivityRevision() ||
-              // Principal close and exact native job cancellation each use
-              // the owner cleanup budget. The VM remains mounted throughout.
-              (next !== null && next <= Date.now() + 2 * input.cleanupTimeoutMs)
-            )
-              throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+            const assertIdle = async () => {
+              const revision = existing.nativeActivityRevision();
+              const schedule = await readNativeScheduleObservations(
+                {
+                  catalog: () =>
+                    existing.readScheduleCatalog(scope.assertCurrent, signal),
+                },
+                signal,
+              );
+              const activity = await existing.readNativeActivity(
+                scope.assertCurrent,
+                signal,
+              );
+              await scope.assertCurrent();
+              const next = earliestNativeScheduleTarget([schedule]);
+              if (
+                !activity.complete ||
+                activity.work.size ||
+                revision !== existing.nativeActivityRevision() ||
+                (next !== null && next <= Date.now() + input.cleanupTimeoutMs)
+              )
+                throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+            };
+            // Close the old scopes only once the owner appears idle. A
+            // previously admitted RPC can still commit during scope close,
+            // so take the decisive activity and schedule sample after join.
+            await assertIdle();
+            await existing.joinStaleProfilePrincipals();
+            await assertIdle();
             await retireEmployee(group, prior, existing, () =>
               joinEmployeeOwner(group, existing),
             );

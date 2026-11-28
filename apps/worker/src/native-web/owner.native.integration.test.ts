@@ -1098,6 +1098,10 @@ it.skipIf(!cli)(
       ).resolves.toMatchObject({ reason: 'completed' });
     }
     await prompt(f.owner, 1);
+    await expect(
+      f.owner.readNativeActivity(async () => {}, signal),
+    ).resolves.toEqual({ complete: true, work: new Set() });
+    await f.owner.joinStaleProfilePrincipals();
     await f.owner.close();
     const next = await f.restartRetained(
       {

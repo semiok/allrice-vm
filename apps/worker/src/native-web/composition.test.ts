@@ -263,6 +263,7 @@ it('replaces only the idle employee owner after a committed profile revision', a
   const previous = {
     ...catalogOwner(),
     nativeActivityRevision: vi.fn(() => 0),
+    joinStaleProfilePrincipals: vi.fn(async () => {}),
     readScheduleCatalog: vi.fn<NativeWebOwner['readScheduleCatalog']>(
       async () => [
         {
@@ -329,9 +330,22 @@ it('replaces only the idle employee owner after a committed profile revision', a
       code: 'WEB_ENDPOINTS_PREPARING',
     });
     expect(previous.close).not.toHaveBeenCalled();
+    expect(previous.joinStaleProfilePrincipals).not.toHaveBeenCalled();
     previous.readNativeActivity.mockResolvedValueOnce({
       complete: false,
       work: new Set(['turn']),
+    });
+    await expect(f.enroll(revised)).rejects.toMatchObject({
+      code: 'WEB_ENDPOINTS_PREPARING',
+    });
+    expect(previous.close).not.toHaveBeenCalled();
+    previous.joinStaleProfilePrincipals.mockImplementationOnce(async () => {
+      previous.readScheduleCatalog.mockResolvedValueOnce([
+        {
+          ...schedule!,
+          scheduledAt: new Date(Date.now() + 1000).toISOString(),
+        },
+      ]);
     });
     await expect(f.enroll(revised)).rejects.toMatchObject({
       code: 'WEB_ENDPOINTS_PREPARING',

@@ -813,6 +813,11 @@ export async function openNativeWebOwner(input: {
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
+      /** The Worker first proves a newer revision under current authority.
+       * Join old scoped invocations before sampling work for replacement. */
+      joinStaleProfilePrincipals() {
+        return principals.close();
+      },
       async verifyStartingEditor<T>(
         startingScope: PersonVmBootstrapScope,
         caller: AbortSignal,
