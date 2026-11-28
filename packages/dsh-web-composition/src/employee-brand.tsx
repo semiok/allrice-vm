@@ -14,17 +14,36 @@ const languages = {
   zh: {
     id: 'zh-x-allrice',
     label: '简体中文（AllRice）',
+    sessionInUse: '当前对话正在另一个工作台中使用。请关闭那个工作台后重试。',
+    browserSelf: '不能在工作台的内嵌浏览器中打开当前应用。',
+    modelAccount: '模型服务账号',
     chat: {
       'chat.deepDiving': '思考中',
       'chat.deepDivingFor': '思考中，用时 {duration} ···',
+      'message.failure.accountSignedOut':
+        '模型服务账号已退出，本次任务已停止。',
+      'message.failure.accountSignInRequired':
+        '模型服务尚未连接，请联系管理员。',
+      'message.failure.interrupted':
+        '工作台在本轮完成前停止。重新打开后，本轮已结束，未完成的工具结果未知。',
     },
   },
   en: {
     id: 'en-x-allrice',
     label: 'English (AllRice)',
+    sessionInUse:
+      'This conversation is open in another workbench. Close it there and try again.',
+    browserSelf: 'The workbench browser cannot open this application.',
+    modelAccount: 'Model service account',
     chat: {
       'chat.deepDiving': 'Thinking',
       'chat.deepDivingFor': 'Thinking for {duration} ···',
+      'message.failure.accountSignedOut':
+        'The task stopped because the model service account was signed out.',
+      'message.failure.accountSignInRequired':
+        'The model service is not connected. Contact your administrator.',
+      'message.failure.interrupted':
+        'The workbench stopped before this turn finished. The turn has ended and unfinished tool results are unknown.',
     },
   },
 } as const;
@@ -127,6 +146,14 @@ export function apply(ctx: Context) {
         locale.register('conversation', pack.id, {
           'hero.headline': '',
           'hero.preview': '',
+          'error.sessionInUse': pack.sessionInUse,
+        }),
+        locale.register('model', pack.id, {
+          'provider.account': pack.modelAccount,
+          'error.sessionInUse': pack.sessionInUse,
+        }),
+        locale.register('sidebarBrowser', pack.id, {
+          'error.application-origin': pack.browserSelf,
         }),
       ]);
       const adoptPublishedPreference = () => {
