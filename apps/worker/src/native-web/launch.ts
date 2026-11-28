@@ -212,6 +212,15 @@ export async function prepareNativeWebLaunch(
     ),
     'utf8',
   );
+  const deliverySource = await readFile(
+    new URL(
+      modelAdapter
+        ? '../../dist/allrice-native-delivery-capture.mjs'
+        : '../../dsh/allrice-native-delivery-capture.mjs',
+      import.meta.url,
+    ),
+    'utf8',
+  );
   const modelOwner = `${directory}/owner-with-model.mjs`;
   const searchPlugin = `${directory}/allrice-managed-web-search.mjs`;
   const searchSource = modelAdapter
@@ -230,6 +239,11 @@ export async function prepareNativeWebLaunch(
     auth,
     files: Object.freeze([
       { path: plugin, contents: ownerSource, mode: 0o600 },
+      {
+        path: `${directory}/allrice-native-delivery-capture.mjs`,
+        contents: deliverySource,
+        mode: 0o600,
+      },
       {
         path: `${directory}/allrice-native-run-journal.mjs`,
         contents: journalSource,

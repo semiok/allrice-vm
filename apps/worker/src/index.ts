@@ -7,6 +7,7 @@ import {
 } from './person-vm/production-recovery-socket.js';
 import { PersonVmError } from '@allrice/person-vm';
 import type { RequestContext } from '@allrice/contracts';
+import { LocalStorageAdapter } from '@allrice/storage';
 import { installDshCloseObservationIdentity } from './harness/dsh-close-observer.js';
 import { observeDshWorkerCloseIdentity } from './harness/dsh-worker-close-identity.js';
 import { processNextReference } from './reference-processing.js';
@@ -452,11 +453,12 @@ function refreshDshRuntimeInventory() {
 }
 
 const httpAborter = new AbortController();
+const storageRoot = process.env.ALLRICE_STORAGE_ROOT ?? '.local/storage';
 let personVmRecovery: () => string = () => 'pending';
 const personVmHost = createProductionPersonVmHost({
   lifetime: httpAborter.signal,
   sources: createProductionPersonVmSources(
-    createProductionNativeModelExecution(),
+    createProductionNativeModelExecution(new LocalStorageAdapter(storageRoot)),
   ),
 }).then(
   (host) => {
@@ -786,9 +788,7 @@ async function runAutomationTick() {
             });
           });
       if (stopping) return;
-      await processNextReference(
-        process.env.ALLRICE_STORAGE_ROOT ?? '.local/storage',
-      );
+      await processNextReference(storageRoot);
       await syncAutomationRuns();
       await processFolderTriggerEvents(Math.max(1, concurrency));
       const limit = Math.max(1, concurrency);

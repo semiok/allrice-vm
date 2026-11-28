@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { makeObjectKey, type StorageObject } from '@allrice/contracts';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -92,6 +92,29 @@ describe('local storage adapter', () => {
     await expect(
       new LocalStorageAdapter(root).put(object, new Blob([content]).stream()),
     ).rejects.toThrow('does not match');
+  });
+
+  it('removes abandoned scratch files for only the tombstoned object', async () => {
+    const object = fixture(new Uint8Array());
+    const root = await mkdtemp(join(tmpdir(), 'allrice-storage-'));
+    try {
+      const destination = join(root, object.key);
+      await mkdir(dirname(destination), { recursive: true });
+      const stale = destination + '.00000000-0000-4000-8000-000000000099.tmp';
+      const neighbor =
+        destination + 'x.00000000-0000-4000-8000-000000000099.tmp';
+      await writeFile(destination, 'tombstoned object');
+      await writeFile(stale, 'uncommitted temp bytes');
+      await writeFile(neighbor, 'not owned by this tombstone');
+      await new LocalStorageAdapter(root).delete({
+        ...object,
+        immutable: false,
+        deletedAt: new Date().toISOString(),
+      });
+      expect(await readdir(dirname(destination))).toEqual([basename(neighbor)]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('enforces retention and immutable deletion policy', async () => {

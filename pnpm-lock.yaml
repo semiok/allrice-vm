@@ -905,6 +905,9 @@ importers:
       '@deepseek-ai/dsh':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(e4510004199143f731a07f1bacc5d1c2)
+      '@deepseek-ai/dsh-api-remotes':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)(@deepseek-ai/dsh-scope@0.2.1-rc.2(@deepseek-ai/cordis@4.0.5))
       '@deepseek-ai/dsh-api-session-controller':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(e7a0c1420fa7e4ca9fdc0707ab0ded72)
@@ -920,6 +923,9 @@ importers:
       '@deepseek-ai/dsh-client-modules':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
+      '@deepseek-ai/dsh-client-ui-chat':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)(@types/react@19.2.18)
       '@deepseek-ai/dsh-client-ui-conversation':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)(@types/react@19.2.18)
@@ -947,6 +953,9 @@ importers:
       '@deepseek-ai/dsh-client-ui-sidebar':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
+      '@deepseek-ai/dsh-client-ui-deliverables':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
       '@deepseek-ai/dsh-client-ui-sidebar-right':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
@@ -971,6 +980,9 @@ importers:
       '@deepseek-ai/dsh-subagent':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(35798409003075a790d2e345ef752118)
+      '@deepseek-ai/dsh-util-workspace-path':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
       '@types/react':
         specifier: 19.2.18
         version: 19.2.18

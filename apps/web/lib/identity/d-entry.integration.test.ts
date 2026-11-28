@@ -4343,6 +4343,7 @@ suite(
                   observeNativeSearchCallFor: unexpectedOwnerOperation,
                   waitNativeTurnEnd: unexpectedOwnerOperation,
                   readPersistedRunTerminalFor: unexpectedOwnerOperation,
+                  exchangeNativeDeliveryFor: unexpectedOwnerOperation,
                   readManagedModelImageFor: unexpectedOwnerOperation,
                   readModelCatalogFor: unexpectedOwnerOperation,
                   nativeActivityRevision: unexpectedOwnerOperation,

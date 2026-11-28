@@ -17,7 +17,16 @@ export * from './d-entry-release-policy.ts';
 export * from './d-entry-admission.ts';
 export * from './d-entry-native-root.ts';
 export {
+  DEntryNativeDeliveryClaimSchema,
+  DEntryNativeDeliveryCaptureSchema,
+  publishCapturedDEntryDelivery,
+  sweepDEntryNativeDeliveryReservations,
+  type DEntryNativeDeliveryClaim,
+  findDEntryNativeDelivery,
+} from './d-entry-native-delivery.ts';
+export {
   DEntryNativeTurnEndSchema,
+  assertDEntryNativeDeliveryRun,
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
   nextRetainedDEntryNativeRunJournalOwner,

@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, rename, rm, stat } from 'node:fs/promises';
-import { dirname, resolve, sep } from 'node:path';
+import { mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
   ObjectKeySchema,
   StorageObjectSchema,
+  UuidSchema,
   type StorageObject,
   type StoragePort,
 } from '@allrice/contracts';
@@ -40,7 +41,7 @@ export class LocalStorageAdapter implements StoragePort {
         if (chunk.done) break;
         size += chunk.value.byteLength;
         hash.update(chunk.value);
-        await handle.write(chunk.value);
+        await handle.writeFile(chunk.value);
       }
       await handle.sync();
       await handle.close();
@@ -79,7 +80,27 @@ export class LocalStorageAdapter implements StoragePort {
     ) {
       throw new Error('storage object is still retained');
     }
-    await rm(objectPath(this.root, object.key), { force: true });
+    const destination = objectPath(this.root, object.key);
+    if (object.deletedAt) {
+      // A confirmed metadata tombstone also owns scratch files left by an
+      // interrupted put. Remove scratch before the destination so a late
+      // rename cannot leave a new final object behind this cleanup.
+      const directory = dirname(destination);
+      const prefix = basename(destination) + '.';
+      try {
+        for (const name of await readdir(directory)) {
+          if (
+            name.startsWith(prefix) &&
+            name.endsWith('.tmp') &&
+            UuidSchema.safeParse(name.slice(prefix.length, -4)).success
+          )
+            await rm(join(directory, name), { force: true });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    await rm(destination, { force: true });
   }
 
   async exists(objectInput: StorageObject) {

@@ -35,6 +35,7 @@ import {
   publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
 import { publicProfileBundles } from '../../../web/lib/d-entry/public-profile-bundles.js';
+import { headlessPresentedHost } from '../../../web/lib/d-entry/presented-host.js';
 import {
   fixture,
   buildProfileFixture,
@@ -451,7 +452,14 @@ it
     const createdNativeId = 'native-created';
     const outerNativeId = 'native-outer-created';
     let expectedNativeId: string | undefined;
+    const deliveryPath = '/work/team/hello-word.md';
+    const deliveryObjectId = randomUUID();
+    const earlierDeliveryId = randomUUID();
+    let deliveryReads = 0;
     if (outerCreate) {
+      f.host.catalog.items = f.host.catalog.items.map((item) =>
+        item.sessionId === 'root' ? { ...item, cwd: '/work/team' } : item,
+      );
       let records: readonly SessionHistoryRecord[] = [];
       f.host.catalog.snapshotRecords = (id) => (id === 'root' ? records : []);
       f.host.catalog.onPrompt = ({ sessionId, content, requestId }) => {
@@ -474,6 +482,24 @@ it
           { type: 'user/message', data: message, surfaceOp: 'append' },
           { type: 'step/start', data: { turn: 1, step: 1 } },
           {
+            type: 'tool/call',
+            data: {
+              turn: 1,
+              step: 1,
+              callId: 'present-file-fixture',
+              name: 'present',
+              arguments: { files: [{ path: deliveryPath }] },
+            },
+          },
+          {
+            type: 'deliverables/presented',
+            data: {
+              turn: 1,
+              callId: 'present-file-fixture',
+              files: [{ path: deliveryPath }, { path: '/private/foreign.md' }],
+            },
+          },
+          {
             type: 'assistant/message',
             data: {
               turn: 1,
@@ -494,6 +520,7 @@ it
           type: 'event',
           event: { ...event, seq: index + 1, time: Date.now() },
         }));
+        f.host.catalog.pageRecords = records;
       };
       f.host.catalog.allocateSessionId = () =>
         summary(expectedNativeId ?? randomUUID()).sessionId;
@@ -782,6 +809,89 @@ it
       };
       try {
         const scopeId = url.searchParams.get('scopeId');
+        if (outerCreate && url.pathname.endsWith('/api/present.host'))
+          return await copy(headlessPresentedHost());
+        if (outerCreate && url.pathname === panelPath + 'deliverables/native') {
+          deliveryReads++;
+          expect(url.searchParams.get('threadId')).toBe(f.selection.threadId);
+          expect(url.searchParams.get('coordinate')).toBe(
+            createHash('sha256')
+              .update(JSON.stringify(['root', deliveryPath]))
+              .digest('hex'),
+          );
+          const exact = url.searchParams.get('occurrence');
+          if (exact)
+            expect(exact).toBe(
+              createHash('sha256')
+                .update(JSON.stringify([1, 4, 'present-file-fixture', 0]))
+                .digest('hex'),
+            );
+          return await copy(
+            Response.json({
+              objectId: exact ? earlierDeliveryId : deliveryObjectId,
+            }),
+          );
+        }
+        if (
+          outerCreate &&
+          url.pathname === panelPath + 'deliverables' &&
+          [deliveryObjectId, earlierDeliveryId].some(
+            (id) => id === url.searchParams.get('objectId'),
+          )
+        ) {
+          return await copy(
+            Response.json({
+              ...panelViewer,
+              employees: [],
+              nextCursor: null,
+              files: [
+                {
+                  objectId: url.searchParams.get('objectId')!,
+                  workspaceId: panelViewer.workspaceId,
+                  fileName: 'hello-word.md',
+                  mediaType: 'text/markdown',
+                  sizeBytes: 20,
+                  createdAt: '2026-11-27T12:00:00.000Z',
+                  checksum: 'sha256:' + 'a'.repeat(64),
+                  category: 'artifact',
+                  origin: 'business-deliverable',
+                  sources: [],
+                  favorite: false,
+                  ownedByMe: true,
+                  canMaintain: true,
+                  revision: 1,
+                  sharing: {
+                    scope: 'personal',
+                    departmentIds: [],
+                    departmentNames: [],
+                  },
+                  sessionIds: [f.selection.threadId],
+                  artifact: null,
+                  isReference: false,
+                  reference: null,
+                },
+              ],
+            }),
+          );
+        }
+        if (
+          outerCreate &&
+          [deliveryObjectId, earlierDeliveryId].some(
+            (id) => url.pathname === panelPath + `deliverables/${id}/preview`,
+          )
+        )
+          return await copy(
+            Response.json({
+              kind: 'text',
+              text: url.pathname.includes(earlierDeliveryId)
+                ? '该次交付固定版本'
+                : '归档后的原始文档',
+              offset: 1,
+              lines: 1,
+              eof: true,
+              mediaType: 'text/markdown',
+            }),
+          );
         if (url.pathname === skillsPath || url.pathname === legacySkillsPath) {
           const ordinal = reads.push({
             method: request.method,
@@ -2127,6 +2237,32 @@ it
         );
       }
       await expect.poll(nativeSession).toBe('root');
+
+      await workbench
+        .locator('[data-presented-files-row]')
+        .getByRole('button', { name: /hello-word\.md/ })
+        .first()
+        .click();
+      await workbench.getByText('归档后的原始文档', { exact: true }).waitFor();
+      expect(
+        await workbench
+          .getByText(
+            /无法读取主机桌面信息|Could not read the Host desktop information/,
+          )
+          .count(),
+      ).toBe(0);
+      await closeWorkbenchPane('root', 'hello-word.md');
+      const detail = workbench.getByRole('button', { name: '查看此版本详情' });
+      await detail.first().click();
+      await workbench.getByText('该次交付固定版本', { exact: true }).waitFor();
+      await closeWorkbenchPane('root', '交付成果');
+      expect(deliveryReads).toBe(2);
+      await detail.last().click();
+      await workbench
+        .getByText('文件尚未归档到交付成果。', { exact: true })
+        .waitFor();
+      expect(deliveryReads).toBe(2);
+      await closeWorkbenchPane('root', '交付成果');
 
       const mark = randomUUID();
       await workbench.locator('#app').evaluate((node, value) => {

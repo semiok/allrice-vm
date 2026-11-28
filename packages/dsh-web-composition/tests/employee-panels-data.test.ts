@@ -36,7 +36,7 @@ describe('explicit browser panel client, without BFF identity or business writes
     const names = Object.keys(
       unboundEmployeePanelDataClient,
     ) as EmployeePanelDataMethod[];
-    expect(names).toHaveLength(17);
+    expect(names).toHaveLength(18);
     for (const name of names) {
       const call = unboundEmployeePanelDataClient[name] as (
         input: unknown,

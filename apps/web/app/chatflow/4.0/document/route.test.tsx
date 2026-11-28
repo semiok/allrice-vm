@@ -7,6 +7,7 @@ import {
   POST as documentUpload,
 } from './[...publicationPath]/route';
 import EntryPage from '../page';
+import { GET as presentedHost } from '../api/present.host/route';
 import { DataAccessError } from '@allrice/database';
 import type * as NativeWorker from '../../../../lib/d-entry/native-worker';
 import type * as SessionIdentity from '../../../../lib/identity/session';
@@ -118,6 +119,32 @@ it('checks the original Request/Cookie before accepting even invalid selectors',
   expect(historyIdentity).not.toHaveBeenCalled();
 });
 
+it('returns the native headless metadata without opening a VM desktop action', async () => {
+  const original = new Request(
+    'https://allrice.test/chatflow/4.0/api/present.host',
+  );
+  const response = await presentedHost(original);
+  expect(authenticated).toHaveBeenCalledExactlyOnceWith(original);
+  expect(response.headers.get('cache-control')).toBe('private, no-store');
+  expect(await response.json()).toEqual({
+    name: 'AllRice',
+    available: false,
+    fileManager: null,
+  });
+  expect(profileRequest).not.toHaveBeenCalled();
+});
+
+it('keeps the native desktop query behind login', async () => {
+  authenticated.mockRejectedValueOnce(
+    new DataAccessError('authentication_required'),
+  );
+  const response = await presentedHost(
+    new Request('https://allrice.test/chatflow/4.0/api/present.host'),
+  );
+  expect(response.status).toBe(401);
+  expect((await response.json()).error.code).toBe('AUTHENTICATION_REQUIRED');
+});
+
 it.each([
   '',
   `${query}&workspaceId=${selection.workspaceId}`,
@@ -195,10 +222,11 @@ it('requires the issued scope in the document address and leaves the two exact n
     graphRev: 'verified-graph',
     manifestSha256: '1'.repeat(64),
   };
+  const documentAddress = { ...claims, nativeSessionId: 'real-native-root' };
   const bundle = 'plugins/??fixture/client.js&rev=r1';
   profileRequest.mockImplementation(async (_input, _type, _selectors, mode) =>
     mode === 'document'
-      ? Response.json({ ...claims, nativeSessionId: 'real-native-root' })
+      ? Response.json(documentAddress)
       : Response.json({
           version: 1,
           scopeReference: { scopeId },
@@ -336,6 +364,22 @@ it('requires the issued scope in the document address and leaves the two exact n
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
   ]);
+  profileRequest.mockClear();
+  const scopedDesktop = await call('api/present.host');
+  expect(scopedDesktop.status).toBe(200);
+  expect(await scopedDesktop.json()).toEqual({
+    name: 'AllRice',
+    available: false,
+    fileManager: null,
+  });
+  expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
+    ['bootstrap', { scopeId }, 'document'],
+  ]);
+  profileRequest.mockResolvedValueOnce(
+    Response.json({ ...documentAddress, bindingRef: 'stale-profile' }),
+  );
+  expect((await call('api/present.host')).status).toBe(404);
+  expect((await call('api/present.open', 'POST')).status).toBe(404);
 });
 
 it(

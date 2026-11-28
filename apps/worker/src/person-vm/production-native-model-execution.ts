@@ -6,6 +6,7 @@ import {
   memoryIndexPolicy,
   type DEntryIdentity,
   type RequestContext,
+  type StoragePort,
 } from '@allrice/contracts';
 import {
   DataAccessError,
@@ -58,7 +59,10 @@ import {
   webSearchRoute,
   webSearchTimeoutMs,
 } from './production-web-search.js';
-import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
+import {
+  reconcileNativeDeliveries,
+  reconcileNativeRunTerminals,
+} from './production-native-run-reconciliation.js';
 import {
   matchNativeToolObservation,
   nativeAdoptedTextProofVersion,
@@ -389,7 +393,9 @@ const reject = (): never => {
   throw new ModelGatewayError('AUTHORIZATION_DENIED');
 };
 
-export function createProductionNativeModelExecution(): ProductionNativeModelExecution {
+export function createProductionNativeModelExecution(
+  deliveryStorage?: StoragePort,
+): ProductionNativeModelExecution {
   let installed: Installed | undefined;
 
   return {
@@ -2151,6 +2157,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       void run(live, (active) =>
         reconcileNativeRunTerminals(host.startup, active),
       ).catch(() => {});
+      if (deliveryStorage)
+        void run(live, (active) =>
+          reconcileNativeDeliveries(host.startup, deliveryStorage, active),
+        ).catch(() => {});
       return owner;
     },
   };

@@ -154,6 +154,10 @@ extra:
     - apps/worker/test/p25/native-schedule-recurring.integration.test.ts
     - apps/worker/test/p25/platform-quality-recurring.integration.test.ts
 tags:
+  platform:linux:
+    platforms: [linux]
+    reason: Native delivery capture needs Linux /proc/self/fd.
+    command: pnpm exec vitest run {file}
   manual:ALLRICE_NATIVE_WEB_TEST_CLI:
     reason: Complete compatible-OS public DSH 0.2.1-rc.2 package artifact with pinned CLI hash; starts its actual Web profile in a synthetic HOME. No dummy protocol server, credentials, model or shared Dev.
     command: >-

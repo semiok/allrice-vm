@@ -14,6 +14,7 @@ import {
 } from '@allrice/contracts';
 import {
   DataAccessError,
+  findDEntryNativeDelivery,
   isIndexableKnowledgeTextSource,
 } from '@allrice/database';
 import { workbenchFileError, workbenchFileHeaders } from '../workbench-files';
@@ -256,6 +257,27 @@ export function createEmployeePanelsHandlers(
       if (value.body.action !== 'retry')
         throw new DataAccessError('authorization_denied');
       return scope.materials.changeSource(scope.context, value, request.signal);
+    }),
+    resolveNativeDelivery: route(false, async (scope, _params, request) => {
+      const query = new URL(request.url).searchParams;
+      if (
+        query.getAll('coordinate').length !== 1 ||
+        query.getAll('occurrence').length > 1
+      )
+        throw new DataAccessError('not_found');
+      const objectId = await findDEntryNativeDelivery(
+        scope.context,
+        scope.selection,
+        query.get('coordinate')!,
+        query.get('occurrence') ?? undefined,
+      );
+      const resource = await scope.deliverables.download(
+        scope.context,
+        { objectId },
+        request.signal,
+      );
+      await resource.reauthorize(request.signal);
+      return { objectId };
     }),
     listDeliverables: route(false, async (scope, _params, request) => {
       const params = new URL(request.url).searchParams;

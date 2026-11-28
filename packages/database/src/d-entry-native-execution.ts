@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { TransactionSql } from 'postgres';
+import type { DEntryNativeDeliveryClaim } from './d-entry-native-delivery.ts';
 import {
   RunStatusSchema,
   UuidSchema,
@@ -392,8 +393,12 @@ export async function listDEntryNativeRunCandidates(
   owner: DEntryNativeRunJournalOwner,
   after?: ScanCursor,
   limit = 64,
+  delivery?: Pick<
+    DEntryNativeDeliveryClaim,
+    'sessionId' | 'turn' | 'attemptId' | 'cursor'
+  >,
+  sql = getDatabase(),
 ) {
-  const sql = getDatabase();
   const rows = await sql<
     {
       run_id: string;
@@ -429,6 +434,19 @@ export async function listDEntryNativeRunCandidates(
       })}
       and r.execution_spec->>'source' in ('dsh-native-prompt','dsh-native-delegation')
       and e.payload->>'source'='dsh-native-attempt'
+      ${
+        delivery
+          ? sql`and e.payload @> ${sql.json({
+              kind: 'assistant',
+              sessionId: delivery.sessionId,
+              turn: delivery.turn,
+              attemptId: delivery.attemptId,
+              cursor: delivery.cursor,
+              vmInstanceId: owner.vmInstanceId,
+              leaseEpoch: owner.leaseEpoch,
+            })}`
+          : sql``
+      }
       ${after ? sql`and (r.id,e.sequence) > (${after.runId}::uuid,${after.sequence}::integer)` : sql``}
     order by r.id, e.sequence
     limit ${limit}
@@ -522,6 +540,50 @@ export function isDEntryNativeRunJournalCurrent(
     signal,
     leaseOwner,
   );
+}
+
+/** Live publication must never borrow the retained-disk exception for a
+ * previous epoch. This is checked in both reservation and finalization. */
+export async function assertDEntryNativeDeliveryRun(
+  tx: TransactionSql,
+  candidate: DEntryNativeRunCandidate,
+  owner: DEntryNativeRunJournalOwner,
+  signal: AbortSignal,
+) {
+  const {
+    runId,
+    executionId,
+    organizationId,
+    workspaceId,
+    ownerId,
+    prompt,
+    attempt,
+  } = candidate;
+  if (
+    attempt.kind !== 'assistant' ||
+    attempt.leaseEpoch !== owner.leaseEpoch ||
+    attempt.vmInstanceId !== owner.vmInstanceId ||
+    !matchesRunScope(prompt, attempt) ||
+    !(await checkCurrentRunJournal(
+      tx,
+      candidate,
+      owner,
+      signal,
+      undefined,
+      true,
+    ))
+  )
+    throw new DataAccessError('not_found');
+  const [row] = await tx`
+    select r.id from allrice_runs r
+    join allrice_run_events e on e.run_id=r.id and e.id=${executionId}
+    where r.id=${runId} and r.organization_id=${organizationId} and r.workspace_id=${workspaceId}
+      and r.owner_id=${ownerId} and r.state='running' and r.visibility='private'
+      and r.execution_spec=${tx.json(prompt)} and e.event_type='step.started'
+      and e.payload=${tx.json(attempt)}
+    for share of r,e`;
+  if (!row) throw new DataAccessError('not_found');
+  signal.throwIfAborted();
 }
 
 const outcomes = {

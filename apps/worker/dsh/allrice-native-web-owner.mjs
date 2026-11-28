@@ -13,6 +13,8 @@ import {
   isNativeForkHeader,
 } from './allrice-native-run-journal.mjs';
 
+import { observeNativeDeliveries } from './allrice-native-delivery-capture.mjs';
+
 export const name = 'allrice-native-web-owner';
 export const inject = [
   'connection',
@@ -1852,12 +1854,20 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
+          'fs',
+          'workingDirectory',
           'tools',
           ...(modelAdapter.webSearchEnabled ? ['web'] : []),
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
+          const delivery = observeNativeDeliveries(scope, {
+            root: workdir,
+            lifetime: signal,
+            current,
+            unwrap: original,
+          });
           const select = managedSearch?.selectScopedModel;
           if (scoped && typeof select !== 'function')
             throw Error('Native managed model policy is unavailable');
@@ -1925,6 +1935,16 @@ export function applyNativeWebOwner(
               if (!current())
                 return new globalThis.Response(null, { status: 404 });
               const value = await request.json();
+              if (
+                value?.adapterId === id &&
+                [
+                  'delivery-pending',
+                  'delivery-read',
+                  'delivery-live',
+                  'delivery-ack',
+                ].includes(value.action)
+              )
+                return delivery(value);
               if (
                 value?.adapterId === id &&
                 value.action === 'read-root-wake' &&
