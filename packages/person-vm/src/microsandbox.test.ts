@@ -7,6 +7,7 @@ import {
   readlink,
   readdir,
   realpath,
+  rename,
   rm,
   rmdir,
   open,
@@ -2923,7 +2924,7 @@ fs.writeFileSync(f,JSON.stringify(v));
   });
 });
 
-it('keeps the mounted disk on retained VMs and rolls back an absent VM to directory provisioning', async () => {
+async function runtimeDiskFixture() {
   const dsh = await readonlyFixture();
   const signed = (input: string) =>
     createHash('sha256').update(input).digest('hex');
@@ -2992,6 +2993,76 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
     await writeFile(join(controls.hostDirectory, name), bytes, {
       mode: name === 'launch-dsh.sh' ? 0o555 : 0o444,
     });
+  return { dsh, disk, controls, diskBytes, cliSha256, bwrapSha256 };
+}
+
+async function observeDiskStreams(diskPath: string) {
+  const file = await open(diskPath, 'r');
+  try {
+    return vi.spyOn(
+      Object.getPrototypeOf(file) as FileHandle,
+      'createReadStream',
+    );
+  } finally {
+    await file.close();
+  }
+}
+
+it.each(['cold', 'replaced', 'missing at prewarm', 'writable'] as const)(
+  'rejects a bad runtime disk at native create (%s)',
+  async (state) => {
+    const { dsh, disk, controls, diskBytes } = await runtimeDiskFixture();
+    const f = await bootstrapFixture('ok', dsh, undefined, {
+      readonlyDshRuntimeDisk: disk,
+      readonlyCommandMemoryDirectory: controls,
+    });
+    const binding = {
+      vmId: randomUUID(),
+      personId: randomUUID(),
+      organizationId: randomUUID(),
+      instanceId: randomUUID(),
+      leaseEpoch: 1,
+    };
+    const diskPath = disk.diskPath;
+    const original = await lstat(diskPath, { bigint: true });
+    const streams = await observeDiskStreams(diskPath);
+    if (state === 'missing at prewarm') {
+      await rm(diskPath);
+      await expect(
+        f.native.prewarmReadonlyDshRuntimeDisk(signal()),
+      ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    } else if (state !== 'cold') {
+      await f.native.prewarmReadonlyDshRuntimeDisk(signal());
+      expect(streams).toHaveBeenCalledTimes(1);
+    }
+    streams.mockClear();
+    if (state === 'writable') {
+      await chmod(diskPath, 0o644);
+    } else {
+      // Preserve path and byte length while installing a different inode.
+      const replacement = diskPath + '.replacement';
+      await writeFile(replacement, diskBytes.replace('sealed', 'forged'), {
+        mode: 0o444,
+      });
+      await rename(replacement, diskPath);
+      const observed = await lstat(diskPath, { bigint: true });
+      expect(observed.size).toBe(original.size);
+      if (state !== 'missing at prewarm')
+        expect(observed.ino).not.toBe(original.ino);
+    }
+    await f.native.prepare(binding, f.mount, signal());
+    await expect(
+      f.native.create(binding, currentReceipt(binding), signal()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(streams).toHaveBeenCalledTimes(state === 'writable' ? 0 : 1);
+    expect((await f.calls()).map(([op]) => op)).not.toContain('create');
+  },
+);
+
+it('uses the warmed runtime disk and preserves disk/directory provisioning across retained starts', async () => {
+  const { dsh, disk, controls, cliSha256, bwrapSha256 } =
+    await runtimeDiskFixture();
+  const { diskPath, diskSha256 } = disk;
   const f = await bootstrapFixture('ok', dsh, undefined, {
     readonlyDshRuntimeDisk: disk,
     readonlyCommandMemoryDirectory: controls,
@@ -3021,7 +3092,11 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
     });
     expect(await job.wait(signal())).toEqual({ exitCode: 0, timedOut: false });
   };
+  const streams = await observeDiskStreams(diskPath);
+  await f.native.prewarmReadonlyDshRuntimeDisk(signal());
+  expect(streams).toHaveBeenCalledTimes(1);
   await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
+  expect(streams).toHaveBeenCalledTimes(1);
   const calls = await f.calls();
   const create = calls.find(([op]) => op === 'create');
   expect(create).toEqual(
@@ -3085,7 +3160,7 @@ it('keeps the mounted disk on retained VMs and rolls back an absent VM to direct
   };
   expect(reference).toMatchObject({
     runtimeDiskSha256: diskSha256,
-    commandMemorySha256: controlsSha,
+    commandMemorySha256: controls.sha256,
   });
   await f.native.stop(binding, signal());
   const retained = f.reloadNative({ ...disk, provision: 'directory' });

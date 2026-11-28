@@ -1479,6 +1479,59 @@ it('a missing verified artifact prevents source binding and any native installat
   expect(io.gateway).not.toHaveBeenCalled();
 });
 
+it.each(['failure', 'shutdown'] as const)(
+  'publishes the host independently of runtime disk prewarm and handles %s',
+  async (outcome) => {
+    const hash = '1'.repeat(64);
+    const generation = join(f.root, 'runtime-disks', hash);
+    f.loaded.configuration.native.readonlyDshRuntimeDisk = {
+      diskPath: join(generation, 'runtime.ext4'),
+      diskSha256: hash,
+      candidatePath: join(generation, 'candidate.json'),
+      candidateSha256: hash,
+      provision: 'disk',
+    };
+    const finish = gate();
+    const aborted = gate();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const prewarm = vi
+      .spyOn(MicrosandboxPersonVm.prototype, 'prewarmReadonlyDshRuntimeDisk')
+      .mockImplementation(async (signal) => {
+        signal.addEventListener('abort', aborted.release, { once: true });
+        await finish.promise;
+        signal.throwIfAborted();
+        throw new PersonVmError('PROVIDER_FAILED');
+      });
+    try {
+      const { host, input } = await open();
+      expect(prewarm).toHaveBeenCalledTimes(1);
+      expect(prewarm.mock.contexts[0]).toBe(input().providers.native);
+      expect(warn).not.toHaveBeenCalled();
+      if (outcome === 'failure') {
+        finish.release();
+        await turn();
+        expect(warn).toHaveBeenCalledWith(
+          '[person-vm] DSH runtime disk prewarm failed. Launch will verify the disk.',
+          'PROVIDER_FAILED',
+        );
+        await host.close();
+      } else {
+        const closed = vi.fn();
+        const closing = host.close().then(closed);
+        await aborted.promise;
+        await turn();
+        expect(closed).not.toHaveBeenCalled();
+        finish.release();
+        await closing;
+        expect(closed).toHaveBeenCalledTimes(1);
+        expect(warn).not.toHaveBeenCalled();
+      }
+    } finally {
+      finish.release();
+    }
+  },
+);
+
 it('cancellation during source construction joins both late source publication and its actual close', async () => {
   const value = fixture(),
     entered = gate(),

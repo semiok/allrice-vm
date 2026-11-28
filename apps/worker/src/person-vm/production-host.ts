@@ -1411,6 +1411,22 @@ export function createProductionPersonVmHost(input: {
             console.warn('[person-vm.disk-preprovision]', event),
         });
       }
+      if (providers.configuration.native.readonlyDshRuntimeDisk) {
+        const native = providers.native;
+        void own(async () => {
+          try {
+            await native.prewarmReadonlyDshRuntimeDisk(lifetime);
+          } catch (error) {
+            if (!lifetime.aborted)
+              console.warn(
+                '[person-vm] DSH runtime disk prewarm failed. Launch will verify the disk.',
+                error instanceof PersonVmError
+                  ? error.code
+                  : 'UNEXPECTED_ERROR',
+              );
+          }
+        });
+      }
       return Object.freeze({
         recoveryState: () =>
           upgradeDrainRequested
