@@ -60,7 +60,7 @@ export interface DEntryNativeDataPort {
     owner: ResolvedDEntryNativeOwner;
     operationId: string;
     signal: AbortSignal;
-    access?: 'page';
+    access?: 'page' | 'employee-streams';
   }): Promise<DEntryAdmissionOwner>;
   acquireRpc?(
     input: {

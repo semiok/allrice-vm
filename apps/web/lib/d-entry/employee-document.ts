@@ -1,4 +1,4 @@
-import { DEntryProfileBootstrapSchema } from '@allrice/contracts';
+import { DEntryProfileDocumentSchema } from '@allrice/contracts';
 import {
   DataAccessError,
   readDEntryEmployeeDirectory,
@@ -9,7 +9,7 @@ import {
 } from './initial-document';
 import { readDEntryWorkerJson, requestDEntryProfile } from './native-worker';
 import { profileAddress, profileDirectory, type profileInput } from './profile';
-import { readReleasedProfileAssets } from './released-profile-assets';
+import { readLocalProfileAssets } from './released-profile-assets';
 
 const escapeAttribute = (value: string) =>
   value
@@ -22,19 +22,39 @@ const safeJson = (value: unknown) =>
 export async function renderEmployeeDocument(
   request: Request,
   input: Awaited<ReturnType<typeof profileInput>>,
-  address: Awaited<ReturnType<typeof profileAddress>>,
-  inline: boolean,
+  target: string | Awaited<ReturnType<typeof profileAddress>>,
 ) {
-  const assets = profileDirectory('static', address);
-  const native = profileDirectory('document', address) + '/native/';
-  const { scopeId, bindingRef, graphRev, selection } = address;
+  const inline = typeof target === 'string';
+  const scopeId = inline ? target : target.scopeId;
+  const { selection } = input;
   const tenant = input.context.organizationId;
   if (input.context.actor.type !== 'user')
     throw new DataAccessError('not_found');
-  const [released, directory] = await Promise.all([
-    readReleasedProfileAssets(address.manifestSha256),
+  const [local, directory] = await Promise.all([
+    readLocalProfileAssets(),
     readDEntryEmployeeDirectory(input.context, selection, request.signal),
   ]);
+  // Directory and local static metadata finish before the final native grant.
+  // That response addresses the exact same release as its bootstrap.
+  const document = inline
+    ? await readDEntryWorkerJson(
+        await requestDEntryProfile(
+          input,
+          'bootstrap',
+          { scopeId },
+          'inline-document',
+        ),
+        DEntryProfileDocumentSchema.parse,
+      )
+    : undefined;
+  const address = inline
+    ? { ...document!.address, selection, scopeId }
+    : target;
+  const { bindingRef, graphRev } = address;
+  const released = local?.stamp === address.manifestSha256 ? local : undefined;
+  const bootstrap = document?.bootstrap;
+  const assets = profileDirectory('static', address);
+  const native = profileDirectory('document', address) + '/native/';
   // The full Worker bootstrap rechecks the exact admitted page/root after
   // the SQL read. The legacy document only has the current address check.
   if (!inline) {
@@ -47,13 +67,6 @@ export async function renderEmployeeDocument(
     )
       throw new DataAccessError('not_found');
   }
-  // No async reads after the grant-bearing bootstrap and its wire guards.
-  const bootstrap = inline
-    ? await readDEntryWorkerJson(
-        await requestDEntryProfile(input, 'bootstrap', { scopeId }),
-        (value) => DEntryProfileBootstrapSchema.parse(value),
-      )
-    : undefined;
   if (
     bootstrap &&
     (bootstrap.scopeReference.scopeId !== scopeId ||

@@ -110,7 +110,7 @@ export function requestDEntryProfile(
   },
   type: 'bootstrap' | 'assets' | 'events' | 'switch',
   selectors: Record<string, string>,
-  request?: 'document' | 'static',
+  request?: 'document' | 'inline-document' | 'static',
 ) {
   input.signal.throwIfAborted();
   const target = new URL(`/internal/d-entry/profile/${type}`, workerBase());

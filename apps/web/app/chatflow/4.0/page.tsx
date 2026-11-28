@@ -1,6 +1,11 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { IdentityError, preparePersonNativeWebRoster } from '@allrice/database';
+import { DEntrySelectionInputSchema } from '@allrice/contracts';
+import {
+  getDEntryNativeRootPin,
+  IdentityError,
+  preparePersonNativeWebRoster,
+} from '@allrice/database';
 import {
   findDEntryCreationWorkspace,
   findDEntryEmployee,
@@ -11,6 +16,53 @@ import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
+
+async function readWarmEntry(query: URLSearchParams) {
+  const selection = DEntrySelectionInputSchema.safeParse(
+    Object.fromEntries(query),
+  );
+  if (
+    !selection.success ||
+    !selection.data.threadId ||
+    [...query.keys()].some((key) => query.getAll(key).length !== 1)
+  )
+    return;
+  const cancellation = new AbortController();
+  const { signal } = cancellation;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        cancellation.abort();
+        resolve(undefined);
+      }, 1_500);
+    });
+    const discover = async () => {
+      const requestHeaders = await headers();
+      if (requestHeaders.get('sec-fetch-dest') !== 'document') return;
+      const request = new Request('http://localhost/chatflow/4.0', {
+        headers: requestHeaders,
+        signal,
+      });
+      const context = await getRequestContext(request);
+      signal.throwIfAborted();
+      if (!context) return;
+      const root = await getDEntryNativeRootPin(context, selection.data, {
+        runningSnapshot: true,
+      });
+      signal.throwIfAborted();
+      // This only identifies a known thread. The existing socket checks the
+      // current editor proof before admitting the warm attempt.
+      return root.identity;
+    };
+    return await Promise.race([discover(), deadline]);
+  } catch {
+    // Cold or unavailable: start through the regular browser prewarm path.
+  } finally {
+    clearTimeout(timer);
+    cancellation.abort();
+  }
+}
 
 export default async function EmployeeNativeEntryPage({
   searchParams,
@@ -92,10 +144,15 @@ export default async function EmployeeNativeEntryPage({
       return <EmployeeNativePage query="" initialUnavailable prepare />;
     }
   }
+  const [startupAssetUrls, warmIdentity] = await Promise.all([
+    readStartupProfileAssetUrls(),
+    readWarmEntry(query),
+  ]);
   return (
     <EmployeeNativePage
       query={query.toString()}
-      startupAssetUrls={await readStartupProfileAssetUrls()}
+      startupAssetUrls={startupAssetUrls}
+      warmIdentity={warmIdentity}
       prepare
     />
   );

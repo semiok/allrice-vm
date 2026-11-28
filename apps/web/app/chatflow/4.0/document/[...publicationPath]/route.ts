@@ -34,7 +34,7 @@ export async function GET(request: Request, { params }: Params) {
     if (target.path !== 'native/index.html')
       return await profileStaticFile(input, target, target.path);
     const address = await qualifyDocument(input, target);
-    return await renderEmployeeDocument(request, input, address, false);
+    return await renderEmployeeDocument(request, input, address);
   } catch (error) {
     return dEntryErrorResponse(error);
   }

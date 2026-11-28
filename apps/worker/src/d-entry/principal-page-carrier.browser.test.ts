@@ -14,6 +14,7 @@ import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
   dEntryRegisteredThreadHeader,
+  dEntryWarmIdentityHeader,
   type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
@@ -70,7 +71,9 @@ it
     const createAfterSwitch =
       scenario === 'native-create-linux' ||
       (nativeCreate && !outerCreate && process.platform !== 'darwin');
-    const realShell = switching || nativeCreate || coldAssets;
+    const warmRefresh = scenario === 'refresh';
+    const usePublicFiles = coldAssets || warmRefresh;
+    const realShell = switching || nativeCreate || coldAssets || warmRefresh;
     const release = await buildProfileFixture();
     // The production pack and guest materialize the same code separately.
     // Let rc.2 compute each graph and serve exact bytes for Worker attestation.
@@ -217,6 +220,7 @@ it
               import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
               createRoot(document.getElementById('root')).render(
                 <EmployeeNativePage prepare query={location.search.slice(1)}
+                  warmIdentity={JSON.parse(document.getElementById('warm-identity')?.textContent ?? 'null') ?? undefined}
                   startupAssetUrls={JSON.parse(document.getElementById('startup-assets')?.textContent ?? '[]')} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
@@ -293,6 +297,7 @@ it
     const deliverCreatedResponse = deferred();
     let holdCreatedResponse = false;
     let switchProofRequests = 0;
+    let loseNextSwitchProofReply = false;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
       const nativeRoots = new Map<
@@ -351,6 +356,7 @@ it
     }
     const unary: string[] = [];
     const startupReplies = new Map<string, unknown>();
+    let nativeEventOpens = 0;
     const startupMethods = new Set([
       'session/list',
       'dynamicCordisRunner/inventory',
@@ -643,8 +649,23 @@ it
             );
           }
           if (url.pathname === '/api/v1/d-entry/native-prewarm') {
+            if (!coldAssets) {
+              const chunks: Buffer[] = [];
+              for await (const chunk of request)
+                chunks.push(Buffer.from(chunk));
+              const { selection } = JSON.parse(
+                Buffer.concat(chunks).toString(),
+              );
+              const headers = selection.threadId
+                ? {
+                    [dEntryWarmIdentityHeader]: JSON.stringify({
+                      identity: f.selectionIdentity(selection),
+                    }),
+                  }
+                : {};
+              return response.writeHead(204, headers).end();
+            }
             request.resume();
-            if (!coldAssets) return response.writeHead(204).end();
             prewarmAt = performance.now();
             return await copy(
               new Response(
@@ -692,6 +713,11 @@ it
               .writeHead(200, { 'content-type': 'text/html' })
               .end(
                 '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div>' +
+                  (warmRefresh
+                    ? '<script id="warm-identity" type="application/json">' +
+                      JSON.stringify(f.identity) +
+                      '</script>'
+                    : '') +
                   (coldAssets && bench !== 'progress'
                     ? '<script id="startup-assets" type="application/json">' +
                       JSON.stringify(coldPaths) +
@@ -720,15 +746,20 @@ it
               ?.split('; ')
               .find((part) => part.startsWith('allrice_session='))
               ?.slice('allrice_session='.length) ?? '';
-          return await copy(
-            await f.proveSwitch(
-              scopeId!,
-              url.searchParams.get('targetThreadId')!,
-              url.searchParams.get('requestId')!,
-              cookie,
-              Object.fromEntries(url.searchParams),
-            ),
+          const proof = await f.proveSwitch(
+            scopeId!,
+            url.searchParams.get('targetThreadId')!,
+            url.searchParams.get('requestId')!,
+            cookie,
+            Object.fromEntries(url.searchParams),
           );
+          if (loseNextSwitchProofReply) {
+            loseNextSwitchProofReply = false;
+            expect(proof.status).toBe(204);
+            response.destroy();
+            return;
+          }
+          return await copy(proof);
         }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           firstRpc ??= performance.now();
@@ -846,7 +877,7 @@ it
           else response.end(encoded);
           return;
         }
-        if (coldAssets && url.pathname.startsWith(publicRoot)) {
+        if (usePublicFiles && url.pathname.startsWith(publicRoot)) {
           const file = url.pathname.slice(publicRoot.length);
           if (
             !(stagedPaths ? stagedPaths.has(file) : staticFiles.has('/' + file))
@@ -1001,8 +1032,8 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
-          ${coldAssets ? nativeStyles : ''}
-          <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
+          ${usePublicFiles ? nativeStyles : ''}
+          <link rel="stylesheet" href="${usePublicFiles ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
@@ -1012,7 +1043,7 @@ it
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(publicIndex)}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
-          <script type="module" src="${coldAssets ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
+          <script type="module" src="${usePublicFiles ? publicEntry : '/managed/employee-web-entry.js'}"></script>`);
       } catch {
         response.writeHead(500).end();
       }
@@ -1113,6 +1144,11 @@ it
     let socketCount = 0;
     let lastScopeId: string | undefined;
     const firstItems: string[] = [];
+    const followed = new Set<string>();
+    const followAddresses = new Map<
+      string,
+      { nativeId: string; scopeId: string }
+    >();
     const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -1129,16 +1165,41 @@ it
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
+        if (frame.type === 'open' && frame.endpoint === '$events')
+          nativeEventOpens++;
+        if (frame.type === 'open' && frame.endpoint === 'session/follow') {
+          const address = frame.payload.args.request.address;
+          followAddresses.set(frame.streamId, {
+            nativeId: address.sessionId ?? address.childSessionId,
+            scopeId: frame.pageScopeId,
+          });
+        }
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
         if (frame.type === 'item' && frame.value.type === 'opened')
           lastScopeId = frame.value.scopeReference.scopeId;
+        if (frame.type === 'item' && frame.value.type === 'switched') {
+          lastScopeId = frame.value.scopeId;
+          for (const address of followAddresses.values()) {
+            if (address.nativeId === frame.value.nativeSessionId)
+              address.scopeId = frame.value.scopeId;
+          }
+        }
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
         )
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
+        const followedSession = followAddresses.get(frame.streamId);
+        if (
+          frame.type === 'item' &&
+          frame.value.type === 'snapshot' &&
+          followedSession
+        )
+          followed.add(
+            followedSession.nativeId + '/' + followedSession.scopeId,
+          );
         if (
           frame.type === 'item' &&
           frame.value.type === 'baseline' &&
@@ -1172,7 +1233,17 @@ it
     started = performance.now();
     await page.goto(
       realShell
-        ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
+        ? f.origin +
+            '/chatflow/4.0?' +
+            new URLSearchParams(
+              scenario === 'switch'
+                ? {
+                    threadId: f.selection.threadId,
+                    workspaceId: f.selection.workspaceId,
+                    employeeInstanceId: f.selection.employeeInstanceId,
+                  }
+                : f.selection,
+            )
         : f.origin,
       coldAssets ? { waitUntil: 'commit' } : undefined,
     );
@@ -1424,7 +1495,27 @@ it
       const mark = randomUUID();
       await workbench.locator('#app').evaluate((node, value) => {
         node.dataset.fixtureDocument = value;
+        const flashes = /重新连接中|连接成功|Reconnecting/u;
+        const observe = new MutationObserver((mutations) => {
+          if (
+            mutations.some(
+              ({ target, addedNodes }) =>
+                (target.nodeType === Node.TEXT_NODE &&
+                  flashes.test(target.textContent ?? '')) ||
+                Array.from(addedNodes).some((added) =>
+                  flashes.test(added.textContent ?? ''),
+                ),
+            )
+          )
+            node.dataset.fixtureConnectionFlash = 'yes';
+        });
+        observe.observe(document.body, {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
       }, mark);
+      const initialNativeEvents = nativeEventOpens;
       const cdp = await context.newCDPSession(page);
       await cdp.send('Network.enable');
       await cdp.send('Network.emulateNetworkConditions', {
@@ -1483,6 +1574,18 @@ it
         if (scenario === 'switch' && attempt === 0) {
           await checkR3SelectedRoot(nativeId, target!);
           await editor.fill('另一条会话的原生草稿');
+          // The first history entry intentionally put threadId first.
+          await page.goBack({ waitUntil: 'commit' });
+          await expect.poll(() => editor.innerText()).toBe('未发送的原生草稿');
+          expect(new URL(page.url()).searchParams.keys().next().value).toBe(
+            'threadId',
+          );
+          await page.goForward({ waitUntil: 'commit' });
+          await expect
+            .poll(() => editor.innerText())
+            .toBe('另一条会话的原生草稿');
+          expect(documentLoads).toBe(1);
+          expect(socketCount).toBe(1);
         }
       }
       expect(await editor.innerText()).toBe('未发送的原生草稿');
@@ -1491,6 +1594,7 @@ it
         expect(documentLoads).toBe(7);
         expect(socketCount).toBe(7);
       } else {
+        loseNextSwitchProofReply = true;
         await workbench
           .locator('[data-row-key="session:' + otherThread + '"]')
           .press('Enter');
@@ -1498,6 +1602,14 @@ it
           (url) => url.searchParams.get('threadId') === otherThread,
         );
         expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+        await page.goBack({ waitUntil: 'commit' });
+        await expect.poll(() => editor.innerText()).toBe('未发送的原生草稿');
+        await page.goForward({ waitUntil: 'commit' });
+        await expect
+          .poll(() => editor.innerText())
+          .toBe('另一条会话的原生草稿');
+        expect(documentLoads).toBe(1);
+        expect(socketCount).toBe(1);
       }
       console.info(
         'NATIVE_THREAD_SWITCH_BENCHMARK ' +
@@ -1507,8 +1619,21 @@ it
             samples,
             documentLoads,
             socketCount,
+            nativeEventOpens: nativeEventOpens - initialNativeEvents,
+            flashed: await workbench
+              .locator('#app')
+              .getAttribute('data-fixture-connection-flash'),
           }),
       );
+      if (scenario === 'switch') {
+        expect(initialNativeEvents).toBeGreaterThan(0);
+        expect(nativeEventOpens).toBe(initialNativeEvents);
+        expect(
+          await workbench
+            .locator('#app')
+            .getAttribute('data-fixture-connection-flash'),
+        ).toBeNull();
+      }
       if (cross) {
         const before = { documentLoads, socketCount };
         const original = [...f.pageSignals].find(
@@ -1702,6 +1827,25 @@ it
       expectedNativeId = createdNativeId;
     }
     if (nativeCreate) {
+      const holdOldOpening = scenario === 'native-create' && !createAfterSwitch;
+      let oldOpeningReleased = false;
+      if (holdOldOpening) {
+        let held = false;
+        f.host.catalog.beforeFollow = async ({ address }, signal) => {
+          if (
+            held ||
+            address.kind !== 'session' ||
+            address.sessionId !== createdNativeId
+          )
+            return;
+          held = true;
+          if (!signal.aborted)
+            await new Promise<void>((resolve) => {
+              signal.addEventListener('abort', () => resolve(), { once: true });
+            });
+          oldOpeningReleased = true;
+        };
+      }
       const mark = randomUUID();
       const frame = page.locator('iframe');
       const initialSockets = socketCount;
@@ -1814,6 +1958,10 @@ it
           { timeout: 10_000 },
         )
         .toBe(createdNativeId);
+      await expect
+        .poll(() => followed.has(createdNativeId + '/' + lastScopeId))
+        .toBe(true);
+      if (holdOldOpening) expect(oldOpeningReleased).toBe(true);
       const draft = '原生新会话草稿';
       await editor.fill(draft, { timeout: 15_000 });
       const draftPrefix =
@@ -2093,19 +2241,28 @@ it
         late.resolve();
       }
     }
-    await page.evaluate(async () => {
-      const finish: unknown = Reflect.get(window, 'finishCarrier');
-      if (typeof finish !== 'function')
-        throw Error('Fixture carrier unavailable');
-      await finish();
-    });
+    if (!warmRefresh)
+      await page.evaluate(async () => {
+        const finish: unknown = Reflect.get(window, 'finishCarrier');
+        if (typeof finish !== 'function')
+          throw Error('Fixture carrier unavailable');
+        await finish();
+      });
 
     const downloaded = () =>
       traffic.filter(({ kind }) => kind.startsWith('public-'));
     expect(downloaded()).toHaveLength(2);
     expect(scopedBundleReads).toBe(0);
+    const refreshCdp = await context.newCDPSession(page);
+    await refreshCdp.send('Network.enable');
+    await refreshCdp.send('Network.emulateNetworkConditions', {
+      offline: false,
+      latency: 400,
+      downloadThroughput: 1_250_000,
+      uploadThroughput: 1_250_000,
+    });
     const refreshedAt = performance.now();
-    await page.reload();
+    await page.reload({ waitUntil: 'commit' });
     await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
     const cached = await workbench.locator('#app').evaluate(
       (_, url) =>
@@ -2133,10 +2290,40 @@ it
     expect(scopedBundleReads).toBe(0);
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(2);
+    const timings = () => ({
+      navigation: performance.getEntriesByType('navigation').map((entry) => {
+        const timing = entry as PerformanceNavigationTiming;
+        return [timing.responseStart, timing.responseEnd];
+      }),
+      reads: performance.getEntriesByType('resource').map((entry) => {
+        const timing = entry as PerformanceResourceTiming;
+        const url = new URL(timing.name);
+        return [
+          url.pathname,
+          Math.round(timing.startTime),
+          Math.round(timing.responseStart),
+          Math.round(timing.responseEnd),
+          timing.transferSize,
+        ];
+      }),
+    });
+    console.info(
+      'SEALED_PROFILE_REFRESH_WATERFALL ' +
+        JSON.stringify({
+          shell: await page.evaluate(timings),
+          workbench: await workbench.locator('#app').evaluate(timings),
+        }),
+    );
+    if (warmRefresh) {
+      expect(
+        (await page.evaluate(timings)).reads.map(([path]) => path),
+      ).not.toContain('/api/v1/d-entry/native-prewarm');
+    }
     console.info(
       'SEALED_PROFILE_REFRESH ' +
         JSON.stringify({
           browser: browser.version(),
+          networkLatencyMs: 400,
           sealedBundleRequests: downloaded().length - 2,
           scopedBundleRequests: scopedBundleReads,
           applicationTransferBytes: cached[0]!.transferSize,
@@ -2147,12 +2334,25 @@ it
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
     );
-    await page.evaluate(async () => {
-      const finish: unknown = Reflect.get(window, 'finishCarrier');
-      if (typeof finish !== 'function')
-        throw Error('Fixture carrier unavailable');
-      await finish();
-    });
+    if (warmRefresh) {
+      const proofAttempts = f.confirmVerifiedEditor.mock.calls.length;
+      f.confirmVerifiedEditor.mockResolvedValueOnce(undefined);
+      await page.reload({ waitUntil: 'commit' });
+      await editor.fill('热校验拒绝后由原预热入口打开', { timeout: 15_000 });
+      expect(f.confirmVerifiedEditor).toHaveBeenCalledTimes(proofAttempts + 1);
+      expect(
+        (await page.evaluate(timings)).reads.filter(
+          ([path]) => path === '/api/v1/d-entry/native-prewarm',
+        ),
+      ).toHaveLength(1);
+    }
+    if (!warmRefresh)
+      await page.evaluate(async () => {
+        const finish: unknown = Reflect.get(window, 'finishCarrier');
+        if (typeof finish !== 'function')
+          throw Error('Fixture carrier unavailable');
+        await finish();
+      });
 
     await context.close();
   },
@@ -2232,7 +2432,12 @@ it.skipIf(!browserExecutable)(
         .invoke(receipt.opened.scopeReference.scopeId)
         .then((value) => value.status),
     ).toBe(404);
-    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(2);
+    expect(
+      vi
+        .mocked(f.owner.acquirePrincipal)
+        .mock.calls.map(([, issue]) => issue.identity.threadId),
+    ).toEqual(expect.arrayContaining([null, f.selection.threadId]));
     await context.close();
   },
 );

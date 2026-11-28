@@ -38,6 +38,7 @@ export function nativeMuxUrl(
   organizationId: string,
   selection: DEntrySelectionInput,
   scopeId?: string,
+  warm?: boolean,
 ) {
   const url = new URL('/api/v1/d-entry/native-mux', origin);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -48,6 +49,7 @@ export function nativeMuxUrl(
     employeeInstanceId: selection.employeeInstanceId,
     ...(selection.threadId && { threadId: selection.threadId }),
     ...(scopeId && { scopeId }),
+    ...(warm && { warm: '1' }),
   }).toString();
   return url;
 }
@@ -56,6 +58,7 @@ export function openNativePageCarrier(
   identity: DEntryIdentity,
   selection: DEntrySelectionInput,
   onRevoked: () => void,
+  warm?: boolean,
 ) {
   const ready =
     pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
@@ -65,7 +68,13 @@ export function openNativePageCarrier(
   void joined.promise.catch(() => {});
   const id = crypto.randomUUID();
   const socket = new WebSocket(
-    nativeMuxUrl(location.origin, identity.organizationId, selection),
+    nativeMuxUrl(
+      location.origin,
+      identity.organizationId,
+      selection,
+      undefined,
+      warm,
+    ),
   );
   let scopeId: string | undefined;
   let carrierSelection = selection;
@@ -119,7 +128,7 @@ export function openNativePageCarrier(
         send({
           type: 'open',
           endpoint: '$d-entry/page',
-          payload: { args: {} },
+          payload: { args: { reuseEmployee: true } },
         });
         dispatched = true;
       } catch (error) {
@@ -172,13 +181,14 @@ export function openNativePageCarrier(
                 value.threadId !== switching.threadId)
             )
               throw Error('Unexpected native page switch acknowledgement');
-            const { result } = switching;
+            const { result, proof } = switching;
             switching = undefined;
+            proof.abort();
             if (value.type === 'switched') {
               scopeId = value.scopeId;
               carrierSelection = { ...selection, threadId: value.threadId };
-              nativeMux?.close();
-              nativeMux = undefined;
+              // Use the same FIFO as native snapshots and stream terminals.
+              nativeMux?.postMessage({ type: 'scope', issued: value });
             }
             result.resolve(value.type === 'switched' ? value : undefined);
             return;
@@ -262,6 +272,7 @@ export function openNativePageCarrier(
         scopeId,
         requestId,
         targetThreadId: threadId,
+        dispatch: 'direct',
       });
       // A current same-origin cookie must prove that this is the login owning
       // the published scope, independently of the token captured by the socket.
@@ -275,18 +286,17 @@ export function openNativePageCarrier(
         .then((response) => {
           if (response.status !== 204)
             throw new EmployeeEntryError(response.status);
-          if (switching?.id !== requestId || requested) return;
-          try {
-            send({
-              type: 'item',
-              value: { type: 'switch', requestId, threadId },
-            });
-          } catch (error) {
-            failure = fail(error);
-          }
         })
         .catch((error: unknown) => {
           if (switching?.id !== requestId || requested) return;
+          // The Worker can commit the switch even when the HTTP reply is
+          // lost on its way back. Only an explicit denial settles this path;
+          // otherwise the socket receipt or its existing deadline owns it.
+          if (
+            !(error instanceof EmployeeEntryError) ||
+            ![400, 401, 403, 404].includes(error.status)
+          )
+            return;
           switching = undefined;
           // A check over HTTP does not report the health of the old socket.
           // The caller uses its existing explicit close-and-join protocol.
@@ -326,7 +336,14 @@ export function openNativePageCarrier(
             (frame.type === 'open' && frame.endpoint === '$d-entry/page')
           )
             throw Error('A borrowed mux cannot control its page');
-          socket.send(event.data.data);
+          if (frame.type === 'open')
+            socket.send(
+              JSON.stringify({
+                ...frame,
+                pageScopeId: event.data.resourceScopeId,
+              }),
+            );
+          else socket.send(event.data.data);
         } catch (error) {
           failure = fail(error);
         }

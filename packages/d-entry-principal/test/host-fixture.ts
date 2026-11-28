@@ -153,7 +153,10 @@ class Catalog extends TypertRemoteService {
   static inject = ['remoteAccess'];
   items = [summary('root'), summary('child', 'root'), summary('other')];
   beforeList?: (signal: AbortSignal, scoped: boolean) => Promise<void>;
-  beforeFollow?: () => Promise<void>;
+  beforeFollow?: (
+    request: SessionFollowRequest,
+    signal: AbortSignal,
+  ) => Promise<void>;
   beforeCreate?: () => Promise<void>;
   allocateSessionId?: () => SessionId;
   onPrompt?: (request: SessionPromptRequest) => void;
@@ -303,7 +306,7 @@ class Catalog extends TypertRemoteService {
         ? request.address.sessionId
         : request.address.childSessionId;
     try {
-      await this.beforeFollow?.();
+      await this.beforeFollow?.(request, signal);
       signal.throwIfAborted();
       // Session content is fixture data; the descriptor, resource guard,
       // cancellableStream and codec are the actual public native path.

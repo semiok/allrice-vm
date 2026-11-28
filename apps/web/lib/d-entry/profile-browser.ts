@@ -295,39 +295,42 @@ export function nativeProfileDocument(
       switching?.requestId === event.data.requestId
     )
       switching = undefined;
-    if (
-      event.data.type === pageThreadScope &&
-      onThreadScope &&
-      !lifetime.signal.aborted &&
-      container.dataset.sharedMux === '1'
-    ) {
-      const result = DEntryPageSwitchResultSchema.safeParse(event.data.issued);
-      if (
-        !result.success ||
-        result.data.type !== 'switched' ||
-        result.data.scopeId === authority.scopeId ||
-        result.data.requestId !== switching?.requestId
-      )
-        return;
-      const next = result.data;
-      switching = undefined;
-      const old = peer;
-      peer = undefined;
-      authority.lifetime.abort();
-      authority = {
-        scopeId: next.scopeId,
-        selection: { ...selection, threadId: next.threadId },
-        lifetime: new AbortController(),
-      };
-      old?.close();
-      try {
-        onThreadScope(next);
-      } catch {
-        cancel();
-        onRevoked();
-      }
-    }
+    if (event.data.type === pageThreadScope)
+      applyThreadScope(event.data.issued);
   };
+  function applyThreadScope(issued: unknown) {
+    if (
+      !onThreadScope ||
+      lifetime.signal.aborted ||
+      container.dataset.sharedMux !== '1'
+    )
+      return;
+    const result = DEntryPageSwitchResultSchema.safeParse(issued);
+    if (
+      !result.success ||
+      result.data.type !== 'switched' ||
+      result.data.scopeId === authority.scopeId ||
+      result.data.requestId !== switching?.requestId
+    )
+      return;
+    const next = result.data;
+    switching = undefined;
+    authority.lifetime.abort();
+    authority = {
+      scopeId: next.scopeId,
+      selection: { ...selection, threadId: next.threadId },
+      lifetime: new AbortController(),
+    };
+    try {
+      onThreadScope(next);
+      // Native consumers may reopen synchronously after reading EOF.
+      // The port supplies snapshots and the handoff in the same order.
+      if (next.retiredStreams?.length) peer?.endStreams?.(next.retiredStreams);
+    } catch {
+      cancel();
+      onRevoked();
+    }
+  }
   window.addEventListener('message', receive);
   function stop() {
     if (closing) return closing;
@@ -498,6 +501,8 @@ export function nativeProfileDocument(
                 scopeId,
                 authority.scopeId,
                 () => !switching?.drainsComplete,
+                () => authority.scopeId,
+                applyThreadScope,
               )
             : new WebSocket(
                 nativeMuxUrl(

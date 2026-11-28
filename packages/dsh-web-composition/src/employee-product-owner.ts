@@ -2,7 +2,6 @@ import type { Context } from '@deepseek-ai/cordis';
 import { ChatSessionSchema } from '@allrice/contracts';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import { employeeSkillHostCopy } from '../../../apps/web/app/chatflow/employee-skill-host-copy';
 import { readDEntryEmployeeSkills } from '../../../apps/web/app/chatflow/employee-skills-api';
@@ -291,25 +290,15 @@ export function installEmployeeProductOwner(ctx: Context) {
     ['uiWorkspace', 'sessions', 'connection', 'sidebarRight'],
     (native) => {
       native.effect(() => {
-        // rc.2 exports the browser handle without augmenting Cordis Context.
-        // This effect is installed only while Cordis injects that service.
-        const { connection } = native as Context & {
-          connection: ConnectionHandle;
-        };
         let pending:
           | {
               scope: PageThreadScope;
-              oldGeneration: ReturnType<
-                typeof connection.generation.getSnapshot
-              >;
               opened: boolean;
             }
           | undefined;
         const update = () => {
           if (!pending || signal.aborted) return;
           const request = pending;
-          const generation = connection.generation.getSnapshot();
-          if (!generation || generation === pending.oldGeneration) return;
           const root = native.sessions.list
             .getSnapshot()
             .ids.find((id) => id === pending?.scope.nativeSessionId);
@@ -345,14 +334,12 @@ export function installEmployeeProductOwner(ctx: Context) {
           switchingScope = true;
           pending = {
             scope: next,
-            oldGeneration: connection.generation.getSnapshot(),
             opened: false,
           };
-          connection.reconnect();
+          update();
         };
         document.addEventListener(pageThreadScope, onScope);
         const cleanup = [
-          connection.generation.subscribe(update),
           native.sessions.list.subscribe(update),
           native.sidebarRight.mounted.subscribe(update),
         ];

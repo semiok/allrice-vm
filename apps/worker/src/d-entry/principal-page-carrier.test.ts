@@ -286,22 +286,124 @@ it('qualifies a new 4.0 editor without writing on upgrade, then prepares its roo
   await next.receive();
 });
 
-it('replaces the bound root on the same page socket and only the target watch remains live', async () => {
+it('requires an exact current editor proof before accepting a warm socket', async () => {
   const f = await fixture();
+  f.confirmVerifiedEditor
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce({
+      binding: { ...f.binding, vmId: randomUUID() },
+      proof: f.owner.revoked,
+    });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const denied = f.connect(undefined, sessionToken, '&warm=1');
+    const [, reply] = await once(denied, 'unexpected-response');
+    expect(reply.statusCode).toBe(503);
+    reply.resume();
+    denied.terminate();
+    expect(f.owner.acquirePrincipal).not.toHaveBeenCalled();
+  }
+  const peer = f.connect(undefined, sessionToken, '&warm=1');
+  await once(peer, 'open');
+  expect(f.confirmVerifiedEditor).toHaveBeenCalledTimes(3);
+});
+
+it('replaces the borrowed root while keeping native employee events on the same channel', async () => {
+  const f = await fixture();
+  const previousRevocation = f.registerThread(f.selection.threadId);
   const target = randomUUID();
   const revoked = f.registerThread(target);
-  const { peer, scopeId, receive } = await open(f);
+  const { peer, scopeId, receive } = await open(f, true);
+  expect(
+    vi
+      .mocked(f.data.resolveAdmissionOwner)
+      .mock.calls.map(([input]) => input.access)
+      .sort(),
+  ).toEqual(['employee-streams', 'page']);
   const requestId = randomUUID();
-  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
   send(peer, {
-    type: 'item',
-    streamId: 'life',
-    value: {
-      type: 'switch',
-      requestId,
-      threadId: target,
-    },
+    type: 'open',
+    streamId: 'employee-events',
+    endpoint: '$events',
+    payload: { args: {} },
   });
+  expect(await receive('employee-events')).toMatchObject({
+    value: { type: 'ready' },
+  });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'previous-journal',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('previous-journal')).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  const readStarted = deferred<AbortSignal>();
+  const releaseRead = deferred();
+  const read = vi.mocked(f.owner.readSessions);
+  const readCatalog = read.getMockImplementation()!;
+  read.mockImplementationOnce(async (signal, notDispatched) => {
+    readStarted.resolve(signal);
+    await releaseRead.promise;
+    signal.throwIfAborted();
+    return readCatalog(signal, notDispatched);
+  });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'cancelled-opening',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  try {
+    const readSignal = await readStarted.promise;
+    send(peer, { type: 'cancel', streamId: 'cancelled-opening' });
+    send(peer, {
+      type: 'open',
+      streamId: 'cancel-order',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await receive('cancel-order')).toMatchObject({
+      value: { type: 'ready' },
+    });
+    expect(
+      (
+        await f.proveSwitch(scopeId, target, requestId, sessionToken, {
+          dispatch: 'direct',
+        })
+      ).status,
+    ).toBe(204);
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(3));
+    expect(readSignal.aborted).toBe(false);
+    expect(f.pageSignals.get(scopeId)?.aborted).toBe(false);
+  } finally {
+    releaseRead.resolve();
+  }
   const switched = await receive('life');
   expect(switched).toMatchObject({
     type: 'item',
@@ -310,10 +412,63 @@ it('replaces the bound root on the same page socket and only the target watch re
       requestId,
       threadId: target,
       nativeSessionId: 'root-' + target,
+      retiredStreams: ['previous-journal'],
     },
   });
   const nextScope = switched.value.scopeId as string;
   expect(nextScope).not.toBe(scopeId);
+  expect(f.pageSignals.get(scopeId)?.aborted).toBe(true);
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'stale-follow',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: { args: {} },
+    }),
+  );
+  expect(await receive('stale-follow')).toMatchObject({
+    type: 'error',
+    error: { code: 'gateway/cancelled' },
+  });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'retired-root-follow',
+      pageScopeId: nextScope,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: {
+              kind: 'session',
+              sessionId: 'root-' + f.selection.threadId,
+            },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('retired-root-follow')).toMatchObject({ type: 'error' });
+  peer.send(
+    JSON.stringify({
+      type: 'open',
+      streamId: 'late-target-follow',
+      pageScopeId: scopeId,
+      endpoint: 'session/follow',
+      payload: {
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: 'root-' + target },
+          },
+        },
+      },
+    }),
+  );
+  expect(await receive('late-target-follow')).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
   expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
     404,
   );
@@ -321,11 +476,55 @@ it('replaces the bound root on the same page socket and only the target watch re
   expect((await f.invokeThread(nextScope, f.selection.threadId)).status).toBe(
     404,
   );
+  previousRevocation.abort();
+  expect((await f.invokeThread(nextScope, target)).status).toBe(200);
   const targetClosed = once(peer, 'close');
   revoked.abort();
   expect(await receive('life')).toMatchObject({ type: 'error' });
   await targetClosed;
   expect((await f.invokeThread(nextScope, target)).status).toBe(404);
+});
+
+it('joins both parts of an employee carrier cancelled before its opened frame', async () => {
+  const f = await fixture();
+  const employeeEntered = deferred<void>();
+  const releaseEmployee = deferred<void>();
+  const read = f.historyIdentity.getMockImplementation()!;
+  f.historyIdentity.mockImplementation(async (context, input) => {
+    if (!(input as { threadId?: string }).threadId) {
+      employeeEntered.resolve();
+      await releaseEmployee.promise;
+    }
+    return read(context, input);
+  });
+  const peer = f.connect();
+  const receive = messages(peer);
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'life',
+    endpoint: '$d-entry/page',
+    payload: { args: { reuseEmployee: true } },
+  });
+  try {
+    await employeeEntered.promise;
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(1));
+    closePage(peer);
+    await vi.waitFor(() =>
+      expect(
+        [...f.pageSignals.values()].every((signal) => signal.aborted),
+      ).toBe(true),
+    );
+  } finally {
+    releaseEmployee.resolve();
+  }
+  expect(await receive('life')).toMatchObject({
+    type: 'error',
+    error: { code: 'gateway/cancelled', message: 'Page closed during setup' },
+  });
+  expect([...f.pageSignals.values()].every((signal) => signal.aborted)).toBe(
+    true,
+  );
 });
 
 it('requires proof from the current browser login even while the original login remains active', async () => {

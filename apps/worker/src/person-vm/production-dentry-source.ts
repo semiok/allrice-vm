@@ -363,6 +363,7 @@ export function installProductionDEntrySource(input: {
     }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
+        const employeeStreams = access === 'employee-streams';
         if (
           context.actor.type !== 'user' ||
           context.actor.id !== binding.personId ||
@@ -370,45 +371,54 @@ export function installProductionDEntrySource(input: {
           identity.organizationId !== binding.organizationId ||
           context.organizationId !== binding.organizationId ||
           context.workspaceId !== identity.workspaceId ||
-          (!identity.threadId && access !== 'page')
+          (employeeStreams
+            ? !!identity.threadId
+            : !identity.threadId && !access)
         )
           denied();
         const scope = structuredClone(context);
         const expected = Object.freeze({ ...identity });
+        const employee = expected.employeeInstanceId;
         const threadId = routeThread(binding, expected);
-        const route = await input.startup.ensureVerifiedEditor(
-          scope,
-          binding,
-          expected.employeeInstanceId,
-          active,
-          threadId,
-        );
-        const revoked = AbortSignal.any([lifetime, owner.revoked, route]);
+        // The carrier only reads the employee's control streams. It owns an
+        // entry permit but cannot borrow a page or resolve a model execution.
+        const proof = employeeStreams
+          ? (input.startup.assertAuthenticatedEntry?.(
+              binding,
+              employee,
+              active,
+            ) ?? input.startup.assertAuthenticatedGroup(binding, active))
+          : await input.startup.ensureVerifiedEditor(
+              scope,
+              binding,
+              employee,
+              active,
+              threadId,
+            );
+        const revoked = AbortSignal.any([lifetime, owner.revoked, proof]);
         const assertCurrent = (caller: AbortSignal) =>
           own(AbortSignal.any([revoked, caller]), async (signal) => {
             await owner.assertCurrent(scope, signal);
-            if (!threadId)
-              input.startup.assertVerifiedEditor(
-                binding,
-                signal,
-                expected.employeeInstanceId,
-              );
+            if (!employeeStreams && !threadId)
+              input.startup.assertVerifiedEditor(binding, signal, employee);
             sameHost(owner, expected);
             signal.throwIfAborted();
           });
         await assertCurrent(active);
-        const previous = owners.get(owner);
-        if (
-          previous &&
-          (!sameSession(previous.context, scope) ||
-            !sameDEntryIdentity(previous.identity, expected))
-        )
-          denied();
-        owners.set(owner, {
-          context: scope,
-          identity: expected,
-          proof: revoked,
-        });
+        if (!employeeStreams) {
+          const previous = owners.get(owner);
+          if (
+            previous &&
+            (!sameSession(previous.context, scope) ||
+              !sameDEntryIdentity(previous.identity, expected))
+          )
+            denied();
+          owners.set(owner, {
+            context: scope,
+            identity: expected,
+            proof: revoked,
+          });
+        }
         return {
           context: scope,
           binding,

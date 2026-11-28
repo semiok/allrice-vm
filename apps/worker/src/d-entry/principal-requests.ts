@@ -82,16 +82,25 @@ export type DEntryPageHandle = Readonly<{
     ReturnType<typeof currentDEntryNativeOwner>
   >['view']['receipt']['binding'];
   signal: AbortSignal;
-  confirmThreadSwitch(requestId: string, threadId: string): void;
+  confirmThreadSwitch(
+    requestId: string,
+    threadId: string,
+    direct?: boolean,
+  ): (() => void) | undefined;
   reserveThreadSwitch(
     requestId: string,
     threadId: string,
+    direct?: boolean,
   ): { drained: Promise<unknown>; release(): void } | undefined;
   runThreadWrite<T>(invoke: () => Promise<T>): Promise<T>;
   assertCurrent(signal: AbortSignal): Promise<void>;
   watchFollow(
     signal: AbortSignal,
   ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
+  authorizeFollow(
+    nativeSessionId: string,
+    signal: AbortSignal,
+  ): Promise<(() => Promise<void>) | undefined>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -288,7 +297,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     opened: (page: DEntryPageHandle) => Promise<void>,
     revoked: (reason: unknown) => void,
     previous?: DEntryPageHandle,
+    dispatchSwitch?: (requestId: string, threadId: string) => void,
+    borrowable = true,
   ) {
+    if (!borrowable && (previous || input.selection.threadId)) throw denied();
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
     const timing = dEntryStartupTiming('page-open');
@@ -405,7 +417,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           owner: current.owner,
           operationId,
           signal: current.signal,
-          access: 'page',
+          access: borrowable ? 'page' : 'employee-streams',
         }),
       );
       if (
@@ -435,10 +447,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const lifetime = AbortSignal.any([admitted, ended.signal]);
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
-          const threadWrites = new Set<Promise<unknown>>();
+          const threadWork = new Set<Promise<unknown>>();
+          const registeredRoots = new Map<string, DEntryHistoryRootPin>();
           let switching = false;
           let switchProof:
-            { requestId: string; threadId: string; until: number } | undefined;
+            | {
+                requestId: string;
+                threadId: string;
+                until: number;
+                direct: boolean;
+              }
+            | undefined;
           let running: Promise<void> | undefined;
           let principal: DEntryPrincipalActivity | undefined;
           let scope: DEntryPrincipalControlScope | undefined;
@@ -478,6 +497,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             });
             fence();
             return closing;
+          }
+          async function ownThreadWork<T>(invoke: () => Promise<T>) {
+            lifetime.throwIfAborted();
+            if (switching) throw denied();
+            const task = Promise.resolve().then(invoke);
+            threadWork.add(task);
+            try {
+              return await task;
+            } finally {
+              threadWork.delete(task);
+            }
           }
           function stopPage() {
             fence(stop.reason);
@@ -595,43 +625,38 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   sessionId: auth.context.sessionId,
                   vmBinding: current.view.receipt.binding,
                   signal: lifetime,
-                  confirmThreadSwitch(requestId, threadId) {
+                  confirmThreadSwitch(requestId, threadId, direct = false) {
                     lifetime.throwIfAborted();
-                    if (switching || !pin) throw denied();
+                    if (switching || !pin || (direct && !dispatchSwitch))
+                      throw denied();
                     switchProof = {
                       requestId,
                       threadId,
                       until: performance.now() + 10_000,
+                      direct,
                     };
+                    if (direct)
+                      return () => dispatchSwitch?.(requestId, threadId);
                   },
-                  reserveThreadSwitch(requestId, threadId) {
+                  reserveThreadSwitch(requestId, threadId, direct = false) {
                     if (
                       switching ||
                       switchProof?.requestId !== requestId ||
                       switchProof.threadId !== threadId ||
+                      switchProof.direct !== direct ||
                       switchProof.until <= performance.now()
                     )
                       return;
                     switchProof = undefined;
                     switching = true;
                     return {
-                      drained: Promise.allSettled(threadWrites),
+                      drained: Promise.allSettled(threadWork),
                       release() {
                         switching = false;
                       },
                     };
                   },
-                  async runThreadWrite(invoke) {
-                    lifetime.throwIfAborted();
-                    if (switching) throw denied();
-                    const task = Promise.resolve().then(invoke);
-                    threadWrites.add(task);
-                    try {
-                      return await task;
-                    } finally {
-                      threadWrites.delete(task);
-                    }
-                  },
+                  runThreadWrite: ownThreadWork,
                   async watchFollow(caller) {
                     if (!authority.observation) return;
                     return openFollowAuthority(
@@ -649,6 +674,47 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       if (!caller.aborted) invalidate(error);
                       throw error;
                     }
+                    active.throwIfAborted();
+                  },
+                  async authorizeFollow(nativeSessionId, active) {
+                    // Create/fork can start following its new native root before
+                    // the browser installs the new page. Only its actual durable
+                    // registration can bridge that opening.
+                    const registered = registeredRoots.get(nativeSessionId);
+                    const threadId = registered?.identity.threadId;
+                    if (registered && threadId) {
+                      const registeredPin = async (caller: AbortSignal) => {
+                        await assertCurrent(caller);
+                        const next = await deps.root(auth.context, {
+                          ...input.selection,
+                          threadId,
+                        });
+                        if (!sameRoot(next, registered)) throw denied();
+                        caller.throwIfAborted();
+                        return next;
+                      };
+                      await ownThreadWork(async () => {
+                        active.throwIfAborted();
+                        await resolveDEntryNativeResource({
+                          ...auth,
+                          identity: registered.identity,
+                          nativeSessionId,
+                          owner: catalog.owner,
+                          signal: lifetime,
+                          root: () => registeredPin(lifetime),
+                        });
+                      });
+                      active.throwIfAborted();
+                      return async () => {
+                        await registeredPin(active);
+                      };
+                    }
+                    // A stream cancellation cannot interrupt a dispatched
+                    // catalog read. The page drains it before planned retirement.
+                    await ownThreadWork(async () => {
+                      active.throwIfAborted();
+                      await authorize(nativeSessionId, 'read', lifetime);
+                    });
                     active.throwIfAborted();
                   },
                   async canReuseNativeSession(nativeSessionId, active) {
@@ -712,6 +778,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     const thread = ChatSessionSchema.parse(registered.thread);
                     if (thread.id !== registered.identity.threadId)
                       throw denied();
+                    registeredRoots.set(nativeSessionId, registered);
                     return thread;
                   },
                   async invokeTerminal(call, active) {
@@ -744,11 +811,12 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   },
                 };
                 if (pages.has(scopeId)) throw denied();
-                pages.set(scopeId, {
-                  sessionId: auth.context.sessionId,
-                  selection: input.selection,
-                  page,
-                });
+                if (borrowable)
+                  pages.set(scopeId, {
+                    sessionId: auth.context.sessionId,
+                    selection: input.selection,
+                    page,
+                  });
                 // The send is part of run, even when the page closes mid-send.
                 await timing.run('opened-reply', () => opened(page));
                 timing.ready();
@@ -812,6 +880,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       token: string,
       input: Selection,
       signal: AbortSignal,
+      warm = false,
     ) {
       const auth = await history(token, input, signal);
       const data = deps.data();
@@ -819,7 +888,24 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       const root =
         input.selection.threadId &&
         (await deps.historyRoot(auth.context, input.selection));
-      if (!root) {
+      if (warm) {
+        if (!root || !data.confirmVerifiedEditor)
+          throw new DEntryNativeUnavailable();
+        const current = await currentDEntryRequest(deps, token, input, signal);
+        if (
+          current.context.sessionId !== auth.context.sessionId ||
+          !sameDEntryIdentity(current.identity, root.identity)
+        )
+          throw denied();
+        const ready = await data.confirmVerifiedEditor(
+          current.context,
+          current.identity,
+          signal,
+        );
+        if (!ready || ready.binding.vmId !== root.vmId)
+          throw new DEntryNativeUnavailable();
+        ready.proof.throwIfAborted();
+      } else if (!root) {
         // Qualification only. Opening the socket alone never creates a root.
         await currentDEntryRequest(deps, token, input, signal);
       }

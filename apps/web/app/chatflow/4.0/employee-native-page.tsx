@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   DEntrySelectionInputSchema,
+  type DEntryIdentity,
   type DEntryNativePrewarmTicket,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
@@ -19,7 +20,6 @@ import {
   pageMuxAttach,
   pageNavigate,
   pageSwitchReady,
-  pageThreadScope,
   pageThreadSwitchCancel,
   pageThreadSwitchPrepare,
   pageThreadSwitchPrepared,
@@ -64,6 +64,7 @@ type Status =
 
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
+const warmUpgradeWaitMs = 3_000;
 const liveSwitchWaitMs = 10_000;
 const closingNoticeMs = 10_000;
 const closingConfirmationMs = 60_000;
@@ -73,6 +74,7 @@ type ThreadHandoff = {
   requestId: string;
   submitted?: boolean;
   scopeId?: string;
+  restored?: boolean;
 };
 
 type EntryWarmup = {
@@ -80,7 +82,8 @@ type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
   stopAssetDownloads(): void;
-  readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
+  readIdentity():
+    Awaited<ReturnType<typeof readEmployeeEntryIdentity>> | undefined;
   progress: {
     current?: { state: EmployeePrewarmProgress; activeLimit?: number };
     ticket?: DEntryNativePrewarmTicket;
@@ -97,19 +100,14 @@ function startEntryWarmup(
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
   const assets = new AbortController();
-  let lookup:
-    | {
-        read: ReturnType<typeof readEmployeeEntryIdentity>;
-        cancel: AbortController;
-      }
-    | undefined;
+  let identity: ReturnType<EntryWarmup['readIdentity']>;
   const result = prewarmEmployeeEntry(selection, lifetime.signal, {
     ticket,
     trigger: foregroundOpen ? 'open' : 'page',
+    ready(checked) {
+      if (selection.threadId) identity = checked;
+    },
     accepted(accepted) {
-      // A cold or resumed operation needs a fresh identity after ready.
-      lookup?.cancel.abort();
-      lookup = undefined;
       progress.ticket = accepted;
       void warmPublicProfileAssets(
         startupAssetUrls,
@@ -122,22 +120,13 @@ function startEntryWarmup(
     },
   });
   void result.catch(() => {}); // setup reports the result for this selection.
-  if (selection.threadId && !ticket) {
-    const cancel = new AbortController();
-    const read = readEmployeeEntryIdentity(
-      selection,
-      AbortSignal.any([lifetime.signal, cancel.signal]),
-    );
-    void read.catch(() => {}); // hot ready can retry an earlier miss.
-    lookup = { read, cancel };
-  }
   return {
     selection,
     lifetime,
     result,
     progress,
     stopAssetDownloads: () => assets.abort(),
-    readIdentity: () => lookup?.read,
+    readIdentity: () => identity,
   };
 }
 
@@ -162,11 +151,13 @@ export function EmployeeNativePage({
   prepare = false,
   initialUnavailable = false,
   startupAssetUrls = noStartupAssets,
+  warmIdentity,
 }: {
   query: string;
   prepare?: boolean;
   initialUnavailable?: boolean;
   startupAssetUrls?: readonly string[];
+  warmIdentity?: DEntryIdentity;
 }) {
   const assetUrls = useRef(startupAssetUrls);
   const frame = useRef<HTMLIFrameElement>(null);
@@ -186,7 +177,8 @@ export function EmployeeNativePage({
     warmup?: EntryWarmup;
     retainFrame?: boolean;
     ticket?: DEntryNativePrewarmTicket;
-  }>({ query });
+    warmIdentity?: DEntryIdentity;
+  }>({ query, warmIdentity });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
     undefined,
@@ -377,6 +369,7 @@ export function EmployeeNativePage({
       join?: Promise<void>,
     ) {
       if (navigating || replace.current !== applyQuery) return;
+      if (switching?.restored) nextQuery.current = location.search.slice(1);
       navigating = true;
       resumable = retainTicket;
       window.clearTimeout(timer);
@@ -570,6 +563,32 @@ export function EmployeeNativePage({
         }
       });
     }
+    function restoredSelection(query: string) {
+      const params = new URLSearchParams(query);
+      const selection = DEntrySelectionInputSchema.safeParse(
+        Object.fromEntries(params),
+      );
+      if (
+        selection.success &&
+        params.size === Object.keys(selection.data).length
+      )
+        return selection.data;
+    }
+    function stillSelected(selection: DEntrySelectionInput) {
+      return (
+        selection.threadId === selectedEmployee?.threadId &&
+        selection.workspaceId === selectedEmployee?.workspaceId &&
+        selection.employeeInstanceId === selectedEmployee?.employeeInstanceId
+      );
+    }
+    function restoreUnavailable() {
+      const query = location.search.slice(1);
+      nextQuery.current = query;
+      const selection = restoredSelection(query);
+      if (selection && stillSelected(selection)) {
+        selectedQuery = displayedQuery.current = query;
+      } else applyQuery();
+    }
     function cancelSwitch(target: ThreadHandoff) {
       switching = undefined;
       window.clearTimeout(switchTimer);
@@ -592,17 +611,15 @@ export function EmployeeNativePage({
             return;
           if (!issued) {
             cancelSwitch(target);
-            navigate(target.selection);
+            if (target.restored) restoreUnavailable();
+            else navigate(target.selection);
             return;
           }
           target.scopeId = issued.scopeId;
-          frame.current?.contentWindow?.postMessage(
-            { type: pageThreadScope, scopeId, issued },
-            location.origin,
-          );
         })
         .catch((error: unknown) => {
           if (switching !== target) return;
+          if (target.restored) nextQuery.current = location.search.slice(1);
           cancelSwitch(target);
           if (error instanceof EmployeeEntryError) {
             if (error.status === 401) return finish('sign-in');
@@ -611,6 +628,46 @@ export function EmployeeNativePage({
           }
           finish('failed');
         });
+    }
+    function beginLiveSwitch(
+      selection: DEntrySelectionInput,
+      restored = false,
+    ) {
+      if (
+        !prepare ||
+        !carrier ||
+        !scopeId ||
+        !switchReady ||
+        switching ||
+        navigating ||
+        detached ||
+        navigationClosed ||
+        remoteRevoked ||
+        superseded ||
+        !selection.threadId ||
+        document.hidden ||
+        location.pathname !== '/chatflow/4.0' ||
+        selectedEmployee?.workspaceId !== selection.workspaceId ||
+        selectedEmployee.employeeInstanceId !== selection.employeeInstanceId ||
+        selectedEmployee.threadId === selection.threadId
+      )
+        return false;
+      const target: ThreadHandoff = {
+        selection: { ...selection, threadId: selection.threadId },
+        requestId: crypto.randomUUID(),
+        restored,
+      };
+      switching = target;
+      switchTimer = window.setTimeout(() => {
+        if (switching !== target) return;
+        cancelSwitch(target);
+        if (target.restored) restoreUnavailable();
+      }, liveSwitchWaitMs);
+      frame.current?.contentWindow?.postMessage(
+        { type: pageThreadSwitchPrepare, scopeId, requestId: target.requestId },
+        location.origin,
+      );
+      return true;
     }
     const receive = (event: MessageEvent) => {
       if (
@@ -644,7 +701,7 @@ export function EmployeeNativePage({
         !detached &&
         !remoteRevoked
       ) {
-        const selection = switching.selection;
+        const { selection, restored } = switching;
         resourceScopeId = switching.scopeId;
         const query = new URLSearchParams({
           workspaceId: selection.workspaceId,
@@ -658,7 +715,10 @@ export function EmployeeNativePage({
         frameSelection.current = selection;
         selectedQuery = query;
         nextQuery.current = displayedQuery.current = query;
-        history.pushState(history.state, '', '/chatflow/4.0?' + query);
+        if (!restored)
+          history.pushState(history.state, '', '/chatflow/4.0?' + query);
+        else if (location.search.slice(1) !== query)
+          queueMicrotask(restoreQuery);
       }
       if (event.data.type === pageClosing) {
         navigationClosed = true;
@@ -726,19 +786,7 @@ export function EmployeeNativePage({
           location.pathname !== '/chatflow/4.0'
         )
           return;
-        const query = new URLSearchParams({
-          workspaceId: next.data.workspaceId,
-          employeeInstanceId: next.data.employeeInstanceId,
-          threadId: next.data.threadId,
-        }).toString();
-        // The live carrier and its authority stay pinned to the same document.
-        // This is the URL for reload, not a request to replace that document.
-        selectedEmployee = next.data;
-        frameSelection.current = next.data;
-        displayedQuery.current = query;
-        nextQuery.current = query;
-        selectedQuery = query;
-        history.replaceState(history.state, '', '/chatflow/4.0?' + query);
+        if (!beginLiveSwitch(next.data)) navigate(next.data);
       }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
@@ -762,37 +810,8 @@ export function EmployeeNativePage({
           selectedEmployee.employeeInstanceId === selection.employeeInstanceId
         )
           return;
-        if (
-          prepare &&
-          !navigating &&
-          switchReady &&
-          selection.threadId &&
-          !document.hidden &&
-          !remoteRevoked &&
-          !detached &&
-          location.pathname === '/chatflow/4.0' &&
-          selectedEmployee?.workspaceId === selection.workspaceId &&
-          selectedEmployee.employeeInstanceId ===
-            selection.employeeInstanceId &&
-          selectedEmployee.threadId !== selection.threadId
-        ) {
-          const target: ThreadHandoff = {
-            selection: { ...selection, threadId: selection.threadId },
-            requestId: crypto.randomUUID(),
-          };
-          switching = target;
-          switchTimer = window.setTimeout(() => {
-            if (switching === target) cancelSwitch(target);
-          }, liveSwitchWaitMs);
-          frame.current?.contentWindow?.postMessage(
-            {
-              type: pageThreadSwitchPrepare,
-              scopeId,
-              requestId: target.requestId,
-            },
-            location.origin,
-          );
-        } else navigate(selection, event.data.reopen === true);
+        if (!beginLiveSwitch(selection))
+          navigate(selection, event.data.reopen === true);
       }
     };
     window.addEventListener('message', receive);
@@ -810,8 +829,28 @@ export function EmployeeNativePage({
     window.addEventListener('pagehide', leaving);
     const restoreQuery = () => {
       if (location.pathname !== '/chatflow/4.0') return;
-      nextQuery.current = location.search.slice(1);
-      if (nextQuery.current !== displayedQuery.current) applyQuery();
+      const query = location.search.slice(1);
+      if (switching && !navigating) {
+        // Finish the current authority handoff, then consume the latest URL.
+        // Closing the same carrier here would interrupt both navigations.
+        switching.restored = true;
+        return;
+      }
+      if (query === displayedQuery.current) {
+        if (navigating) nextQuery.current = query;
+        return;
+      }
+      const restored = restoredSelection(query);
+      if (restored) {
+        if (stillSelected(restored)) {
+          nextQuery.current = query;
+          if (!navigating) selectedQuery = displayedQuery.current = query;
+          return;
+        }
+        if (beginLiveSwitch(restored, true)) return;
+      }
+      nextQuery.current = query;
+      if (switching || query !== displayedQuery.current) applyQuery();
     };
     window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
@@ -829,78 +868,133 @@ export function EmployeeNativePage({
             : state,
       );
     };
-    const prewarming = prepare
-      ? parsedEntry.then(async ({ selection }) => {
-          await waitForVisibleEntry(lifetime.signal);
-          lifetime.signal.throwIfAborted();
-          warmup ??= startEntryWarmup(
-            selection,
-            lifetime,
-            assetUrls.current,
-            ticket,
-            activation.foregroundOpen,
-          );
-          warmup.progress.show = showPrewarm;
-          const progress = warmup.progress.current;
-          if (progress) showPrewarm(progress.state, progress.activeLimit);
-          await warmup.result;
-        })
-      : undefined;
+    const startPrewarming = () =>
+      prepare
+        ? parsedEntry.then(async ({ selection }) => {
+            await waitForVisibleEntry(lifetime.signal);
+            lifetime.signal.throwIfAborted();
+            warmup ??= startEntryWarmup(
+              selection,
+              lifetime,
+              assetUrls.current,
+              ticket,
+              activation.foregroundOpen,
+            );
+            warmup.progress.show = showPrewarm;
+            const progress = warmup.progress.current;
+            if (progress) showPrewarm(progress.state, progress.activeLimit);
+            await warmup.result;
+          })
+        : undefined;
+    let prewarming = activation.warmIdentity ? undefined : startPrewarming();
     void prewarming?.catch(() => {}); // setup reports the same rejection.
+    const opening = () => {
+      ticket = undefined;
+      if (warmup) warmup.progress.ticket = undefined;
+      setStatus('opening');
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+    };
+    const connect = (
+      identity: DEntryIdentity,
+      selection: DEntrySelectionInput,
+      warm?: boolean,
+    ) =>
+      openNativePageCarrier(
+        identity,
+        selection,
+        () => {
+          remoteRevoked = true;
+          unbindMemoryWrites?.();
+          send(pageRevoked);
+          if (!prepare && !lifetime.signal.aborted) setFailed(true);
+          // Before issuance, ready's rejection is handled by setting below.
+          if (prepare && mounted) finish('failed');
+          // Password changes and logout can revoke this carrier before their
+          // responses reach the iframe. Only the current cookie decides where
+          // the outer page goes.
+          if (mounted)
+            void retire()
+              .then(async () => {
+                if (detached || replace.current !== applyQuery) return;
+                const response = await fetch('/api/v1/auth/session', {
+                  credentials: 'same-origin',
+                  cache: 'no-store',
+                  signal: lifetime.signal,
+                });
+                // The unqualified entry checks the cookie again on navigation.
+                if (
+                  response.status === 401 &&
+                  !detached &&
+                  replace.current === applyQuery
+                )
+                  location.replace('/chatflow/4.0');
+              })
+              .catch(() => {});
+        },
+        warm,
+      );
     const setup = async () => {
       const entry = await parsedEntry;
-      const selection = prepare
-        ? await prepareEmployeeEntry(
-            entry,
-            lifetime.signal,
-            () => {
-              ticket = undefined;
-              if (warmup) warmup.progress.ticket = undefined;
-              setStatus('opening');
-              timer = window.setTimeout(() => finish('failed'), entryWaitMs);
-            },
-            prewarming,
-          )
-        : entry.selection;
       const { params } = entry;
-      if (selection.threadId && !entry.selection.threadId)
-        params.set('threadId', selection.threadId);
-      if (prepare && selection.threadId) selectedQuery = params.toString();
-      const speculative = await warmup?.readIdentity()?.catch(() => undefined);
-      const identity =
-        speculative ??
-        (await readEmployeeEntryIdentity(selection, lifetime.signal));
-      lifetime.signal.throwIfAborted();
-      carrier = openNativePageCarrier(identity, selection, () => {
-        remoteRevoked = true;
-        unbindMemoryWrites?.();
-        send(pageRevoked);
-        if (!prepare && !lifetime.signal.aborted) setFailed(true);
-        // Before issuance, ready's rejection is handled by setting below.
-        if (prepare && mounted) finish('failed');
-        // Password changes and logout can revoke this carrier before their
-        // responses reach the iframe. Only the current cookie decides where
-        // the outer page goes.
-        if (mounted)
-          void retire()
-            .then(async () => {
-              if (detached || replace.current !== applyQuery) return;
-              const response = await fetch('/api/v1/auth/session', {
-                credentials: 'same-origin',
-                cache: 'no-store',
-                signal: lifetime.signal,
-              });
-              // The unqualified entry checks the cookie again on navigation.
-              if (
-                response.status === 401 &&
-                !detached &&
-                replace.current === applyQuery
-              )
-                location.replace('/chatflow/4.0');
-            })
-            .catch(() => {});
-      });
-      const issued = (await carrier.ready).scopeReference;
+      let selection = entry.selection;
+      let identity: DEntryIdentity | undefined;
+      let opened: Awaited<ReturnType<typeof connect>['ready']> | undefined;
+      const warm = activation.warmIdentity;
+      if (
+        prepare &&
+        !entry.operationId &&
+        warm &&
+        selection.threadId &&
+        warm.threadId === selection.threadId &&
+        warm.workspaceId === selection.workspaceId &&
+        warm.employeeInstanceId === selection.employeeInstanceId
+      ) {
+        await waitForVisibleEntry(lifetime.signal);
+        selectedQuery = params.toString();
+        timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+        const attempt = (carrier = connect(warm, selection, true));
+        const upgradeTimer = window.setTimeout(() => {
+          if (!attempt.dispatched) void attempt.close().catch(() => {});
+        }, warmUpgradeWaitMs);
+        try {
+          opened = await attempt.ready;
+          identity = warm;
+          opening();
+        } catch (error) {
+          lifetime.signal.throwIfAborted();
+          // Before the page command it is safe to fall back to the cold path.
+          // A dispatched attempt must retain its normal failure and close.
+          if (attempt.dispatched) throw error;
+          await attempt.close();
+          carrier = undefined;
+          remoteRevoked = false;
+          window.clearTimeout(timer);
+        } finally {
+          window.clearTimeout(upgradeTimer);
+        }
+      }
+      if (!opened || !identity) {
+        prewarming ??= startPrewarming();
+        selection = prepare
+          ? await prepareEmployeeEntry(
+              entry,
+              lifetime.signal,
+              opening,
+              prewarming,
+            )
+          : entry.selection;
+        if (selection.threadId && !entry.selection.threadId)
+          params.set('threadId', selection.threadId);
+        if (prepare && selection.threadId) selectedQuery = params.toString();
+        identity =
+          warmup?.readIdentity() ??
+          (await readEmployeeEntryIdentity(selection, lifetime.signal));
+        lifetime.signal.throwIfAborted();
+        carrier = connect(identity, selection);
+        opened = await carrier.ready;
+      }
+      const issued = opened.scopeReference;
       scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
       if (navigating) return;

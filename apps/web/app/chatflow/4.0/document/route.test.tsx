@@ -22,16 +22,22 @@ import {
 import { deferred } from '../../../../../../packages/d-entry-principal/test/host-fixture';
 
 const authenticated = vi.hoisted(() => vi.fn());
+const entryContext = vi.hoisted(() => vi.fn());
+const entryRoot = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
 const directory = vi.hoisted(() => vi.fn());
 const releasedAssets = vi.hoisted(() => vi.fn());
 const cookie = vi.hoisted(() => ({ value: '' }));
+const requestDestination = vi.hoisted(() => ({ value: 'document' }));
 vi.mock('@allrice/database', async (load) => ({
   ...(await load<typeof Database>()),
   readDEntryEmployeeDirectory: directory,
+  getDEntryNativeRootPin: entryRoot,
 }));
 vi.mock('next/headers', () => ({
+  headers: async () =>
+    new Headers({ 'sec-fetch-dest': requestDestination.value }),
   cookies: async () => ({
     get: () => cookie,
   }),
@@ -43,9 +49,10 @@ vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
 vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
   ...(await importOriginal<typeof SessionIdentity>()),
   requireRequestContext: authenticated,
+  getRequestContext: entryContext,
 }));
 vi.mock('../../../../lib/d-entry/released-profile-assets', () => ({
-  readReleasedProfileAssets: releasedAssets,
+  readLocalProfileAssets: releasedAssets,
   readStartupProfileAssetUrls: async () => [
     '/_next/static/dsh-profile/' +
       'a'.repeat(64) +
@@ -72,12 +79,33 @@ const request = (suffix = query) =>
   });
 beforeEach(() => {
   authenticated.mockReset();
+  entryContext.mockReset();
+  entryRoot.mockReset();
   historyIdentity.mockReset();
   profileRequest.mockReset();
   directory.mockReset();
   releasedAssets.mockReset();
+  requestDestination.value = 'document';
   cookie.value = 'unit-test-original-session-cookie';
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
+});
+
+it('offers the warm path only on a document load with an exact owned root', async () => {
+  const f = await fixture();
+  entryContext.mockResolvedValue(f.context);
+  entryRoot.mockImplementation(() => f.root());
+  const render = () =>
+    EntryPage({ searchParams: Promise.resolve(f.selection) });
+  expect((await render()).props.warmIdentity).toEqual(f.identity);
+  expect(entryRoot).toHaveBeenCalledExactlyOnceWith(f.context, f.selection, {
+    runningSnapshot: true,
+  });
+  entryRoot.mockRejectedValueOnce(new DataAccessError('not_found'));
+  expect((await render()).props.warmIdentity).toBeUndefined();
+  entryRoot.mockClear();
+  requestDestination.value = 'empty';
+  expect((await render()).props.warmIdentity).toBeUndefined();
+  expect(entryRoot).not.toHaveBeenCalled();
 });
 
 it('the Next product page preserves selection before the client opens its long-lived owner', async () => {
@@ -196,35 +224,39 @@ it('requires the issued scope in the document address and leaves the two exact n
     manifestSha256: '1'.repeat(64),
   };
   const bundle = 'plugins/??fixture/client.js&rev=r1';
-  profileRequest.mockImplementation(async (_input, _type, _selectors, mode) =>
-    mode === 'document'
-      ? Response.json({ ...claims, nativeSessionId: 'real-native-root' })
-      : Response.json({
-          version: 1,
-          scopeReference: { scopeId },
-          bindingRef: claims.bindingRef,
-          graph: {
-            rev: claims.graphRev,
-            release: { version: '0.2.1-rc.2' },
-            entries: [{ id: 'fixture', url: bundle, rev: 'r1' }],
-            batches: [
-              {
-                phase: 'bootstrap',
-                url: bundle,
-                rev: 'r1',
-                entries: ['fixture'],
-              },
-            ],
-          },
-          injections: [
+  const address = { ...claims, nativeSessionId: 'real-native-root' };
+  profileRequest.mockImplementation(async (_input, _type, _selectors, mode) => {
+    if (mode === 'document') return Response.json(address);
+    expect(mode).toBe('inline-document');
+    return Response.json({
+      address,
+      bootstrap: {
+        version: 1,
+        scopeReference: { scopeId },
+        bindingRef: claims.bindingRef,
+        graph: {
+          rev: claims.graphRev,
+          release: { version: '0.2.1-rc.2' },
+          entries: [{ id: 'fixture', url: bundle, rev: 'r1' }],
+          batches: [
             {
-              kind: 'script',
-              placement: 'head',
-              text: '/* </script><script>unexpected</script> */',
+              phase: 'bootstrap',
+              url: bundle,
+              rev: 'r1',
+              entries: ['fixture'],
             },
           ],
-        }),
-  );
+        },
+        injections: [
+          {
+            kind: 'script',
+            placement: 'head',
+            text: '/* </script><script>unexpected</script> */',
+          },
+        ],
+      },
+    });
+  });
   directory.mockResolvedValue({
     sessions: [{ id: threadId, title: '</script><script>unexpected</script>' }],
     employees: [],
@@ -257,6 +289,7 @@ it('requires the issued scope in the document address and leaves the two exact n
   const assetRoot = '/_next/static/dsh-profile/' + claims.manifestSha256 + '/';
   releasedAssets.mockResolvedValue({
     root: assetRoot,
+    stamp: claims.manifestSha256,
     paths: new Set([
       'native/assets/index-BxpfOGf3.css',
       'managed/employee-web-entry.js',
@@ -288,7 +321,7 @@ it('requires the issued scope in the document address and leaves the two exact n
   );
   expect(html).not.toContain(cookie.value);
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
-  expect(releasedAssets).toHaveBeenCalledExactlyOnceWith(claims.manifestSha256);
+  expect(releasedAssets).toHaveBeenCalledExactlyOnceWith();
   expect(html).toContain(
     'src="' + assetRoot + 'managed/employee-web-entry.js"',
   );
@@ -331,8 +364,7 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect((await call('api/file?path=%2Ftest')).status).toBe(403);
   expect((await call('api/session/uploadFileBinary', 'POST')).status).toBe(403);
   expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
-    ['bootstrap', { scopeId }, 'document'],
-    ['bootstrap', { scopeId }],
+    ['bootstrap', { scopeId }, 'inline-document'],
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
   ]);
@@ -394,7 +426,7 @@ it(
     expect(await denied.text()).not.toMatch(
       /private employee|private session|<script/,
     );
-    expect(profileRequest).toHaveBeenCalledTimes(2);
+    expect(profileRequest).toHaveBeenCalledTimes(1);
     expect(
       profileRequest.mock.calls.every(
         ([input]) =>

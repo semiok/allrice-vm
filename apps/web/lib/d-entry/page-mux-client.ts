@@ -5,7 +5,9 @@ export type NativePageSocket = Pick<
   WebSocket,
   'readyState' | 'send' | 'close'
 > &
-  Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
+  Pick<EventTarget, 'addEventListener' | 'removeEventListener'> & {
+    endStreams?(ids: readonly string[]): void;
+  };
 
 /** Expose the rc.2 text-stream socket interface to the owned iframe without
  * opening another connection or handing it the parent page protocol. */
@@ -13,6 +15,8 @@ export function borrowPageMux(
   scopeId: string,
   resourceScopeId = scopeId,
   canSendInput: () => boolean = () => true,
+  currentScope: () => string = () => resourceScopeId,
+  applyScope?: (issued: unknown) => void,
 ): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
@@ -26,6 +30,8 @@ export function borrowPageMux(
   port1.onmessage = ({ data }) => {
     if (data?.type === 'close') {
       finish();
+    } else if (data?.type === 'scope' && readyState === WebSocket.OPEN) {
+      applyScope?.(data.issued);
     } else if (data?.type === 'open' && readyState === WebSocket.CONNECTING) {
       readyState = WebSocket.OPEN;
       events.dispatchEvent(new Event('open'));
@@ -47,6 +53,14 @@ export function borrowPageMux(
     get readyState() {
       return readyState;
     },
+    endStreams(ids) {
+      for (const streamId of ids)
+        events.dispatchEvent(
+          new MessageEvent('message', {
+            data: JSON.stringify({ type: 'end', streamId }),
+          }),
+        );
+    },
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),
     send(data) {
@@ -60,7 +74,11 @@ export function borrowPageMux(
           'Native resource mux is unavailable',
           'InvalidStateError',
         );
-      port1.postMessage({ type: 'frame', data });
+      port1.postMessage({
+        type: 'frame',
+        data,
+        resourceScopeId: currentScope(),
+      });
     },
     close() {
       if (readyState === WebSocket.CLOSED) return;

@@ -119,15 +119,20 @@ export async function fixture(
   const selectionIdentity = (value: unknown) => {
     const selection = DEntrySelectionInputSchema.parse(value);
     const threadId = selection.threadId;
-    const other = threadId && otherEmployees.get(threadId);
+    const other = threadId
+      ? otherEmployees.get(threadId)
+      : [...otherEmployees.values()].find(
+          (item) =>
+            item.identity.employeeInstanceId === selection.employeeInstanceId,
+        );
     if (
       other &&
       other.identity.employeeInstanceId === selection.employeeInstanceId
     )
-      return other.identity;
+      return { ...other.identity, threadId: threadId ?? null };
     return threadId && roots.has(threadId)
       ? { ...f.identity, threadId }
-      : rootless
+      : rootless || !threadId
         ? { ...f.identity, threadId: null }
         : f.identity;
   };
@@ -328,19 +333,35 @@ export async function fixture(
     await args[4].verifyRoster(args[3]);
     return f.deps.watch();
   });
+  const confirmVerifiedEditor = vi.fn(
+    async () =>
+      ({
+        binding: f.binding,
+        proof: f.owner.revoked,
+      }) as { binding: typeof f.binding; proof: AbortSignal } | undefined,
+  );
   const pages = createDEntryPageRequests({
     ...f.deps,
     owners: {
       async resolve(_context, identity) {
-        const other =
-          identity.threadId && otherEmployees.get(identity.threadId);
+        const other = identity.threadId
+          ? otherEmployees.get(identity.threadId)
+          : [...otherEmployees.values()].find(
+              (item) =>
+                item.identity.employeeInstanceId ===
+                identity.employeeInstanceId,
+            );
         return other &&
           identity.employeeInstanceId === other.identity.employeeInstanceId
           ? other.owner
           : f.deps.owners.resolve();
       },
     },
-    ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
+    data: () => ({
+      ...f.data,
+      confirmVerifiedEditor,
+      ...(newRoot && { prepareEditorRoot }),
+    }),
     authenticate,
     async watch(_context, selection) {
       const authority = await f.deps.watch();
@@ -368,7 +389,17 @@ export async function fixture(
   const mux = createDEntryPageMux(
     {
       ...pages,
-      own(token, selection, active, stop, opened, revoked, previous) {
+      own(
+        token,
+        selection,
+        active,
+        stop,
+        opened,
+        revoked,
+        previous,
+        dispatch,
+        borrowable,
+      ) {
         return pages.own(
           token,
           selection,
@@ -380,6 +411,8 @@ export async function fixture(
           },
           revoked,
           previous,
+          dispatch,
+          borrowable,
         );
       },
     },
@@ -598,6 +631,7 @@ export async function fixture(
   return {
     ...f,
     proveSwitch,
+    confirmVerifiedEditor,
     prepareEditorRoot,
     registerRoot,
     rememberRoot,
@@ -655,7 +689,10 @@ export function messages(peer: WebSocket) {
     }
   };
 }
-export async function open(f: Awaited<ReturnType<typeof fixture>>) {
+export async function open(
+  f: Awaited<ReturnType<typeof fixture>>,
+  reuseEmployee = false,
+) {
   const peer = f.connect();
   await once(peer, 'open');
   const receive = messages(peer);
@@ -663,7 +700,7 @@ export async function open(f: Awaited<ReturnType<typeof fixture>>) {
     type: 'open',
     streamId: 'life',
     endpoint: '$d-entry/page',
-    payload: { args: {} },
+    payload: { args: reuseEmployee ? { reuseEmployee: true } : {} },
   });
   const frame = await receive();
   expect(frame).toMatchObject({

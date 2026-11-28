@@ -160,6 +160,7 @@ export const DEntryPageSwitchResultSchema = z.discriminatedUnion('type', [
     threadId: UuidSchema,
     scopeId: UuidSchema,
     nativeSessionId: z.string().min(1),
+    retiredStreams: z.array(z.string().min(1)).optional(),
   }),
   z.strictObject({
     type: z.literal('switch-unavailable'),
@@ -170,6 +171,7 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   carrier: z.literal('page'),
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
+  warm: z.literal('1').optional(),
 });
 // Connection's canonical namespace/method syntax. A caller can name a method
 // here, but only the admitted guest can resolve and authorize its descriptor.
@@ -179,6 +181,7 @@ export const DEntryPageUnarySchema = z
 // Only an acknowledged, currently authorized page create/fork may carry this
 // AllRice thread id. The DSH reply body and rpcId keep their original contract.
 export const dEntryRegisteredThreadHeader = 'x-allrice-d-entry-thread';
+export const dEntryWarmIdentityHeader = 'x-allrice-d-entry-identity';
 export function decodeDEntryRegisteredThread(header: string | null) {
   if (!header || header.length > 4096) return;
   try {
@@ -204,6 +207,7 @@ export const DEntryPageBorrowSchema = DEntrySelectionInputSchema.extend({
   scopeId: UuidSchema,
 });
 export const DEntryPageSwitchProofSchema = DEntryPageBorrowSchema.extend({
+  dispatch: z.literal('direct').optional(),
   requestId: UuidSchema,
   targetThreadId: UuidSchema,
 });
@@ -279,6 +283,14 @@ export const DEntryProfileBootstrapSchema = z.strictObject({
   bindingRef: profileToken,
   graph: DEntryProfileGraphSchema,
   injections: z.array(DEntryProfileInjectionSchema).min(1),
+});
+
+/** Private Web-to-Worker document response from the same published scope. */
+export const DEntryProfileDocumentSchema = z.strictObject({
+  address: DEntryProfileAddressSchema.extend({
+    nativeSessionId: z.string().min(1),
+  }),
+  bootstrap: DEntryProfileBootstrapSchema,
 });
 export const DEntryProfileFilePathSchema = z
   .string()

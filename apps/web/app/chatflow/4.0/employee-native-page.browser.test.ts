@@ -673,7 +673,7 @@ suite('4.0 browser cold entry', () => {
       await expect
         .poll(() => page.getByRole('button', { name: '继续' }).isEnabled())
         .toBe(true);
-      expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+      expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(2);
       expect(documents).toEqual([]);
       const birthsBeforePolling = births.slice();
       await page.getByRole('button', { name: '继续' }).click();

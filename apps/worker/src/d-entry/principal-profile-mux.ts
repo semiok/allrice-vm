@@ -18,6 +18,7 @@ import {
   DEntryPageRpcRequestSchema,
   DEntryPageUnarySchema,
   DEntryPageSwitchSchema,
+  sameDEntryIdentity,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
@@ -26,6 +27,7 @@ import {
   type DEntryPageInput,
 } from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
+import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import {
   DEntryNativeRootRejected,
@@ -38,9 +40,30 @@ import {
 } from './principal-requests.js';
 
 const emptyPayload = z.object({ args: z.strictObject({}) }).strict();
+const pageOpenPayload = z.strictObject({
+  args: z.strictObject({ reuseEmployee: z.literal(true).optional() }),
+});
 const denied = () => new DataAccessError('authorization_denied');
 type Frame = ReturnType<typeof parseRemoteStreamClientMessage>;
 type Send = (value: RemoteStreamServerMessage) => Promise<void>;
+
+function followedSessionId(frame: Frame) {
+  if (frame.type !== 'open' || frame.endpoint !== 'session/follow') return;
+  try {
+    const { request } = TYPERT_REMOTE.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(
+        DEntryPageRpcRequestSchema.shape.payload.parse(frame.payload).args,
+      );
+    const { address } = request;
+    return address.kind === 'session'
+      ? address.sessionId
+      : address.childSessionId;
+  } catch {
+    // Malformed opens follow the normal per-stream error path.
+  }
+}
 
 export function pageRemoteFailure(error: unknown) {
   if (error instanceof DEntryNativeRootRejected)
@@ -113,6 +136,15 @@ type OwnedPage = {
   operation: Promise<void>;
 };
 
+// These are employee-wide read streams in the existing rc.2 page profile.
+// Session follow and every other stream stay with the currently issued page.
+const employeeStreams = new Set([
+  '$events',
+  'remoteAccess/follow',
+  'session/control',
+  'workspace/follow',
+]);
+
 async function runOwner(
   pages: ReturnType<typeof createDEntryPageRequests>,
   token: string,
@@ -125,9 +157,15 @@ async function runOwner(
 ) {
   const send = sendTo(peer);
   let streamId: string | undefined;
+  let publishedScopeId: string | undefined;
   let current: OwnedPage | undefined;
   let staged: OwnedPage | undefined;
+  let transport: OwnedPage | undefined;
+  let shared: ReturnType<typeof pageStreams> | undefined;
   let handoff: Promise<void> | undefined;
+  let restarting: Map<string, Frame> | undefined;
+  let followHandoff:
+    { previousScopeId: string; targetRoot: string } | undefined;
   let terminal: Promise<void> | undefined;
   let requestedClose = false;
   const notify = (error: unknown) => {
@@ -149,6 +187,7 @@ async function runOwner(
     selection: DEntrySelectionInput,
     publish: (generation: OwnedPage, page: DEntryPageHandle) => Promise<void>,
     previous?: DEntryPageHandle,
+    borrowable = true,
   ) {
     const setup = new AbortController();
     const stop = new AbortController();
@@ -171,6 +210,19 @@ async function runOwner(
           if (!requestedClose && !stop.signal.aborted) fail(error);
         },
         previous,
+        (requestId, threadId) => {
+          if (current !== generation || !streamId || requestedClose) return;
+          void Promise.resolve()
+            .then(() =>
+              switchThread(
+                { type: 'switch', requestId, threadId },
+                streamId!,
+                true,
+              ),
+            )
+            .catch(fail);
+        },
+        borrowable,
       ),
     };
     return generation;
@@ -203,6 +255,7 @@ async function runOwner(
       page,
       send,
       AbortSignal.any([connected, generation.stop.signal, page.signal]),
+      Boolean(shared),
     );
     current = generation;
   }
@@ -210,6 +263,7 @@ async function runOwner(
   function switchThread(
     command: ReturnType<typeof DEntryPageSwitchSchema.parse>,
     id: string,
+    direct = false,
   ) {
     const previous = current;
     const previousPage = previous?.page;
@@ -225,6 +279,7 @@ async function runOwner(
     const reserved = previousPage.reserveThreadSwitch(
       command.requestId,
       command.threadId,
+      direct,
     );
     if (!reserved) return decline();
     staged = begin(
@@ -241,6 +296,17 @@ async function runOwner(
         );
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
+        const retiring = shared
+          ? previous.resources?.retire(root.rootNativeSessionId)
+          : undefined;
+        restarting = new Map(
+          retiring?.pending.map((opening) => [opening.streamId, opening]),
+        );
+        if (shared)
+          followHandoff = {
+            previousScopeId: previousPage.scope.opened.scopeId,
+            targetRoot: root.rootNativeSessionId,
+          };
         endPage(previous);
         await join(previous);
         generation.stop.signal.throwIfAborted();
@@ -250,7 +316,7 @@ async function runOwner(
         connected.throwIfAborted();
         mount(generation, page);
         staged = undefined;
-        await send({
+        const published = send({
           type: 'item',
           streamId: id,
           value: {
@@ -259,8 +325,14 @@ async function runOwner(
             threadId: command.threadId,
             scopeId: page.scope.opened.scopeId,
             nativeSessionId: root.rootNativeSessionId,
+            ...(retiring?.end.length && { retiredStreams: retiring.end }),
           },
         });
+        for (const opening of restarting.values())
+          generation.resources?.accept(opening);
+        restarting = undefined;
+        await published;
+        publishedScopeId = page.scope.opened.scopeId;
       },
       previousPage,
     );
@@ -285,6 +357,16 @@ async function runOwner(
     // rejection listener until the generation itself terminates.
   }
 
+  async function joinPages() {
+    const generations = new Set([transport, current, staged]);
+    const results = await Promise.allSettled([
+      shared?.close(),
+      ...[...generations].map(join),
+    ]);
+    for (const result of results)
+      if (result.status === 'rejected') throw result.reason;
+  }
+
   try {
     for await (const [message, binary] of on(peer, 'message', {
       signal: connected,
@@ -293,15 +375,61 @@ async function runOwner(
       lowWaterMark: 1,
     })) {
       if (binary) throw denied();
-      const frame = parseRemoteStreamClientMessage(String(message));
+      const decoded: unknown = JSON.parse(String(message));
+      const pageScopeId =
+        decoded && typeof decoded === 'object' && 'pageScopeId' in decoded
+          ? decoded.pageScopeId
+          : undefined;
+      if (decoded && typeof decoded === 'object' && 'pageScopeId' in decoded)
+        delete decoded.pageScopeId;
+      const frame = parseRemoteStreamClientMessage(JSON.stringify(decoded));
       if (
         !streamId &&
         frame.type === 'open' &&
         frame.endpoint === '$d-entry/page'
       ) {
-        emptyPayload.parse(frame.payload);
+        const { args } = pageOpenPayload.parse(frame.payload);
         const id = (streamId = frame.streamId);
+        const sharedPage = args.reuseEmployee
+          ? new Promise<DEntryPageHandle>((resolve, reject) => {
+              transport = begin(
+                {
+                  workspaceId: input.selection.workspaceId,
+                  employeeInstanceId: input.selection.employeeInstanceId,
+                },
+                async (_generation, page) => {
+                  resolve(page);
+                },
+                undefined,
+                false,
+              );
+              void transport.operation.then(() => reject(denied()), reject);
+            })
+          : undefined;
+        void sharedPage?.catch((error: unknown) => {
+          if (!requestedClose) fail(error);
+        });
         current = begin(input.selection, async (generation, page) => {
+          if (sharedPage) {
+            const employee = await sharedPage;
+            if (
+              !sameDEntryIdentity(employee.identity, {
+                ...page.identity,
+                threadId: null,
+              }) ||
+              employee.sessionId !== page.sessionId ||
+              employee.bindingRef !== page.bindingRef
+            )
+              throw denied();
+            employee.signal.throwIfAborted();
+            shared = pageStreams(
+              employee,
+              send,
+              AbortSignal.any([connected, employee.signal]),
+            );
+          }
+          generation.stop.signal.throwIfAborted();
+          page.signal.throwIfAborted();
           mount(generation, page);
           await send({
             type: 'item',
@@ -312,13 +440,55 @@ async function runOwner(
               bindingRef: page.bindingRef,
             },
           });
+          publishedScopeId = page.scope.opened.scopeId;
         });
         void current.operation.catch((error) => {
           if (!requestedClose) fail(error);
         });
       } else if (frame.streamId !== streamId) {
         if (!current?.resources || requestedClose) throw denied();
-        if (!current.stop.signal.aborted) current.resources.accept(frame);
+        const local = current.resources;
+        const id = frame.streamId;
+        if (frame.type === 'cancel') restarting?.delete(id);
+        const stable =
+          shared &&
+          (frame.type === 'open'
+            ? employeeStreams.has(frame.endpoint)
+            : shared.has(id));
+        if (
+          frame.type === 'open' &&
+          (local.has(id) || shared?.has(id) || restarting?.has(id))
+        )
+          throw denied();
+        // A native selection may dispatch its journal open just as the
+        // old scope retires. Only its exact new root can enter the new scope.
+        const followsTarget =
+          followHandoff &&
+          pageScopeId === followHandoff.previousScopeId &&
+          followedSessionId(frame) === followHandoff.targetRoot;
+        if (followsTarget && restarting) {
+          restarting.set(id, frame);
+          continue;
+        }
+        const resources = stable ? shared : local;
+        const replaced =
+          frame.type === 'open' &&
+          !stable &&
+          !followsTarget &&
+          (pageScopeId !== undefined || Boolean(shared)) &&
+          pageScopeId !== current.page?.scope.opened.scopeId;
+        if (resources && !resources.signal.aborted && !replaced)
+          resources.accept(frame);
+        else if (frame.type === 'open')
+          await send({
+            type: 'error',
+            streamId: id,
+            error: {
+              code: 'gateway/cancelled',
+              message: 'Native session selection changed',
+              details: {},
+            },
+          });
       } else if (
         frame.type === 'item' &&
         frame.value === 'close' &&
@@ -328,6 +498,7 @@ async function runOwner(
         const reason = new DOMException('Page closed', 'AbortError');
         endPage(current, reason);
         endPage(staged, reason);
+        endPage(transport, reason);
       } else if (frame.type === 'item' && !requestedClose) {
         await switchThread(
           DEntryPageSwitchSchema.parse(frame.value),
@@ -335,12 +506,10 @@ async function runOwner(
         );
       } else if (frame.type === 'end') {
         if (!requestedClose) break;
-        const scopeId = current?.page?.scope.opened.scopeId;
         try {
-          const joins = await Promise.allSettled([join(staged), join(current)]);
-          for (const result of joins)
-            if (result.status === 'rejected') throw result.reason;
+          await joinPages();
           connected.throwIfAborted();
+          const scopeId = publishedScopeId;
           if (!scopeId) {
             await send({
               type: 'error',
@@ -372,21 +541,30 @@ async function runOwner(
   } catch (error) {
     endPage(current, error);
     endPage(staged, error);
+    endPage(transport, error);
     await notify(error);
   } finally {
     endPage(current, connected.reason);
     endPage(staged, connected.reason);
-    await Promise.allSettled([join(current), join(staged), handoff, terminal]);
+    endPage(transport, connected.reason);
+    await Promise.allSettled([joinPages(), handoff, terminal]);
   }
 }
 
-function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
+function pageStreams(
+  page: DEntryPageHandle,
+  send: Send,
+  signal: AbortSignal,
+  exactRoot = false,
+) {
   const streams = new Map<
     string,
     {
       cancel(): void;
       sendInput(input: DEntryPageInput): void;
       work: Promise<void>;
+      isOpen(): boolean;
+      beforeSnapshot(nativeId: string): Frame | undefined;
     }
   >();
   const scopeId = page.scope.opened.scopeId;
@@ -398,6 +576,9 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     const id = frame.streamId;
     let settled = false;
     let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
+    let verifyRegistration: (() => Promise<void>) | undefined;
+    const followedId = exactRoot ? followedSessionId(frame) : undefined;
+    let openingSent = false;
     let buffered = 0;
     let input = Promise.resolve();
     let inputError = Promise.resolve();
@@ -417,8 +598,13 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
       void inputError.catch((error: unknown) => stop.abort(error));
     }
     const source = page.use(child, async (child) => {
-      if (frame.endpoint === 'session/follow')
+      if (frame.endpoint === 'session/follow') {
+        if (exactRoot) {
+          if (!followedId) throw denied();
+          verifyRegistration = await page.authorizeFollow(followedId, child);
+        }
         follow = await page.watchFollow(child);
+      }
       if (follow) {
         if (!page.scope.opened.followWithdrawals)
           throw new RemoteError(
@@ -465,8 +651,10 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
             while ((pending = follow.pending())) await pending;
             follow.signal.throwIfAborted();
           } else await page.assertCurrent(child);
+          if (verifyRegistration) await verifyRegistration();
           if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
+          openingSent = true;
           await send({ type: 'item', streamId: id, value: item.value });
         }
         follow?.signal.throwIfAborted();
@@ -507,6 +695,9 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     streams.set(id, {
       work,
       cancel: () => controller.abort(),
+      isOpen: () => !settled && !child.aborted,
+      beforeSnapshot: (nativeId) =>
+        !openingSent && followedId === nativeId ? frame : undefined,
       sendInput(command) {
         if (settled || child.aborted) return;
         const bytes = Buffer.byteLength(JSON.stringify(command));
@@ -540,8 +731,26 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     });
     void work.catch((error) => stop.abort(error));
   }
+  async function close() {
+    stop.abort();
+    await Promise.allSettled([...streams.values()].map(({ work }) => work));
+  }
   return {
     signal: active,
+    has: (id: string) => streams.has(id),
+    retire(nativeId: string) {
+      const end: string[] = [];
+      const pending: Frame[] = [];
+      for (const [id, entry] of streams) {
+        if (!entry.isOpen()) continue;
+        // rc.2 treats EOF before its first snapshot as terminal. Resume an
+        // opening follow of the target on the new scope with the same id.
+        const opening = entry.beforeSnapshot(nativeId);
+        if (opening) pending.push(opening);
+        else end.push(id);
+      }
+      return { end, pending };
+    },
     accept(frame: Frame) {
       active.throwIfAborted();
       const prior = streams.get(frame.streamId);
@@ -561,10 +770,7 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
         });
       }
     },
-    async close() {
-      stop.abort();
-      await Promise.allSettled([...streams.values()].map(({ work }) => work));
-    },
+    close,
   };
 }
 
@@ -638,6 +844,7 @@ export function createDEntryPageMux(
           const {
             organizationId,
             scopeId,
+            warm,
             workspaceId,
             employeeInstanceId,
             threadId,
@@ -657,6 +864,7 @@ export function createDEntryPageMux(
             peer.on('error', stop);
             return peer;
           };
+          if (warm && (scopeId || !threadId)) throw denied();
           if (scopeId) {
             await pages.borrow(
               token,
@@ -674,7 +882,7 @@ export function createDEntryPageMux(
               },
             );
           } else {
-            await pages.authorizeUpgrade(token, input, connected);
+            await pages.authorizeUpgrade(token, input, connected, warm === '1');
             await runOwner(pages, token, input, await accept(), connected);
           }
         })

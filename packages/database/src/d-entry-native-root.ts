@@ -152,11 +152,22 @@ export async function getDEntryHistoryRootPin(
 export async function getDEntryNativeRootPin(
   context: RequestContext,
   input: unknown,
+  options?: { runningSnapshot?: boolean },
 ) {
   const identity = await requireDEntryNativeIdentity(context, input);
   if (!identity.threadId) return deny();
-  const pin = await readPin(getDatabase(), identity);
+  const sql = getDatabase();
+  const pin = await readPin(sql, identity);
   if (!pin) throw Error('NATIVE_QUERY_BINDING_UNAVAILABLE');
+  if (options?.runningSnapshot) {
+    const [running] = await sql<{ active: boolean }[]>`
+      select exists (
+        select 1 from person_virtual_machines
+        where person_id=${identity.personId} and organization_id=${identity.organizationId}
+          and vm_id=${pin.vmId} and phase='running' and lease_owner is null
+      ) as active`;
+    if (!running?.active) throw Error('NATIVE_QUERY_BINDING_UNAVAILABLE');
+  }
   return pin;
 }
 
