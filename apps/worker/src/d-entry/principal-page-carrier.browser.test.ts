@@ -917,10 +917,8 @@ it
       const before = materialReads.length;
       await openWorkbenchPane(nativeId, '企业资料');
       await dock(nativeId)
-        .getByRole('button', {
-          name: '引用到对话 ' + file,
-          exact: true,
-        })
+        .locator(`[data-file-id="${reference.revisionId}"]`)
+        .getByRole('button', { name: '引用到对话', exact: true })
         .click();
       await expect.poll(() => editor.textContent()).toContain(file);
       expect(materialReads.slice(before)).toEqual([threadId, threadId]);
