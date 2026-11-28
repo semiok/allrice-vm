@@ -111,12 +111,12 @@ export async function stageDshProfileAssets(root, sourceSha) {
     await writeFile(destination, bytes, { flag: 'wx' });
   }
 
-  function batchTrailer(reference) {
+  function batchTrailer(entries, revision) {
     return Buffer.from(
-      '//# sourceMappingURL=' +
-        reference
-          .slice('plugins/'.length)
-          .replaceAll('/client.js', '/client.js.map') +
+      '//# sourceMappingURL=??' +
+        entries.map((id) => id + '/client.js.map').join(',') +
+        '&rev=' +
+        revision +
         '\n',
     );
   }
@@ -135,7 +135,7 @@ export async function stageDshProfileAssets(root, sourceSha) {
     for (const id of batch.entries) {
       const entry = graph.entries.find((item) => item.id === id);
       const single = await readAsset(resources.get(entry?.url)?.path);
-      const trailer = batchTrailer(entry.url);
+      const trailer = batchTrailer([id], entry.rev);
       const length = single.length - trailer.length;
       if (
         length <= 0 ||
@@ -150,7 +150,7 @@ export async function stageDshProfileAssets(root, sourceSha) {
       entries.push({ id, offset, length });
       offset += length;
     }
-    if (!bytes.subarray(offset).equals(batchTrailer(batch.url)))
+    if (!bytes.subarray(offset).equals(batchTrailer(batch.entries, batch.rev)))
       throw new Error('Invalid Employee Web public bundle trailer');
     return { phase: batch.phase, byteLength: bytes.length, entries };
   }

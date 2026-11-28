@@ -40,7 +40,9 @@ it('uses a public digest only for the exact graph resource and revision', () => 
 it('uses the same verified public packet after relocation and reconstructs the admitted native order', async () => {
   const root = '/_next/static/dsh-profile/' + 'a'.repeat(64) + '/';
   const rev = '1'.repeat(12);
-  const url = `plugins/??@dsh/second/client.js,@dsh/first/client.js&rev=${rev}`;
+  const firstId = '@dsh/client.js-first';
+  const secondId = '@dsh/second';
+  const url = `plugins/??${secondId}/client.js,${firstId}/client.js&rev=${rev}`;
   const first = 'first("中");\n';
   const second = 'second();\n';
   const bytes = new TextEncoder().encode(first + second + 'sealed trailer');
@@ -56,9 +58,9 @@ it('uses the same verified public packet after relocation and reconstructs the a
           phase: 'application',
           byteLength: bytes.length,
           entries: [
-            { id: '@dsh/first', offset: 0, length: Buffer.byteLength(first) },
+            { id: firstId, offset: 0, length: Buffer.byteLength(first) },
             {
-              id: '@dsh/second',
+              id: secondId,
               offset: Buffer.byteLength(first),
               length: Buffer.byteLength(second),
             },
@@ -72,7 +74,7 @@ it('uses the same verified public packet after relocation and reconstructs the a
     url,
     rev,
     phase: 'application',
-    entries: ['@dsh/second', '@dsh/first'],
+    entries: [secondId, firstId],
   };
   const packet = resolve(batch)!;
   expect(packet.url).toBe(root + 'bundles/' + sha256 + '.js');
@@ -80,9 +82,7 @@ it('uses the same verified public packet after relocation and reconstructs the a
   expect(new TextDecoder().decode(received)).toBe(
     second +
       first +
-      '//# sourceMappingURL=' +
-      url.slice('plugins/'.length).replaceAll('/client.js', '/client.js.map') +
-      '\n',
+      `//# sourceMappingURL=??${secondId}/client.js.map,${firstId}/client.js.map&rev=${rev}\n`,
   );
   const changed = bytes.slice();
   changed[0] = 0;
@@ -93,9 +93,7 @@ it('uses the same verified public packet after relocation and reconstructs the a
     'Invalid public profile packet length',
   );
   expect(resolve({ ...batch, phase: 'bootstrap' })).toBeUndefined();
-  expect(
-    resolve({ ...batch, entries: ['@dsh/first', '@dsh/second'] }),
-  ).toBeUndefined();
+  expect(resolve({ ...batch, entries: [firstId, secondId] })).toBeUndefined();
   expect(
     resolve({
       ...batch,

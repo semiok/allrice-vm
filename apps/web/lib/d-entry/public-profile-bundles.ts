@@ -52,7 +52,9 @@ export function findPublicProfileBundle(
     !entries?.length ||
     new Set(entries).size !== entries.length ||
     !/^[a-f0-9]{12}$/.test(rev) ||
-    entries.some((id) => !/^(?:@[\w.-]+\/)?[\w.-]+$/.test(id)) ||
+    entries.some(
+      (id) => !/^(?:@[a-z\d][a-z\d._-]*\/)?[a-z\d][a-z\d._-]*$/i.test(id),
+    ) ||
     batch.url !==
       'plugins/??' +
         entries.map((id) => id + '/client.js').join(',') +
@@ -69,10 +71,10 @@ export function findPublicProfileBundle(
     const spans = entries.map((id) => registrations.get(id));
     if (!spans.every((span) => span !== undefined)) continue;
     const trailer = new TextEncoder().encode(
-      '//# sourceMappingURL=' +
-        batch.url
-          .slice('plugins/'.length)
-          .replaceAll('/client.js', '/client.js.map') +
+      '//# sourceMappingURL=??' +
+        entries.map((id) => id + '/client.js.map').join(',') +
+        '&rev=' +
+        rev +
         '\n',
     );
     return {

@@ -23,11 +23,12 @@ const head = '1'.repeat(40);
 const application = 'plugins/' + '2'.repeat(64) + '.js';
 const artifact = 'apps/worker/dist/d-entry-web';
 const next = 'apps/web/.next';
-const reference = 'plugins/??application/client.js&rev=build';
-const singleReference = 'plugins/??application/client.js&rev=single';
+const moduleId = '@fixture/client.js-app';
+const reference = `plugins/??${moduleId}/client.js&rev=build`;
+const singleReference = `plugins/??${moduleId}/client.js&rev=single`;
 const single = 'plugins/' + '3'.repeat(64) + '.js';
 const script = (body, rev) =>
-  body + `\n//# sourceMappingURL=??application/client.js.map&rev=${rev}\n`;
+  body + `\n//# sourceMappingURL=??${moduleId}/client.js.map&rev=${rev}\n`;
 const paths = {
   'managed/employee-web-entry.js': 'export const runtime = 1;',
   'managed/employee-web-entry.css': '.entry {color: black}',
@@ -72,13 +73,13 @@ async function fixture(op) {
         files,
         profile: {
           graph: {
-            entries: [{ id: 'application', url: singleReference }],
+            entries: [{ id: moduleId, rev: 'single', url: singleReference }],
             batches: [
               {
                 url: reference,
                 rev: 'build',
                 phase: 'application',
-                entries: ['application'],
+                entries: [moduleId],
               },
             ],
           },
@@ -165,7 +166,7 @@ test('stages sealed JS and CSS under immutable paths and changes the URL on new 
             byteLength: Buffer.byteLength(bytes),
             entries: [
               {
-                id: 'application',
+                id: moduleId,
                 offset: 0,
                 length: Buffer.byteLength(body + '\n'),
               },
