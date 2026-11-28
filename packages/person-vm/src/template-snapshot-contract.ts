@@ -168,7 +168,9 @@ export type TemplateRestoreRequest = Readonly<{
 
 /** The provider verifies /work inside the guest against the owned host mount.
  * It authenticates the restored compute and consumes a fresh challenge on a
- * new private endpoint for this binding. User ingress waits for these proofs. */
+ * new private endpoint for this binding. Only after all freshness and mount
+ * proofs pass may the caller start the employee owner, inject credentials,
+ * expose sessions or open ingress. Business readiness uses the existing path. */
 export type RestoredCompute = Readonly<{
   binding: PersonVmBinding;
   templateDigest: string;
