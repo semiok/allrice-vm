@@ -38,6 +38,67 @@ import {
   otherToken,
 } from './principal-page-carrier.fixture.js';
 
+// Install the child fixture in the actual document response. A Playwright
+// init script may first run in the iframe's initial about:blank document.
+function walletInterference(
+  child: boolean,
+  denied: boolean,
+  ownedError: boolean,
+) {
+  return String.raw`(() => {
+    if ((window !== parent) !== ${child}) return;
+    if (${denied}) {
+      const blocked = () => {
+        throw new DOMException('Access to storage is not allowed from this context', 'SecurityError');
+      };
+      for (const name of ['localStorage', 'caches', 'indexedDB'])
+        Object.defineProperty(window, name, { get: blocked });
+      Object.defineProperty(Storage.prototype, 'getItem', { value: blocked });
+    }
+    const noise = { target: 'metamask-inpage', data: { name: 'ObjectMultiplex' } };
+    let bursts = 0;
+    const timer = setInterval(() => {
+      const peer = ${child} ? parent : document.querySelector('iframe')?.contentWindow;
+      if (!peer) return;
+      const scopeId = document.getElementById('app')?.dataset.scopeId;
+      for (let i = 0; i < 24; i++)
+        peer.postMessage({ ...noise, scopeId }, location.origin);
+      document.documentElement.dataset.walletBursts = String(++bursts);
+      if (bursts === 40) clearInterval(timer);
+    }, 10);
+    if (!${child}) return;
+    const append = Element.prototype.append;
+    Element.prototype.append = function (...nodes) {
+      const registration = nodes.find(node => node instanceof HTMLScriptElement && node.textContent);
+      if (this !== document.head || !registration ||
+          document.documentElement.hasAttribute('data-wallet-registration-noise'))
+        return append.apply(this, nodes);
+      document.documentElement.dataset.walletRegistrationNoise = '1';
+      if (${ownedError}) {
+        registration.textContent += "\n;throw Error('Owned bundle registration failed');";
+        return append.apply(this, nodes);
+      }
+      const scopeId = document.getElementById('app').dataset.scopeId;
+      parent.dispatchEvent(new MessageEvent('message', {
+        origin: location.origin, source: window,
+        data: { type: 'allrice:d-entry:startup-failed', scopeId },
+      }));
+      window.dispatchEvent(new MessageEvent('message', {
+        origin: location.origin, source: parent,
+        data: { type: 'allrice:d-entry:revoked', scopeId },
+      }));
+      const injected = document.createElement('script');
+      injected.textContent = "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
+      append.call(this, injected);
+      injected.remove();
+      const extra = document.createElement('script');
+      extra.src = '/wallet-extension-chunk.js';
+      append.call(this, extra);
+      append.apply(this, nodes);
+    };
+  })();`;
+}
+
 const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
@@ -1005,6 +1066,7 @@ it
         const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
+          ${wallet ? '<script>' + walletInterference(true, scenario === 'wallet-storage', scenario === 'wallet-owned-error') + '</script>' : ''}
           ${coldAssets ? nativeStyles : ''}
           <link rel="stylesheet" href="${coldAssets ? publicStyle : '/managed/employee-web-entry.css'}">
           <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
@@ -1032,96 +1094,10 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
-    if (wallet) {
-      await page.addInitScript(
-        ({ denyStorage, ownedError }) => {
-          const child = window !== parent;
-          if (child && !location.pathname.includes('/document')) return;
-          const denied = () => {
-            throw new DOMException(
-              'Access to storage is not allowed from this context',
-              'SecurityError',
-            );
-          };
-          if (denyStorage) {
-            Object.defineProperty(window, 'localStorage', { get: denied });
-            Object.defineProperty(Storage.prototype, 'getItem', {
-              value: denied,
-            });
-            for (const name of ['caches', 'indexedDB'])
-              Object.defineProperty(window, name, { get: denied });
-          }
-          const noise = {
-            target: 'metamask-inpage',
-            data: { name: 'ObjectMultiplex' },
-          };
-          let bursts = 0;
-          const broadcast = setInterval(() => {
-            const peer = child
-              ? parent
-              : document.querySelector('iframe')?.contentWindow;
-            if (!peer) return;
-            const scopeId = child
-              ? document.getElementById('app')?.dataset.scopeId
-              : undefined;
-            for (let i = 0; i < 24; i++)
-              peer.postMessage({ ...noise, scopeId }, location.origin);
-            document.documentElement.dataset.walletBursts = String(++bursts);
-            if (bursts === 40) clearInterval(broadcast);
-          }, 10);
-          if (!child) return;
-          const append = Element.prototype.append;
-          Element.prototype.append = function (...nodes) {
-            if (
-              this === document.head &&
-              !document.documentElement.hasAttribute(
-                'data-wallet-registration-noise',
-              ) &&
-              nodes.some(
-                (node) => node instanceof HTMLScriptElement && node.textContent,
-              )
-            ) {
-              document.documentElement.dataset.walletRegistrationNoise = '1';
-              if (ownedError) {
-                for (const node of nodes)
-                  if (node instanceof HTMLScriptElement && node.textContent)
-                    node.textContent +=
-                      "\n;throw Error('Owned bundle registration failed');";
-                return append.apply(this, nodes);
-              }
-              const scopeId = document.getElementById('app')!.dataset.scopeId;
-              parent.dispatchEvent(
-                new MessageEvent('message', {
-                  origin: location.origin,
-                  source: window,
-                  data: { type: 'allrice:d-entry:startup-failed', scopeId },
-                }),
-              );
-              window.dispatchEvent(
-                new MessageEvent('message', {
-                  origin: location.origin,
-                  source: parent,
-                  data: { type: 'allrice:d-entry:revoked', scopeId },
-                }),
-              );
-              const injected = document.createElement('script');
-              injected.textContent =
-                "throw Error('Wallet content script noise');\n//# sourceURL=chrome-extension://fixture/injected.js";
-              append.call(this, injected);
-              injected.remove();
-              const extra = document.createElement('script');
-              extra.src = '/wallet-extension-chunk.js';
-              append.call(this, extra);
-            }
-            append.apply(this, nodes);
-          };
-        },
-        {
-          denyStorage: scenario === 'wallet-storage',
-          ownedError: scenario === 'wallet-owned-error',
-        },
-      );
-    }
+    if (wallet)
+      await page.addInitScript({
+        content: walletInterference(false, false, false),
+      });
     if (bench === 'overlap') {
       const href = f.origin + applicationPath;
       page.on('request', (request) => {
