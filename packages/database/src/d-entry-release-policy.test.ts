@@ -106,9 +106,15 @@ function fixture(
       throw Error('Unexpected fixture query');
     },
   );
-  const end = vi.fn(async () => {});
+  let socketClosed!: () => void;
+  const end = vi.fn(async () => socketClosed());
   data.getDatabase.mockReturnValue({ options: { fetch_types: true } });
-  data.createDedicatedDatabase.mockReturnValue(Object.assign(sql, { end }));
+  data.createDedicatedDatabase.mockImplementation(
+    ({ options }: { options: { onclose(): void } }) => {
+      socketClosed = options.onclose;
+      return Object.assign(sql, { end });
+    },
+  );
   return { end, seen, sql };
 }
 beforeEach(() => {
@@ -286,7 +292,7 @@ it('reads the foreground busy projection in a bounded read-only transaction', as
     await readPersonVmDiskPreparationForegroundBusy(person, signal()),
   ).toBe(true);
   expect(data.createDedicatedDatabase).toHaveBeenCalledWith({
-    options: { fetch_types: false },
+    options: { fetch_types: false, onclose: expect.any(Function) },
   });
   expect(seen[0]?.query).toBe('begin read only');
   expect(seen[1]?.query).toBe("set local transaction_timeout = '5s'");

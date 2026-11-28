@@ -267,6 +267,7 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
       port: { prepare: prepared },
       observe: () => {},
     });
+    const failures: unknown[] = [];
     try {
       await run({
         feed,
@@ -279,20 +280,29 @@ suite('disk-preprovision scanner with actual PostgreSQL sockets', () => {
         previousFeedClosed,
         settledReadsAtFeedOpen,
       });
-    } finally {
-      try {
-        const cleanup = await Promise.allSettled([
-          owner.close(),
-          feed.close(),
-          reads.close(),
-        ]);
-        for (const result of cleanup)
-          if (result.status === 'rejected') throw result.reason;
-      } finally {
-        await client.closeDatabase();
-        vi.unstubAllEnvs();
-      }
+    } catch (error) {
+      failures.push(error);
     }
+    try {
+      const cleanup = await Promise.allSettled([
+        owner.close(),
+        feed.close(),
+        reads.close(),
+      ]);
+      for (const result of cleanup)
+        if (result.status === 'rejected') failures.push(result.reason);
+      await client.closeDatabase();
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    if (failures.length > 1)
+      throw new AggregateError(
+        failures,
+        'Preprovision scenario and cleanup failed',
+      );
+    if (failures.length) throw failures[0];
   }
 
   it.each([

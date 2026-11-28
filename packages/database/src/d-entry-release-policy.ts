@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type postgres from 'postgres';
 import { z } from 'zod';
 import {
@@ -250,11 +251,41 @@ async function readDiskPreparation<T>(
   // postgres 3.4.9 can reject its internal type discovery outside the caller
   // when the owned connection is ended mid-startup. These reads use scalar
   // parameters and infer all built-in result types without that extra query.
+  const options = getDatabase().options;
+  let confirmSocketClosed!: () => void;
+  const socketClosed = new Promise<void>((resolve) => {
+    confirmSocketClosed = resolve;
+  });
   const client = createDedicatedDatabase({
-    options: { ...getDatabase().options, fetch_types: false },
+    options: {
+      ...options,
+      fetch_types: false,
+      onclose(id) {
+        confirmSocketClosed();
+        options.onclose?.(id);
+      },
+    },
   });
   let closing: Promise<void> | undefined;
-  const close = () => (closing ??= client.end({ timeout: 0 }));
+  const close = () =>
+    (closing ??= (async () => {
+      await client.end({ timeout: 0 });
+      // The end timeout can initiate a half-close. Join the driver's actual
+      // socket-close event before the scanner may finish or replace its feed.
+      const deadline = new AbortController();
+      try {
+        await Promise.race([
+          socketClosed,
+          sleep(6_000, undefined, { signal: deadline.signal, ref: false }).then(
+            () => {
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            },
+          ),
+        ]);
+      } finally {
+        deadline.abort();
+      }
+    })());
   const abort = () => void close().catch(() => {});
   active.addEventListener('abort', abort, { once: true });
   try {
