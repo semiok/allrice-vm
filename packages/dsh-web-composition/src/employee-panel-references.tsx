@@ -281,6 +281,7 @@ export function apply(ctx: Context) {
           name: source,
           showGroupTitle: false,
           header: (_, { query, quoted }) =>
+            // r1-exempt(format): The literal @ breadcrumb path opens the materials header.
             query.startsWith(materialPath)
               ? [
                   {
@@ -296,6 +297,7 @@ export function apply(ctx: Context) {
             if (!binding) return [];
             const target = currentPanelOwner(id);
             const threadId = target?.snapshot.publicationManagement?.threadId;
+            // r1-exempt(format): The explicit @ breadcrumb path selects the catalog to search. Both paths still recheck authority.
             const inFolder = query.startsWith(materialPath);
             const candidates: InputTriggerCandidate[] = [];
             const attempt = AbortSignal.any(
