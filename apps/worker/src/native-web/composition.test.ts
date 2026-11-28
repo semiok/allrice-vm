@@ -28,7 +28,8 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from './composition.js';
-import { dEntryNativePublicUrl } from './launch.js';
+import * as NativeLaunch from './launch.js';
+const { dEntryNativePublicUrl } = NativeLaunch;
 const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
@@ -308,6 +309,14 @@ it('proves the exact scoped thread during starting without using running-only or
   }));
   const verify = vi.fn(async () => proof.signal);
   f.service.installStartingEditorProof(verify);
+  const prepareLaunch = NativeLaunch.prepareNativeWebLaunch;
+  // This test exercises startup evidence. Leave production artifact
+  // construction to the build gates, which have the compiled Worker files.
+  const stage = vi
+    .spyOn(NativeLaunch, 'prepareNativeWebLaunch')
+    .mockImplementation((config, binding, profile, memory) =>
+      prepareLaunch(config, binding, profile, memory),
+    );
   const owner = {
     ...catalogOwner(),
     verifyStartingEditor: vi.fn<NativeWebOwner['verifyStartingEditor']>(
@@ -327,6 +336,7 @@ it('proves the exact scoped thread during starting without using running-only or
   open.mockResolvedValue(owner);
   try {
     await f.service.memoryGuestPlan(f.binding, signal(), web);
+    expect(stage.mock.calls[0]?.[4]).toMatchObject({ scoped: { rules: [] } });
     await f.service.start(f.binding, signal(), f.scope, web);
     expect(verify).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ threadId: editor.threadId }),
@@ -350,6 +360,7 @@ it('proves the exact scoped thread during starting without using running-only or
       ),
     ).toThrow(expect.objectContaining({ code: 'RUNTIME_NOT_READY' }));
   } finally {
+    stage.mockRestore();
     await f.service.close();
   }
 });
