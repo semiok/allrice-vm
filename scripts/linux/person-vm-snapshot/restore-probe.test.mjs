@@ -1,5 +1,7 @@
 /* global AbortController */
 
+import { isDeepStrictEqual } from 'node:util';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { measureRestore } from './measure.mjs';
@@ -101,7 +103,7 @@ function setup(options = {}) {
           binding,
           templateDigest: hash,
           memoryMode: 'cow',
-          computeIdentity,
+          computeIdentity: options.computeIdentity ?? computeIdentity,
           ...options.nativeReceipt,
         };
       };
@@ -129,13 +131,16 @@ function setup(options = {}) {
       networkFenced: scope.networkFenced,
     })),
     withCurrentAuthority: vi.fn(async (expected, signal, start) => {
-      await options.beforeAuthority?.(dimensions);
+      await options.beforeAuthority?.(dimensions, scope);
       signal.throwIfAborted();
       if (
         dimensions.revoked ||
-        expected.binding !== scope.disk.binding ||
-        expected.disk.mountId !== scope.disk.mountId ||
-        expected.egress.bindingId !== scope.egress.bindingId
+        !isDeepStrictEqual(expected.binding, scope.disk.binding) ||
+        !isDeepStrictEqual(expected.disk, scope.disk) ||
+        !isDeepStrictEqual(expected.egress, scope.egress) ||
+        !isDeepStrictEqual(expected.control, scope.control) ||
+        expected.isolationId !== scope.isolationId ||
+        scope.networkFenced !== true
       )
         throw Error('AUTHORITY_LOST');
       return start();
@@ -459,13 +464,20 @@ describe('isolated Linux snapshot restore', () => {
     try {
       await aStopping.promise;
       const aPeer = await a.scope.connectGate.mock.results[0].value;
-      const b = setup({ offset: 1 });
+      const b = setup({
+        offset: 1,
+        computeIdentity: { pid: 2040, startedAt: 'other-birth' },
+      });
+      const aExchanges = a.calls.filter((call) => call === 'reseed').length;
       b.scope.connectGate.mockResolvedValue(aPeer);
       expect(await b.run()).toMatchObject({
         failure: { code: 'GATE_PEER_UNVERIFIED' },
         resourcesReleased: true,
       });
       expect(b.calls).not.toContain('reseed');
+      expect(a.calls.filter((call) => call === 'reseed')).toHaveLength(
+        aExchanges,
+      );
       expect(b.native.stopAndJoin).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ vmId: 'vm-2', leaseEpoch: 2 }),
         expect.anything(),
@@ -616,6 +628,55 @@ describe('isolated Linux snapshot restore', () => {
         resourcesReleased: true,
       });
       expect(fixture.scope.probeSyntheticEditor).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      'same mount ID with different backing inode',
+      (scope) => {
+        scope.disk = {
+          ...scope.disk,
+          image: { ...scope.disk.image, inode: 'other' },
+        };
+      },
+    ],
+    [
+      'same egress ID with open port',
+      (scope) => {
+        scope.egress = { ...scope.egress, gatewayPorts: [1080] };
+      },
+    ],
+    [
+      'replacement control',
+      (scope) => {
+        scope.control = { ...scope.control, socketPath: '/private/wrong.sock' };
+      },
+    ],
+    [
+      'replacement namespace',
+      (scope) => {
+        scope.isolationId = 'wrong';
+      },
+    ],
+    [
+      'open business routes',
+      (scope) => {
+        scope.networkFenced = false;
+      },
+    ],
+  ])(
+    'refuses %s changed inside the last asynchronous admission step',
+    async (_label, invalidate) => {
+      const fixture = setup({
+        beforeAuthority: (_state, scope) => invalidate(scope),
+      });
+      expect(await fixture.run()).toMatchObject({
+        failure: { stage: 'restore' },
+        resourcesReleased: true,
+      });
+      expect(fixture.calls).not.toContain('restore');
+      expect(fixture.scope.connectGate).not.toHaveBeenCalled();
     },
   );
 
